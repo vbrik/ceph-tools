@@ -1,0 +1,3 @@
+[submodule "pgremapper"]
+	path = pgremapper
+	url = https://github.com/digitalocean/pgremapper

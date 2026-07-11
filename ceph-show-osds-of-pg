@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""
+Show the 'up' and 'acting' OSD sets for a given Ceph PG, with each OSD's
+host (CRUSH bucket of type 'host').
+
+Usage: pg-osds <pgid>
+  e.g. pg-osds 3.1a2
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+
+
+def run_json(cmd: list[str]) -> object:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"ERROR: {' '.join(cmd)}\n{exc.stderr.strip()}")
+    except FileNotFoundError:
+        sys.exit("ERROR: 'ceph' binary not found in PATH.")
+    return json.loads(proc.stdout)
+
+
+def fetch_pg_info(pgid: str) -> dict:
+    data = run_json(['ceph', 'pg', pgid, 'query', '--format', 'json'])
+    try:
+        stats = data.get('info', {}).get('stats', {})
+        return {
+            'up':             data['up'],
+            'up_primary':     stats['up_primary'],
+            'acting':         data['acting'],
+            'acting_primary': stats['acting_primary'],
+            'state':          data['state'],
+        }
+    except KeyError as exc:
+        sys.exit(f"ERROR: unexpected JSON shape from 'ceph pg query': missing key {exc}")
+
+
+def build_osd_host_map() -> dict[int, str]:
+    """Return {osd_id: host_name} by walking the CRUSH tree."""
+    data = run_json(['ceph', 'osd', 'tree', '--format', 'json'])
+    nodes = data.get('nodes', [])
+
+    by_id   = {n['id']: n for n in nodes}
+    # child_id → parent_id
+    parent  = {}
+    for n in nodes:
+        for child_id in n.get('children', []):
+            parent[child_id] = n['id']
+
+    def find_host(osd_id: int) -> str:
+        cur = osd_id
+        while cur in parent:
+            cur = parent[cur]
+            node = by_id.get(cur, {})
+            if node.get('type') == 'host':
+                return node['name']
+        return '?'
+
+    return {
+        n['id']: find_host(n['id'])
+        for n in nodes
+        if n.get('type') == 'osd'
+    }
+
+
+CRUSH_ITEM_NONE = 2147483647  # 0x7fffffff — empty slot
+
+
+def fmt_osd(osd_id: int, primary_id: int, host_map: dict[int, str],
+            osd_col: int, host_col: int) -> str:
+    if osd_id == CRUSH_ITEM_NONE:
+        name = '(none)'
+        tag  = ''
+        host = ''
+    else:
+        tag  = ' (primary)' if osd_id == primary_id else ''
+        name = f'osd.{osd_id}'
+        host = host_map.get(osd_id, '?')
+    return f'  {name:<{osd_col}}{tag:<11}{host}'
+
+
+def print_set(label: str, osds: list[int], primary: int,
+              host_map: dict[int, str]) -> None:
+    osd_col = max((len(f'osd.{o}') for o in osds), default=5)
+    print(f'{label}:')
+    for osd_id in osds:
+        print(fmt_osd(osd_id, primary, host_map, osd_col, 0))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Show up/acting OSD sets for a Ceph PG, with host names.")
+    parser.add_argument('pgid', help='PG id, e.g. 3.1a2')
+    args = parser.parse_args()
+
+    pg       = fetch_pg_info(args.pgid)
+    host_map = build_osd_host_map()
+
+    print(f'PG {args.pgid}  state: {pg["state"]}\n')
+    print_set('up',     pg['up'],     pg['up_primary'],     host_map)
+    print()
+    print_set('acting', pg['acting'], pg['acting_primary'], host_map)
+
+
+if __name__ == '__main__':
+    main()

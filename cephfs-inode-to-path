@@ -1,0 +1,20 @@
+#!/bin/bash
+# inode number must be in hex (0x prefix optional)
+inode="${1#0x}"
+object="${inode}.00000000"
+
+echo If inode hasn"'"t been persisted yet, have to use "ceph tell mds.X dump inode 0x..."
+echo But that command has a chance of crashing the MDS, especially if used often.
+
+if rados -p cephfs.default.meta stat $object >& /dev/null ; then
+    pool=cephfs.default.meta
+elif rados -p cephfs.default.data stat $object >& /dev/null; then
+    pool=cephfs.default.data
+else
+    echo $object not found in cephfs.default.\{meta,data\} pools
+    exit 1
+fi
+
+rados -p $pool getxattr $object parent \
+    | ceph-dencoder type 'inode_backtrace_t' import - decode dump_json \
+    | jq '.ancestors| map(.dname) | reverse | join("/") | "/" + .'

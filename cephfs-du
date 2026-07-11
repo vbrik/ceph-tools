@@ -1,0 +1,14 @@
+#!/bin/bash
+
+for arg in $@; do
+    if [[ $(stat -f -c %T $arg) != "ceph" ]]; then
+        echo "skipping b/c not on ceph: $arg"
+        continue
+    fi
+    if test -d $arg; then
+        bytes=$(getfattr --only-values -n ceph.dir.rbytes $arg |& grep -v 'Removing leading')
+    else
+        bytes=$(stat -c %s $arg)
+    fi
+    echo "$(numfmt --from auto --to iec-i <<< $bytes) $arg"
+done
