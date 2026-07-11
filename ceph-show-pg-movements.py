@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """
 For each PG where 'up' != 'acting', print:
   - shard index (EC pools only — see below)

@@ -84,5 +84,5 @@ Check `--help` and adjust flags/defaults as needed for other environments.
 
 ## License
 
-No license file is currently included; `pgremapper` (submodule) carries
-its own Apache 2.0 license.
+MIT (see `LICENSE`). `pgremapper` (submodule) carries its own Apache 2.0
+license.

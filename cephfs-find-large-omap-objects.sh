@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 
 ceph pg dump --format json 2>/dev/null \
     | jq '.pg_map.pg_stats[]

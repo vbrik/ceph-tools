@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 
 num_mds=$(ceph fs status | grep active | wc -l)
 subtrees=$(ceph tell mds.0 get subtrees)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """
 Human-friendly display of CephFS MDS operations from `ceph tell mds.X dump_*` JSON.
 Reads JSON from stdin. Handles dump_blocked_ops, dump_historic_ops,

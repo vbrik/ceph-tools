@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Show CephFS clients with the highest load, live from the cluster.
 """
 import argparse
