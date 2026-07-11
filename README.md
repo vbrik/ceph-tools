@@ -17,7 +17,9 @@ is no shared library or install step beyond the requirements below.
   `python` shebang, everything else under `python3`). Stdlib only, except:
   - `cephfs-mds-ops-pretty.py` optionally uses the `ldap3` package for
     UID/GID resolution, falling back to the `ldapsearch` CLI if it isn't
-    installed, or working with neither via `--no-ldap`.
+    installed, and skipping resolution automatically (showing plain numbers)
+    if neither is present. `--no-ldap` forces the same behavior even when
+    LDAP tooling is available.
 - `jq` for the `.sh` scripts.
 - `getfattr` (from `attr`/`acl` packages) for `cephfs-du`.
 

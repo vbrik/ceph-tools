@@ -340,7 +340,10 @@ def print_op(op, clients, inode_cache, cfg, ldap):
 def main():
     ap = argparse.ArgumentParser(
         description='Human-friendly display of CephFS MDS dump_* ops. Reads JSON from stdin.',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog='The --ldap-* options only matter when the ldap3 package or the '
+               'ldapsearch command is available; otherwise UID/GID are shown as '
+               'plain numbers regardless of --no-ldap.')
     ap.add_argument('--client-ls', metavar='FILE', nargs='+',
                     help='JSON file(s) from "ceph tell mds.N client ls"; '
                          'if omitted, queries mds.MDS_RANK live')
@@ -358,7 +361,9 @@ def main():
                     help='LDAP search base for GID lookup (posixGroup); '
                          'defaults to --ldap-base with ou=People replaced by ou=Group')
     ap.add_argument('--no-ldap', action='store_true',
-                    help='Disable LDAP UID/GID resolution')
+                    help='Skip LDAP UID/GID resolution; only useful when ldap3 or '
+                         'ldapsearch is installed, since resolution is skipped '
+                         'automatically otherwise')
     args = ap.parse_args()
 
     data = json.load(sys.stdin)
@@ -378,8 +383,8 @@ def main():
             'ou=People,', 'ou=Group,', 1)
         ldap = LdapResolver(args.ldap_server, args.ldap_base, group_base)
     elif not args.no_ldap:
-        print('warning: neither ldap3 nor ldapsearch available; '
-              'UID/GID will be shown as numbers', file=sys.stderr)
+        print('note: neither ldap3 nor ldapsearch is available, so UID/GID '
+              'will be shown as plain numbers', file=sys.stderr)
 
     if ldap:
         ldap._ensure_conn()
