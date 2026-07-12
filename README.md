@@ -61,7 +61,12 @@ Check `--help` and adjust flags/defaults as needed for other environments.
 
 - **`cephfs-client-inodes.py`** — Show filesystem paths for the inodes
   (delegated/completed-request/preallocated) held by a client session.
-  `cephfs-client-inodes.py [--meta-pool POOL] [--data-pool POOL] <client> <file|->`
+  Reads client sessions from a `client ls` JSON file/stdin, or, if the file
+  argument is omitted, queries MDS rank(s) live via
+  `ceph tell mds.RANK client ls` (all active ranks by default, or one rank
+  via `--rank`); live queries print a warning since `client ls` can be
+  resource-intensive on a busy MDS.
+  `cephfs-client-inodes.py [--meta-pool POOL] [--data-pool POOL] [--rank RANK] <client> [file|-]`
 
 - **`cephfs-load-top.py`** — `top`-style live view of CephFS client load
   across MDS ranks (request rate, caps, leases, in-flight requests, etc.),
