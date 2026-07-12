@@ -1,2 +1,3 @@
 - update README.md when appropriate
 - note that there are some files in ./gitignore that are useful for testing of some scripts (don't add them to the repo and don't delete them!)
+- Run `ruff` on python files before comitting
