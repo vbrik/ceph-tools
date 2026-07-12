@@ -71,6 +71,8 @@ Check `--help` and adjust flags/defaults as needed for other environments.
 - **`cephfs-mds-ops-pretty.py`** — Human-friendly rendering of
   `ceph tell mds.X dump_{blocked,historic,ops_in_flight}` JSON (read from
   stdin): resolves inodes to paths and client IDs to hostnames/users.
+  Inode-to-path lookups are cached on disk across runs by default (see
+  `--inode-cache-ttl`/`--no-inode-cache`/`--inode-cache-dir` in `--help`).
   `ceph tell mds.0 dump_ops_in_flight | cephfs-mds-ops-pretty.py [options]`
 
 - **`cephfs-dir-tree-pins.sh`** — List directories pinned (exported) to

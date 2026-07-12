@@ -6,13 +6,17 @@ Reads JSON from stdin. Handles dump_blocked_ops, dump_historic_ops,
 dump_historic_ops_by_duration, and dump_ops_in_flight.
 """
 import argparse
+import concurrent.futures
 from dataclasses import dataclass
 import json
+import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
+import time
 
 try:
     import ldap3 as _ldap3
@@ -69,10 +73,23 @@ HEADER = (
 )
 
 
+def default_inode_cache_dir():
+    # uid-suffixed: avoids trusting/colliding with another user's files in shared /tmp.
+    return os.path.join(tempfile.gettempdir(), f'cephfs-mds-ops-pretty.{os.getuid()}')
+
+
+def inode_cache_file(cache_dir, fsid):
+    """One file per fsid: pool/filesystem names aren't unique across clusters."""
+    return os.path.join(cache_dir, f'{fsid}.json')
+
+
 @dataclass
 class Config:
     meta_pool: str
     resolve: bool
+    cache_enabled: bool
+    cache_ttl: int
+    cache_dir: str
 
 
 _CONN_FAILED = object()  # sentinel: LDAP connection permanently failed
@@ -211,11 +228,79 @@ def _rados_inode_path(inode_hex, meta_pool):
     return ('/' + '/'.join(dnames)) if dnames else None
 
 
-def resolve_inode(inode_hex, cfg, cache):
-    if inode_hex in cache:
-        return cache[inode_hex]
+def get_fsid():
+    """Return the live cluster's fsid, or None if it can't be determined."""
+    try:
+        r = subprocess.run(['ceph', 'fsid'], capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+def load_inode_cache(path):
+    """Never raises. Returns (entries, age_seconds); age is None if no file existed."""
+    try:
+        with open(path) as f:
+            entries = json.load(f)
+        age = time.time() - os.path.getmtime(path)
+    except FileNotFoundError:
+        return {}, None
+    except (OSError, ValueError) as exc:
+        print(f'warning: ignoring unreadable inode cache {path}: {exc}', file=sys.stderr)
+        return {}, None
+    return (entries if isinstance(entries, dict) else {}), age
+
+
+def save_inode_cache(path, cache):
+    """A failed lookup may be transient, so only successful resolutions are persisted."""
+    entries = {k: v for k, v in cache.items() if isinstance(v, dict) and v.get('path') is not None}
+    dir_path = os.path.dirname(path) or '.'
+    tmp_path = None
+    try:
+        os.makedirs(dir_path, mode=0o700, exist_ok=True)
+        # Merge with the current on-disk content (newer entry wins) so concurrent runs don't clobber each other.
+        try:
+            with open(path) as f:
+                on_disk = json.load(f)
+        except (OSError, ValueError):
+            on_disk = {}
+        if isinstance(on_disk, dict):
+            for k, v in on_disk.items():
+                if isinstance(v, dict) and v.get('path') is not None:
+                    if k not in entries or v.get('ts', 0) > entries[k].get('ts', 0):
+                        entries[k] = v
+        # mkstemp avoids the symlink attack a predictable f'{path}.tmp' would invite in a shared /tmp.
+        fd, tmp_path = tempfile.mkstemp(prefix=f'.{os.path.basename(path)}.', dir=dir_path)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(entries, f)
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        print(f'warning: failed to save inode cache to {path}: {exc}', file=sys.stderr)
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def resolve_inode(inode_hex, cfg, cache, stats):
+    """This run's own cache entries never expire; disk-loaded ones expire after cfg.cache_ttl (0 = never)."""
+    key = f'{cfg.meta_pool}:{inode_hex}'
+    entry = cache.get(key)
+    if isinstance(entry, dict):
+        ts = entry.get('ts')
+        fresh = ts is not None and (
+            ts >= stats['run_start'] or cfg.cache_ttl == 0 or (time.time() - ts) < cfg.cache_ttl)
+        if fresh:
+            return entry.get('path')
     path = _rados_inode_path(inode_hex, cfg.meta_pool)
-    cache[inode_hex] = path
+    if path is None and isinstance(entry, dict) and entry.get('path') is not None:
+        # Keep serving the last-known-good path on a failed re-fetch; a later success overwrites it.
+        path = entry['path']
+        cache[key] = {'path': path, 'ts': time.time()}
+        return path
+    cache[key] = {'path': path, 'ts': time.time()}
+    if path is not None:  # None isn't persisted (see save_inode_cache), so it's not "new to disk"
+        stats['dirty'] = True
     return path
 
 
@@ -240,6 +325,20 @@ def fmt_dur(secs):
     if secs < 60:
         return f'{secs:.3f}s'
     return f'{int(secs // 60)}m{secs % 60:.1f}s'
+
+
+def fmt_cache_age(secs):
+    secs = int(secs)
+    mins, secs = divmod(secs, 60)
+    if mins == 0:
+        return f'{secs}s'
+    hours, mins = divmod(mins, 60)
+    if hours == 0:
+        return f'{mins}m{secs}s'
+    days, hours = divmod(hours, 24)
+    if days == 0:
+        return f'{hours}h{mins}m'
+    return f'{days}d{hours}h'
 
 
 def fmt_flag(flag):
@@ -268,7 +367,7 @@ def _short_host(ip, hostname):
     return short
 
 
-def print_op(op, clients, inode_cache, cfg, ldap):
+def print_op(op, clients, inode_cache, cfg, ldap, cache_stats):
     desc = op.get('description', '')
     m = DESC_RE.match(desc)
 
@@ -311,7 +410,7 @@ def print_op(op, clients, inode_cache, cfg, ldap):
             rest = args[im.end():].split()
             filename = rest[0] if rest else None
         if cfg.resolve:
-            dir_path = resolve_inode(inode_str, cfg, inode_cache)
+            dir_path = resolve_inode(inode_str, cfg, inode_cache, cache_stats)
         else:
             dir_path = None
         if dir_path is not None:
@@ -353,6 +452,18 @@ def main():
                     help='Skip inode-to-path resolution (faster, shows raw inode hex)')
     ap.add_argument('--meta-pool', default='cephfs.default.meta',
                     help='CephFS metadata pool (rados fallback for inode resolution)')
+    ap.add_argument('--inode-cache-ttl', type=int, default=3600, metavar='SECONDS',
+                    help='How long a cached inode-to-path lookup stays valid '
+                         'before being re-fetched from the metadata pool; '
+                         '0 = never expires')
+    ap.add_argument('--no-inode-cache', action='store_true',
+                    help='Do not read or write the on-disk inode-to-path cache; '
+                         'always query the metadata pool (still avoids '
+                         'querying the same inode twice within one run)')
+    ap.add_argument('--inode-cache-dir', metavar='DIR', default=default_inode_cache_dir(),
+                    help='Directory for on-disk inode-to-path cache files; one file '
+                         "per cluster (named by the cluster's fsid), so it's always "
+                         'safe to share this directory across clusters')
     ap.add_argument('--ldap-server', default='ldaps://ldap-supplier.icecube.wisc.edu',
                     help='LDAP server URL for UID/GID resolution')
     ap.add_argument('--ldap-base', default='ou=People,dc=icecube,dc=wisc,dc=edu',
@@ -375,6 +486,9 @@ def main():
     cfg = Config(
         meta_pool=args.meta_pool,
         resolve=not args.no_resolve_inodes,
+        cache_enabled=not args.no_inode_cache,
+        cache_ttl=args.inode_cache_ttl,
+        cache_dir=args.inode_cache_dir,
     )
 
     ldap = None
@@ -386,15 +500,38 @@ def main():
         print('note: neither ldap3 nor ldapsearch is available, so UID/GID '
               'will be shown as plain numbers', file=sys.stderr)
 
-    if ldap:
-        ldap._ensure_conn()
+    # client ls, `ceph fsid`, and the LDAP bind are independent I/O calls; run them concurrently, not back-to-back.
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        clients_future = pool.submit(load_client_ls, args.client_ls, args.mds_rank)
+        fsid_future = (pool.submit(get_fsid)
+                        if cfg.resolve and cfg.cache_enabled else None)
+        if ldap:
+            pool.submit(ldap._ensure_conn)
 
-    clients = load_client_ls(args.client_ls, args.mds_rank)
-    inode_cache = {}
+        clients = clients_future.result()
 
+        cache_file = None
+        inode_cache = {}
+        cache_age = None
+        if fsid_future is not None:
+            fsid = fsid_future.result()
+            if fsid is None:
+                print('warning: could not determine cluster fsid (`ceph fsid` failed); '
+                      'not using the on-disk inode cache for this run', file=sys.stderr)
+            else:
+                cache_file = inode_cache_file(cfg.cache_dir, fsid)
+                inode_cache, cache_age = load_inode_cache(cache_file)
+
+    cache_stats = {'dirty': False, 'run_start': time.time()}
     print(HEADER)
     for op in ops:
-        print_op(op, clients, inode_cache, cfg, ldap)
+        print_op(op, clients, inode_cache, cfg, ldap, cache_stats)
+
+    if cache_file is not None and cache_stats['dirty']:
+        save_inode_cache(cache_file, inode_cache)
+    if cache_age is not None:
+        print(f'(inode cache: {cache_file}, age {fmt_cache_age(cache_age)})',
+              file=sys.stderr)
     return 0
 
 
