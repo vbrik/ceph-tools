@@ -501,9 +501,10 @@ def main():
     ap = argparse.ArgumentParser(
         description="Human-friendly display of CephFS MDS dump_* ops. Reads JSON from stdin.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog="The --ldap-* options only matter when the ldap3 package or the "
-        "ldapsearch command is available; otherwise UID/GID are shown as "
-        "plain numbers regardless of --no-ldap.",
+        epilog="LDAP UID/GID resolution is off by default: it only activates "
+        "when both --ldap-server and --ldap-base are given, and even then "
+        "only if the ldap3 package or the ldapsearch command is available; "
+        "otherwise UID/GID are shown as plain numbers.",
     )
     ap.add_argument(
         "--client-ls",
@@ -554,26 +555,26 @@ def main():
     )
     ap.add_argument(
         "--ldap-server",
-        default="ldaps://ldap-supplier.icecube.wisc.edu",
-        help="LDAP server URL for UID/GID resolution",
+        default=None,
+        metavar="URL",
+        help="LDAP server URL for UID/GID resolution (e.g. "
+        "ldaps://ldap.example.com); UID/GID resolution is disabled unless "
+        "this and --ldap-base are both given",
     )
     ap.add_argument(
         "--ldap-base",
-        default="ou=People,dc=icecube,dc=wisc,dc=edu",
-        help="LDAP search base for UID lookup (posixAccount)",
+        default=None,
+        metavar="DN",
+        help="LDAP search base for UID lookup (posixAccount), e.g. "
+        "ou=People,dc=example,dc=com; UID/GID resolution is disabled "
+        "unless this and --ldap-server are both given",
     )
     ap.add_argument(
         "--ldap-group-base",
         default=None,
+        metavar="DN",
         help="LDAP search base for GID lookup (posixGroup); "
         "defaults to --ldap-base with ou=People replaced by ou=Group",
-    )
-    ap.add_argument(
-        "--no-ldap",
-        action="store_true",
-        help="Skip LDAP UID/GID resolution; only useful when ldap3 or "
-        "ldapsearch is installed, since resolution is skipped "
-        "automatically otherwise",
     )
     args = ap.parse_args()
 
@@ -592,17 +593,18 @@ def main():
     )
 
     ldap = None
-    if not args.no_ldap and (_LDAP3_AVAILABLE or _LDAPSEARCH):
-        group_base = args.ldap_group_base or args.ldap_base.replace(
-            "ou=People,", "ou=Group,", 1
-        )
-        ldap = LdapResolver(args.ldap_server, args.ldap_base, group_base)
-    elif not args.no_ldap:
-        print(
-            "note: neither ldap3 nor ldapsearch is available, so UID/GID "
-            "will be shown as plain numbers",
-            file=sys.stderr,
-        )
+    if args.ldap_server and args.ldap_base:
+        if _LDAP3_AVAILABLE or _LDAPSEARCH:
+            group_base = args.ldap_group_base or args.ldap_base.replace(
+                "ou=People,", "ou=Group,", 1
+            )
+            ldap = LdapResolver(args.ldap_server, args.ldap_base, group_base)
+        else:
+            print(
+                "note: neither ldap3 nor ldapsearch is available, so UID/GID "
+                "will be shown as plain numbers",
+                file=sys.stderr,
+            )
 
     # client ls, `ceph fsid`, and the LDAP bind are independent I/O calls; run them concurrently, not back-to-back.
     with concurrent.futures.ThreadPoolExecutor() as pool:

@@ -17,18 +17,17 @@ is no shared library or install step beyond the requirements below.
   pointed at the target cluster.
 - Python 3 for the `.py` scripts (`cephfs-client-inodes.py` runs under the
   `python` shebang, everything else under `python3`). Stdlib only, except:
-  - `cephfs-mds-ops-pretty.py` optionally uses the `ldap3` package for
-    UID/GID resolution, falling back to the `ldapsearch` CLI if it isn't
-    installed, and skipping resolution automatically (showing plain numbers)
-    if neither is present. `--no-ldap` forces the same behavior even when
-    LDAP tooling is available.
+  - `cephfs-mds-ops-pretty.py` can optionally resolve UID/GID to names via
+    LDAP, using the `ldap3` package if installed, falling back to the
+    `ldapsearch` CLI otherwise. This is off by default and only activates
+    when both `--ldap-server` and `--ldap-base` are given (see `--help`).
 - `jq` for the `.sh` scripts.
 - `getfattr` (from `attr`/`acl` packages) for `cephfs-du`.
 
 Some scripts hard-code environment-specific defaults (e.g. pool names
-`cephfs.default.meta`/`cephfs.default.data`, or the IceCube LDAP server in
-`cephfs-mds-ops-pretty.py`) that were written for a specific cluster.
-Check `--help` and adjust flags/defaults as needed for other environments.
+`cephfs.default.meta`/`cephfs.default.data`) that were written for a
+specific cluster. Check `--help` and adjust flags/defaults as needed for
+other environments.
 
 ## Tools
 
