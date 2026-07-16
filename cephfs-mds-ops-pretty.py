@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: MIT
 """
 Human-friendly display of CephFS MDS operations from `ceph tell mds.X dump_*` JSON.
-By default, queries the specified MDS live for one of dump_blocked_ops,
-dump_historic_ops, or dump_ops_in_flight. A JSON file (e.g. saved output of
+By default, queries all active MDS ranks live (auto-detected via `ceph fs
+status`) for one of dump_blocked_ops, dump_historic_ops, or
+dump_ops_in_flight, and tags each op with the rank it came from. Pass
+--mds-rank to query a single rank instead. A JSON file (e.g. saved output of
 one of those commands, or dump_historic_ops_by_duration) can be read instead
 with --json-file.
 """
@@ -52,6 +54,7 @@ DESC_RE = re.compile(
 INODE_ARGS_RE = re.compile(r"#(0x[0-9a-f]+)(?:/(\S+))?")
 
 # Column widths for fixed-width fields.
+_W_RANK = 4  # MDS rank, or "?" when the source dump's rank is unknown
 _W_TIME = 12  # HH:MM:SS.mmm
 _W_DUR = 7  # e.g. 1.685s, 559ms
 _W_AGE = 7
@@ -63,7 +66,8 @@ _W_CLIENT = 40  # client_id (ip, short-hostname)
 _W_INODE = 14  # 0x + up to 12 hex digits
 
 HEADER = (
-    f"{'time':<{_W_TIME}}"
+    f"{'rank':<{_W_RANK}}"
+    f"  {'time':<{_W_TIME}}"
     f"  {'dur':>{_W_DUR}}"
     f"  {'age':>{_W_AGE}}"
     f"  {'type':<{_W_TYPE}}"
@@ -194,9 +198,12 @@ class LdapResolver:
         return self._cache[key]
 
 
-def query_mds_dump(op_type, mds_rank):
-    """Live `ceph tell mds.X dump_*` query. Unlike load_client_ls, failure here
-    is fatal: there's no meaningful fallback when the ops data itself is unavailable."""
+def query_mds_dump(op_type, mds_rank, fatal=True):
+    """Live `ceph tell mds.X dump_*` query. When only one rank is being queried,
+    failure is fatal: there's no meaningful fallback when the ops data itself is
+    unavailable. When querying multiple ranks, pass fatal=False so one rank's
+    failure doesn't take down the whole run; the caller gets None back and can
+    warn and continue."""
     r = subprocess.run(
         ["ceph", "tell", f"mds.{mds_rank}", op_type, "--format=json"],
         capture_output=True,
@@ -204,11 +211,42 @@ def query_mds_dump(op_type, mds_rank):
     )
     if r.returncode != 0:
         print(
-            f"error: ceph tell mds.{mds_rank} {op_type} failed: {r.stderr.strip()}",
+            f"{'error' if fatal else 'warning'}: ceph tell mds.{mds_rank} {op_type} "
+            f"failed: {r.stderr.strip()}",
             file=sys.stderr,
         )
-        sys.exit(1)
+        if fatal:
+            sys.exit(1)
+        return None
     return json.loads(r.stdout)
+
+
+def get_active_ranks():
+    """Return the sorted list of currently active MDS ranks, via `ceph fs status`.
+
+    Only "active" ranks are included (not standby, standby-replay, etc.): those
+    are the ones that actually serve client requests and thus have op dumps
+    worth showing."""
+    r = subprocess.run(
+        ["ceph", "fs", "status", "--format=json"], capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        print(f"error: ceph fs status failed: {r.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError as exc:
+        print(f"error: could not parse `ceph fs status` output: {exc}", file=sys.stderr)
+        sys.exit(1)
+    ranks = sorted(
+        entry["rank"]
+        for entry in data.get("mdsmap", [])
+        if entry.get("state") == "active"
+    )
+    if not ranks:
+        print("error: no active MDS ranks found", file=sys.stderr)
+        sys.exit(1)
+    return ranks
 
 
 def _parse_client_records(records):
@@ -530,7 +568,8 @@ def _short_host(ip, hostname):
     return short
 
 
-def print_op(op, clients, inode_cache, cfg, ldap, cache_stats):
+def print_op(op, rank, clients, inode_cache, cfg, ldap, cache_stats):
+    rank_str = str(rank)
     desc = op.get("description", "")
     m = DESC_RE.match(desc)
 
@@ -547,7 +586,7 @@ def print_op(op, clients, inode_cache, cfg, ldap, cache_stats):
 
     if not m:
         print(
-            f"{time_str:<{_W_TIME}}  {dur_str:>{_W_DUR}}  {age_str:>{_W_AGE}}"
+            f"{rank_str:<{_W_RANK}}  {time_str:<{_W_TIME}}  {dur_str:>{_W_DUR}}  {age_str:>{_W_AGE}}"
             f"  {op_type}  {flag}  [unparseable: {desc}]"
         )
         return
@@ -595,7 +634,8 @@ def print_op(op, clients, inode_cache, cfg, ldap, cache_stats):
         path = args
 
     print(
-        f"{time_str:<{_W_TIME}}"
+        f"{rank_str:<{_W_RANK}}"
+        f"  {time_str:<{_W_TIME}}"
         f"  {dur_str:>{_W_DUR}}"
         f"  {age_str:>{_W_AGE}}"
         f"  {op_type:<{_W_TYPE}}"
@@ -612,7 +652,7 @@ def print_op(op, clients, inode_cache, cfg, ldap, cache_stats):
 def main():
     ap = argparse.ArgumentParser(
         description="Human-friendly display of CephFS MDS dump_* ops. "
-        "By default, queries the specified MDS live.",
+        "By default, queries all active MDS ranks live.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog="LDAP UID/GID resolution is off by default: it only activates "
         "when both --ldap-server and --ldap-base are given, and even then "
@@ -642,8 +682,12 @@ def main():
     ap.add_argument(
         "--mds-rank",
         type=int,
-        default=0,
-        help="MDS rank used for live ceph tell queries (op dump, client ls, dump inode)",
+        default=None,
+        metavar="RANK",
+        help="Query only this MDS rank instead of all active ranks. Default: "
+        "auto-detect and query every active rank live (via `ceph fs status`), "
+        "tagging each op with its rank. Ignored (an unavailable ops dump falls "
+        "back to a single rank, defaulting to 0) when --json-file is given",
     )
     ap.add_argument(
         "--client-cache-ttl",
@@ -733,6 +777,18 @@ def main():
     elif not args.op_type:
         ap.error("op_type is required unless --json-file is given")
 
+    if data is not None:
+        # A file's dump has no discoverable rank of origin; args.mds_rank (or
+        # its default) is only needed to target live client-ls/inode lookups.
+        ranks = [args.mds_rank if args.mds_rank is not None else 0]
+        dump_rank_known = False
+    else:
+        ranks = [args.mds_rank] if args.mds_rank is not None else get_active_ranks()
+        dump_rank_known = True
+
+    if args.client_cache_file and len(ranks) > 1:
+        ap.error("--client-cache-file requires a single MDS rank (--mds-rank)")
+
     cfg = Config(
         meta_pool=args.meta_pool,
         resolve=not args.no_resolve_inodes,
@@ -755,31 +811,65 @@ def main():
                 file=sys.stderr,
             )
 
-    # The ops dump (if live), client ls, `ceph fsid`, and the LDAP bind are
-    # independent I/O calls; run them concurrently, not back-to-back.
+    # The ops dump(s) (if live), client ls (one query per rank -- sessions are
+    # per-rank), `ceph fsid`, and the LDAP bind are independent I/O calls; run
+    # them concurrently, not back-to-back.
     with concurrent.futures.ThreadPoolExecutor() as pool:
-        ops_future = (
-            pool.submit(query_mds_dump, args.op_type, args.mds_rank)
+        ops_futures = (
+            {
+                r: pool.submit(query_mds_dump, args.op_type, r, len(ranks) == 1)
+                for r in ranks
+            }
             if data is None
-            else None
+            else {}
         )
-        clients_future = pool.submit(
-            load_client_ls_cached,
-            args.client_ls,
-            args.mds_rank,
-            args.client_cache_ttl,
-            args.client_cache_file,
-            cfg.cache_dir,
-        )
+        if args.client_ls:
+            clients_futures = {
+                None: pool.submit(
+                    load_client_ls_cached,
+                    args.client_ls,
+                    ranks[0],
+                    args.client_cache_ttl,
+                    args.client_cache_file,
+                    cfg.cache_dir,
+                )
+            }
+        else:
+            clients_futures = {
+                r: pool.submit(
+                    load_client_ls_cached,
+                    None,
+                    r,
+                    args.client_cache_ttl,
+                    args.client_cache_file,
+                    cfg.cache_dir,
+                )
+                for r in ranks
+            }
         fsid_future = (
             pool.submit(get_fsid) if cfg.resolve and cfg.cache_enabled else None
         )
         if ldap:
             pool.submit(ldap._ensure_conn)
 
-        if ops_future is not None:
-            data = ops_future.result()
-        clients = clients_future.result()
+        # Grouped by rank in `ranks` order (ascending); a rank that failed
+        # (multi-rank live query only -- single-rank failures are fatal) is
+        # simply missing, not interleaved with the others' ops.
+        dumps_by_rank = {}
+        if data is None:
+            for r, fut in ops_futures.items():
+                result = fut.result()
+                if result is not None:
+                    dumps_by_rank[r] = result
+            if not dumps_by_rank:
+                print("error: failed to query ops from all MDS ranks", file=sys.stderr)
+                return 1
+        else:
+            dumps_by_rank[ranks[0]] = data
+
+        clients = {}
+        for fut in clients_futures.values():
+            clients.update(fut.result())
 
         cache_file = None
         inode_cache = {}
@@ -796,15 +886,19 @@ def main():
                 cache_file = inode_cache_file(cfg.cache_dir, fsid)
                 inode_cache, cache_age = load_inode_cache(cache_file)
 
-    ops = extract_ops(data)
+    ops = [
+        (r if dump_rank_known else "?", op)
+        for r, dump in dumps_by_rank.items()
+        for op in extract_ops(dump)
+    ]
     if not ops:
         print("No ops found in input.", file=sys.stderr)
         return 1
 
     cache_stats = {"dirty": False, "run_start": time.time()}
     print(HEADER)
-    for op in ops:
-        print_op(op, clients, inode_cache, cfg, ldap, cache_stats)
+    for rank, op in ops:
+        print_op(op, rank, clients, inode_cache, cfg, ldap, cache_stats)
 
     if cache_file is not None and cache_stats["dirty"]:
         save_inode_cache(cache_file, inode_cache)

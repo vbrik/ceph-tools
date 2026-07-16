@@ -76,8 +76,10 @@ other environments.
 
 - **`cephfs-mds-ops-pretty.py`** — Human-friendly rendering of
   `ceph tell mds.X dump_{blocked,historic,ops_in_flight}` JSON. By default,
-  queries the given MDS live; a saved JSON file can be used instead via
-  `--json-file`. Resolves inodes to paths and client IDs to hostnames/users.
+  auto-detects and queries every active MDS rank live, tagging each op with
+  its rank (`--mds-rank` restricts to one); a saved JSON file can be used
+  instead via `--json-file`. Resolves inodes to paths and client IDs to
+  hostnames/users.
   Inode-to-path lookups are cached on disk across runs by default (see
   `--inode-cache-ttl`/`--no-inode-cache`/`--inode-cache-dir` in `--help`).
   `client ls` results can optionally be cached the same way, off by default
