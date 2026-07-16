@@ -654,10 +654,6 @@ def main():
         description="Human-friendly display of CephFS MDS dump_* ops. "
         "By default, queries all active MDS ranks live.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog="LDAP UID/GID resolution is off by default: it only activates "
-        "when both --ldap-server and --ldap-base are given, and even then "
-        "only if the ldap3 package or the ldapsearch command is available; "
-        "otherwise UID/GID are shown as plain numbers.",
     )
     ap.add_argument(
         "op_type",
@@ -673,13 +669,6 @@ def main():
         "command) instead of querying the MDS live",
     )
     ap.add_argument(
-        "--client-ls",
-        metavar="FILE",
-        nargs="+",
-        help='JSON file(s) from "ceph tell mds.N client ls"; '
-        "if omitted, queries mds.MDS_RANK live",
-    )
-    ap.add_argument(
         "--mds-rank",
         type=int,
         default=None,
@@ -689,7 +678,18 @@ def main():
         "tagging each op with its rank. Ignored (an unavailable ops dump falls "
         "back to a single rank, defaulting to 0) when --json-file is given",
     )
-    ap.add_argument(
+
+    client_group = ap.add_argument_group(
+        "client identification", "Map client IDs in ops to IP/hostname."
+    )
+    client_group.add_argument(
+        "--client-ls",
+        metavar="FILE",
+        nargs="+",
+        help='JSON file(s) from "ceph tell mds.N client ls"; '
+        "if omitted, queries mds.MDS_RANK live",
+    )
+    client_group.add_argument(
         "--client-cache-ttl",
         type=int,
         default=0,
@@ -702,24 +702,35 @@ def main():
         "Default: 0, disabled (always query live). Ignored when "
         "--client-ls is given",
     )
-    ap.add_argument(
+    client_group.add_argument(
         "--client-cache-file",
         default=None,
         metavar="PATH",
         help="Cache file to use with --client-cache-ttl (default: a fixed "
         "path under --inode-cache-dir, chosen based on --mds-rank)",
     )
-    ap.add_argument(
+
+    inode_group = ap.add_argument_group(
+        "inode resolution", "Resolve op target inodes to filesystem paths."
+    )
+    inode_group.add_argument(
         "--no-resolve-inodes",
         action="store_true",
         help="Skip inode-to-path resolution (faster, shows raw inode hex)",
     )
-    ap.add_argument(
+    inode_group.add_argument(
         "--meta-pool",
         default="cephfs.default.meta",
         help="CephFS metadata pool (rados fallback for inode resolution)",
     )
-    ap.add_argument(
+    inode_group.add_argument(
+        "--no-inode-cache",
+        action="store_true",
+        help="Do not read or write the on-disk inode-to-path cache; "
+        "always query the metadata pool (still avoids "
+        "querying the same inode twice within one run)",
+    )
+    inode_group.add_argument(
         "--inode-cache-ttl",
         type=int,
         default=3600,
@@ -728,14 +739,7 @@ def main():
         "before being re-fetched from the metadata pool; "
         "0 = never expires",
     )
-    ap.add_argument(
-        "--no-inode-cache",
-        action="store_true",
-        help="Do not read or write the on-disk inode-to-path cache; "
-        "always query the metadata pool (still avoids "
-        "querying the same inode twice within one run)",
-    )
-    ap.add_argument(
+    inode_group.add_argument(
         "--inode-cache-dir",
         metavar="DIR",
         default=default_inode_cache_dir(),
@@ -743,7 +747,15 @@ def main():
         "per cluster (named by the cluster's fsid), so it's always "
         "safe to share this directory across clusters",
     )
-    ap.add_argument(
+
+    ldap_group = ap.add_argument_group(
+        "LDAP UID/GID resolution",
+        "Off by default: activates only when --ldap-server and --ldap-base "
+        "are both given, and even then only if the ldap3 package or the "
+        "ldapsearch command is available; otherwise UID/GID are shown as "
+        "plain numbers.",
+    )
+    ldap_group.add_argument(
         "--ldap-server",
         default=None,
         metavar="URL",
@@ -751,7 +763,7 @@ def main():
         "ldaps://ldap.example.com); UID/GID resolution is disabled unless "
         "this and --ldap-base are both given",
     )
-    ap.add_argument(
+    ldap_group.add_argument(
         "--ldap-base",
         default=None,
         metavar="DN",
@@ -759,7 +771,7 @@ def main():
         "ou=People,dc=example,dc=com; UID/GID resolution is disabled "
         "unless this and --ldap-server are both given",
     )
-    ap.add_argument(
+    ldap_group.add_argument(
         "--ldap-group-base",
         default=None,
         metavar="DN",
