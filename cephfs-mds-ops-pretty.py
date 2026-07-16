@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: MIT
 """
 Human-friendly display of CephFS MDS operations from `ceph tell mds.X dump_*` JSON.
-Reads JSON from stdin. Handles dump_blocked_ops, dump_historic_ops,
-dump_historic_ops_by_duration, and dump_ops_in_flight.
+By default, queries the specified MDS live for one of dump_blocked_ops,
+dump_historic_ops, or dump_ops_in_flight. A JSON file (e.g. saved output of
+one of those commands, or dump_historic_ops_by_duration) can be read instead
+with --json-file.
 """
 
 import argparse
@@ -190,6 +192,23 @@ class LdapResolver:
                 self._group_base, f"(gidNumber={gid_num})", "cn"
             )
         return self._cache[key]
+
+
+def query_mds_dump(op_type, mds_rank):
+    """Live `ceph tell mds.X dump_*` query. Unlike load_client_ls, failure here
+    is fatal: there's no meaningful fallback when the ops data itself is unavailable."""
+    r = subprocess.run(
+        ["ceph", "tell", f"mds.{mds_rank}", op_type, "--format=json"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        print(
+            f"error: ceph tell mds.{mds_rank} {op_type} failed: {r.stderr.strip()}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return json.loads(r.stdout)
 
 
 def load_client_ls(files, mds_rank):
@@ -499,12 +518,26 @@ def print_op(op, clients, inode_cache, cfg, ldap, cache_stats):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Human-friendly display of CephFS MDS dump_* ops. Reads JSON from stdin.",
+        description="Human-friendly display of CephFS MDS dump_* ops. "
+        "By default, queries the specified MDS live.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog="LDAP UID/GID resolution is off by default: it only activates "
         "when both --ldap-server and --ldap-base are given, and even then "
         "only if the ldap3 package or the ldapsearch command is available; "
         "otherwise UID/GID are shown as plain numbers.",
+    )
+    ap.add_argument(
+        "op_type",
+        nargs="?",
+        choices=["dump_blocked_ops", "dump_historic_ops", "dump_ops_in_flight"],
+        default=None,
+        help="Which MDS op dump to query live; required unless --json-file is given",
+    )
+    ap.add_argument(
+        "--json-file",
+        metavar="FILE",
+        help="Read ops JSON from this file (e.g. saved output of a dump_* "
+        "command) instead of querying the MDS live",
     )
     ap.add_argument(
         "--client-ls",
@@ -517,7 +550,7 @@ def main():
         "--mds-rank",
         type=int,
         default=0,
-        help="MDS rank used for live ceph tell queries (client ls and dump inode)",
+        help="MDS rank used for live ceph tell queries (op dump, client ls, dump inode)",
     )
     ap.add_argument(
         "--no-resolve-inodes",
@@ -578,11 +611,14 @@ def main():
     )
     args = ap.parse_args()
 
-    data = json.load(sys.stdin)
-    ops = extract_ops(data)
-    if not ops:
-        print("No ops found in input.", file=sys.stderr)
-        return 1
+    data = None
+    if args.json_file:
+        if args.op_type:
+            ap.error("op_type is ignored when --json-file is given")
+        with open(args.json_file) as f:
+            data = json.load(f)
+    elif not args.op_type:
+        ap.error("op_type is required unless --json-file is given")
 
     cfg = Config(
         meta_pool=args.meta_pool,
@@ -606,8 +642,14 @@ def main():
                 file=sys.stderr,
             )
 
-    # client ls, `ceph fsid`, and the LDAP bind are independent I/O calls; run them concurrently, not back-to-back.
+    # The ops dump (if live), client ls, `ceph fsid`, and the LDAP bind are
+    # independent I/O calls; run them concurrently, not back-to-back.
     with concurrent.futures.ThreadPoolExecutor() as pool:
+        ops_future = (
+            pool.submit(query_mds_dump, args.op_type, args.mds_rank)
+            if data is None
+            else None
+        )
         clients_future = pool.submit(load_client_ls, args.client_ls, args.mds_rank)
         fsid_future = (
             pool.submit(get_fsid) if cfg.resolve and cfg.cache_enabled else None
@@ -615,6 +657,8 @@ def main():
         if ldap:
             pool.submit(ldap._ensure_conn)
 
+        if ops_future is not None:
+            data = ops_future.result()
         clients = clients_future.result()
 
         cache_file = None
@@ -631,6 +675,11 @@ def main():
             else:
                 cache_file = inode_cache_file(cfg.cache_dir, fsid)
                 inode_cache, cache_age = load_inode_cache(cache_file)
+
+    ops = extract_ops(data)
+    if not ops:
+        print("No ops found in input.", file=sys.stderr)
+        return 1
 
     cache_stats = {"dirty": False, "run_start": time.time()}
     print(HEADER)
