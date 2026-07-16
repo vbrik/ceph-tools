@@ -211,27 +211,7 @@ def query_mds_dump(op_type, mds_rank):
     return json.loads(r.stdout)
 
 
-def load_client_ls(files, mds_rank):
-    """Return dict of client_id (int) -> {ip, hostname}."""
-    records = []
-    if files:
-        for path in files:
-            with open(path) as f:
-                records.extend(json.load(f))
-    else:
-        r = subprocess.run(
-            ["ceph", "tell", f"mds.{mds_rank}", "client", "ls", "--format=json"],
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode != 0:
-            print(
-                f"warning: ceph tell mds.{mds_rank} client ls failed: {r.stderr.strip()}",
-                file=sys.stderr,
-            )
-            return {}
-        records = json.loads(r.stdout)
-
+def _parse_client_records(records):
     clients = {}
     for c in records:
         cid = c.get("id")
@@ -241,6 +221,119 @@ def load_client_ls(files, mds_rank):
         ip = addr.split(":")[0] if addr else ""
         hostname = c.get("client_metadata", {}).get("hostname", "")
         clients[cid] = {"ip": ip, "hostname": hostname}
+    return clients
+
+
+def load_client_ls(files):
+    """Return dict of client_id (int) -> {ip, hostname} from saved `client ls` JSON file(s)."""
+    records = []
+    for path in files:
+        with open(path) as f:
+            records.extend(json.load(f))
+    return _parse_client_records(records)
+
+
+def query_client_ls_live(mds_rank):
+    """Live `ceph tell mds.X client ls` query. Returns None (with a warning)
+    on failure -- unlike query_mds_dump, this is never fatal: the ops
+    display just falls back to showing raw client IDs."""
+    r = subprocess.run(
+        ["ceph", "tell", f"mds.{mds_rank}", "client", "ls", "--format=json"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        print(
+            f"warning: ceph tell mds.{mds_rank} client ls failed: {r.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    return _parse_client_records(json.loads(r.stdout))
+
+
+# Bump whenever the on-disk client ls cache payload's shape changes, so a
+# cache file left behind by an older/newer version of this script is treated
+# as a miss instead of being misinterpreted.
+CLIENT_CACHE_VERSION = 1
+
+
+def default_client_cache_file(cache_dir, mds_rank):
+    return os.path.join(cache_dir, f"client-ls.mds{mds_rank}.json")
+
+
+def _save_client_ls_cache(path, fsid, mds_rank, clients):
+    dir_path = os.path.dirname(path) or "."
+    tmp_path = None
+    try:
+        os.makedirs(dir_path, mode=0o700, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.", dir=dir_path
+        )
+        with os.fdopen(fd, "w") as f:
+            json.dump(
+                {
+                    "version": CLIENT_CACHE_VERSION,
+                    "fsid": fsid,
+                    "rank": mds_rank,
+                    "clients": clients,
+                },
+                f,
+            )
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        print(
+            f"warning: failed to save client ls cache to {path}: {exc}", file=sys.stderr
+        )
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def load_client_ls_cached(files, mds_rank, cache_ttl, cache_file, cache_dir):
+    """Return dict of client_id (int) -> {ip, hostname}.
+
+    Reads from `files` if given (no caching involved: the caller already has
+    a static snapshot). Otherwise queries the MDS live, or -- when
+    cache_ttl > 0 -- reuses a JSON snapshot at cache_file (or a default path
+    derived from mds_rank under cache_dir) as long as it's younger than
+    cache_ttl seconds, was written by this same version of the script, for
+    the same mds_rank, and is stamped with the fsid of the cluster we're
+    currently pointed at. A stale/mismatched/corrupt cache falls straight
+    through to a live query, whose result then refreshes the cache file.
+
+    Caching trades staleness for less client-ls load on the MDS: a client
+    that connected after the cached snapshot was taken -- quite possibly the
+    very client generating the op you're inspecting -- won't be in it and
+    will show up with numeric/blank fields instead of hostname/IP. It's off
+    by default (cache_ttl == 0) for that reason.
+    """
+    if files:
+        return load_client_ls(files)
+    if cache_ttl <= 0:
+        return query_client_ls_live(mds_rank) or {}
+
+    path = cache_file or default_client_cache_file(cache_dir, mds_rank)
+    fsid = None
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < cache_ttl:
+        fsid = get_fsid()
+        try:
+            with open(path) as f:
+                cached = json.load(f)
+            if (
+                cached.get("version") == CLIENT_CACHE_VERSION
+                and cached.get("rank") == mds_rank
+                and cached.get("fsid") == fsid
+            ):
+                return {int(k): v for k, v in cached["clients"].items()}
+        except (json.JSONDecodeError, KeyError, TypeError, OSError):
+            pass  # incompatible, corrupt, or unreadable cache; fall through to a live query
+
+    clients = query_client_ls_live(mds_rank)
+    if clients is None:
+        return {}
+    if fsid is None:
+        fsid = get_fsid()
+    if fsid is not None:
+        _save_client_ls_cache(path, fsid, mds_rank, clients)
     return clients
 
 
@@ -553,6 +646,26 @@ def main():
         help="MDS rank used for live ceph tell queries (op dump, client ls, dump inode)",
     )
     ap.add_argument(
+        "--client-cache-ttl",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="Reuse the last `client ls` result for up to SECONDS seconds "
+        "instead of querying the MDS live every run; trades staleness "
+        "(a client that connected after the snapshot was taken -- possibly "
+        "the one generating the op you're inspecting -- shows up with "
+        "numeric/blank fields) for less client-ls load on the MDS. "
+        "Default: 0, disabled (always query live). Ignored when "
+        "--client-ls is given",
+    )
+    ap.add_argument(
+        "--client-cache-file",
+        default=None,
+        metavar="PATH",
+        help="Cache file to use with --client-cache-ttl (default: a fixed "
+        "path under --inode-cache-dir, chosen based on --mds-rank)",
+    )
+    ap.add_argument(
         "--no-resolve-inodes",
         action="store_true",
         help="Skip inode-to-path resolution (faster, shows raw inode hex)",
@@ -650,7 +763,14 @@ def main():
             if data is None
             else None
         )
-        clients_future = pool.submit(load_client_ls, args.client_ls, args.mds_rank)
+        clients_future = pool.submit(
+            load_client_ls_cached,
+            args.client_ls,
+            args.mds_rank,
+            args.client_cache_ttl,
+            args.client_cache_file,
+            cfg.cache_dir,
+        )
         fsid_future = (
             pool.submit(get_fsid) if cfg.resolve and cfg.cache_enabled else None
         )

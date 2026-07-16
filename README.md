@@ -80,6 +80,9 @@ other environments.
   `--json-file`. Resolves inodes to paths and client IDs to hostnames/users.
   Inode-to-path lookups are cached on disk across runs by default (see
   `--inode-cache-ttl`/`--no-inode-cache`/`--inode-cache-dir` in `--help`).
+  `client ls` results can optionally be cached the same way, off by default
+  since a stale cache can hide the very client generating the op you're
+  inspecting (see `--client-cache-ttl`/`--client-cache-file`).
   `cephfs-mds-ops-pretty.py dump_ops_in_flight [options]`
 
 - **`cephfs-dir-tree-pins.sh`** — List directories pinned (exported) to
