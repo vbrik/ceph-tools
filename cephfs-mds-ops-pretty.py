@@ -327,7 +327,9 @@ def _save_client_ls_cache(path, fsid, mds_rank, clients):
 
 
 def load_client_ls_cached(files, mds_rank, cache_ttl, cache_file, cache_dir):
-    """Return dict of client_id (int) -> {ip, hostname}.
+    """Return (clients, cache_info): clients is a dict of client_id (int) ->
+    {ip, hostname}; cache_info is (path, age_seconds) if an on-disk cache was
+    used to satisfy this call, else None.
 
     Reads from `files` if given (no caching involved: the caller already has
     a static snapshot). Otherwise queries the MDS live, or -- when
@@ -341,38 +343,44 @@ def load_client_ls_cached(files, mds_rank, cache_ttl, cache_file, cache_dir):
     Caching trades staleness for less client-ls load on the MDS: a client
     that connected after the cached snapshot was taken -- quite possibly the
     very client generating the op you're inspecting -- won't be in it and
-    will show up with numeric/blank fields instead of hostname/IP. It's off
-    by default (cache_ttl == 0) for that reason.
+    will show up with numeric/blank fields instead of hostname/IP. Enabled
+    by default with a short TTL to keep that window small; pass
+    cache_ttl=0 to always query live.
     """
     if files:
-        return load_client_ls(files)
+        return load_client_ls(files), None
     if cache_ttl <= 0:
-        return query_client_ls_live(mds_rank) or {}
+        return query_client_ls_live(mds_rank) or {}, None
 
     path = cache_file or default_client_cache_file(cache_dir, mds_rank)
     fsid = None
-    if os.path.exists(path) and time.time() - os.path.getmtime(path) < cache_ttl:
-        fsid = get_fsid()
-        try:
-            with open(path) as f:
-                cached = json.load(f)
-            if (
-                cached.get("version") == CLIENT_CACHE_VERSION
-                and cached.get("rank") == mds_rank
-                and cached.get("fsid") == fsid
-            ):
-                return {int(k): v for k, v in cached["clients"].items()}
-        except (json.JSONDecodeError, KeyError, TypeError, OSError):
-            pass  # incompatible, corrupt, or unreadable cache; fall through to a live query
+    if os.path.exists(path):
+        age = time.time() - os.path.getmtime(path)
+        if age < cache_ttl:
+            fsid = get_fsid()
+            try:
+                with open(path) as f:
+                    cached = json.load(f)
+                if (
+                    cached.get("version") == CLIENT_CACHE_VERSION
+                    and cached.get("rank") == mds_rank
+                    and cached.get("fsid") == fsid
+                ):
+                    return {int(k): v for k, v in cached["clients"].items()}, (
+                        path,
+                        age,
+                    )
+            except (json.JSONDecodeError, KeyError, TypeError, OSError):
+                pass  # incompatible, corrupt, or unreadable cache; fall through to a live query
 
     clients = query_client_ls_live(mds_rank)
     if clients is None:
-        return {}
+        return {}, None
     if fsid is None:
         fsid = get_fsid()
     if fsid is not None:
         _save_client_ls_cache(path, fsid, mds_rank, clients)
-    return clients
+    return clients, None
 
 
 def _rados_inode_path(inode_hex, meta_pool):
@@ -692,14 +700,14 @@ def main():
     client_group.add_argument(
         "--client-cache-ttl",
         type=int,
-        default=0,
+        default=600,
         metavar="SECONDS",
         help="Reuse the last `client ls` result for up to SECONDS seconds "
         "instead of querying the MDS live every run; trades staleness "
         "(a client that connected after the snapshot was taken -- possibly "
         "the one generating the op you're inspecting -- shows up with "
         "numeric/blank fields) for less client-ls load on the MDS. "
-        "Default: 0, disabled (always query live). Ignored when "
+        "0 disables caching (always query live). Ignored when "
         "--client-ls is given",
     )
     client_group.add_argument(
@@ -880,8 +888,12 @@ def main():
             dumps_by_rank[ranks[0]] = data
 
         clients = {}
+        client_cache_notes = []
         for fut in clients_futures.values():
-            clients.update(fut.result())
+            c, client_cache_info = fut.result()
+            clients.update(c)
+            if client_cache_info is not None:
+                client_cache_notes.append(client_cache_info)
 
         cache_file = None
         inode_cache = {}
@@ -914,9 +926,16 @@ def main():
 
     if cache_file is not None and cache_stats["dirty"]:
         save_inode_cache(cache_file, inode_cache)
+    if cache_age is not None or client_cache_notes:
+        print(file=sys.stderr)
     if cache_age is not None:
         print(
             f"(inode cache: {cache_file}, age {fmt_cache_age(cache_age)})",
+            file=sys.stderr,
+        )
+    for client_cache_path, client_cache_age in client_cache_notes:
+        print(
+            f"(client ls cache: {client_cache_path}, age {fmt_cache_age(client_cache_age)})",
             file=sys.stderr,
         )
     return 0
