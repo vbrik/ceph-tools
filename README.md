@@ -1,10 +1,12 @@
 # ceph-tools
 
-Small standalone scripts for day-to-day operation and debugging of Ceph and
-CephFS clusters. Each tool wraps `ceph` CLI / `rados` output (mostly JSON)
-into something more directly useful — grouping, resolving IDs to names,
-diffing, sorting — for questions that come up repeatedly during cluster
-operation but aren't answered directly by a single `ceph` subcommand.
+Command-line tools for Ceph and CephFS cluster administration, debugging,
+and troubleshooting: PG movement/remapping, OSD/PG lookups, MDS ops
+inspection, CephFS client load and inode-to-path resolution. Each tool
+wraps `ceph` CLI / `rados` output (mostly JSON) into something more
+directly useful — grouping, resolving IDs to names, diffing, sorting — for
+questions that come up repeatedly during cluster operation but aren't
+answered directly by a single `ceph` subcommand.
 
 Every script is standalone and can be copied out and run on its own; there
 is no shared library or install step beyond the requirements below.
@@ -68,10 +70,10 @@ Check `--help` and adjust flags/defaults as needed for other environments.
   resource-intensive on a busy MDS.
   `cephfs-client-inodes.py [--meta-pool POOL] [--data-pool POOL] [--rank RANK] <client> [file|-]`
 
-- **`cephfs-load-top.py`** — `top`-style live view of CephFS client load
-  across MDS ranks (request rate, caps, leases, in-flight requests, etc.),
-  sortable and filterable by column, with optional result caching.
-  `cephfs-load-top.py [-r RANK] [-n N] [-s COLUMNS] [--hide COLUMNS] [--cache-ttl SECONDS] [--cache-file PATH] [--full-mount-point]`
+- **`cephfs-client-load-top.py`** — `top`-style live view of CephFS client
+  load across MDS ranks (request rate, caps, leases, in-flight requests,
+  etc.), sortable and filterable by column, with optional result caching.
+  `cephfs-client-load-top.py [-r RANK] [-n N] [-s COLUMNS] [--hide COLUMNS] [--cache-ttl SECONDS] [--cache-file PATH] [--full-mount-point]`
 
 - **`cephfs-mds-ops-pretty.py`** — Human-friendly rendering of
   `ceph tell mds.X dump_{blocked,historic,ops_in_flight}` JSON (read from
