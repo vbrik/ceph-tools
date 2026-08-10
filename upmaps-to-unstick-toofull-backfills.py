@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+Propose upmap re-targets that divert backfill_toofull PGs away from a full host.
+
+The situation this solves
+-------------------------
+When a single OSD goes out/down, CRUSH does *not* spread its PGs across the
+cluster. For a rule of the form "choose a host bucket, then a leaf inside it"
+(chooseleaf_firstn/indep type host), the failed leaf is retried *within the
+same host bucket* — so every PG that lived on the dead OSD is re-placed onto
+one of its 20-or-so same-host siblings. On a cluster that is already uniformly
+full, those siblings blow past backfillfull_ratio and the PGs wedge in
+backfill_toofull, while the rest of the cluster sits several percent emptier
+and idle.
+
+This script finds those PGs and, for each one, picks an OSD elsewhere in the
+cluster that the shard could legally be moved to instead. It only prints the
+proposed re-targets; it changes nothing. The output is meant to be fed to
+another script (or eyeballed) to actually apply the remaps.
+
+How PGs are identified
+----------------------
+A PG is selected when it is in backfill_toofull *and* one of its shards is
+newly arriving on the source OSD's host — that is, an OSD on that host is in
+the PG's 'up' set but not its 'acting' set.
+
+Note this is host-based, not OSD-based provenance. Once an OSD is out, the
+slot it vacated in 'acting' reads as CRUSH_ITEM_NONE, not as its OSD id, so
+there is no way to prove from the PG map that a given shard used to live on
+the source OSD specifically. Matching on "a shard newly landed on the source
+OSD's host" is the observable signal, and it is the one that matters: the host
+is what is out of space. This also keeps PGs that are remapped but not
+degraded (a real OSD id in 'acting') from being dropped.
+
+'up'/'acting' are diffed differently per pool type, for the same reason as in
+pg-movements.py: EC shards are identified by position, so index i is diffed
+against index i and the shard index is reported. Replicated replicas are
+interchangeable, so position carries no identity (a same-OSD-set reorder from
+primary-affinity or pg-upmap-items is not movement) and the sets are diffed
+instead, with SHARD shown as '-'.
+
+How targets are chosen
+----------------------
+Candidates are OSDs of the same device class as the source OSD, that are up,
+in (reweight > 0), and have a non-zero CRUSH weight, sorted by utilization
+ascending (OSD id breaks ties, so re-runs are reproducible). The source OSD
+itself is excluded — note it would otherwise sort *first*, since 'ceph osd df'
+reports an out OSD at 0% utilization.
+
+For each PG, the least-utilized candidate is taken whose host is not already
+used by the PG's 'up' set. Because the arriving OSD being diverted is itself
+on the source host, the source host is automatically excluded, which is the
+whole point of the tool. A candidate is also rejected if it already appears in
+the PG's *raw* CRUSH mapping (see below).
+
+Each chosen OSD is removed from the candidate pool, so no two PGs are sent to
+the same OSD. If a PG has several diverted shards, each target host is added
+to that PG's exclusion set before its next shard is placed.
+
+Why the raw CRUSH mapping matters
+---------------------------------
+A PG that already carries pg_upmap_items has OSDs in its raw CRUSH mapping
+that are absent from 'up' — an entry "from 409 to 600" means 409 is what CRUSH
+chose and 600 is what is actually used. Host 409 lives on is typically *not*
+an 'up' host (that is usually why the upmap exists), so a check against 'up'
+alone would happily propose 409 as a target. Applying that would put the same
+OSD in the mapping twice; Ceph's upmap validation drops such an entry silently,
+so the command appears to succeed and then has no effect. Targets are
+therefore checked against 'up' union the reconstructed raw mapping.
+
+Applying the output
+-------------------
+Three caveats for whatever consumes this:
+
+  - UP_HOSTS is abbreviated. Its entries are the hosts of the PG's 'up' set,
+    one per slot and in slot order (so an EC SHARD index indexes into it),
+    with the prefix common to all printed hostnames removed. That prefix is
+    reported on stderr; every other column is verbatim.
+
+  - 'ceph osd pg-upmap-items' *replaces* a PG's entire upmap entry rather than
+    adding to it. PGs here frequently already carry unrelated upmap pairs, so
+    a command that states only the new pair silently discards the others and
+    triggers fresh remapping. The EXISTING_UPMAPS column reports each PG's
+    current pairs so they can be restated. ('pgremapper remap' merges instead
+    of replacing, and does not have this problem.)
+
+  - If the upmap balancer is active ('ceph balancer status'), it may undo
+    manually placed upmap entries. Consider 'ceph balancer off' while the
+    diverted backfills drain.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from typing import NamedTuple
+
+# Sentinel used by CRUSH/Ceph for "no OSD in this slot" (crush/crush.h).
+# 'ceph pg ls'/'ceph pg dump' JSON uses this value, not -1, for empty slots.
+CRUSH_ITEM_NONE = 0x7FFFFFFF
+
+POOL_TYPE_ERASURE = 3
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "source_osd",
+        type=int,
+        help="OSD id whose host is absorbing the remaps (e.g. the OSD that "
+        "went out). Its host is what backfills are diverted away from.",
+    )
+    return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Data collection
+# ---------------------------------------------------------------------------
+
+
+def _ceph_json(cmd: list[str]) -> object:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"ERROR: ceph command failed:\n{exc.stderr.strip()}")
+    except FileNotFoundError:
+        sys.exit("ERROR: 'ceph' binary not found in PATH.")
+    return json.loads(proc.stdout)
+
+
+def fetch_osd_hosts() -> dict[int, str]:
+    """Return {osd_id: short_hostname} from 'ceph osd tree'."""
+    data = _ceph_json(["ceph", "osd", "tree", "--format", "json"])
+    nodes = data.get("nodes", []) + data.get("stray", [])
+    by_id = {n["id"]: n for n in nodes}
+    result = {}
+    for n in nodes:
+        if n.get("type") == "host":
+            short = n["name"].split(".")[0]
+            for child_id in n.get("children", []):
+                if by_id.get(child_id, {}).get("type") == "osd":
+                    result[child_id] = short
+    return result
+
+
+def fetch_osd_df() -> dict[int, dict]:
+    """Return {osd_id: node} from 'ceph osd df'.
+
+    Each node carries device_class, utilization, status, reweight and
+    crush_weight, which together are everything needed to decide whether an
+    OSD is a usable backfill target — no separate 'ceph osd dump' pass.
+    """
+    data = _ceph_json(["ceph", "osd", "df", "--format", "json"])
+    nodes = data.get("nodes", []) + data.get("stray", [])
+    return {n["id"]: n for n in nodes}
+
+
+def fetch_upmap_items() -> dict[str, list[dict]]:
+    """Return {pgid: [{'from': osd, 'to': osd}, ...]} from 'ceph osd dump'."""
+    data = _ceph_json(["ceph", "osd", "dump", "--format", "json"])
+    return {e["pgid"]: e["mappings"] for e in data.get("pg_upmap_items", [])}
+
+
+def fetch_ec_pool_ids() -> set[int]:
+    """Return the set of pool ids that are erasure-coded (type == 3)."""
+    data = _ceph_json(["ceph", "osd", "pool", "ls", "detail", "--format", "json"])
+    return {p["pool_id"] for p in data if p.get("type") == POOL_TYPE_ERASURE}
+
+
+def fetch_backfill_toofull_pgs() -> list[dict]:
+    """Return pg_stat dicts for PGs in backfill_toofull.
+
+    Filtered server-side by 'ceph pg ls', which is dramatically cheaper than
+    dumping every PG in the cluster and filtering here.
+    """
+    raw = _ceph_json(["ceph", "pg", "ls", "backfill_toofull", "--format", "json"])
+    return _extract_pg_stats(raw)
+
+
+def _extract_pg_stats(raw) -> list[dict]:
+    """Pull the pg_stat list out of the several shapes ceph releases return."""
+    if isinstance(raw, list):
+        return raw
+
+    if isinstance(raw, dict):
+        if "pg_stats" in raw:
+            return raw["pg_stats"]
+
+        pg_map = raw.get("pg_map", {})
+        if "pg_stats" in pg_map:
+            return pg_map["pg_stats"]
+
+        for val in raw.values():
+            if (
+                isinstance(val, list)
+                and val
+                and isinstance(val[0], dict)
+                and "pgid" in val[0]
+            ):
+                return val
+
+    raise SystemExit(
+        f"ERROR: unrecognised JSON structure from 'ceph pg ls'.\n"
+        f"Top-level type: {type(raw).__name__}"
+        + (f", keys: {list(raw.keys())}" if isinstance(raw, dict) else "")
+    )
+
+
+# ---------------------------------------------------------------------------
+# PG analysis
+# ---------------------------------------------------------------------------
+
+
+def _is_real_osd(osd_id) -> bool:
+    return osd_id not in (CRUSH_ITEM_NONE, -1, None)
+
+
+def _slot(osd_list: list, index: int) -> "int | None":
+    """Return the real OSD id at a position, or None for a missing/empty slot."""
+    if index >= len(osd_list):
+        return None
+    osd_id = osd_list[index]
+    return osd_id if _is_real_osd(osd_id) else None
+
+
+def raw_crush_osds(up: list, upmap_pairs: list[dict]) -> set[int]:
+    """Reconstruct the OSDs CRUSH itself chose, by undoing the PG's upmaps.
+
+    pg_upmap_items rewrites the CRUSH result: a pair {'from': X, 'to': Y}
+    means CRUSH picked X and Y is used instead. Substituting each active
+    pair's 'to' back to its 'from' recovers the raw mapping, whose members
+    must not be proposed as targets (see module docstring).
+    """
+    raw = [osd_id for osd_id in up]
+    for pair in upmap_pairs:
+        if pair["to"] in raw:
+            raw[raw.index(pair["to"])] = pair["from"]
+    return {osd_id for osd_id in raw if _is_real_osd(osd_id)}
+
+
+class DivertedShard(NamedTuple):
+    """A shard that CRUSH re-placed onto the full source host."""
+
+    pgid: str
+    shard: "int | str"  # EC shard index, or '-' for replicated pools
+    arriving_osd: int  # OSD on the source host now receiving the shard;
+    # this is the 'from' of the upmap that would divert it
+    vacated_osd: "int | None"  # OSD that left this slot, or None when the
+    # slot reads as CRUSH_ITEM_NONE (the usual out-OSD case)
+    up: list  # the PG's full up set, for reporting and exclusions
+
+
+def find_diverted_shards(
+    pg: dict, source_host: str, osd_host: dict[int, str], is_ec: bool
+) -> list[DivertedShard]:
+    """Return the shards of one PG that are newly arriving on the source host."""
+    pgid = pg["pgid"]
+    up = pg["up"]
+    acting = pg["acting"]
+    found = []
+
+    if is_ec:
+        # EC: shard identity is positional, so diff index by index. This is
+        # what lets the shard index be reported, and keeps two unrelated
+        # shard moves in one PG from being conflated.
+        for i in range(max(len(up), len(acting))):
+            arriving = _slot(up, i)
+            vacated = _slot(acting, i)
+            if arriving is None or arriving == vacated:
+                continue
+            if osd_host.get(arriving) != source_host:
+                continue
+            found.append(DivertedShard(pgid, i, arriving, vacated, up))
+    else:
+        # Replicated: replicas are interchangeable, so position means nothing
+        # and only the set difference is real movement.
+        up_set = {o for o in up if _is_real_osd(o)}
+        acting_set = {o for o in acting if _is_real_osd(o)}
+        vacated_osds = sorted(acting_set - up_set)
+        for arriving in sorted(up_set - acting_set):
+            if osd_host.get(arriving) != source_host:
+                continue
+            # A replicated PG can have several arriving/vacated replicas at
+            # once with no way to pair them up; report one vacated OSD only
+            # when the pairing is unambiguous.
+            vacated = vacated_osds[0] if len(vacated_osds) == 1 else None
+            found.append(DivertedShard(pgid, "-", arriving, vacated, up))
+
+    return found
+
+
+def pgid_sort_key(pgid: str) -> tuple[int, int]:
+    """Sort PG IDs numerically: pool id (decimal), then pg id (hex)."""
+    pool_str, pg_hex = pgid.split(".")
+    return (int(pool_str), int(pg_hex, 16))
+
+
+# ---------------------------------------------------------------------------
+# Target selection
+# ---------------------------------------------------------------------------
+
+
+def build_candidate_osds(
+    osd_df: dict[int, dict], device_class: str, source_osd: int
+) -> list[int]:
+    """Return usable target OSD ids of the given class, least-utilized first.
+
+    Excludes OSDs that are down, out (reweight 0) or have no CRUSH weight,
+    and the source OSD itself. Without this an out OSD sorts to the very
+    front: 'ceph osd df' reports it at 0% utilization.
+    """
+    usable = [
+        node
+        for osd_id, node in osd_df.items()
+        if osd_id != source_osd
+        and node.get("device_class") == device_class
+        and node.get("status") == "up"
+        and node.get("reweight", 0) > 0
+        and node.get("crush_weight", 0) > 0
+    ]
+    # OSD id as secondary key: utilizations tie constantly on a uniformly
+    # full cluster, and the operator will re-run this.
+    usable.sort(key=lambda n: (n["utilization"], n["id"]))
+    return [n["id"] for n in usable]
+
+
+class Proposal(NamedTuple):
+    shard: DivertedShard
+    target_osd: int
+    target_host: str
+    target_utilization: float
+
+
+def assign_targets(
+    shards: list[DivertedShard],
+    candidates: list[int],
+    osd_host: dict[int, str],
+    osd_df: dict[int, dict],
+    upmap_items: dict[str, list[dict]],
+) -> tuple[list[Proposal], list[DivertedShard], list[DivertedShard]]:
+    """Greedily give each diverted shard the least-utilized legal target.
+
+    Returns (proposals, unplaceable shards, unappliable shards). Each target
+    OSD is consumed, so no two shards are sent to the same OSD.
+    """
+    available = list(candidates)
+    # Hosts already spoken for per PG: seeded from the up set, then extended
+    # as each of the PG's shards is placed, so a PG with two diverted shards
+    # cannot be given two targets on one host.
+    blocked_hosts: dict[str, set[str]] = {}
+    proposals = []
+    unplaceable = []
+    unappliable = []
+
+    for shard in shards:
+        forbidden_hosts = blocked_hosts.setdefault(
+            shard.pgid,
+            {osd_host.get(o) for o in shard.up if _is_real_osd(o)},
+        )
+        raw = raw_crush_osds(shard.up, upmap_items.get(shard.pgid, []))
+        # 'up' alone is not enough: an OSD displaced by an existing upmap is
+        # absent from 'up' but still in the raw mapping, and re-proposing it
+        # would put the same OSD in the mapping twice — which Ceph's upmap
+        # validation drops silently (see module docstring).
+        forbidden_osds = raw | {o for o in shard.up if _is_real_osd(o)}
+
+        # The arriving OSD becomes the 'from' of the diverting upmap pair, and
+        # 'from' must be an OSD CRUSH itself chose. If the arriving OSD is
+        # absent from the raw mapping it is itself the product of an existing
+        # upmap (the balancer places these, and it is active on this cluster),
+        # so diverting it means rewriting that pair's 'to' rather than adding
+        # a new pair. Emitting a row here would produce a command that Ceph
+        # accepts and then silently ignores, so report it instead.
+        if shard.arriving_osd not in raw:
+            unappliable.append(shard)
+            continue
+
+        for candidate in available:
+            if osd_host.get(candidate) in forbidden_hosts:
+                continue
+            if candidate in forbidden_osds:
+                continue
+            available.remove(candidate)
+            forbidden_hosts.add(osd_host.get(candidate))
+            proposals.append(
+                Proposal(
+                    shard,
+                    candidate,
+                    osd_host.get(candidate, "?"),
+                    osd_df[candidate]["utilization"],
+                )
+            )
+            break
+        else:
+            unplaceable.append(shard)
+
+    return proposals, unplaceable, unappliable
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+COLUMNS = [
+    "PGID",
+    "SHARD",
+    "FROM_OSD",
+    "TARGET_OSD",
+    "TARGET_HOST",
+    "TGT_UTIL",
+    "VACATED",
+    "EXISTING_UPMAPS",
+    "UP_HOSTS",
+]
+
+
+def common_host_prefix(hostnames: set[str]) -> str:
+    """Return the shared leading part of hostnames, cut at a readable boundary.
+
+    UP_HOSTS is the widest column and its entries usually differ only in a
+    trailing number, so the shared part is noise. The raw longest common
+    prefix is a bad place to cut, though: for ceph-osd-101/ceph-osd-102 it is
+    'ceph-osd-10', which eats a digit of the host number. The prefix is
+    therefore pulled back to the last separator, or, if it contains none, past
+    any trailing digits.
+    """
+    if len(hostnames) < 2:
+        return ""
+
+    first, *rest = sorted(hostnames)
+    prefix = first
+    for name in rest:
+        while not name.startswith(prefix):
+            prefix = prefix[:-1]
+
+    boundary = max(prefix.rfind(sep) for sep in "-_.")
+    prefix = prefix[: boundary + 1] if boundary >= 0 else prefix.rstrip("0123456789")
+
+    # Never strip a name down to nothing (e.g. hosts 'ceph-' and 'ceph-1').
+    return "" if prefix in hostnames else prefix
+
+
+def format_row(
+    proposal: Proposal,
+    osd_host: dict[int, str],
+    upmap_items: dict[str, list[dict]],
+    host_prefix: str = "",
+) -> list[str]:
+    shard = proposal.shard
+    pairs = upmap_items.get(shard.pgid, [])
+
+    # The prefix is derived from known hostnames only, so '?' passes through.
+    def short(hostname: str) -> str:
+        if not hostname.startswith(host_prefix):
+            return hostname
+        return hostname[len(host_prefix) :]
+
+    return [
+        shard.pgid,
+        str(shard.shard),
+        f"osd.{shard.arriving_osd}",
+        f"osd.{proposal.target_osd}",
+        proposal.target_host,
+        f"{proposal.target_utilization:.1f}%",
+        f"osd.{shard.vacated_osd}" if shard.vacated_osd is not None else "none",
+        ",".join(f"{p['from']}->{p['to']}" for p in pairs) if pairs else "-",
+        # One entry per up slot, in order, so an EC shard index still indexes
+        # into this list; empty slots keep their place as 'none'.
+        ",".join(
+            short(osd_host.get(o, "?")) if _is_real_osd(o) else "none" for o in shard.up
+        ),
+    ]
+
+
+def print_table(rows: list[list[str]]) -> None:
+    widths = [
+        max(len(header), *(len(row[i]) for row in rows))
+        for i, header in enumerate(COLUMNS)
+    ]
+
+    # Last column is variable-width and rightmost; leave it unpadded.
+    def emit(cells):
+        print(
+            "  ".join(
+                cell.ljust(widths[i]) if i < len(cells) - 1 else cell
+                for i, cell in enumerate(cells)
+            )
+        )
+
+    emit(COLUMNS)
+    for row in rows:
+        emit(row)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    args = parse_args()
+    source_osd = args.source_osd
+
+    osd_host = fetch_osd_hosts()
+    osd_df = fetch_osd_df()
+
+    if source_osd not in osd_df:
+        sys.exit(f"ERROR: osd.{source_osd} not found in 'ceph osd df' output.")
+    source_host = osd_host.get(source_osd)
+    if source_host is None:
+        sys.exit(
+            f"ERROR: could not determine the host of osd.{source_osd} from "
+            f"'ceph osd tree' (is it still in the CRUSH map?)."
+        )
+    device_class = osd_df[source_osd].get("device_class")
+
+    upmap_items = fetch_upmap_items()
+    ec_pool_ids = fetch_ec_pool_ids()
+    toofull_pgs = fetch_backfill_toofull_pgs()
+
+    shards = []
+    for pg in toofull_pgs:
+        is_ec = int(pg["pgid"].split(".")[0]) in ec_pool_ids
+        shards.extend(find_diverted_shards(pg, source_host, osd_host, is_ec))
+    shards.sort(
+        key=lambda s: (
+            pgid_sort_key(s.pgid),
+            s.shard if isinstance(s.shard, int) else -1,
+        )
+    )
+
+    candidates = build_candidate_osds(osd_df, device_class, source_osd)
+    proposals, unplaceable, unappliable = assign_targets(
+        shards, candidates, osd_host, osd_df, upmap_items
+    )
+
+    # Shortening is based on the hosts actually printed, so the column is
+    # trimmed by as much as the output allows.
+    up_hostnames = {
+        osd_host[o]
+        for p in proposals
+        for o in p.shard.up
+        if _is_real_osd(o) and o in osd_host
+    }
+    host_prefix = common_host_prefix(up_hostnames)
+
+    # Everything informational goes to stderr so stdout stays parseable.
+    print(
+        f"source: osd.{source_osd} on {source_host} (class {device_class}); "
+        f"{len(toofull_pgs)} backfill_toofull PGs cluster-wide, "
+        f"{len(shards)} shard(s) of them arriving on {source_host}; "
+        f"{len(candidates)} candidate target OSDs",
+        file=sys.stderr,
+    )
+    if host_prefix:
+        print(
+            f"UP_HOSTS names have the common prefix '{host_prefix}' stripped",
+            file=sys.stderr,
+        )
+
+    if proposals:
+        print_table(
+            [format_row(p, osd_host, upmap_items, host_prefix) for p in proposals]
+        )
+
+    for shard in unplaceable:
+        print(
+            f"WARNING: no legal target left for {shard.pgid} shard "
+            f"{shard.shard} (arriving on osd.{shard.arriving_osd}) — every "
+            f"candidate OSD is on a host already in the PG's up set, already "
+            f"in its CRUSH mapping, or already used by another PG",
+            file=sys.stderr,
+        )
+
+    for shard in unappliable:
+        print(
+            f"WARNING: skipped {shard.pgid} shard {shard.shard}: the arriving "
+            f"osd.{shard.arriving_osd} is not in the PG's raw CRUSH mapping, "
+            f"so it was placed there by an existing upmap. Divert it by "
+            f"rewriting that pair's 'to', not by adding a new pair",
+            file=sys.stderr,
+        )
+
+    print(
+        f"proposed {len(proposals)} remap(s), {len(unplaceable)} unplaceable, "
+        f"{len(unappliable)} unappliable",
+        file=sys.stderr,
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -47,6 +47,23 @@ other environments.
   given OSD is a source or destination.
   `upmaps-of-osd.sh <osd>`
 
+- **`upmaps-to-unstick-toofull-backfills.py`** —
+  Propose upmap re-targets that unstick PGs wedged in `backfill_toofull`
+  on a full host. When an OSD goes out, a `chooseleaf ... type host` CRUSH
+  rule retries *inside the same host bucket*, so the dead OSD's PGs pile
+  onto its same-host siblings instead of spreading across the cluster; on
+  an already-full cluster those siblings cross `backfillfull_ratio` and the
+  backfills stall. Given the OSD that went out, this finds the
+  `backfill_toofull` PGs with a shard newly landing on its host and, for
+  each, picks the least-utilized OSD of the same device class on a host not
+  already in the PG's `up` set — a destination that satisfies the
+  fault domain. Prints the proposed remaps (including each PG's existing
+  `pg_upmap_items`, since `ceph osd pg-upmap-items` replaces rather than
+  adds to an entry) for another script to apply; changes nothing itself.
+  Handles EC pools per-shard and replicated pools by set difference. See
+  `--help` for the full explanation and caveats.
+  `upmaps-to-unstick-toofull-backfills.py <osd>`
+
 - **`find-large-omap-objects.sh`** — List PGs with objects flagged
   for having large omap entries.
 
