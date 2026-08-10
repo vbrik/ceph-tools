@@ -71,23 +71,36 @@ therefore checked against 'up' union the reconstructed raw mapping.
 
 Applying the output
 -------------------
-Three caveats for whatever consumes this:
+Two output formats are available. The default is a human-readable table.
+--pgremapper instead emits one bare '<pgid> <from osd> <target osd>' line per
+remap — the same first three columns as the table, which are also exactly the
+positional arguments of 'pgremapper remap' (which calls FROM_OSD the "source
+osd"). Only the rows go to stdout in either mode — everything else is on
+stderr — so the output stays parseable.
 
-  - UP_HOSTS is abbreviated. Its entries are the hosts of the PG's 'up' set,
-    one per slot and in slot order (so an EC SHARD index indexes into it),
-    with the prefix common to all printed hostnames removed. That prefix is
-    reported on stderr; every other column is verbatim.
+Two caveats for whatever consumes this:
 
   - 'ceph osd pg-upmap-items' *replaces* a PG's entire upmap entry rather than
     adding to it. PGs here frequently already carry unrelated upmap pairs, so
     a command that states only the new pair silently discards the others and
     triggers fresh remapping. The EXISTING_UPMAPS column reports each PG's
-    current pairs so they can be restated. ('pgremapper remap' merges instead
-    of replacing, and does not have this problem.)
+    current pairs so they can be restated. 'pgremapper remap' merges into the
+    existing entry rather than replacing it, so it needs no such restatement —
+    which is why --pgremapper omits that column.
 
   - If the upmap balancer is active ('ceph balancer status'), it may undo
     manually placed upmap entries. Consider 'ceph balancer off' while the
     diverted backfills drain.
+
+Review the proposals before applying them. To hand them to pgremapper:
+
+    upmaps-to-unstick-toofull-backfills.py --pgremapper <osd> > remaps.txt
+    xargs -a remaps.txt -L1 pgremapper-v1.0.0-linux-amd64 remap
+
+Use 'xargs -a', not '< remaps.txt': with a redirect, xargs points each child's
+stdin at /dev/null, so pgremapper's per-remap confirmation prompt reads EOF
+instead of an answer. '-a' leaves stdin on the terminal. (Add '--yes' to
+pgremapper to skip the prompt and its dry-run entirely.)
 """
 
 import argparse
@@ -118,6 +131,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="OSD id whose host is absorbing the remaps (e.g. the OSD that "
         "went out). Its host is what backfills are diverted away from.",
+    )
+    parser.add_argument(
+        "--pgremapper",
+        action="store_true",
+        help="Print '<pgid> <from osd> <target osd>' lines with no header "
+        "instead of the table, so each line can be passed as the arguments "
+        "of 'pgremapper remap' (see the epilogue above for the xargs form).",
     )
     return parser.parse_args()
 
@@ -256,7 +276,8 @@ class DivertedShard(NamedTuple):
     # this is the 'from' of the upmap that would divert it
     vacated_osd: "int | None"  # OSD that left this slot, or None when the
     # slot reads as CRUSH_ITEM_NONE (the usual out-OSD case)
-    up: list  # the PG's full up set, for reporting and exclusions
+    up: list  # the PG's full up set, for host exclusions and for
+    # reconstructing the raw CRUSH mapping
 
 
 def find_diverted_shards(
@@ -419,50 +440,15 @@ COLUMNS = [
     "TGT_UTIL",
     "VACATED",
     "EXISTING_UPMAPS",
-    "UP_HOSTS",
 ]
-
-
-def common_host_prefix(hostnames: set[str]) -> str:
-    """Return the shared leading part of hostnames, cut at a readable boundary.
-
-    UP_HOSTS is the widest column and its entries usually differ only in a
-    trailing number, so the shared part is noise. The raw longest common
-    prefix is a bad place to cut, though: for ceph-osd-101/ceph-osd-102 it is
-    'ceph-osd-10', which eats a digit of the host number. The prefix is
-    therefore pulled back to the last separator, or, if it contains none, past
-    any trailing digits.
-    """
-    if len(hostnames) < 2:
-        return ""
-
-    first, *rest = sorted(hostnames)
-    prefix = first
-    for name in rest:
-        while not name.startswith(prefix):
-            prefix = prefix[:-1]
-
-    boundary = max(prefix.rfind(sep) for sep in "-_.")
-    prefix = prefix[: boundary + 1] if boundary >= 0 else prefix.rstrip("0123456789")
-
-    # Never strip a name down to nothing (e.g. hosts 'ceph-' and 'ceph-1').
-    return "" if prefix in hostnames else prefix
 
 
 def format_row(
     proposal: Proposal,
-    osd_host: dict[int, str],
     upmap_items: dict[str, list[dict]],
-    host_prefix: str = "",
 ) -> list[str]:
     shard = proposal.shard
     pairs = upmap_items.get(shard.pgid, [])
-
-    # The prefix is derived from known hostnames only, so '?' passes through.
-    def short(hostname: str) -> str:
-        if not hostname.startswith(host_prefix):
-            return hostname
-        return hostname[len(host_prefix) :]
 
     return [
         shard.pgid,
@@ -473,11 +459,6 @@ def format_row(
         f"{proposal.target_utilization:.1f}%",
         f"osd.{shard.vacated_osd}" if shard.vacated_osd is not None else "none",
         ",".join(f"{p['from']}->{p['to']}" for p in pairs) if pairs else "-",
-        # One entry per up slot, in order, so an EC shard index still indexes
-        # into this list; empty slots keep their place as 'none'.
-        ",".join(
-            short(osd_host.get(o, "?")) if _is_real_osd(o) else "none" for o in shard.up
-        ),
     ]
 
 
@@ -499,6 +480,22 @@ def print_table(rows: list[list[str]]) -> None:
     emit(COLUMNS)
     for row in rows:
         emit(row)
+
+
+def print_pgremapper(proposals: list[Proposal]) -> None:
+    """Print one '<pgid> <from osd> <target osd>' line per proposal.
+
+    These are the positional arguments of 'pgremapper remap', in order and
+    with nothing else on the line, so the output can be fed to it directly.
+    (What the table calls FROM_OSD is pgremapper's "source osd" argument —
+    not to be confused with this script's source_osd, the OSD that went out.)
+    OSD ids are bare integers: pgremapper parses them with strconv.Atoi and
+    rejects the 'osd.N' form the table uses.
+    """
+    for proposal in proposals:
+        print(
+            f"{proposal.shard.pgid} {proposal.shard.arriving_osd} {proposal.target_osd}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -543,16 +540,6 @@ def main() -> None:
         shards, candidates, osd_host, osd_df, upmap_items
     )
 
-    # Shortening is based on the hosts actually printed, so the column is
-    # trimmed by as much as the output allows.
-    up_hostnames = {
-        osd_host[o]
-        for p in proposals
-        for o in p.shard.up
-        if _is_real_osd(o) and o in osd_host
-    }
-    host_prefix = common_host_prefix(up_hostnames)
-
     # Everything informational goes to stderr so stdout stays parseable.
     print(
         f"source: osd.{source_osd} on {source_host} (class {device_class}); "
@@ -561,16 +548,12 @@ def main() -> None:
         f"{len(candidates)} candidate target OSDs",
         file=sys.stderr,
     )
-    if host_prefix:
-        print(
-            f"UP_HOSTS names have the common prefix '{host_prefix}' stripped",
-            file=sys.stderr,
-        )
 
     if proposals:
-        print_table(
-            [format_row(p, osd_host, upmap_items, host_prefix) for p in proposals]
-        )
+        if args.pgremapper:
+            print_pgremapper(proposals)
+        else:
+            print_table([format_row(p, upmap_items) for p in proposals])
 
     for shard in unplaceable:
         print(

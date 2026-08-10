@@ -60,9 +60,12 @@ other environments.
   fault domain. Prints the proposed remaps (including each PG's existing
   `pg_upmap_items`, since `ceph osd pg-upmap-items` replaces rather than
   adds to an entry) for another script to apply; changes nothing itself.
-  Handles EC pools per-shard and replicated pools by set difference. See
-  `--help` for the full explanation and caveats.
-  `upmaps-to-unstick-toofull-backfills.py <osd>`
+  `--pgremapper` switches the output to headerless
+  `<pgid> <from osd> <target osd>` lines, ready to feed to `pgremapper remap`
+  (via `xargs -a remaps.txt -L1 …`). Handles EC pools per-shard and
+  replicated pools by set difference. See `--help` for the full explanation
+  and caveats.
+  `upmaps-to-unstick-toofull-backfills.py [--pgremapper] <osd>`
 
 - **`find-large-omap-objects.sh`** — List PGs with objects flagged
   for having large omap entries.
