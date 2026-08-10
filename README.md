@@ -33,26 +33,28 @@ other environments.
 
 ### RADOS / OSD
 
-- **`ceph-show-osds-of-pg`** — Show the `up` and `acting` OSD sets for a
+- **`osds-of-pg`** — Show the `up` and `acting` OSD sets for a
   given PG, with each OSD's host.
-  `ceph-show-osds-of-pg <pgid>`
+  `osds-of-pg <pgid>`
 
-- **`ceph-show-pg-movements.py`** — For every PG where `up` != `acting`,
+- **`pg-movements.py`** — For every PG where `up` != `acting`,
   print source/destination OSDs, movement type, and PG state. Handles EC
   (per-shard) and replicated (set-diff) pools differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
-  `ceph-show-pg-movements.py [--sort-by {pgid,from-osd,to-osd}]`
+  `pg-movements.py [--sort-by {pgid,from-osd,to-osd}]`
 
-- **`ceph-show-upmaps-of-osd.sh`** — Show `pg_upmap_items` entries where a
+- **`upmaps-of-osd.sh`** — Show `pg_upmap_items` entries where a
   given OSD is a source or destination.
-  `ceph-show-upmaps-of-osd.sh <osd>`
+  `upmaps-of-osd.sh <osd>`
 
-- **`cephfs-find-large-omap-objects.sh`** — List PGs with objects flagged
+- **`find-large-omap-objects.sh`** — List PGs with objects flagged
   for having large omap entries.
 
-- **`pgremapper`** (git submodule, [digitalocean/pgremapper](https://github.com/digitalocean/pgremapper)) —
+- **`pgremapper-v1.0.0-linux-amd64`** (prebuilt binary,
+  [digitalocean/pgremapper](https://github.com/digitalocean/pgremapper)) —
   Third-party tool for controlling PG backfill/remapping without CRUSH map
-  changes. Run `git submodule update --init` and build per its own README.
+  changes. Vendored as a static Linux amd64 binary; see its own project for
+  source and other platforms.
 
 ### CephFS clients and MDS
 
@@ -100,5 +102,5 @@ other environments.
 
 ## License
 
-MIT (see `LICENSE`). `pgremapper` (submodule) carries its own Apache 2.0
-license.
+MIT (see `LICENSE`). `pgremapper-v1.0.0-linux-amd64` (vendored binary)
+carries its own Apache 2.0 license.
