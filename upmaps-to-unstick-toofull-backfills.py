@@ -52,11 +52,12 @@ instead, with SHARD shown as '-'.
 
 How targets are chosen
 ----------------------
-Candidates are OSDs that are up, in (reweight > 0) and have a non-zero CRUSH
-weight, grouped by device class and sorted by utilization ascending within
-each class (OSD id breaks ties, so re-runs are reproducible). Down and out
-OSDs are excluded by those filters, which also keeps an out OSD from sorting
-*first* — 'ceph osd df' reports one at 0% utilization.
+Candidates are OSDs that are up, in (reweight > 0), have a non-zero CRUSH
+weight and have a known device class, grouped by that class and sorted by
+utilization ascending within each class (OSD id breaks ties, so re-runs are
+reproducible). Down and out OSDs are excluded by those filters, which also
+keeps an out OSD from sorting *first* — 'ceph osd df' reports one at 0%
+utilization.
 
 A shard is only offered candidates of its *own* device class, that of the OSD
 it is arriving on. Pools' CRUSH rules are typically class-constrained, so an
@@ -89,16 +90,25 @@ OSD in the mapping twice; Ceph's upmap validation drops such an entry silently,
 so the command appears to succeed and then has no effect. Targets are
 therefore checked against 'up' union the reconstructed raw mapping.
 
+The same reconstruction decides whether a shard can be diverted at all. The
+arriving OSD becomes the 'from' of the new upmap pair, and 'from' must be an
+OSD CRUSH itself chose. An arriving OSD that is *absent* from the raw mapping
+is one an existing upmap already put there (the balancer places these), so
+diverting it means rewriting that pair's 'to' rather than adding a pair —
+a distinct edit this script does not emit. Such shards are reported as
+"unappliable" on stderr, with the pair to rewrite, and are left out of the
+proposals rather than turned into a command Ceph would accept and ignore.
+
 Applying the output
 -------------------
 Two output formats are available. The default is a human-readable table.
 --pgremapper instead emits one bare '<pgid> <from osd> <target osd>' line per
-remap — the same first three columns as the table, which are also exactly the
-positional arguments of 'pgremapper remap' (which calls FROM_OSD the "source
-osd"). Only the rows go to stdout in either mode — everything else is on
-stderr — so the output stays parseable.
+remap — the table's PGID, FROM_OSD and TARGET_OSD columns, which are exactly
+the positional arguments of 'pgremapper remap' (which calls FROM_OSD the
+"source osd"). Only the rows go to stdout in either mode — everything else is
+on stderr — so the output stays parseable.
 
-Two caveats for whatever consumes this:
+Caveats for whatever consumes this:
 
   - 'ceph osd pg-upmap-items' *replaces* a PG's entire upmap entry rather than
     adding to it. PGs here frequently already carry unrelated upmap pairs, so
@@ -107,6 +117,14 @@ Two caveats for whatever consumes this:
     current pairs so they can be restated. 'pgremapper remap' merges into the
     existing entry rather than replacing it, so it needs no such restatement —
     which is why --pgremapper omits that column.
+
+  - For the same reason, rows are not independent when a PG has more than one
+    diverted shard. Such a PG gets one row per shard, each repeating that PG's
+    same EXISTING_UPMAPS, so running one 'pg-upmap-items' command per row makes
+    the last command replace the entry the earlier ones wrote and only the
+    final diversion survives. All rows sharing a PGID must be folded into a
+    single command listing EXISTING_UPMAPS plus every one of that PG's new
+    pairs. ('pgremapper remap' is per-pair and merges, so it is unaffected.)
 
   - If the upmap balancer is active ('ceph balancer status'), it may undo
     manually placed upmap entries. Consider 'ceph balancer off' while the
