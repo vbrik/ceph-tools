@@ -14,6 +14,11 @@ full, those siblings blow past backfillfull_ratio and the PGs wedge in
 backfill_toofull, while the rest of the cluster sits several percent emptier
 and idle.
 
+Everything above only holds if the relevant pools' CRUSH rules actually fail
+over at the host bucket type, so this is checked at startup (see
+check_host_failure_domain) and the script exits with an error if it does not
+hold.
+
 This script finds those PGs and, for each one, picks an OSD elsewhere in the
 cluster that the shard could legally be moved to instead. It only prints the
 proposed re-targets; it changes nothing. The output is meant to be fed to
@@ -190,10 +195,20 @@ def fetch_upmap_items() -> dict[str, list[dict]]:
     return {e["pgid"]: e["mappings"] for e in data.get("pg_upmap_items", [])}
 
 
-def fetch_ec_pool_ids() -> set[int]:
+def fetch_pool_details() -> list[dict]:
+    """Return the list of pool dicts from 'ceph osd pool ls detail'."""
+    return _ceph_json(["ceph", "osd", "pool", "ls", "detail", "--format", "json"])
+
+
+def ec_pool_ids_from(pools: list[dict]) -> set[int]:
     """Return the set of pool ids that are erasure-coded (type == 3)."""
-    data = _ceph_json(["ceph", "osd", "pool", "ls", "detail", "--format", "json"])
-    return {p["pool_id"] for p in data if p.get("type") == POOL_TYPE_ERASURE}
+    return {p["pool_id"] for p in pools if p.get("type") == POOL_TYPE_ERASURE}
+
+
+def fetch_crush_rules() -> dict[int, dict]:
+    """Return {rule_id: rule} from 'ceph osd crush rule dump'."""
+    data = _ceph_json(["ceph", "osd", "crush", "rule", "dump", "--format", "json"])
+    return {r["rule_id"]: r for r in data}
 
 
 def fetch_backfill_toofull_pgs() -> list[dict]:
@@ -238,6 +253,55 @@ def _extract_pg_stats(raw) -> list[dict]:
         f"Top-level type: {type(raw).__name__}"
         + (f", keys: {list(raw.keys())}" if isinstance(raw, dict) else "")
     )
+
+
+# ---------------------------------------------------------------------------
+# Failure domain validation
+# ---------------------------------------------------------------------------
+
+
+def rule_failure_domain(rule: dict) -> "str | None":
+    """Return the bucket type CRUSH spreads shards over for redundancy.
+
+    This is the 'type' of the first choose*/chooseleaf* step in the rule
+    (after 'take'). For a plain replicated rule that is its one chooseleaf
+    step; for the common EC shape ('choose indep 0 type host' followed by
+    'chooseleaf indep 1 type osd') it is the outer choose step, which is the
+    one that determines the failure domain — the inner osd pick is just
+    which leaf within that bucket, not what CRUSH spreads shards over.
+    """
+    for step in rule.get("steps", []):
+        if step.get("op", "").startswith("choose"):
+            return step.get("type")
+    return None
+
+
+def check_host_failure_domain(pools: list[dict], crush_rules: dict[int, dict]) -> None:
+    """Exit with an error unless every given pool's CRUSH rule fails over at host.
+
+    The diversion strategy this script implements (see module docstring)
+    only makes sense if a failed leaf is retried within the same host
+    bucket — that is what makes "a shard newly landed on the source OSD's
+    host" a meaningful signal in find_diverted_shards(). If a pool's rule
+    fails over at some other bucket type, that signal means nothing for it.
+    """
+    bad = []
+    for pool in pools:
+        rule = crush_rules.get(pool["crush_rule"])
+        domain = rule_failure_domain(rule) if rule else None
+        if domain != "host":
+            bad.append((pool["pool_name"], pool["crush_rule"], domain))
+    if bad:
+        lines = "\n".join(
+            f"  pool '{name}' uses crush rule {rule_id} (failure domain: "
+            f"{domain or 'unknown'})"
+            for name, rule_id, domain in bad
+        )
+        sys.exit(
+            "ERROR: this script assumes every pool's CRUSH failure domain is "
+            "'host' (see module docstring), but the following pool(s) do "
+            f"not:\n{lines}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -526,8 +590,16 @@ def main() -> None:
     device_class = osd_df[source_osd].get("device_class")
 
     upmap_items = fetch_upmap_items()
-    ec_pool_ids = fetch_ec_pool_ids()
+    pools = fetch_pool_details()
+    ec_pool_ids = ec_pool_ids_from(pools)
     toofull_pgs = fetch_backfill_toofull_pgs()
+
+    toofull_pool_ids = {int(pg["pgid"].split(".")[0]) for pg in toofull_pgs}
+    pools_by_id = {p["pool_id"]: p for p in pools}
+    check_host_failure_domain(
+        [pools_by_id[i] for i in toofull_pool_ids if i in pools_by_id],
+        fetch_crush_rules(),
+    )
 
     shards = []
     for pg in toofull_pgs:
