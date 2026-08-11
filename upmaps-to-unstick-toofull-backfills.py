@@ -228,6 +228,11 @@ def _extract_pg_stats(raw) -> list[dict]:
             ):
                 return val
 
+        # When no PGs match the filter, 'ceph pg ls' omits 'pg_stats'
+        # entirely and returns just {"pg_ready": true}.
+        if "pg_ready" in raw:
+            return []
+
     raise SystemExit(
         f"ERROR: unrecognised JSON structure from 'ceph pg ls'.\n"
         f"Top-level type: {type(raw).__name__}"
