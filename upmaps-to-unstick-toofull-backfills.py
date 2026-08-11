@@ -161,15 +161,25 @@ POOL_TYPE_ERASURE = 3
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Propose upmap re-targets that divert stuck "
+        "backfill_toofull PGs to emptier OSDs. Every backfill_toofull PG in "
+        "the cluster is examined, and each shard newly arriving on a host too "
+        "full to take it is offered the least-utilized "
+        "OSD of its own device class that it could legally be moved to "
+        "instead. Only the proposals are printed; nothing is changed. Assumes "
+        "the affected pools' CRUSH failure domain is 'host', and exits with an "
+        "error if it is not.",
+        epilog="See the docstring at the top of this script for how targets "
+        "are chosen, which shards get skipped and why, and the caveats that "
+        "apply when turning these rows into 'ceph osd pg-upmap-items' or "
+        "'pgremapper remap' commands.",
     )
     parser.add_argument(
         "--pgremapper",
         action="store_true",
         help="Print '<pgid> <from osd> <target osd>' lines with no header "
         "instead of the table, so each line can be passed as the arguments "
-        "of 'pgremapper remap' (see the epilogue above for the xargs form).",
+        "of 'pgremapper remap' (the script's docstring has the xargs form).",
     )
     return parser.parse_args()
 
