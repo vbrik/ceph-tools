@@ -12,3 +12,4 @@
 # Code quality
 - Make sure comments stay in sync with the code
 - Structure code for human readability
+- Make comment language crisp and concise, no fluff
