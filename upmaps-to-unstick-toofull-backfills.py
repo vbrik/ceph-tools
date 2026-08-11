@@ -1,42 +1,47 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """
-Propose upmap re-targets that divert backfill_toofull PGs away from a full host.
+Propose upmap re-targets that divert stuck backfill_toofull PGs to emptier OSDs.
 
 The situation this solves
 -------------------------
-When a single OSD goes out/down, CRUSH does *not* spread its PGs across the
-cluster. For a rule of the form "choose a host bucket, then a leaf inside it"
-(chooseleaf_firstn/indep type host), the failed leaf is retried *within the
-same host bucket* — so every PG that lived on the dead OSD is re-placed onto
-one of its 20-or-so same-host siblings. On a cluster that is already uniformly
-full, those siblings blow past backfillfull_ratio and the PGs wedge in
-backfill_toofull, while the rest of the cluster sits several percent emptier
-and idle.
+The motivating case is a single OSD going out/down. CRUSH does *not* spread
+its PGs across the cluster: for a rule of the form "choose a host bucket, then
+a leaf inside it" (chooseleaf_firstn/indep type host), the failed leaf is
+retried *within the same host bucket* — so every PG that lived on the dead OSD
+is re-placed onto one of its 20-or-so same-host siblings. On a cluster that is
+already uniformly full, those siblings blow past backfillfull_ratio and the
+PGs wedge in backfill_toofull, while the rest of the cluster sits several
+percent emptier and idle.
 
-Everything above only holds if the relevant pools' CRUSH rules actually fail
-over at the host bucket type, so this is checked at startup (see
-check_host_failure_domain) and the script exits with an error if it does not
-hold.
+That is the shape of the problem, not a precondition of the code: the script
+takes no arguments and works from whatever is in backfill_toofull right now,
+whichever hosts are absorbing the shards and however they got that way.
 
-This script finds those PGs and, for each one, picks an OSD elsewhere in the
-cluster that the shard could legally be moved to instead. It only prints the
-proposed re-targets; it changes nothing. The output is meant to be fed to
-another script (or eyeballed) to actually apply the remaps.
+The strategy does rely on the relevant pools' CRUSH rules failing over at the
+host bucket type, so this is checked at startup (see check_host_failure_domain)
+and the script exits with an error if it does not hold.
+
+For each stuck shard the script picks an OSD elsewhere in the cluster that the
+shard could legally be moved to instead. It only prints the proposed
+re-targets; it changes nothing. The output is meant to be fed to another
+script (or eyeballed) to actually apply the remaps.
 
 How PGs are identified
 ----------------------
-A PG is selected when it is in backfill_toofull *and* one of its shards is
-newly arriving on the source OSD's host — that is, an OSD on that host is in
-the PG's 'up' set but not its 'acting' set.
+Every PG in backfill_toofull is examined, and a shard of it is selected when
+that shard is newly arriving — in the PG's 'up' set but not its 'acting' set.
+The host it is arriving on is by definition one that cannot take it, since
+that is what backfill_toofull means, so no further filtering is needed. A
+backfill_toofull PG with no newly-arriving shard yields nothing; it is counted
+on stderr so the silence is not ambiguous.
 
-Note this is host-based, not OSD-based provenance. Once an OSD is out, the
-slot it vacated in 'acting' reads as CRUSH_ITEM_NONE, not as its OSD id, so
-there is no way to prove from the PG map that a given shard used to live on
-the source OSD specifically. Matching on "a shard newly landed on the source
-OSD's host" is the observable signal, and it is the one that matters: the host
-is what is out of space. This also keeps PGs that are remapped but not
-degraded (a real OSD id in 'acting') from being dropped.
+Note the vacated OSD often cannot be identified. Once an OSD is out, the slot
+it vacated in 'acting' reads as CRUSH_ITEM_NONE, not as its OSD id, so there
+is no way to prove from the PG map where the shard came from. That does not
+matter here — the arriving side is what is out of space, and it is always
+observable. VACATED is reported when it happens to be recoverable and 'none'
+otherwise.
 
 'up'/'acting' are diffed differently per pool type, for the same reason as in
 pg-movements.py: EC shards are identified by position, so index i is diffed
@@ -47,21 +52,31 @@ instead, with SHARD shown as '-'.
 
 How targets are chosen
 ----------------------
-Candidates are OSDs of the same device class as the source OSD, that are up,
-in (reweight > 0), and have a non-zero CRUSH weight, sorted by utilization
-ascending (OSD id breaks ties, so re-runs are reproducible). The source OSD
-itself is excluded — note it would otherwise sort *first*, since 'ceph osd df'
-reports an out OSD at 0% utilization.
+Candidates are OSDs that are up, in (reweight > 0) and have a non-zero CRUSH
+weight, grouped by device class and sorted by utilization ascending within
+each class (OSD id breaks ties, so re-runs are reproducible). Down and out
+OSDs are excluded by those filters, which also keeps an out OSD from sorting
+*first* — 'ceph osd df' reports one at 0% utilization.
 
-For each PG, the least-utilized candidate is taken whose host is not already
-used by the PG's 'up' set. Because the arriving OSD being diverted is itself
-on the source host, the source host is automatically excluded, which is the
+A shard is only offered candidates of its *own* device class, that of the OSD
+it is arriving on. Pools' CRUSH rules are typically class-constrained, so an
+hdd shard sent to an ssd OSD would be an illegal placement.
+
+For each shard the least-utilized such candidate is taken whose host is not
+already used by the PG's 'up' set. The arriving OSD is itself a member of
+'up', so the host being diverted away from is always excluded — that is the
 whole point of the tool. A candidate is also rejected if it already appears in
 the PG's *raw* CRUSH mapping (see below).
 
-Each chosen OSD is removed from the candidate pool, so no two PGs are sent to
-the same OSD. If a PG has several diverted shards, each target host is added
-to that PG's exclusion set before its next shard is placed.
+Each chosen OSD is removed from its class's candidate pool, so no two shards
+are sent to the same OSD. If a PG has several diverted shards, each target
+host is added to that PG's exclusion set before its next shard is placed.
+
+That one-target-per-OSD rule can genuinely run out: a cluster-wide run may
+have more stuck shards than there are usable OSDs in a class, in which case
+the tail is reported as unplaceable rather than doubled up. Shards are
+processed in PG id order, so the lowest pool ids get the emptiest targets; the
+ordering is fixed rather than fair, which is what makes re-runs reproducible.
 
 Why the raw CRUSH mapping matters
 ---------------------------------
@@ -99,7 +114,7 @@ Two caveats for whatever consumes this:
 
 Review the proposals before applying them. To hand them to pgremapper:
 
-    upmaps-to-unstick-toofull-backfills.py --pgremapper <osd> > remaps.txt
+    upmaps-to-unstick-toofull-backfills.py --pgremapper > remaps.txt
     xargs -a remaps.txt -L1 pgremapper-v1.0.0-linux-amd64 remap
 
 Use 'xargs -a', not '< remaps.txt': with a redirect, xargs points each child's
@@ -130,12 +145,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "source_osd",
-        type=int,
-        help="OSD id whose host is absorbing the remaps (e.g. the OSD that "
-        "went out). Its host is what backfills are diverted away from.",
     )
     parser.add_argument(
         "--pgremapper",
@@ -281,9 +290,11 @@ def check_host_failure_domain(pools: list[dict], crush_rules: dict[int, dict]) -
 
     The diversion strategy this script implements (see module docstring)
     only makes sense if a failed leaf is retried within the same host
-    bucket — that is what makes "a shard newly landed on the source OSD's
-    host" a meaningful signal in find_diverted_shards(). If a pool's rule
-    fails over at some other bucket type, that signal means nothing for it.
+    bucket, since that is what concentrates the re-placed shards onto one
+    already-full host and makes moving them to a host outside the PG's up
+    set the fix. If a pool's rule fails over at some other bucket type,
+    excluding hosts is neither the constraint CRUSH enforces for it nor the
+    one that would unstick it.
     """
     bad = []
     for pool in pools:
@@ -337,22 +348,21 @@ def raw_crush_osds(up: list, upmap_pairs: list[dict]) -> set[int]:
 
 
 class DivertedShard(NamedTuple):
-    """A shard that CRUSH re-placed onto the full source host."""
+    """A shard newly arriving on a host that is too full to take it."""
 
     pgid: str
     shard: "int | str"  # EC shard index, or '-' for replicated pools
-    arriving_osd: int  # OSD on the source host now receiving the shard;
-    # this is the 'from' of the upmap that would divert it
+    arriving_osd: int  # OSD now receiving the shard; this is the 'from' of
+    # the upmap that would divert it, and its host is
+    # the one the shard is diverted away from
     vacated_osd: "int | None"  # OSD that left this slot, or None when the
     # slot reads as CRUSH_ITEM_NONE (the usual out-OSD case)
     up: list  # the PG's full up set, for host exclusions and for
     # reconstructing the raw CRUSH mapping
 
 
-def find_diverted_shards(
-    pg: dict, source_host: str, osd_host: dict[int, str], is_ec: bool
-) -> list[DivertedShard]:
-    """Return the shards of one PG that are newly arriving on the source host."""
+def find_diverted_shards(pg: dict, is_ec: bool) -> list[DivertedShard]:
+    """Return the shards of one PG that are newly arriving on their up OSD."""
     pgid = pg["pgid"]
     up = pg["up"]
     acting = pg["acting"]
@@ -367,8 +377,6 @@ def find_diverted_shards(
             vacated = _slot(acting, i)
             if arriving is None or arriving == vacated:
                 continue
-            if osd_host.get(arriving) != source_host:
-                continue
             found.append(DivertedShard(pgid, i, arriving, vacated, up))
     else:
         # Replicated: replicas are interchangeable, so position means nothing
@@ -377,8 +385,6 @@ def find_diverted_shards(
         acting_set = {o for o in acting if _is_real_osd(o)}
         vacated_osds = sorted(acting_set - up_set)
         for arriving in sorted(up_set - acting_set):
-            if osd_host.get(arriving) != source_host:
-                continue
             # A replicated PG can have several arriving/vacated replicas at
             # once with no way to pair them up; report one vacated OSD only
             # when the pairing is unambiguous.
@@ -399,28 +405,38 @@ def pgid_sort_key(pgid: str) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
-def build_candidate_osds(
-    osd_df: dict[int, dict], device_class: str, source_osd: int
-) -> list[int]:
-    """Return usable target OSD ids of the given class, least-utilized first.
+def osd_class(osd_df: dict[int, dict], osd_id: int) -> "str | None":
+    """Return an OSD's device class, or None if it is unknown."""
+    return osd_df.get(osd_id, {}).get("device_class")
 
-    Excludes OSDs that are down, out (reweight 0) or have no CRUSH weight,
-    and the source OSD itself. Without this an out OSD sorts to the very
-    front: 'ceph osd df' reports it at 0% utilization.
+
+def build_candidate_osds(osd_df: dict[int, dict]) -> dict[str, list[int]]:
+    """Return usable target OSD ids per device class, least-utilized first.
+
+    Excludes OSDs that are down, out (reweight 0) or have no CRUSH weight.
+    That also covers the OSD whose failure caused the pile-up in the first
+    place: without it an out OSD would sort to the very front, since
+    'ceph osd df' reports one at 0% utilization.
+
+    Keyed by device class because a shard may only be diverted to an OSD of
+    its own class (see module docstring); each class's pool is drawn down
+    independently.
     """
     usable = [
         node
-        for osd_id, node in osd_df.items()
-        if osd_id != source_osd
-        and node.get("device_class") == device_class
-        and node.get("status") == "up"
+        for node in osd_df.values()
+        if node.get("status") == "up"
         and node.get("reweight", 0) > 0
         and node.get("crush_weight", 0) > 0
+        and node.get("device_class")
     ]
     # OSD id as secondary key: utilizations tie constantly on a uniformly
     # full cluster, and the operator will re-run this.
     usable.sort(key=lambda n: (n["utilization"], n["id"]))
-    return [n["id"] for n in usable]
+    by_class: dict[str, list[int]] = {}
+    for node in usable:
+        by_class.setdefault(node["device_class"], []).append(node["id"])
+    return by_class
 
 
 class Proposal(NamedTuple):
@@ -432,7 +448,7 @@ class Proposal(NamedTuple):
 
 def assign_targets(
     shards: list[DivertedShard],
-    candidates: list[int],
+    candidates: dict[str, list[int]],
     osd_host: dict[int, str],
     osd_df: dict[int, dict],
     upmap_items: dict[str, list[dict]],
@@ -440,9 +456,10 @@ def assign_targets(
     """Greedily give each diverted shard the least-utilized legal target.
 
     Returns (proposals, unplaceable shards, unappliable shards). Each target
-    OSD is consumed, so no two shards are sent to the same OSD.
+    OSD is consumed from its device class's pool, so no two shards are sent
+    to the same OSD.
     """
-    available = list(candidates)
+    available = {cls: list(osds) for cls, osds in candidates.items()}
     # Hosts already spoken for per PG: seeded from the up set, then extended
     # as each of the PG's shards is placed, so a PG with two diverted shards
     # cannot be given two targets on one host.
@@ -474,12 +491,16 @@ def assign_targets(
             unappliable.append(shard)
             continue
 
-        for candidate in available:
+        # Only OSDs of the arriving OSD's own class are legal targets. An
+        # unknown class yields an empty pool, so the shard falls through to
+        # unplaceable rather than being sent somewhere CRUSH would reject.
+        pool = available.get(osd_class(osd_df, shard.arriving_osd), [])
+        for candidate in pool:
             if osd_host.get(candidate) in forbidden_hosts:
                 continue
             if candidate in forbidden_osds:
                 continue
-            available.remove(candidate)
+            pool.remove(candidate)
             forbidden_hosts.add(osd_host.get(candidate))
             proposals.append(
                 Proposal(
@@ -504,6 +525,7 @@ COLUMNS = [
     "PGID",
     "SHARD",
     "FROM_OSD",
+    "FROM_HOST",
     "TARGET_OSD",
     "TARGET_HOST",
     "TGT_UTIL",
@@ -514,6 +536,7 @@ COLUMNS = [
 
 def format_row(
     proposal: Proposal,
+    osd_host: dict[int, str],
     upmap_items: dict[str, list[dict]],
 ) -> list[str]:
     shard = proposal.shard
@@ -523,6 +546,9 @@ def format_row(
         shard.pgid,
         str(shard.shard),
         f"osd.{shard.arriving_osd}",
+        # Varies per row now that the whole cluster is scanned, so unlike
+        # the single-host version it cannot live in the stderr header.
+        osd_host.get(shard.arriving_osd, "?"),
         f"osd.{proposal.target_osd}",
         proposal.target_host,
         f"{proposal.target_utilization:.1f}%",
@@ -556,8 +582,7 @@ def print_pgremapper(proposals: list[Proposal]) -> None:
 
     These are the positional arguments of 'pgremapper remap', in order and
     with nothing else on the line, so the output can be fed to it directly.
-    (What the table calls FROM_OSD is pgremapper's "source osd" argument —
-    not to be confused with this script's source_osd, the OSD that went out.)
+    (What the table calls FROM_OSD is pgremapper's "source osd" argument.)
     OSD ids are bare integers: pgremapper parses them with strconv.Atoi and
     rejects the 'osd.N' form the table uses.
     """
@@ -574,21 +599,9 @@ def print_pgremapper(proposals: list[Proposal]) -> None:
 
 def main() -> None:
     args = parse_args()
-    source_osd = args.source_osd
 
     osd_host = fetch_osd_hosts()
     osd_df = fetch_osd_df()
-
-    if source_osd not in osd_df:
-        sys.exit(f"ERROR: osd.{source_osd} not found in 'ceph osd df' output.")
-    source_host = osd_host.get(source_osd)
-    if source_host is None:
-        sys.exit(
-            f"ERROR: could not determine the host of osd.{source_osd} from "
-            f"'ceph osd tree' (is it still in the CRUSH map?)."
-        )
-    device_class = osd_df[source_osd].get("device_class")
-
     upmap_items = fetch_upmap_items()
     pools = fetch_pool_details()
     ec_pool_ids = ec_pool_ids_from(pools)
@@ -602,9 +615,12 @@ def main() -> None:
     )
 
     shards = []
+    pgs_with_shards = 0
     for pg in toofull_pgs:
         is_ec = int(pg["pgid"].split(".")[0]) in ec_pool_ids
-        shards.extend(find_diverted_shards(pg, source_host, osd_host, is_ec))
+        found = find_diverted_shards(pg, is_ec)
+        shards.extend(found)
+        pgs_with_shards += bool(found)
     shards.sort(
         key=lambda s: (
             pgid_sort_key(s.pgid),
@@ -612,17 +628,20 @@ def main() -> None:
         )
     )
 
-    candidates = build_candidate_osds(osd_df, device_class, source_osd)
+    candidates = build_candidate_osds(osd_df)
     proposals, unplaceable, unappliable = assign_targets(
         shards, candidates, osd_host, osd_df, upmap_items
     )
 
     # Everything informational goes to stderr so stdout stays parseable.
+    by_class = ", ".join(
+        f"{cls}={len(osds)}" for cls, osds in sorted(candidates.items())
+    )
     print(
-        f"source: osd.{source_osd} on {source_host} (class {device_class}); "
-        f"{len(toofull_pgs)} backfill_toofull PGs cluster-wide, "
-        f"{len(shards)} shard(s) of them arriving on {source_host}; "
-        f"{len(candidates)} candidate target OSDs",
+        f"{len(toofull_pgs)} backfill_toofull PG(s) cluster-wide, "
+        f"{pgs_with_shards} with newly-arriving shard(s); "
+        f"{len(shards)} shard(s) to divert; "
+        f"candidate target OSDs: {by_class or 'none'}",
         file=sys.stderr,
     )
 
@@ -630,14 +649,15 @@ def main() -> None:
         if args.pgremapper:
             print_pgremapper(proposals)
         else:
-            print_table([format_row(p, upmap_items) for p in proposals])
+            print_table([format_row(p, osd_host, upmap_items) for p in proposals])
 
     for shard in unplaceable:
         print(
             f"WARNING: no legal target left for {shard.pgid} shard "
-            f"{shard.shard} (arriving on osd.{shard.arriving_osd}) — every "
-            f"candidate OSD is on a host already in the PG's up set, already "
-            f"in its CRUSH mapping, or already used by another PG",
+            f"{shard.shard} (arriving on osd.{shard.arriving_osd}, class "
+            f"{osd_class(osd_df, shard.arriving_osd) or 'unknown'}) — every "
+            f"candidate OSD of that class is on a host already in the PG's up "
+            f"set, already in its CRUSH mapping, or already used by another PG",
             file=sys.stderr,
         )
 
@@ -655,6 +675,13 @@ def main() -> None:
         f"{len(unappliable)} unappliable",
         file=sys.stderr,
     )
+    if unplaceable:
+        print(
+            "NOTE: each target OSD is used at most once, so a cluster-wide run "
+            "with more stuck shards than usable OSDs will always leave a tail "
+            "unplaceable. Apply these, let them drain, then re-run.",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
