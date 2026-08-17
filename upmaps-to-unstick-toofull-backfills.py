@@ -698,7 +698,7 @@ def main() -> None:
     flagged = [p for p in proposals if p.via_existing_upmap]
     if flagged:
         print(
-            f"NOTE: {len(flagged)} proposal(s) have a FROM_OSD marked '*': "
+            f"\nNOTE: {len(flagged)} proposal(s) have a FROM_OSD marked '*': "
             "that OSD is itself the 'to' of an existing upmap pair, so "
             "apply the row by rewriting that pair's 'to' to TARGET_OSD, not "
             "by adding 'FROM_OSD->TARGET_OSD' as a new pair (see "
