@@ -17,7 +17,7 @@ is no shared library or install step beyond the requirements below.
   pointed at the target cluster.
 - Python 3 for the `.py` scripts (`cephfs-client-inodes.py` runs under the
   `python` shebang, everything else under `python3`). Stdlib only, except:
-  - `cephfs-mds-ops-pretty.py` can optionally resolve UID/GID to names via
+  - `mds-ops-pretty.py` can optionally resolve UID/GID to names via
     LDAP, using the `ldap3` package if installed, falling back to the
     `ldapsearch` CLI otherwise. This is off by default and only activates
     when both `--ldap-server` and `--ldap-base` are given (see `--help`).
@@ -99,7 +99,7 @@ other environments.
   etc.), sortable and filterable by column, with optional result caching.
   `cephfs-client-load-top.py [-r RANK] [-n N] [-s COLUMNS] [--hide COLUMNS] [--cache-ttl SECONDS] [--cache-file PATH] [--full-mount-point]`
 
-- **`cephfs-mds-ops-pretty.py`** — Human-friendly rendering of
+- **`mds-ops-pretty.py`** — Human-friendly rendering of
   `ceph tell mds.X dump_{blocked,historic,ops_in_flight}` JSON. By default,
   auto-detects and queries every active MDS rank live, tagging each op with
   its rank (`--mds-rank` restricts to one); a saved JSON file can be used
@@ -110,7 +110,7 @@ other environments.
   `client ls` results are cached the same way for a short time by default
   (10 minutes), since a stale cache can hide the very client generating the
   op you're inspecting (see `--client-cache-ttl`/`--client-cache-file`).
-  `cephfs-mds-ops-pretty.py dump_ops_in_flight [options]`
+  `mds-ops-pretty.py dump_ops_in_flight [options]`
 
 - **`cephfs-dir-tree-pins.sh`** — List directories pinned (exported) to
   each MDS rank.

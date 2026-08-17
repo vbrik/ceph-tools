@@ -83,7 +83,7 @@ HEADER = (
 
 def default_inode_cache_dir():
     # uid-suffixed: avoids trusting/colliding with another user's files in shared /tmp.
-    return os.path.join(tempfile.gettempdir(), f"cephfs-mds-ops-pretty.{os.getuid()}")
+    return os.path.join(tempfile.gettempdir(), f"mds-ops-pretty.{os.getuid()}")
 
 
 def inode_cache_file(cache_dir, fsid):
