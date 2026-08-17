@@ -101,6 +101,22 @@ note on stderr points at EXISTING_UPMAPS — on the assumption that whoever
 applies this by hand will rewrite that pair's 'to' rather than paste the row
 in as a new one.
 
+Testing against saved cluster state
+------------------------------------
+By default every run calls the live 'ceph' CLI (see SNAPSHOT_COMMANDS for
+the six commands and their JSON output). --save-state DIR captures that
+same JSON, one '<key>.json' file per command, into DIR as a side effect of
+an otherwise normal run — analysis and output proceed as usual, so the
+saved state is exactly what produced the run's own proposals. DIR must be
+empty or not yet exist.
+
+--load-state DIR reads those six files back instead of calling 'ceph', so a
+captured state can be replayed offline with no cluster access. The two
+flags are mutually exclusive. gitignore/upmaps-toofull-*/ hold sample
+captures (each with a README describing the scenario and the exact output
+the script should reproduce from it) usable directly as --load-state
+arguments.
+
 Applying the output
 -------------------
 Two output formats are available. The default is a human-readable table.
@@ -153,6 +169,7 @@ import argparse
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import NamedTuple
 
 # Sentinel used by CRUSH/Ceph for "no OSD in this slot" (crush/crush.h).
@@ -160,6 +177,36 @@ from typing import NamedTuple
 CRUSH_ITEM_NONE = 0x7FFFFFFF
 
 POOL_TYPE_ERASURE = 3
+
+# Maps each snapshot to the 'ceph ... --format json' command that produces
+# it and the '<key>.json' filename it is saved/loaded as under --save-state/
+# --load-state. Keys match the fixtures under gitignore/upmaps-toofull-*/
+# verbatim, so those directories can be passed straight to --load-state.
+SNAPSHOT_COMMANDS: dict[str, list[str]] = {
+    "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
+    "osd_df": ["ceph", "osd", "df", "--format", "json"],
+    "osd_dump": ["ceph", "osd", "dump", "--format", "json"],
+    "pool_ls_detail": ["ceph", "osd", "pool", "ls", "detail", "--format", "json"],
+    "crush_rule_dump": ["ceph", "osd", "crush", "rule", "dump", "--format", "json"],
+    "pg_ls_backfill_toofull": [
+        "ceph",
+        "pg",
+        "ls",
+        "backfill_toofull",
+        "--format",
+        "json",
+    ],
+}
+
+# Set from args at the top of main(): None means "call the live ceph CLI as
+# normal"; a Path means "read '<key>.json' from this directory instead of
+# running SNAPSHOT_COMMANDS[key]" (see --load-state).
+LOAD_STATE_DIR: "Path | None" = None
+
+# Set from args at the top of main(): None means "don't save"; a Path means
+# "before returning each snapshot, also write it verbatim to
+# '<dir>/<key>.json'" (see --save-state).
+SAVE_STATE_DIR: "Path | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +236,28 @@ def parse_args() -> argparse.Namespace:
         "instead of the table, so each line can be passed as the arguments "
         "of 'pgremapper remap' (the script's docstring has the xargs form).",
     )
+    state_group = parser.add_mutually_exclusive_group()
+    state_group.add_argument(
+        "--load-state",
+        metavar="DIR",
+        help="Analyze a saved cluster state instead of a live cluster. DIR "
+        "must contain the six '<key>.json' files documented at "
+        "SNAPSHOT_COMMANDS (osd_tree.json, osd_df.json, osd_dump.json, "
+        "pool_ls_detail.json, crush_rule_dump.json and "
+        "pg_ls_backfill_toofull.json) — the same layout as the fixtures "
+        "under gitignore/upmaps-toofull-*/, and what --save-state produces. "
+        "No 'ceph' commands are run.",
+    )
+    state_group.add_argument(
+        "--save-state",
+        metavar="DIR",
+        help="Also save the live cluster state this run collects into DIR, "
+        "as the six '<key>.json' files --load-state reads back (created if "
+        "missing; must be empty or not exist, so a snapshot is never "
+        "partially overwritten). Analysis and normal output proceed as "
+        "usual — this only adds the save as a side effect, so the saved "
+        "state is exactly what produced the run's own output.",
+    )
     return parser.parse_args()
 
 
@@ -197,19 +266,49 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def _ceph_json(cmd: list[str]) -> object:
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError as exc:
-        sys.exit(f"ERROR: ceph command failed:\n{exc.stderr.strip()}")
-    except FileNotFoundError:
-        sys.exit("ERROR: 'ceph' binary not found in PATH.")
-    return json.loads(proc.stdout)
+def _snapshot_text(key: str) -> str:
+    """Return the raw JSON text for one of SNAPSHOT_COMMANDS's keys.
+
+    Read from '<LOAD_STATE_DIR>/<key>.json' verbatim if --load-state was
+    given, otherwise run the live ceph command. Either way, if --save-state
+    was given, the text is written to '<SAVE_STATE_DIR>/<key>.json' verbatim
+    (byte-for-byte, no re-serialization) before being returned, so a save
+    reproduces exactly what the fixtures under gitignore/upmaps-toofull-*/
+    look like.
+    """
+    if LOAD_STATE_DIR is not None:
+        path = LOAD_STATE_DIR / f"{key}.json"
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            cmd = " ".join(SNAPSHOT_COMMANDS[key])
+            sys.exit(
+                f"ERROR: --load-state directory is missing {path} (the "
+                f"output of '{cmd}')."
+            )
+    else:
+        cmd = SNAPSHOT_COMMANDS[key]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as exc:
+            sys.exit(f"ERROR: ceph command failed:\n{exc.stderr.strip()}")
+        except FileNotFoundError:
+            sys.exit("ERROR: 'ceph' binary not found in PATH.")
+        text = proc.stdout
+
+    if SAVE_STATE_DIR is not None:
+        (SAVE_STATE_DIR / f"{key}.json").write_text(text)
+
+    return text
+
+
+def _ceph_json(key: str) -> object:
+    return json.loads(_snapshot_text(key))
 
 
 def fetch_osd_hosts() -> dict[int, str]:
     """Return {osd_id: short_hostname} from 'ceph osd tree'."""
-    data = _ceph_json(["ceph", "osd", "tree", "--format", "json"])
+    data = _ceph_json("osd_tree")
     nodes = data.get("nodes", []) + data.get("stray", [])
     by_id = {n["id"]: n for n in nodes}
     result = {}
@@ -229,20 +328,20 @@ def fetch_osd_df() -> dict[int, dict]:
     crush_weight, which together are everything needed to decide whether an
     OSD is a usable backfill target — no separate 'ceph osd dump' pass.
     """
-    data = _ceph_json(["ceph", "osd", "df", "--format", "json"])
+    data = _ceph_json("osd_df")
     nodes = data.get("nodes", []) + data.get("stray", [])
     return {n["id"]: n for n in nodes}
 
 
 def fetch_upmap_items() -> dict[str, list[dict]]:
     """Return {pgid: [{'from': osd, 'to': osd}, ...]} from 'ceph osd dump'."""
-    data = _ceph_json(["ceph", "osd", "dump", "--format", "json"])
+    data = _ceph_json("osd_dump")
     return {e["pgid"]: e["mappings"] for e in data.get("pg_upmap_items", [])}
 
 
 def fetch_pool_details() -> list[dict]:
     """Return the list of pool dicts from 'ceph osd pool ls detail'."""
-    return _ceph_json(["ceph", "osd", "pool", "ls", "detail", "--format", "json"])
+    return _ceph_json("pool_ls_detail")
 
 
 def ec_pool_ids_from(pools: list[dict]) -> set[int]:
@@ -252,7 +351,7 @@ def ec_pool_ids_from(pools: list[dict]) -> set[int]:
 
 def fetch_crush_rules() -> dict[int, dict]:
     """Return {rule_id: rule} from 'ceph osd crush rule dump'."""
-    data = _ceph_json(["ceph", "osd", "crush", "rule", "dump", "--format", "json"])
+    data = _ceph_json("crush_rule_dump")
     return {r["rule_id"]: r for r in data}
 
 
@@ -262,7 +361,7 @@ def fetch_backfill_toofull_pgs() -> list[dict]:
     Filtered server-side by 'ceph pg ls', which is dramatically cheaper than
     dumping every PG in the cluster and filtering here.
     """
-    raw = _ceph_json(["ceph", "pg", "ls", "backfill_toofull", "--format", "json"])
+    raw = _ceph_json("pg_ls_backfill_toofull")
     return _extract_pg_stats(raw)
 
 
@@ -643,6 +742,20 @@ def print_pgremapper(proposals: list[Proposal]) -> None:
 
 def main() -> None:
     args = parse_args()
+
+    global LOAD_STATE_DIR, SAVE_STATE_DIR
+    if args.load_state:
+        LOAD_STATE_DIR = Path(args.load_state)
+        if not LOAD_STATE_DIR.is_dir():
+            sys.exit(f"ERROR: --load-state directory not found: {LOAD_STATE_DIR}")
+    if args.save_state:
+        SAVE_STATE_DIR = Path(args.save_state)
+        SAVE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        existing = list(SAVE_STATE_DIR.iterdir())
+        if existing:
+            sys.exit(
+                f"ERROR: --save-state directory is not empty: {SAVE_STATE_DIR}"
+            )
 
     osd_host = fetch_osd_hosts()
     osd_df = fetch_osd_df()
