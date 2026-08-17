@@ -90,14 +90,16 @@ OSD in the mapping twice; Ceph's upmap validation drops such an entry silently,
 so the command appears to succeed and then has no effect. Targets are
 therefore checked against 'up' union the reconstructed raw mapping.
 
-The same reconstruction decides whether a shard can be diverted at all. The
-arriving OSD becomes the 'from' of the new upmap pair, and 'from' must be an
-OSD CRUSH itself chose. An arriving OSD that is *absent* from the raw mapping
-is one an existing upmap already put there (the balancer places these), so
-diverting it means rewriting that pair's 'to' rather than adding a pair —
-a distinct edit this script does not emit. Such shards are reported as
-"unappliable" on stderr, with the pair to rewrite, and are left out of the
-proposals rather than turned into a command Ceph would accept and ignore.
+The same reconstruction also flags a subtler case. The arriving OSD becomes
+the 'from' of the new upmap pair, and 'from' must be an OSD CRUSH itself
+chose. An arriving OSD that is *absent* from the raw mapping is one an
+existing upmap already put there (the balancer places these), so diverting
+it means rewriting that pair's 'to' rather than adding a new pair — Ceph's
+upmap validation silently drops a 'from' that CRUSH did not itself pick.
+Such rows are still proposed — FROM_OSD is marked with a trailing '*', and a
+note on stderr points at EXISTING_UPMAPS — on the assumption that whoever
+applies this by hand will rewrite that pair's 'to' rather than paste the row
+in as a new one.
 
 Applying the output
 -------------------
@@ -129,6 +131,12 @@ Caveats for whatever consumes this:
   - If the upmap balancer is active ('ceph balancer status'), it may undo
     manually placed upmap entries. Consider 'ceph balancer off' while the
     diverted backfills drain.
+
+  - A FROM_OSD suffixed '*' is itself the 'to' of one of that row's
+    EXISTING_UPMAPS pairs (see "Why the raw CRUSH mapping matters" above).
+    Apply such a row by rewriting that pair's 'to' to TARGET_OSD, not by
+    adding 'FROM_OSD->TARGET_OSD' as a new pair — Ceph accepts a new pair
+    like that and then silently drops it.
 
 Review the proposals before applying them. To hand them to pgremapper:
 
@@ -472,6 +480,10 @@ class Proposal(NamedTuple):
     target_osd: int
     target_host: str
     target_utilization: float
+    via_existing_upmap: bool  # arriving_osd is absent from the raw CRUSH
+    # mapping, i.e. it is itself the 'to' of an existing pair (see module
+    # docstring); applying this row means rewriting that pair's 'to', not
+    # adding a new pair
 
 
 def assign_targets(
@@ -480,12 +492,11 @@ def assign_targets(
     osd_host: dict[int, str],
     osd_df: dict[int, dict],
     upmap_items: dict[str, list[dict]],
-) -> tuple[list[Proposal], list[DivertedShard], list[DivertedShard]]:
+) -> tuple[list[Proposal], list[DivertedShard]]:
     """Greedily give each diverted shard the least-utilized legal target.
 
-    Returns (proposals, unplaceable shards, unappliable shards). Each target
-    OSD is consumed from its device class's pool, so no two shards are sent
-    to the same OSD.
+    Returns (proposals, unplaceable shards). Each target OSD is consumed
+    from its device class's pool, so no two shards are sent to the same OSD.
     """
     available = {cls: list(osds) for cls, osds in candidates.items()}
     # Hosts already spoken for per PG: seeded from the up set, then extended
@@ -494,7 +505,6 @@ def assign_targets(
     blocked_hosts: dict[str, set[str]] = {}
     proposals = []
     unplaceable = []
-    unappliable = []
 
     for shard in shards:
         forbidden_hosts = blocked_hosts.setdefault(
@@ -508,16 +518,13 @@ def assign_targets(
         # validation drops silently (see module docstring).
         forbidden_osds = raw | {o for o in shard.up if _is_real_osd(o)}
 
-        # The arriving OSD becomes the 'from' of the diverting upmap pair, and
-        # 'from' must be an OSD CRUSH itself chose. If the arriving OSD is
-        # absent from the raw mapping it is itself the product of an existing
-        # upmap (the balancer places these, and it is active on this cluster),
-        # so diverting it means rewriting that pair's 'to' rather than adding
-        # a new pair. Emitting a row here would produce a command that Ceph
-        # accepts and then silently ignores, so report it instead.
-        if shard.arriving_osd not in raw:
-            unappliable.append(shard)
-            continue
+        # The arriving OSD becomes the 'from' of the diverting upmap pair,
+        # and 'from' must be an OSD CRUSH itself chose. If the arriving OSD
+        # is absent from the raw mapping it is itself the product of an
+        # existing upmap (the balancer places these), so applying this row
+        # as printed means rewriting that pair's 'to' rather than adding a
+        # new pair — flagged rather than skipped (see module docstring).
+        via_existing_upmap = shard.arriving_osd not in raw
 
         # Only OSDs of the arriving OSD's own class are legal targets. An
         # unknown class yields an empty pool, so the shard falls through to
@@ -536,13 +543,14 @@ def assign_targets(
                     candidate,
                     osd_host.get(candidate, "?"),
                     osd_df[candidate]["utilization"],
+                    via_existing_upmap,
                 )
             )
             break
         else:
             unplaceable.append(shard)
 
-    return proposals, unplaceable, unappliable
+    return proposals, unplaceable
 
 
 # ---------------------------------------------------------------------------
@@ -570,10 +578,18 @@ def format_row(
     shard = proposal.shard
     pairs = upmap_items.get(shard.pgid, [])
 
+    # '*' means arriving_osd is itself the 'to' of one of this row's
+    # EXISTING_UPMAPS pairs; applying the row means rewriting that pair's
+    # 'to' rather than adding 'FROM_OSD->TARGET_OSD' as a new pair (see
+    # module docstring).
+    from_osd = f"osd.{shard.arriving_osd}" + (
+        "*" if proposal.via_existing_upmap else ""
+    )
+
     return [
         shard.pgid,
         str(shard.shard),
-        f"osd.{shard.arriving_osd}",
+        from_osd,
         # Varies per row now that the whole cluster is scanned, so unlike
         # the single-host version it cannot live in the stderr header.
         osd_host.get(shard.arriving_osd, "?"),
@@ -657,7 +673,7 @@ def main() -> None:
     )
 
     candidates = build_candidate_osds(osd_df)
-    proposals, unplaceable, unappliable = assign_targets(
+    proposals, unplaceable = assign_targets(
         shards, candidates, osd_host, osd_df, upmap_items
     )
 
@@ -679,6 +695,17 @@ def main() -> None:
         else:
             print_table([format_row(p, osd_host, upmap_items) for p in proposals])
 
+    flagged = [p for p in proposals if p.via_existing_upmap]
+    if flagged:
+        print(
+            f"NOTE: {len(flagged)} proposal(s) have a FROM_OSD marked '*': "
+            "that OSD is itself the 'to' of an existing upmap pair, so "
+            "apply the row by rewriting that pair's 'to' to TARGET_OSD, not "
+            "by adding 'FROM_OSD->TARGET_OSD' as a new pair (see "
+            "EXISTING_UPMAPS).",
+            file=sys.stderr,
+        )
+
     for shard in unplaceable:
         print(
             f"WARNING: no legal target left for {shard.pgid} shard "
@@ -689,18 +716,8 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    for shard in unappliable:
-        print(
-            f"WARNING: skipped {shard.pgid} shard {shard.shard}: the arriving "
-            f"osd.{shard.arriving_osd} is not in the PG's raw CRUSH mapping, "
-            f"so it was placed there by an existing upmap. Divert it by "
-            f"rewriting that pair's 'to', not by adding a new pair",
-            file=sys.stderr,
-        )
-
     print(
-        f"proposed {len(proposals)} remap(s), {len(unplaceable)} unplaceable, "
-        f"{len(unappliable)} unappliable",
+        f"proposed {len(proposals)} remap(s), {len(unplaceable)} unplaceable",
         file=sys.stderr,
     )
     if unplaceable:
