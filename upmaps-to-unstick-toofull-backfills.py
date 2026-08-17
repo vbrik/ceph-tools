@@ -106,16 +106,28 @@ Testing against saved cluster state
 By default every run calls the live 'ceph' CLI (see SNAPSHOT_COMMANDS for
 the six commands and their JSON output). --save-state DIR captures that
 same JSON, one '<key>.json' file per command, into DIR as a side effect of
-an otherwise normal run — analysis and output proceed as usual, so the
-saved state is exactly what produced the run's own proposals. DIR must be
-empty or not yet exist.
+an otherwise normal run — analysis and output proceed as usual against the
+real data, so the run's own proposals are unaffected by the save. DIR must
+be empty or not yet exist.
+
+The saved copy is anonymized (see anonymize_snapshots): cluster fsid, OSD
+IP addresses, OSD uuids, hostnames and pool/CRUSH-rule names are replaced
+with deterministic fake values before writing, so a --save-state capture is
+safe to hand to someone outside the cluster (or commit to a public repo)
+without hand-editing it first. Every substitution is a pure function of an
+id already in the same record (OSD id, pool id, rule id) or of the real
+value itself, so the same real entity always anonymizes to the same fake
+one — including across separate runs against the same cluster, with no
+shared state needed. PG ids, OSD ids, utilizations and the overall topology
+are left untouched, since those are what the analysis (and a replay via
+--load-state) actually depends on.
 
 --load-state DIR reads those six files back instead of calling 'ceph', so a
-captured state can be replayed offline with no cluster access. The two
-flags are mutually exclusive. gitignore/upmaps-toofull-*/ hold sample
-captures (each with a README describing the scenario and the exact output
-the script should reproduce from it) usable directly as --load-state
-arguments.
+captured state — anonymized or not — can be replayed offline with no
+cluster access. The two flags are mutually exclusive. test-data/
+upmaps-toofull-*/ hold sample captures (each with a README describing the
+scenario and the exact output the script should reproduce from it) usable
+directly as --load-state arguments.
 
 Applying the output
 -------------------
@@ -166,7 +178,10 @@ pgremapper to skip the prompt and its dry-run entirely.)
 """
 
 import argparse
+import copy
+import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -180,7 +195,7 @@ POOL_TYPE_ERASURE = 3
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces
 # it and the '<key>.json' filename it is saved/loaded as under --save-state/
-# --load-state. Keys match the fixtures under gitignore/upmaps-toofull-*/
+# --load-state. Keys match the fixtures under test-data/upmaps-toofull-*/
 # verbatim, so those directories can be passed straight to --load-state.
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
@@ -204,8 +219,8 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 LOAD_STATE_DIR: "Path | None" = None
 
 # Set from args at the top of main(): None means "don't save"; a Path means
-# "before returning each snapshot, also write it verbatim to
-# '<dir>/<key>.json'" (see --save-state).
+# "once all six snapshots are collected, write an anonymized copy of each to
+# '<dir>/<key>.json'" (see --save-state and anonymize_snapshots).
 SAVE_STATE_DIR: "Path | None" = None
 
 
@@ -245,7 +260,7 @@ def parse_args() -> argparse.Namespace:
         "SNAPSHOT_COMMANDS (osd_tree.json, osd_df.json, osd_dump.json, "
         "pool_ls_detail.json, crush_rule_dump.json and "
         "pg_ls_backfill_toofull.json) — the same layout as the fixtures "
-        "under gitignore/upmaps-toofull-*/, and what --save-state produces. "
+        "under test-data/upmaps-toofull-*/, and what --save-state produces. "
         "No 'ceph' commands are run.",
     )
     state_group.add_argument(
@@ -255,8 +270,10 @@ def parse_args() -> argparse.Namespace:
         "as the six '<key>.json' files --load-state reads back (created if "
         "missing; must be empty or not exist, so a snapshot is never "
         "partially overwritten). Analysis and normal output proceed as "
-        "usual — this only adds the save as a side effect, so the saved "
-        "state is exactly what produced the run's own output.",
+        "usual against the real data — only the saved copy is anonymized "
+        "(cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule names "
+        "replaced with deterministic fake values; see anonymize_snapshots), "
+        "so it is safe to share outside the cluster without hand-editing.",
     )
     return parser.parse_args()
 
@@ -266,16 +283,24 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def _snapshot_text(key: str) -> str:
-    """Return the raw JSON text for one of SNAPSHOT_COMMANDS's keys.
+# Populated lazily by _ceph_json, keyed by SNAPSHOT_COMMANDS key. main()
+# ends up fetching all six keys unconditionally, so by the time a
+# --save-state write happens the cache always holds the complete set — that
+# completeness (not just laziness) is what write_anonymized_state relies on.
+_SNAPSHOT_CACHE: dict[str, object] = {}
 
-    Read from '<LOAD_STATE_DIR>/<key>.json' verbatim if --load-state was
-    given, otherwise run the live ceph command. Either way, if --save-state
-    was given, the text is written to '<SAVE_STATE_DIR>/<key>.json' verbatim
-    (byte-for-byte, no re-serialization) before being returned, so a save
-    reproduces exactly what the fixtures under gitignore/upmaps-toofull-*/
-    look like.
+
+def _ceph_json(key: str) -> object:
+    """Return parsed JSON for one of SNAPSHOT_COMMANDS's keys.
+
+    Read from '<LOAD_STATE_DIR>/<key>.json' if --load-state was given,
+    otherwise run the live ceph command. Cached after the first call, so
+    each key is read/run at most once per process even though the fetch_*
+    functions are called from a few different places in main().
     """
+    if key in _SNAPSHOT_CACHE:
+        return _SNAPSHOT_CACHE[key]
+
     if LOAD_STATE_DIR is not None:
         path = LOAD_STATE_DIR / f"{key}.json"
         try:
@@ -296,14 +321,8 @@ def _snapshot_text(key: str) -> str:
             sys.exit("ERROR: 'ceph' binary not found in PATH.")
         text = proc.stdout
 
-    if SAVE_STATE_DIR is not None:
-        (SAVE_STATE_DIR / f"{key}.json").write_text(text)
-
-    return text
-
-
-def _ceph_json(key: str) -> object:
-    return json.loads(_snapshot_text(key))
+    _SNAPSHOT_CACHE[key] = json.loads(text)
+    return _SNAPSHOT_CACHE[key]
 
 
 def fetch_osd_hosts() -> dict[int, str]:
@@ -397,6 +416,143 @@ def _extract_pg_stats(raw) -> list[dict]:
         f"Top-level type: {type(raw).__name__}"
         + (f", keys: {list(raw.keys())}" if isinstance(raw, dict) else "")
     )
+
+
+# ---------------------------------------------------------------------------
+# Anonymization for --save-state
+# ---------------------------------------------------------------------------
+
+# A reserved-for-documentation range (RFC 5737 TEST-NET-2): guaranteed not
+# to be a real routable address, so a saved capture can't be mistaken for
+# one and can't leak the real network's layout.
+_FAKE_IP_PREFIX = "198.51.100."
+
+_ADDR_IP_RE = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
+_TRAILING_NUM_RE = re.compile(r"(\d+)$")
+
+FAKE_FSID = "00000000-0000-0000-0000-000000000000"
+
+
+def _fake_ip(real_ip: str) -> str:
+    """Map a real IP to a deterministic, non-routable stand-in.
+
+    Keyed off the real address's own last octet, so the same real IP always
+    anonymizes to the same fake one with no lookup table required. Distinct
+    real IPs that happen to share a last octet collide onto the same fake
+    one; that's harmless here since the script never parses these fields —
+    they're descriptive only (see fetch_osd_df et al., none of which read
+    any *_addr* key).
+    """
+    last_octet = int(real_ip.rsplit(".", 1)[-1])
+    return f"{_FAKE_IP_PREFIX}{max(1, min(254, last_octet))}"
+
+
+def _anonymize_addr_string(addr: str) -> str:
+    """Replace the IP inside an 'IP:PORT' or 'IP:PORT/NONCE' address string."""
+    return _ADDR_IP_RE.sub(lambda m: _fake_ip(m.group()), addr)
+
+
+def _fake_uuid(osd_id: int) -> str:
+    # '1's rather than '0's so osd.0's fake uuid can't collide with FAKE_FSID.
+    return f"11111111-1111-1111-1111-{osd_id:012d}"
+
+
+def _fake_hostname(real_name: str) -> str:
+    """Map a real hostname to a deterministic stand-in.
+
+    Most ceph hostnames end in a distinguishing number (e.g. 'ceph2-11');
+    keying off that number, rather than the encounter order of any one run,
+    is what lets independent runs against the same cluster (or independent
+    anonymization passes over related fixture directories) agree on the
+    same fake name for the same real host with no shared state. A hostname
+    with no trailing number falls back to a hash of the whole name, which
+    is still deterministic, just not as readable.
+    """
+    m = _TRAILING_NUM_RE.search(real_name)
+    if m:
+        return f"host{int(m.group(1)):02d}"
+    return "host-" + hashlib.sha256(real_name.encode()).hexdigest()[:8]
+
+
+def anonymize_snapshots(snapshots: dict[str, object]) -> None:
+    """Anonymize a complete set of six parsed snapshots in place.
+
+    Replaces the cluster fsid, OSD IP addresses, OSD uuids, hostnames and
+    pool/CRUSH-rule names with deterministic fake values (see _fake_ip,
+    _fake_uuid, _fake_hostname above) — everything in these snapshots that
+    could fingerprint the real cluster or site. PG ids, OSD ids,
+    utilizations, weights and device classes are left untouched: they carry
+    no site-identifying information and are exactly what the analysis (and
+    any --load-state replay) depends on.
+
+    pool_name and rule_name are display-only in this script (used solely in
+    an error message in check_host_failure_domain; every lookup elsewhere
+    is by pool_id/rule_id/crush_rule id), so renaming them to 'pool<id>'/
+    'rule<id>' is safe and needs no cross-reference fixups.
+
+    snapshots must hold parsed JSON for all six SNAPSHOT_COMMANDS keys
+    together (not a subset) — hostnames live only in osd_tree, but the IPs
+    and uuids they'd otherwise help identify live in osd_dump, so partial
+    input would anonymize inconsistently.
+
+    Idempotent: every substitution is keyed off a value already present in
+    the record (osd id, pool id, rule id) or, for IPs and hostnames, off the
+    real value itself — re-running this on already-anonymized snapshots
+    reproduces the same fake values rather than mangling them further. That
+    is what lets independent anonymization passes (e.g. over several
+    related fixture directories, or a second pass after this function
+    changes) agree without needing to share state.
+    """
+    osd_tree = snapshots["osd_tree"]
+    for node in osd_tree.get("nodes", []) + osd_tree.get("stray", []):
+        if node.get("type") == "host":
+            node["name"] = _fake_hostname(node["name"])
+
+    osd_dump = snapshots["osd_dump"]
+    osd_dump["fsid"] = FAKE_FSID
+    # 'ceph osd dump' embeds its own copy of each pool's name (separate from
+    # pool_ls_detail's), keyed by 'pool' rather than 'pool_id' here.
+    for pool in osd_dump.get("pools", []):
+        pool["pool_name"] = f"pool{pool['pool']}"
+    for osd in osd_dump.get("osds", []):
+        osd["uuid"] = _fake_uuid(osd["osd"])
+        for key in (
+            "public_addr",
+            "cluster_addr",
+            "heartbeat_back_addr",
+            "heartbeat_front_addr",
+        ):
+            if key in osd:
+                osd[key] = _anonymize_addr_string(osd[key])
+        for key in (
+            "public_addrs",
+            "cluster_addrs",
+            "heartbeat_back_addrs",
+            "heartbeat_front_addrs",
+        ):
+            for entry in osd.get(key, {}).get("addrvec", []):
+                entry["addr"] = _anonymize_addr_string(entry["addr"])
+
+    for pool in snapshots["pool_ls_detail"]:
+        pool["pool_name"] = f"pool{pool['pool_id']}"
+
+    for rule in snapshots["crush_rule_dump"]:
+        rule["rule_name"] = f"rule{rule['rule_id']}"
+
+
+def write_anonymized_state(dir_: Path, snapshots: dict[str, object]) -> None:
+    """Write an anonymized copy of every collected snapshot under dir_.
+
+    Called once, after all six snapshots have been collected (see
+    _SNAPSHOT_CACHE), so anonymize_snapshots sees the complete set it
+    requires. Operates on a deep copy — the cache that fed the run's own
+    analysis and output is left untouched, so --save-state never changes
+    what a run itself reports.
+    """
+    anonymized = copy.deepcopy(snapshots)
+    anonymize_snapshots(anonymized)
+    for key, obj in anonymized.items():
+        (dir_ / f"{key}.json").write_text(json.dumps(obj, separators=(",", ":")))
 
 
 # ---------------------------------------------------------------------------
@@ -764,11 +920,22 @@ def main() -> None:
     ec_pool_ids = ec_pool_ids_from(pools)
     toofull_pgs = fetch_backfill_toofull_pgs()
 
+    crush_rules = fetch_crush_rules()
+
+    # All six SNAPSHOT_COMMANDS keys are now in _SNAPSHOT_CACHE (every
+    # fetch_* above has run), so this is the earliest point an anonymized
+    # save can be written. Deliberately done before check_host_failure_domain,
+    # which can sys.exit: a cluster that fails that check is exactly the kind
+    # of surprising state worth having captured, so the save must not be
+    # skipped just because the rest of the analysis can't proceed.
+    if SAVE_STATE_DIR is not None:
+        write_anonymized_state(SAVE_STATE_DIR, _SNAPSHOT_CACHE)
+
     toofull_pool_ids = {int(pg["pgid"].split(".")[0]) for pg in toofull_pgs}
     pools_by_id = {p["pool_id"]: p for p in pools}
     check_host_failure_domain(
         [pools_by_id[i] for i in toofull_pool_ids if i in pools_by_id],
-        fetch_crush_rules(),
+        crush_rules,
     )
 
     shards = []
