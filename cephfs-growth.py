@@ -15,6 +15,7 @@ Example:
 """
 
 import argparse
+import concurrent.futures
 import os
 import sys
 import time
@@ -51,11 +52,14 @@ def subdirs(path: str) -> list[str]:
     return sorted(result)
 
 
-def sample(paths: list[str]) -> dict[str, int]:
+def sample(
+    paths: list[str], pool: concurrent.futures.ThreadPoolExecutor
+) -> dict[str, int]:
     """Map path -> recursive byte count, skipping paths without rstats."""
     result = {}
-    for p in paths:
-        rbytes = getxattr_int(p, RBYTES)
+    futures = {p: pool.submit(getxattr_int, p, RBYTES) for p in paths}
+    for p, fut in futures.items():
+        rbytes = fut.result()
         if rbytes is not None:
             result[p] = rbytes
     return result
@@ -70,14 +74,19 @@ def human(n: float) -> str:
         n /= 1024
 
 
-def measure_level(root: str, interval: float, top: int) -> "str | None":
+def measure_level(
+    root: str,
+    interval: float,
+    top: int,
+    pool: concurrent.futures.ThreadPoolExecutor,
+) -> "str | None":
     """
     Sample root and its children over `interval` seconds, report the deltas,
     and return the fastest-growing child (or None if there is no clear one).
     """
     targets = [root] + subdirs(root)
     t0 = time.monotonic()
-    before = sample(targets)
+    before = sample(targets, pool)
     if root not in before:
         print(
             f"error: {root} has no {RBYTES} xattr -- not a CephFS mount?",
@@ -86,7 +95,7 @@ def measure_level(root: str, interval: float, top: int) -> "str | None":
         return None
 
     time.sleep(interval)
-    after = sample(targets)
+    after = sample(targets, pool)
     elapsed = time.monotonic() - t0
 
     root_after = after.get(root, before[root])
@@ -156,18 +165,27 @@ def main() -> int:
         default=10,
         help="how many children to list per level (default: 10)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="concurrent xattr lookups per sample (default: 16)",
+    )
     args = parser.parse_args()
     if args.interval < 0:
         parser.error("--interval must be non-negative")
     if args.top < 1:
         parser.error("--top must be at least 1")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
 
     current = os.path.abspath(args.root)
-    for level in range(args.depth):
-        nxt = measure_level(current, args.interval, args.top)
-        if nxt is None:
-            break
-        current = nxt
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+        for level in range(args.depth):
+            nxt = measure_level(current, args.interval, args.top, pool)
+            if nxt is None:
+                break
+            current = nxt
 
     print(f"\nfinal: {current}")
     rfiles = getxattr_int(current, RFILES)

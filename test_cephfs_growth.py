@@ -76,7 +76,7 @@ class MeasureLevelTest(unittest.TestCase):
     def _run(self, before, after, top=10, subdir_list=None):
         calls = {"n": 0}
 
-        def fake_sample(paths):
+        def fake_sample(paths, pool):
             calls["n"] += 1
             d = before if calls["n"] == 1 else after
             return {p: d[p] for p in paths if p in d}
@@ -88,7 +88,7 @@ class MeasureLevelTest(unittest.TestCase):
             mock.patch.object(cg, "sample", side_effect=fake_sample),
             mock.patch.object(cg.time, "sleep", return_value=None),
         ):
-            return cg.measure_level("/r", 1.0, top)
+            return cg.measure_level("/r", 1.0, top, None)
 
     def test_picks_largest_grower(self):
         before = {"/r": 1000, "/r/a": 100, "/r/b": 100}
@@ -136,6 +136,11 @@ class CliValidationTest(unittest.TestCase):
         result = self._run_cli("--top", "-1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--top must be at least 1", result.stderr)
+
+    def test_negative_workers_rejected(self):
+        result = self._run_cli("--workers", "0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--workers must be at least 1", result.stderr)
 
 
 if __name__ == "__main__":
