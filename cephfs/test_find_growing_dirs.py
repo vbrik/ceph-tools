@@ -1,4 +1,4 @@
-"""Unit tests for cephfs-growth.py."""
+"""Unit tests for find-growing-dirs.py."""
 
 import importlib.util
 import os
@@ -8,9 +8,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-SCRIPT = os.path.join(os.path.dirname(__file__), "cephfs-growth.py")
+SCRIPT = os.path.join(os.path.dirname(__file__), "find-growing-dirs.py")
 
-spec = importlib.util.spec_from_file_location("cephfs_growth", SCRIPT)
+spec = importlib.util.spec_from_file_location("find_growing_dirs", SCRIPT)
 cg = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cg)
 

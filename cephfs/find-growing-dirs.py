@@ -11,7 +11,7 @@ Requires a CephFS mount (kernel client or ceph-fuse). Read access to the
 directories being sampled is sufficient; no MDS admin socket access needed.
 
 Example:
-    ./cephfs-growth.py /mnt/cephfs --interval 60 --depth 6
+    ./find-growing-dirs.py /mnt/cephfs --interval 60 --depth 6
 """
 
 import argparse

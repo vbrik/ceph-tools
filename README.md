@@ -12,27 +12,28 @@ answer questions that come up repeatedly during cluster operation but
 aren't answered directly by a single `ceph` subcommand.
 
 Every script is standalone and can be copied out and run on its own; there
-is no shared library or install step beyond the requirements below.
+is no shared library or install step beyond the requirements below. CephFS
+tools live in the `cephfs/` directory; everything else is at the top level.
 
 ## Requirements
 
 - A working `ceph` CLI (and `rados`, `ceph-dencoder` for a couple of tools)
   pointed at the target cluster.
 - Python 3 for the `.py` scripts. Most run under the `python3` shebang;
-  `cephfs-client-inodes.py`, `find-cephfs-rctime.py` and
+  `cephfs/client-inodes.py`, `cephfs/find-recent-rctime.py` and
   `scrub-all-pgs-that-need-it.py` use `python`. Stdlib only, except:
-  - `find-cephfs-rctime.py` requires `python-dateutil` for its flexible
-    `--min-ctime` date parsing.
-  - `mds-ops-pretty.py` can optionally resolve UID/GID to names via
+  - `cephfs/find-recent-rctime.py` requires `python-dateutil` for its
+    flexible `--min-ctime` date parsing.
+  - `cephfs/mds-ops-pretty.py` can optionally resolve UID/GID to names via
     LDAP, using the `ldap3` package if installed, falling back to the
     `ldapsearch` CLI otherwise. This is off by default and only activates
     when both `--ldap-server` and `--ldap-base` are given (see `--help`).
   - `upmap-remapped.py` uses the `rados` Python bindings if importable and
     otherwise falls back to shelling out to `ceph ... | jq`.
 - `jq` for the `.sh` scripts and for `upmap-remapped.py`'s fallback path.
-- A mounted CephFS (kernel client or ceph-fuse) for `cephfs-du`,
-  `cephfs-growth.py`, `find-cephfs-rctime.py` and `cephfs-find-wide-dirs`;
-  plus `getfattr` (from `attr`/`acl` packages) for `cephfs-du`.
+- A mounted CephFS (kernel client or ceph-fuse) for `cephfs/du`,
+  `cephfs/find-growing-dirs.py`, `cephfs/find-recent-rctime.py` and
+  `cephfs/cephfs-find-wide-dirs`; plus `getfattr` (from `attr`/`acl` packages) for `cephfs/du`.
 
 Some scripts hard-code environment-specific defaults (e.g. pool names
 `cephfs.default.meta`/`cephfs.default.data`) that were written for a
@@ -114,25 +115,25 @@ other environments.
 
 ### CephFS clients and MDS
 
-- **`cephfs-client-id-to-host`** — Resolve a CephFS client session ID to
+- **`cephfs/client-id-to-host`** — Resolve a CephFS client session ID to
   hostname and IP.
-  `cephfs-client-id-to-host <client-id>`
+  `cephfs/client-id-to-host <client-id>`
 
-- **`cephfs-client-inodes.py`** — Show filesystem paths for the inodes
+- **`cephfs/client-inodes.py`** — Show filesystem paths for the inodes
   (delegated/completed-request/preallocated) held by a client session.
   Reads client sessions from a `client ls` JSON file/stdin, or, if the file
   argument is omitted, queries MDS rank(s) live via
   `ceph tell mds.RANK client ls` (all active ranks by default, or one rank
   via `--rank`); live queries print a warning since `client ls` can be
   resource-intensive on a busy MDS.
-  `cephfs-client-inodes.py [--meta-pool POOL] [--data-pool POOL] [--rank RANK] <client> [file|-]`
+  `cephfs/client-inodes.py [--meta-pool POOL] [--data-pool POOL] [--rank RANK] <client> [file|-]`
 
-- **`cephfs-client-load-top.py`** — `top`-style live view of CephFS client
+- **`cephfs/top.py`** — `top`-style live view of CephFS client
   load across MDS ranks (request rate, caps, leases, in-flight requests,
   etc.), sortable and filterable by column, with optional result caching.
-  `cephfs-client-load-top.py [-r RANK] [-n N] [-s COLUMNS] [--hide COLUMNS] [--cache-ttl SECONDS] [--cache-file PATH] [--full-mount-point]`
+  `cephfs/top.py [-r RANK] [-n N] [-s COLUMNS] [--hide COLUMNS] [--cache-ttl SECONDS] [--cache-file PATH] [--full-mount-point]`
 
-- **`mds-ops-pretty.py`** — Human-friendly rendering of
+- **`cephfs/mds-ops-pretty.py`** — Human-friendly rendering of
   `ceph tell mds.X dump_{blocked,historic,ops_in_flight}` JSON. By default,
   auto-detects and queries every active MDS rank live, tagging each op with
   its rank (`--mds-rank` restricts to one); a saved JSON file can be used
@@ -143,14 +144,14 @@ other environments.
   `client ls` results are cached the same way for a short time by default
   (10 minutes), since a stale cache can hide the very client generating the
   op you're inspecting (see `--client-cache-ttl`/`--client-cache-file`).
-  `mds-ops-pretty.py dump_ops_in_flight [options]`
+  `cephfs/mds-ops-pretty.py dump_ops_in_flight [options]`
 
-- **`cephfs-dir-tree-pins.sh`** — List directories pinned (exported) to
+- **`cephfs/dir-tree-pins.sh`** — List directories pinned (exported) to
   each MDS rank.
 
-- **`cephfs-inode-to-path`** — Resolve a hex inode number to its filesystem
+- **`cephfs/inode-to-path`** — Resolve a hex inode number to its filesystem
   path via the metadata/data pool backtrace xattr.
-  `cephfs-inode-to-path <inode-hex>`
+  `cephfs/inode-to-path <inode-hex>`
 
 ### CephFS trees (on a mounted filesystem)
 
@@ -159,30 +160,30 @@ These read CephFS recursive statistics (`ceph.dir.rbytes`,
 credentials or MDS admin access — only read access to the directories
 being examined.
 
-- **`cephfs-du`** — Report size (`ceph.dir.rbytes` for directories, file
+- **`cephfs/du`** — Report size (`ceph.dir.rbytes` for directories, file
   size otherwise) of paths on a mounted CephFS, in human-readable units.
-  `cephfs-du <path> [path...]`
+  `cephfs/du <path> [path...]`
 
-- **`cephfs-growth.py`** — Locate the fastest-growing subtree without
-  walking the tree. Samples `ceph.dir.rbytes` on a directory's immediate
+- **`cephfs/find-growing-dirs.py`** — Locate the fastest-growing subtree
+  without walking the tree. Samples `ceph.dir.rbytes` on a directory's immediate
   children twice, ranks children by delta, then descends into the top
   grower and repeats. Cost is O(children per level), not O(files).
-  `cephfs-growth.py [--interval SECONDS] [--depth N] [--top N] [--workers N] <root>`
+  `cephfs/find-growing-dirs.py [--interval SECONDS] [--depth N] [--top N] [--workers N] <root>`
 
-- **`find-cephfs-rctime.py`** — Find files and directories whose `ctime` is
+- **`cephfs/find-recent-rctime.py`** — Find files and directories whose `ctime` is
   at or after a given date, using `ceph.dir.rctime` to prune subtrees that
   cannot contain a match — much faster than `find -newer` on a large tree.
   Accepts a variety of date formats, or Unix time as `@SECONDS`. `--parents`
   prints only the parent directories of matches. Being IO-bound, it defaults
   to far more workers than there are CPUs.
-  `find-cephfs-rctime.py --min-ctime DATE [--relative] [--parents] [--threads NUM] <path>`
+  `cephfs/find-recent-rctime.py --min-ctime DATE [--relative] [--parents] [--threads NUM] <path>`
 
-- **`cephfs-find-wide-dirs`** — Quickly find directories holding many
+- **`cephfs/cephfs-find-wide-dirs`** — Quickly find directories holding many
   files, using the `ceph.dir.files` / `ceph.dir.rfiles` xattrs.
   `--min-num-files 0` skips the xattr reads and matches every directory.
   Vendored here as a prebuilt x86-64 Linux binary; the Rust source lives in
   [vbrik/cephfs-find-wide-dirs](https://github.com/vbrik/cephfs-find-wide-dirs).
-  `cephfs-find-wide-dirs --min-num-files NUMBER [--threads NUMBER] <path>`
+  `cephfs/cephfs-find-wide-dirs --min-num-files NUMBER [--threads NUMBER] <path>`
 
 ## License
 
@@ -194,6 +195,6 @@ MIT (see `LICENSE`), except for the vendored third-party tools:
   is GPL-2.0 licensed; the file itself credits Dan van der Ster (CERN) and
   carries a no-warranty disclaimer.
 
-`cephfs-find-wide-dirs` is a build of
+`cephfs/cephfs-find-wide-dirs` is a build of
 [vbrik/cephfs-find-wide-dirs](https://github.com/vbrik/cephfs-find-wide-dirs),
 which states no license of its own.
