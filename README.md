@@ -76,10 +76,11 @@ other environments.
   the output to headerless `<pgid> <from osd> <target osd>` lines, ready to
   feed to `pgremapper remap` (via `xargs -a remaps.txt -L1 …`). Each target
   OSD is used at most once, so a large run may report a tail as unplaceable;
-  apply, drain, re-run. Handles EC pools per-shard and replicated pools by
+  apply, drain, re-run. `--max-target-util PERCENT` drops OSDs already above
+  that current utilization from consideration as targets. Handles EC pools per-shard and replicated pools by
   set difference. See the script's module docstring for the full explanation
   and caveats (`--help` summarizes and points there).
-  `upmaps-to-unstick-toofull-backfills.py [--pgremapper]`
+  `upmaps-to-unstick-toofull-backfills.py [--pgremapper] [--max-target-util PERCENT]`
 
 - **`scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /

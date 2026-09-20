@@ -59,6 +59,13 @@ reproducible). Down and out OSDs are excluded by those filters, which also
 keeps an out OSD from sorting *first* — 'ceph osd df' reports one at 0%
 utilization.
 
+--max-target-util PERCENT additionally drops every OSD whose current
+utilization is above PERCENT, so a target is never one that is itself nearly
+full. The cap is checked against the same current 'ceph osd df' figure the
+ranking and the TGT_UTIL column use, so it does not account for the shard
+about to be added; leave headroom for that. Set too low it simply leaves
+shards unplaceable.
+
 A shard is only offered candidates of its *own* device class, that of the OSD
 it is arriving on. Pools' CRUSH rules are typically class-constrained, so an
 hdd shard sent to an ssd OSD would be an illegal placement.
@@ -250,6 +257,15 @@ def parse_args() -> argparse.Namespace:
         help="Print '<pgid> <from osd> <target osd>' lines with no header "
         "instead of the table, so each line can be passed as the arguments "
         "of 'pgremapper remap' (the script's docstring has the xargs form).",
+    )
+    parser.add_argument(
+        "--max-target-util",
+        type=float,
+        metavar="PERCENT",
+        help="Do not consider OSDs whose current utilization is above "
+        "PERCENT as targets. Uses the current 'ceph osd df' utilization, "
+        "without the shard being moved; shards left with no eligible target "
+        "are reported as unplaceable.",
     )
     state_group = parser.add_mutually_exclusive_group()
     state_group.add_argument(
@@ -701,13 +717,18 @@ def osd_class(osd_df: dict[int, dict], osd_id: int) -> "str | None":
     return osd_df.get(osd_id, {}).get("device_class")
 
 
-def build_candidate_osds(osd_df: dict[int, dict]) -> dict[str, list[int]]:
+def build_candidate_osds(
+    osd_df: dict[int, dict], max_util: "float | None" = None
+) -> dict[str, list[int]]:
     """Return usable target OSD ids per device class, least-utilized first.
 
     Excludes OSDs that are down, out (reweight 0) or have no CRUSH weight.
     That also covers the OSD whose failure caused the pile-up in the first
     place: without it an out OSD would sort to the very front, since
     'ceph osd df' reports one at 0% utilization.
+
+    If max_util is given, OSDs whose utilization is above it (percent) are
+    excluded too.
 
     Keyed by device class because a shard may only be diverted to an OSD of
     its own class (see module docstring); each class's pool is drawn down
@@ -720,6 +741,7 @@ def build_candidate_osds(osd_df: dict[int, dict]) -> dict[str, list[int]]:
         and node.get("reweight", 0) > 0
         and node.get("crush_weight", 0) > 0
         and node.get("device_class")
+        and (max_util is None or node["utilization"] <= max_util)
     ]
     # OSD id as secondary key: utilizations tie constantly on a uniformly
     # full cluster, and the operator will re-run this.
@@ -961,7 +983,7 @@ def main() -> None:
         )
     )
 
-    candidates = build_candidate_osds(osd_df)
+    candidates = build_candidate_osds(osd_df, args.max_target_util)
     proposals, unplaceable = assign_targets(
         shards, candidates, osd_host, osd_df, upmap_items
     )
@@ -1003,7 +1025,12 @@ def main() -> None:
             f"{shard.shard} (arriving on osd.{shard.arriving_osd}, class "
             f"{osd_class(osd_df, shard.arriving_osd) or 'unknown'}) — every "
             f"candidate OSD of that class is on a host already in the PG's up "
-            f"set, already in its CRUSH mapping, or already used by another PG",
+            f"set, already in its CRUSH mapping, already used by another PG"
+            + (
+                f", or above --max-target-util {args.max_target_util:g}%"
+                if args.max_target_util is not None
+                else ""
+            ),
             file=sys.stderr,
         )
 
