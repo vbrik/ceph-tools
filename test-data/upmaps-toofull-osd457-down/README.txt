@@ -25,10 +25,11 @@ osd.457's) correctly reports 1 backfill_toofull PG cluster-wide, 1 shard
 arriving on host27, and proposes remapping 19.21f shard 7 from osd.625 to
 osd.849 (host35, 86.8% util). Table output:
 
-  PGID    SHARD  ACTING_OSD  ACTING_UTIL  ACTING_HOST  UP_OSD   UP_UTIL  UP_HOST  TARGET_OSD  TARGET_UTIL  TARGET_HOST
-  19.21f  7      none        -            -            osd.625  89.4%    host27   osd.849     86.8%        host35
+                   ---- ACTING ----    --------- UP ---------    ------- TARGET -------
+  PGID    SHARD    OSD   UTIL  HOST    OSD      UTIL   HOST      OSD      UTIL   HOST
+  19.21f  7        none  -     -       osd.625  89.4%  host27    osd.849  86.8%  host35
 
-This fixture is also the one that exercises the unknown-ACTING_OSD case:
+This fixture is also the one that exercises the unknown-ACTING-OSD case:
 osd.457 is already out, so the slot it left in 'acting' reads as
 CRUSH_ITEM_NONE and the row shows 'none' with '-' for the utilization and
 host that would have been derived from it.

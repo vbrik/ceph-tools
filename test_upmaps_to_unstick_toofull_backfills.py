@@ -1,13 +1,16 @@
 """Unit tests for upmaps-to-unstick-toofull-backfills.py.
 
 The table's column layout is the main thing under test here: the columns
-are named after the PG sets they come from (ACTING_*/UP_*/TARGET_*) and
+are grouped under the PG set they come from (ACTING/UP/TARGET) and
 ordered along the shard's path, and a row that silently drifts out of that
 order is exactly the kind of bug that reads as plausible output.
 """
 
+import contextlib
 import importlib.util
+import io
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -75,12 +78,92 @@ class FormatRowTest(unittest.TestCase):
         # CRUSH_ITEM_NONE, so neither its utilization nor its host exists.
         row = ut.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF)
         cells = dict(zip(ut.COLUMNS, row))
-        self.assertEqual(cells["ACTING_OSD"], "none")
-        self.assertEqual(cells["ACTING_UTIL"], ut.NOT_APPLICABLE)
-        self.assertEqual(cells["ACTING_HOST"], ut.NOT_APPLICABLE)
+        self.assertEqual(cells[("ACTING", "OSD")], "none")
+        self.assertEqual(cells[("ACTING", "UTIL")], ut.NOT_APPLICABLE)
+        self.assertEqual(cells[("ACTING", "HOST")], ut.NOT_APPLICABLE)
         # The up side is still fully known — that is the whole premise.
-        self.assertEqual(cells["UP_OSD"], "osd.882")
-        self.assertEqual(cells["UP_UTIL"], "69.1%")
+        self.assertEqual(cells[("UP", "OSD")], "osd.882")
+        self.assertEqual(cells[("UP", "UTIL")], "69.1%")
+
+
+def table_lines(rows):
+    """Return the lines print_table writes for rows."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ut.print_table(rows)
+    return buf.getvalue().splitlines()
+
+
+class PrintTableTest(unittest.TestCase):
+    def test_header_is_two_lines_with_each_group_named_once(self):
+        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
+        group_line, label_line, _ = table_lines([row])
+        self.assertEqual(re.findall(r"[A-Z]+", group_line), ["ACTING", "UP", "TARGET"])
+        self.assertEqual(
+            label_line.split(),
+            ["PGID", "SHARD"] + ["OSD", "UTIL", "HOST"] * 3,
+        )
+
+    def test_group_span_covers_exactly_its_three_columns(self):
+        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
+        group_line, label_line, data_line = table_lines([row])
+        spans = list(re.finditer(r"-+ [A-Z]+ -+", group_line))
+        osd_starts = [m.start() for m in re.finditer("OSD", label_line)]
+        self.assertEqual([m.start() for m in spans], osd_starts)
+        # A span ends a group separator before the next group's first column,
+        # and the last one at the end of the data row.
+        gap = len(ut.GROUP_SEP)
+        self.assertEqual(
+            [m.end() for m in spans[:2]], [start - gap for start in osd_starts[1:]]
+        )
+        self.assertEqual(spans[2].end(), len(data_line))
+        # The name is centered: dashes on both sides.
+        for m in spans:
+            self.assertTrue(m.group().startswith("-") and m.group().endswith("-"))
+
+    def test_ungrouped_columns_have_a_blank_group_line(self):
+        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
+        group_line, label_line, _ = table_lines([row])
+        pgid_and_shard = label_line.index("OSD")
+        self.assertEqual(group_line[:pgid_and_shard], " " * pgid_and_shard)
+
+    def test_groups_are_set_apart_by_a_wider_gap_than_columns_within_one(self):
+        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
+        _, _, data_line = table_lines([row])
+        # Data cells fill their columns exactly, so the gaps read off directly:
+        # 2 spaces within a group, 4 between groups (and after SHARD).
+        self.assertRegex(data_line, r"osd\.406 {2}89\.9% {2}host32")
+        self.assertRegex(data_line, r"host32 {4}osd\.882")
+        self.assertRegex(data_line, r"host50 {4}osd\.898")
+        # SHARD's cell '0' is padded to the 5-char label, then the 4-space gap.
+        self.assertRegex(data_line, r" 0 {8}osd\.406")
+
+    def test_no_trailing_whitespace(self):
+        # Narrow cells (unknown acting OSD) and a blank final group cell
+        # must not leave padding on any line.
+        row = ut.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF)
+        for line in table_lines([row]):
+            self.assertEqual(line, line.rstrip())
+
+    def test_columns_widen_to_fit_the_widest_cell(self):
+        rows = [
+            ut.format_row(make_proposal(), OSD_HOST, OSD_DF),
+            ["19.1ce0"] + ut.format_row(make_proposal(), OSD_HOST, OSD_DF)[1:],
+        ]
+        lines = table_lines(rows)
+        # The widest PGID ('19.1ce0') pushes every line's SHARD column right.
+        self.assertTrue(lines[1].startswith("PGID     SHARD"))
+        self.assertEqual({line.index("osd.406") for line in lines[2:]}, {18})
+
+    def test_column_and_row_widths_agree(self):
+        # Every cell of the group line and label line must be a column of
+        # the same table as the data rows.
+        rows = [ut.format_row(make_proposal(), OSD_HOST, OSD_DF)]
+        _, label_line, data_line = table_lines(rows)
+        self.assertEqual(len(ut.COLUMNS), len(rows[0]))
+        self.assertEqual(
+            len(label_line.split()), len(data_line.split()), (label_line, data_line)
+        )
 
 
 class FindDivertedShardsTest(unittest.TestCase):
@@ -157,8 +240,8 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertEqual(self.run_script(fixture), table_from_readme(fixture))
 
     def test_existing_upmap_row_is_unmarked_and_has_no_upmap_column(self):
-        # UP_OSD is a plain 'osd.N' even when it is the 'to' of an existing
-        # pair; pgremapper handles that case itself.
+        # The UP OSD is a plain 'osd.N' even when it is the 'to' of an
+        # existing pair; pgremapper handles that case itself.
         out = self.run_script("upmaps-toofull-osd263-existing-upmap-chain")
         self.assertNotIn("*", out)
         self.assertNotIn("EXISTING_UPMAPS", out)
@@ -176,8 +259,8 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertEqual(proc.stderr.count("NOTE"), 0)
 
     def test_pgremapper_emits_up_osd_not_acting_osd(self):
-        # 'pgremapper remap' takes the upmap's 'from', which is UP_OSD.
-        # Emitting ACTING_OSD here would remap the wrong OSD, and the table
+        # 'pgremapper remap' takes the upmap's 'from', which is the UP OSD.
+        # Emitting the ACTING OSD here would remap the wrong OSD, and the table
         # would still look right.
         out = self.run_script("upmaps-toofull-osd457-down", "--pgremapper")
         self.assertEqual(out, "19.21f 625 849")

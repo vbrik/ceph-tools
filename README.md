@@ -70,9 +70,10 @@ other environments.
   OSD of that shard's own device class on a host not already in the PG's `up`
   set — a destination that satisfies the fault domain. Prints the proposed
   remaps; changes nothing itself. Each row follows one shard's path, giving
-  the OSD, utilization and host at each step: `ACTING_*` where its data sits
-  now, `UP_*` the too-full OSD the stalled backfill is aimed at, `TARGET_*`
-  the proposed replacement. `--pgremapper` switches
+  the OSD, utilization and host at each step, under a two-line header whose
+  first line spans each group: `ACTING` where its data sits now, `UP` the
+  too-full OSD the stalled backfill is aimed at, `TARGET` the proposed
+  replacement. `--pgremapper` switches
   the output to headerless `<pgid> <from osd> <target osd>` lines, ready to
   feed to `pgremapper remap` (via `xargs -a remaps.txt -L1 …`), which merges
   into a PG's existing `pg_upmap_items` — apply with it rather than by hand

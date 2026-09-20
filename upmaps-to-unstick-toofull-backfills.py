@@ -45,25 +45,26 @@ instead, with SHARD shown as '-'.
 
 Which way a row points
 ----------------------
-Each OSD column is named for the set it came from, and the columns are
-ordered along the shard's path:
+The table's header has two lines: a group name (ACTING, UP or TARGET) spanning
+each OSD/UTIL/HOST triple, named for the set the OSD came from. The groups
+are ordered along the shard's path:
 
-  ACTING_OSD  where the shard's data is right now — the backfill's source
-  UP_OSD      where CRUSH wants it, i.e. the arriving OSD whose host is too
+  ACTING OSD  where the shard's data is right now — the backfill's source
+  UP OSD      where CRUSH wants it, i.e. the arriving OSD whose host is too
               full, which is what wedges the backfill
-  TARGET_OSD  where this script proposes it go instead
+  TARGET OSD  where this script proposes it go instead
 
-So data flows ACTING_OSD -> UP_OSD today and is stuck; applying a row
-redirects that to ACTING_OSD -> TARGET_OSD. UP_OSD is the 'from' of the
+So data flows ACTING OSD -> UP OSD today and is stuck; applying a row
+redirects that to ACTING OSD -> TARGET OSD. UP OSD is the 'from' of the
 upmap pair that does the redirecting (and pgremapper's "source osd"), but
 that is a direction in the *mapping*, not in the data: nothing is ever
-copied off UP_OSD.
+copied off UP OSD.
 
-ACTING_OSD often cannot be identified. Once an OSD is out, the slot it left
+ACTING OSD often cannot be identified. Once an OSD is out, the slot it left
 in 'acting' reads as CRUSH_ITEM_NONE, not as its OSD id, so there is no way
 to prove from the PG map where the shard is coming from. That does not
 matter here — the arriving side is what is out of space, and it is always
-observable. ACTING_OSD is reported when it happens to be recoverable and
+observable. ACTING OSD is reported when it happens to be recoverable and
 'none' (with '-' for its utilization and host) otherwise.
 
 How targets are chosen
@@ -78,7 +79,7 @@ utilization.
 --max-target-util PERCENT additionally drops every OSD whose current
 utilization is above PERCENT, so a target is never one that is itself nearly
 full. The cap is checked against the same current 'ceph osd df' figure the
-ranking and the TARGET_UTIL column use, so it does not account for the shard
+ranking and the TARGET UTIL column use, so it does not account for the shard
 about to be added; leave headroom for that. Set too low it simply leaves
 shards unplaceable.
 
@@ -153,9 +154,9 @@ Applying the output
 -------------------
 Two output formats are available. The default is a human-readable table
 for review. --pgremapper instead emits one bare '<pgid> <from osd> <target
-osd>' line per remap — the table's PGID, UP_OSD and TARGET_OSD columns, which
+osd>' line per remap — the table's PGID, UP OSD and TARGET OSD columns, which
 are exactly the positional arguments of 'pgremapper remap' (which calls
-UP_OSD the "source osd", meaning the upmap's 'from'). In --pgremapper mode
+UP OSD the "source osd", meaning the upmap's 'from'). In --pgremapper mode
 only the rows go to stdout — everything else is on stderr — so it stays
 parseable.
 
@@ -169,9 +170,9 @@ existing upmap pairs, and 'pg-upmap-items' cannot be driven without them:
     independent when a PG has more than one diverted shard: one command per
     row makes the last replace what the earlier ones wrote.
 
-  - When UP_OSD is itself the 'to' of an existing pair (the balancer places
-    these), adding 'UP_OSD->TARGET_OSD' as a new pair is accepted and then
-    silently dropped by Ceph, because UP_OSD is not an OSD CRUSH chose. The
+  - When UP OSD is itself the 'to' of an existing pair (the balancer places
+    these), adding the pair 'UP OSD -> TARGET OSD' is accepted and then
+    silently dropped by Ceph, because UP OSD is not an OSD CRUSH chose. The
     existing pair's 'to' has to be rewritten instead.
 
 'pgremapper remap' is per-pair and merges into the existing entry, and when
@@ -200,6 +201,7 @@ import json
 import re
 import subprocess
 import sys
+from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
 
@@ -832,25 +834,32 @@ def assign_targets(
 # ---------------------------------------------------------------------------
 
 # Ordered so each row reads along the shard's path: where its data is now
-# (ACTING_*), where the stuck backfill is trying to put it (UP_*), and where
-# this script proposes it go instead (TARGET_*), with each OSD followed by
-# its utilization and host. print_table leaves the final column unpadded.
+# (ACTING), where the stalled backfill is trying to put it (UP), and where
+# this script proposes it go instead (TARGET), with each OSD followed by its
+# utilization and host. Each entry is (group, label); the header is printed
+# on two lines, the group name spanning its columns above their labels, and
+# an empty group means the column has no group line. print_table leaves the
+# final column unpadded.
 COLUMNS = [
-    "PGID",
-    "SHARD",
-    "ACTING_OSD",
-    "ACTING_UTIL",
-    "ACTING_HOST",
-    "UP_OSD",
-    "UP_UTIL",
-    "UP_HOST",
-    "TARGET_OSD",
-    "TARGET_UTIL",
-    "TARGET_HOST",
+    ("", "PGID"),
+    ("", "SHARD"),
+    ("ACTING", "OSD"),
+    ("ACTING", "UTIL"),
+    ("ACTING", "HOST"),
+    ("UP", "OSD"),
+    ("UP", "UTIL"),
+    ("UP", "HOST"),
+    ("TARGET", "OSD"),
+    ("TARGET", "UTIL"),
+    ("TARGET", "HOST"),
 ]
 
-# Printed in ACTING_UTIL/ACTING_HOST when the acting OSD is unknown (the
-# usual out-OSD case, where ACTING_OSD itself reads 'none'). Distinct from
+# Between table columns of one group, and between columns of different groups.
+COLUMN_SEP = "  "
+GROUP_SEP = "    "
+
+# Printed in the ACTING UTIL/HOST columns when the acting OSD is unknown (the
+# usual out-OSD case, where the ACTING OSD itself reads 'none'). Distinct from
 # format_utilization's '?', which means the OSD is known but 'ceph osd df'
 # had no figure for it.
 NOT_APPLICABLE = "-"
@@ -889,21 +898,43 @@ def format_row(
 
 
 def print_table(rows: list[list[str]]) -> None:
+    """Print rows under a two-line header: group spans, then column labels.
+
+    A group's name is centered in dashes across the full width of its
+    columns, so it visibly covers all of them. The span is always wider than
+    the name (the labels under it alone are wider), so no fitting is needed.
+    Columns of different groups are separated by the wider GROUP_SEP, on every
+    line, to set the groups visually apart.
+    """
     widths = [
-        max(len(header), *(len(row[i]) for row in rows))
-        for i, header in enumerate(COLUMNS)
+        max(len(label), *(len(row[i]) for row in rows))
+        for i, (_, label) in enumerate(COLUMNS)
     ]
+    # seps[i] is what precedes column i.
+    seps = [""] + [
+        COLUMN_SEP if COLUMNS[i][0] == COLUMNS[i - 1][0] else GROUP_SEP
+        for i in range(1, len(COLUMNS))
+    ]
+
+    group_line = ""
+    for group, indexes in groupby(range(len(COLUMNS)), key=lambda i: COLUMNS[i][0]):
+        cols = list(indexes)
+        span = sum(widths[i] for i in cols) + sum(len(seps[i]) for i in cols[1:])
+        group_line += seps[cols[0]]
+        group_line += f" {group} ".center(span, "-") if group else " " * span
+    print(group_line.rstrip())
 
     # Last column is variable-width and rightmost; leave it unpadded.
     def emit(cells):
+        last = len(cells) - 1
         print(
-            "  ".join(
-                cell.ljust(widths[i]) if i < len(cells) - 1 else cell
-                for i, cell in enumerate(cells)
+            "".join(
+                sep + (cell.ljust(widths[i]) if i < last else cell)
+                for i, (sep, cell) in enumerate(zip(seps, cells))
             )
         )
 
-    emit(COLUMNS)
+    emit([label for _, label in COLUMNS])
     for row in rows:
         emit(row)
 
@@ -914,7 +945,7 @@ def print_pgremapper(proposals: list[Proposal]) -> None:
     These are the positional arguments of 'pgremapper remap', in order and
     with nothing else on the line, so the output can be fed to it directly.
     pgremapper's "source osd" is the upmap's 'from', i.e. the table's
-    UP_OSD — not ACTING_OSD, which is where the data actually sits. OSD ids
+    UP OSD — not ACTING OSD, which is where the data actually sits. OSD ids
     are bare integers: pgremapper parses them with strconv.Atoi and rejects
     the 'osd.N' form the table uses.
     """

@@ -26,13 +26,14 @@ Verified against the live cluster: running the script reports 6
 backfill_toofull PGs cluster-wide, 6 shards to divert and 0 unplaceable.
 Table output:
 
-  PGID     SHARD  ACTING_OSD  ACTING_UTIL  ACTING_HOST  UP_OSD   UP_UTIL  UP_HOST  TARGET_OSD  TARGET_UTIL  TARGET_HOST
-  19.7be   1      osd.863     88.4%        host35       osd.263  87.6%    host12   osd.842     86.9%        host36
-  19.bd5   8      osd.625     88.7%        host27       osd.263  87.6%    host12   osd.829     87.0%        host34
-  19.d85   9      osd.189     87.8%        host30       osd.263  87.6%    host12   osd.617     87.0%        host11
-  19.118a  2      osd.618     88.4%        host13       osd.263  87.6%    host12   osd.446     87.0%        host26
-  19.122e  7      osd.487     88.7%        host12       osd.263  87.6%    host12   osd.813     87.0%        host35
-  19.1ce0  0      osd.723     88.7%        host27       osd.263  87.6%    host12   osd.45      87.0%        host11
+                    ------- ACTING -------    --------- UP ---------    ------- TARGET -------
+  PGID     SHARD    OSD      UTIL   HOST      OSD      UTIL   HOST      OSD      UTIL   HOST
+  19.7be   1        osd.863  88.4%  host35    osd.263  87.6%  host12    osd.842  86.9%  host36
+  19.bd5   8        osd.625  88.7%  host27    osd.263  87.6%  host12    osd.829  87.0%  host34
+  19.d85   9        osd.189  87.8%  host30    osd.263  87.6%  host12    osd.617  87.0%  host11
+  19.118a  2        osd.618  88.4%  host13    osd.263  87.6%  host12    osd.446  87.0%  host26
+  19.122e  7        osd.487  88.7%  host12    osd.263  87.6%  host12    osd.813  87.0%  host35
+  19.1ce0  0        osd.723  88.7%  host27    osd.263  87.6%  host12    osd.45   87.0%  host11
 
 The table does not mark which rows are the "existing upmap" kind; for
 reference, the PGs' pg_upmap_items pairs were:
