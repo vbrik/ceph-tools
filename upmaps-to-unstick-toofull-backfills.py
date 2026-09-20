@@ -341,7 +341,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         metavar="PERCENT",
         help="Do not consider OSDs whose current utilization is above "
-        "PERCENT as targets. Defaults to the cluster's backfillfull_ratio, "
+        "PERCENT as targets. Defaults to the cluster's backfillfull_ratio - 1, "
         "so a proposal is never aimed at an OSD Ceph would already refuse; "
         "pass 100 to disable the cap. Uses the current 'ceph osd df' "
         "utilization, without the shard being moved; shards left with no "
@@ -1145,7 +1145,7 @@ def main() -> None:
     ratios = fetch_full_ratios()
     min_up_util = ratios.nearfull if args.min_up_util is None else args.min_up_util
     max_target_util = (
-        ratios.backfillfull if args.max_target_util is None else args.max_target_util
+        ratios.backfillfull - 1 if args.max_target_util is None else args.max_target_util
     )
 
     toofull_pool_ids = {int(pg["pgid"].split(".")[0]) for pg in toofull_pgs}
