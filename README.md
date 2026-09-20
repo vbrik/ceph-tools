@@ -65,10 +65,11 @@ other environments.
   same-host siblings instead of spreading across the cluster; on an
   already-full cluster those siblings cross `backfillfull_ratio` and the
   backfills stall. It needs no arguments to say where to look: it scans every
-  `backfill_toofull` PG cluster-wide, finds each shard newly landing on a host
-  that cannot take it (in `up` but not `acting`), and picks the least-utilized
-  OSD of that shard's own device class on a host not already in the PG's `up`
-  set — a destination that satisfies the fault domain. Prints the proposed
+  `backfill_toofull` PG cluster-wide, finds each shard newly landing on an OSD
+  full enough to be what is blocking it (in `up` but not `acting`), and picks
+  the least-utilized OSD of that shard's own device class on a host not
+  already in the PG's `up` set — a destination that satisfies the fault
+  domain and has room for the shard. Prints the proposed
   remaps; changes nothing itself. Each row follows one shard's path, giving
   the OSD, utilization and host at each step, under a two-line header whose
   first line spans each group: `ACTING` where its data sits now, `UP` the
@@ -79,11 +80,23 @@ other environments.
   into a PG's existing `pg_upmap_items` — apply with it rather than by hand
   with `ceph osd pg-upmap-items`, which replaces the whole entry. Each target
   OSD is used at most once, so a large run may report a tail as unplaceable;
-  apply, drain, re-run. `--max-target-util PERCENT` drops OSDs already above
-  that current utilization from consideration as targets. Handles EC pools per-shard and replicated pools by
-  set difference. See the script's module docstring for the full explanation
-  and caveats (`--help` summarizes and points there).
-  `upmaps-to-unstick-toofull-backfills.py [--pgremapper] [--max-target-util PERCENT]`
+  apply, drain, re-run.
+  Two safety thresholds default to the cluster's own ratios and can be
+  overridden. `--min-source-util PERCENT` (default `nearfull_ratio`) only
+  diverts a shard whose arriving OSD is that full: `backfill_toofull` is a
+  property of the PG, not of each shard arriving on it, so without this a PG
+  with one wedged shard has all its healthy arrivals diverted too, spending
+  target OSDs that genuinely stuck shards then cannot get.
+  `--max-target-util PERCENT` (default `backfillfull_ratio`) drops OSDs above
+  that current utilization from consideration as targets, so a proposal is
+  never aimed at an OSD Ceph would already refuse; pass `100` to disable it,
+  and any proposal past `backfillfull_ratio` is counted and warned about on
+  stderr. `--save-state DIR` writes the run's cluster state as JSON,
+  anonymized so it can be shared, and `--load-state DIR` replays such a
+  capture offline with no cluster access. Handles EC pools per-shard and
+  replicated pools by set difference. See the script's module docstring for
+  the full explanation and caveats (`--help` summarizes and points there).
+  `upmaps-to-unstick-toofull-backfills.py [--pgremapper] [--min-source-util PERCENT] [--max-target-util PERCENT] [--save-state DIR | --load-state DIR]`
 
 - **`scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /
@@ -200,9 +213,12 @@ python3 -m unittest discover -s cephfs -p 'test_*.py'
 ```
 
 The `upmaps-to-unstick-toofull-backfills.py` tests replay the
-cluster-state snapshots under `test-data/` via `--load-state` and compare the
-output against the table each fixture's `README.txt` documents, so fixture
-and code cannot drift apart.
+cluster-state snapshots under `test-data/` via `--load-state` and check the
+output against what each fixture's `README.txt` documents, so fixture and
+code cannot drift apart: the exact table for the small fixtures, and for the
+cluster-sized one (808 stuck PGs, 1513 arriving shards) the counts plus the
+invariants that matter — no target at or above `backfillfull_ratio`, no
+shard diverted off an OSD below `nearfull_ratio`, no target OSD used twice.
 
 ## License
 

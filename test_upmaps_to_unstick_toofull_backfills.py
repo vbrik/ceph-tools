@@ -1,18 +1,31 @@
 """Unit tests for upmaps-to-unstick-toofull-backfills.py.
 
-The table's column layout is the main thing under test here: the columns
-are grouped under the PG set they come from (ACTING/UP/TARGET) and
-ordered along the shard's path, and a row that silently drifts out of that
-order is exactly the kind of bug that reads as plausible output.
+Two kinds of bug drive what is tested here, both of which read as
+plausible output rather than as an obvious failure.
+
+The table's column layout: the columns are grouped under the PG set they
+come from (ACTING/UP/TARGET) and ordered along the shard's path, so a row
+that silently drifts out of that order still looks like a valid proposal.
+
+The two safety thresholds: --min-source-util keeps shards that were never
+blocked from being diverted (backfill_toofull is a property of the PG, not
+of each shard arriving on it), and --max-target-util keeps proposals off
+OSDs Ceph already refuses to backfill onto. Both default to the cluster's
+own ratios, so the tests check the defaults are read from the capture, and
+the cluster-sized fixture is checked by invariant -- no target at or above
+backfillfull_ratio, no shard diverted off an OSD below nearfull_ratio.
 """
 
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 SCRIPT = os.path.join(
@@ -196,6 +209,133 @@ class FindDivertedShardsTest(unittest.TestCase):
         self.assertEqual(ut.find_diverted_shards(pg, is_ec=False), [])
 
 
+class FullRatiosTest(unittest.TestCase):
+    """The thresholds both defaults derive from."""
+
+    def _ratios(self, dump):
+        ut._SNAPSHOT_CACHE.clear()
+        ut._SNAPSHOT_CACHE["osd_dump"] = dump
+        try:
+            return ut.fetch_full_ratios()
+        finally:
+            ut._SNAPSHOT_CACHE.clear()
+
+    def test_ratios_are_converted_to_percent(self):
+        # Ceph reports fractions; the flags and 'ceph osd df' are in percent.
+        r = self._ratios({"nearfull_ratio": 0.85, "backfillfull_ratio": 0.91})
+        self.assertEqual((r.nearfull, r.backfillfull), (85.0, 91.0))
+
+    def test_missing_ratios_fall_back_to_cephs_defaults(self):
+        # Falling back to "no threshold" would be the unsafe direction, so a
+        # dump without the keys still yields usable numbers.
+        r = self._ratios({})
+        self.assertEqual(
+            (r.nearfull, r.backfillfull),
+            (ut.DEFAULT_NEARFULL_RATIO * 100, ut.DEFAULT_BACKFILLFULL_RATIO * 100),
+        )
+
+
+# Arriving OSDs spanning the --min-source-util decision: well over the
+# threshold, exactly on it, plainly below it, and one 'ceph osd df' has no
+# figure for.
+SOURCE_DF = {
+    1: {"id": 1, "utilization": 92.0},
+    2: {"id": 2, "utilization": 85.0},
+    3: {"id": 3, "utilization": 70.0},
+    4: {"id": 4},
+}
+
+
+class SelectStuckShardsTest(unittest.TestCase):
+    """backfill_toofull is a PG property, so arriving shards get filtered."""
+
+    def shard(self, up_osd):
+        return ut.DivertedShard("19.1", "-", up_osd, None, [up_osd])
+
+    def test_shard_on_a_full_osd_is_kept(self):
+        stuck, skipped = ut.select_stuck_shards([self.shard(1)], SOURCE_DF, 85.0)
+        self.assertEqual(([s.up_osd for s in stuck], skipped), ([1], []))
+
+    def test_threshold_is_inclusive(self):
+        # An OSD exactly at nearfull_ratio is still a plausible blocker.
+        stuck, skipped = ut.select_stuck_shards([self.shard(2)], SOURCE_DF, 85.0)
+        self.assertEqual(([s.up_osd for s in stuck], skipped), ([2], []))
+
+    def test_shard_arriving_on_an_empty_osd_is_left_alone(self):
+        # The case that wasted targets before: a healthy shard of a PG that
+        # is in backfill_toofull because some *other* shard is wedged.
+        stuck, skipped = ut.select_stuck_shards([self.shard(3)], SOURCE_DF, 85.0)
+        self.assertEqual((stuck, [s.up_osd for s in skipped]), ([], [3]))
+
+    def test_unknown_utilization_is_kept_not_dropped(self):
+        # Cannot be ruled out as the blocker, so it must not vanish silently.
+        stuck, skipped = ut.select_stuck_shards([self.shard(4)], SOURCE_DF, 85.0)
+        self.assertEqual(([s.up_osd for s in stuck], skipped), ([4], []))
+
+    def test_zero_threshold_keeps_everything(self):
+        shards = [self.shard(o) for o in (1, 2, 3, 4)]
+        stuck, skipped = ut.select_stuck_shards(shards, SOURCE_DF, 0)
+        self.assertEqual((len(stuck), skipped), (4, []))
+
+    def test_input_order_is_preserved_in_both_halves(self):
+        shards = [self.shard(o) for o in (3, 1, 3, 2)]
+        stuck, skipped = ut.select_stuck_shards(shards, SOURCE_DF, 85.0)
+        self.assertEqual([s.up_osd for s in stuck], [1, 2])
+        self.assertEqual([s.up_osd for s in skipped], [3, 3])
+
+
+class BuildCandidateOsdsTest(unittest.TestCase):
+    def df(self, **overrides):
+        node = {
+            "id": 1,
+            "status": "up",
+            "reweight": 1.0,
+            "crush_weight": 1.0,
+            "device_class": "hdd",
+            "utilization": 50.0,
+        }
+        return {1: node | overrides}
+
+    def test_usable_osd_is_offered_under_its_class(self):
+        self.assertEqual(ut.build_candidate_osds(self.df()), {"hdd": [1]})
+
+    def test_max_util_is_inclusive(self):
+        self.assertEqual(ut.build_candidate_osds(self.df(), 50.0), {"hdd": [1]})
+        self.assertEqual(ut.build_candidate_osds(self.df(), 49.9), {})
+
+    def test_osd_without_a_utilization_figure_is_excluded(self):
+        # It cannot be ranked, and treating a missing value as 0% would make
+        # it sort ahead of every real candidate.
+        df = self.df()
+        del df[1]["utilization"]
+        self.assertEqual(ut.build_candidate_osds(df), {})
+
+    def test_down_and_out_osds_are_excluded(self):
+        self.assertEqual(ut.build_candidate_osds(self.df(status="down")), {})
+        self.assertEqual(ut.build_candidate_osds(self.df(reweight=0)), {})
+        self.assertEqual(ut.build_candidate_osds(self.df(crush_weight=0)), {})
+
+    def test_candidates_are_sorted_by_utilization_then_id(self):
+        base = self.df()[1]
+        df = {
+            10: base | {"id": 10, "utilization": 60.0},
+            11: base | {"id": 11, "utilization": 50.0},
+            12: base | {"id": 12, "utilization": 50.0},
+        }
+        self.assertEqual(ut.build_candidate_osds(df), {"hdd": [11, 12, 10]})
+
+
+class PrintTableEdgeCaseTest(unittest.TestCase):
+    def test_empty_rows_prints_just_the_header(self):
+        # main() guards this today, but the star-args width form used to
+        # raise TypeError here rather than degrade gracefully.
+        group_line, label_line = table_lines([])
+        self.assertEqual(re.findall(r"[A-Z]+", group_line), ["ACTING", "UP", "TARGET"])
+        self.assertEqual(
+            label_line.split(), ["PGID", "SHARD"] + ["OSD", "UTIL", "HOST"] * 3
+        )
+
+
 def table_from_readme(fixture):
     """Return the table block quoted after 'Table output:' in a fixture README.
 
@@ -214,6 +354,41 @@ def table_from_readme(fixture):
         elif block:
             break
     return "\n".join(block)
+
+
+CEPH2_FIXTURE = "upmaps-toofull-ceph2-util-emergency-2-new-hosts"
+
+# What the fixture's README.txt documents, and what the thresholds buy:
+# 1513 arriving shards, 976 of them plausibly blocked, 480 placeable below
+# backfillfull_ratio. Asserted as counts and invariants rather than an
+# exact 480-row table, which would be unreadable in a README.
+CEPH2_ARRIVING = 1513
+CEPH2_STUCK = 976
+CEPH2_PROPOSED = 480
+CEPH2_UNPLACEABLE = 496
+CEPH2_NEARFULL = 85.0
+CEPH2_BACKFILLFULL = 91.0
+
+# What the tool did on this capture before the thresholds existed, kept so
+# the regression is pinned rather than merely described: every usable hdd
+# OSD consumed, 342 of them already past backfillfull_ratio.
+CEPH2_UNCAPPED_PROPOSED = 822
+CEPH2_UNCAPPED_DOOMED = 342
+
+
+def parse_table(stdout):
+    """Return the table's data rows as dicts keyed by ut.COLUMNS."""
+    lines = stdout.splitlines()[2:]  # group line, label line, then rows
+    rows = []
+    for line in lines:
+        cells = line.split()
+        assert len(cells) == len(ut.COLUMNS), line
+        rows.append(dict(zip(ut.COLUMNS, cells)))
+    return rows
+
+
+def percent(cell):
+    return float(cell.rstrip("%"))
 
 
 class FixtureReplayTest(unittest.TestCase):
@@ -267,6 +442,165 @@ class FixtureReplayTest(unittest.TestCase):
 
     def test_no_backfill_toofull_pgs_prints_nothing_on_stdout(self):
         self.assertEqual(self.run_script("upmaps-toofull-nominal-synthetic"), "")
+
+    def test_default_thresholds_come_from_the_clusters_own_ratios(self):
+        # osd457-down has backfillfull_ratio 0.90, ceph2 has it raised to
+        # 0.91: the reported caps must track the capture, not a constant.
+        for fixture, nearfull, backfillfull in [
+            ("upmaps-toofull-osd457-down", "85", "90"),
+            (CEPH2_FIXTURE, "85", "91"),
+        ]:
+            with self.subTest(fixture=fixture):
+                err = self.run_proc(fixture).stderr
+                self.assertIn(f"--min-source-util {nearfull}%", err)
+                self.assertIn(f"--max-target-util {backfillfull}%", err)
+
+
+class Ceph2FixtureInvariantTest(unittest.TestCase):
+    """The cluster-sized capture, checked by invariant rather than by table.
+
+    This is the fixture that exposed both threshold bugs: a general
+    utilization emergency with two newly-added, still-empty hosts. Before
+    the thresholds existed it proposed 822 remaps, 342 of them onto OSDs
+    already past backfillfull_ratio, while diverting 537 shards that were
+    arriving on perfectly healthy OSDs.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--load-state",
+                os.path.join(TEST_DATA, CEPH2_FIXTURE),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        cls.rows = parse_table(cls.proc.stdout)
+
+    def test_proposal_and_unplaceable_counts_match_the_readme(self):
+        self.assertEqual(len(self.rows), CEPH2_PROPOSED)
+        self.assertIn(
+            f"proposed {CEPH2_PROPOSED} remap(s), {CEPH2_UNPLACEABLE} unplaceable",
+            self.proc.stderr,
+        )
+
+    def test_shard_counts_match_the_readme(self):
+        skipped = CEPH2_ARRIVING - CEPH2_STUCK
+        self.assertIn(
+            f"{CEPH2_ARRIVING} arriving shard(s), of which {CEPH2_STUCK} on an OSD",
+            self.proc.stderr,
+        )
+        self.assertIn(f"({skipped} left alone as not the blocker)", self.proc.stderr)
+
+    def test_no_target_is_at_or_above_backfillfull(self):
+        # The headline invariant: every one of these remaps can actually
+        # complete. Before --max-target-util defaulted, 342 could not.
+        over = [
+            r for r in self.rows if percent(r[("TARGET", "UTIL")]) >= CEPH2_BACKFILLFULL
+        ]
+        self.assertEqual(over, [])
+
+    def test_no_shard_is_diverted_off_a_healthy_osd(self):
+        # The two new hosts sit around 70% and are absorbing shards, not
+        # blocking them; diverting off them wasted targets.
+        under = [r for r in self.rows if percent(r[("UP", "UTIL")]) < CEPH2_NEARFULL]
+        self.assertEqual(under, [])
+
+    def test_the_new_empty_hosts_receive_shards_instead_of_losing_them(self):
+        targets = {r[("TARGET", "HOST")] for r in self.rows}
+        self.assertTrue({"host50", "host51"} <= targets)
+
+    def test_each_target_osd_is_used_at_most_once(self):
+        targets = [r[("TARGET", "OSD")] for r in self.rows]
+        self.assertEqual(len(targets), len(set(targets)))
+
+    def test_no_row_targets_a_host_already_in_its_pgs_up_set(self):
+        for row in self.rows:
+            self.assertNotEqual(row[("TARGET", "HOST")], row[("UP", "HOST")])
+
+    def test_disabling_both_thresholds_restores_the_old_unsafe_behavior(self):
+        # Guards the regression path: this is what the tool used to do by
+        # default, and it must now be both opt-in and loudly flagged.
+        proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--load-state",
+                os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                "--min-source-util",
+                "0",
+                "--max-target-util",
+                "100",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        rows = parse_table(proc.stdout)
+        self.assertEqual(len(rows), CEPH2_UNCAPPED_PROPOSED)
+        doomed = [
+            r for r in rows if percent(r[("TARGET", "UTIL")]) >= CEPH2_BACKFILLFULL
+        ]
+        self.assertEqual(len(doomed), CEPH2_UNCAPPED_DOOMED)
+        self.assertIn(
+            f"WARNING: {CEPH2_UNCAPPED_DOOMED} of {CEPH2_UNCAPPED_PROPOSED} "
+            "proposed target(s) are at or above the cluster's "
+            "backfillfull_ratio (91%)",
+            proc.stderr,
+        )
+
+    def test_pgremapper_mode_agrees_with_the_table(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--load-state",
+                os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                "--pgremapper",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = proc.stdout.splitlines()
+        self.assertEqual(len(lines), CEPH2_PROPOSED)
+        expected = [
+            f"{r[('', 'PGID')]} {r[('UP', 'OSD')].removeprefix('osd.')} "
+            f"{r[('TARGET', 'OSD')].removeprefix('osd.')}"
+            for r in self.rows
+        ]
+        self.assertEqual(lines, expected)
+
+
+class UnknownPoolTest(unittest.TestCase):
+    """A stuck PG whose pool is missing from 'ceph osd pool ls detail'."""
+
+    def test_unknown_pool_is_refused_rather_than_analyzed_wrongly(self):
+        # Silently skipping it would bypass the failure-domain check and
+        # diff the pool's EC shards as interchangeable replicas — both
+        # failures produce plausible-looking rows.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(TEST_DATA, "upmaps-toofull-osd457-down")
+            dst = os.path.join(tmp, "fixture")
+            shutil.copytree(src, dst)
+            path = os.path.join(dst, "pool_ls_detail.json")
+            with open(path) as f:
+                pools = json.load(f)
+            with open(path, "w") as f:
+                json.dump([p for p in pools if p["pool_id"] != 19], f)
+            proc = subprocess.run(
+                [sys.executable, SCRIPT, "--load-state", dst],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("pool id(s) 19", proc.stderr)
+        self.assertIn("does not list", proc.stderr)
 
 
 if __name__ == "__main__":

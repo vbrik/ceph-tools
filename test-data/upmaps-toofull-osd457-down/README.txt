@@ -19,15 +19,24 @@ This is the single-OSD-out / same-host-retry mechanism from the script's
 module docstring, just with only one PG affected so far (osd.457 had only
 just gone down at capture time).
 
-Verified against the live cluster: running the script (it takes no
-arguments -- it scans every backfill_toofull PG cluster-wide, not just
-osd.457's) correctly reports 1 backfill_toofull PG cluster-wide, 1 shard
-arriving on host27, and proposes remapping 19.21f shard 7 from osd.625 to
-osd.849 (host35, 86.8% util). Table output:
+Verified against the live cluster: running the script (it needs no
+argument to say where to look -- it scans every backfill_toofull PG
+cluster-wide, not just osd.457's) correctly reports 1 backfill_toofull PG
+cluster-wide, 1 arriving shard, and proposes remapping 19.21f shard 7 from
+osd.625 to osd.849 (host35, 86.8% util). Table output:
 
                    ---- ACTING ----    --------- UP ---------    ------- TARGET -------
   PGID    SHARD    OSD   UTIL  HOST    OSD      UTIL   HOST      OSD      UTIL   HOST
   19.21f  7        none  -     -       osd.625  89.4%  host27    osd.849  86.8%  host35
+
+This fixture also pins down where --min-source-util draws its line.
+osd.625 is at 89.4% against this cluster's backfillfull_ratio of 0.90, so
+it is below the ratio and yet is demonstrably the blocker -- Ceph refuses a
+backfill on the target's projected usage once the shard lands, not on its
+usage today. That is why the default threshold is nearfull_ratio (85%) and
+not backfillfull_ratio: at backfillfull_ratio this genuinely stuck shard
+would be filtered out and the fixture would propose nothing. The default
+--max-target-util here is 90%, and osd.849 at 86.8% clears it.
 
 This fixture is also the one that exercises the unknown-ACTING-OSD case:
 osd.457 is already out, so the slot it left in 'acting' reads as
