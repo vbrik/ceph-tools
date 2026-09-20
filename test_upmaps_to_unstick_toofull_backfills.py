@@ -1,0 +1,183 @@
+"""Unit tests for upmaps-to-unstick-toofull-backfills.py.
+
+The table's column layout is the main thing under test here: the columns
+are named after the PG sets they come from (ACTING_*/UP_*/TARGET_*) and
+ordered along the shard's path, and a row that silently drifts out of that
+order is exactly the kind of bug that reads as plausible output.
+"""
+
+import importlib.util
+import os
+import subprocess
+import sys
+import unittest
+
+SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "upmaps-to-unstick-toofull-backfills.py",
+)
+TEST_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-data")
+
+spec = importlib.util.spec_from_file_location("upmaps_toofull", SCRIPT)
+ut = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ut)
+
+
+# A real row: the shard's data is on osd.406, the stalled backfill is aimed
+# at osd.882 (whose host is too full), and osd.898 is the proposal.
+OSD_HOST = {406: "host32", 882: "host50", 898: "host51"}
+OSD_DF = {
+    406: {"id": 406, "utilization": 89.9, "device_class": "hdd"},
+    882: {"id": 882, "utilization": 69.1, "device_class": "hdd"},
+    898: {"id": 898, "utilization": 61.7, "device_class": "hdd"},
+}
+UPMAPS = {"19.2": [{"from": 519, "to": 368}]}
+
+
+def make_proposal(acting_osd=406, via_existing_upmap=False):
+    shard = ut.DivertedShard(
+        pgid="19.2",
+        shard=0,
+        up_osd=882,
+        acting_osd=acting_osd,
+        up_set=[882, 111, 222],
+    )
+    return ut.Proposal(shard, 898, "host51", 61.7, via_existing_upmap)
+
+
+class FormatRowTest(unittest.TestCase):
+    def test_row_matches_column_order(self):
+        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF, UPMAPS)
+        self.assertEqual(
+            row,
+            [
+                "19.2",
+                "0",
+                "osd.406",
+                "89.9%",
+                "host32",
+                "osd.882",
+                "69.1%",
+                "host50",
+                "osd.898",
+                "61.7%",
+                "host51",
+                "519->368",
+            ],
+        )
+
+    def test_row_length_tracks_columns(self):
+        # Guards against a column being added to COLUMNS (or to the row)
+        # without the other side following.
+        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF, UPMAPS)
+        self.assertEqual(len(row), len(ut.COLUMNS))
+
+    def test_unknown_acting_osd_renders_as_none_and_dashes(self):
+        # The usual out-OSD case: the slot the shard is coming from reads as
+        # CRUSH_ITEM_NONE, so neither its utilization nor its host exists.
+        row = ut.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF, UPMAPS)
+        cells = dict(zip(ut.COLUMNS, row))
+        self.assertEqual(cells["ACTING_OSD"], "none")
+        self.assertEqual(cells["ACTING_UTIL"], ut.NOT_APPLICABLE)
+        self.assertEqual(cells["ACTING_HOST"], ut.NOT_APPLICABLE)
+        # The up side is still fully known — that is the whole premise.
+        self.assertEqual(cells["UP_OSD"], "osd.882")
+        self.assertEqual(cells["UP_UTIL"], "69.1%")
+
+    def test_existing_upmap_flag_marks_up_osd_only(self):
+        row = ut.format_row(
+            make_proposal(via_existing_upmap=True), OSD_HOST, OSD_DF, UPMAPS
+        )
+        cells = dict(zip(ut.COLUMNS, row))
+        self.assertEqual(cells["UP_OSD"], "osd.882*")
+        self.assertEqual(cells["ACTING_OSD"], "osd.406")
+
+    def test_pg_without_upmaps_renders_dash(self):
+        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF, {})
+        self.assertEqual(dict(zip(ut.COLUMNS, row))["EXISTING_UPMAPS"], "-")
+
+
+class FindDivertedShardsTest(unittest.TestCase):
+    def test_ec_pairs_up_and_acting_by_position(self):
+        pg = {"pgid": "19.2", "up": [882, 111], "acting": [406, 111]}
+        (shard,) = ut.find_diverted_shards(pg, is_ec=True)
+        self.assertEqual((shard.shard, shard.up_osd, shard.acting_osd), (0, 882, 406))
+
+    def test_ec_empty_acting_slot_yields_unknown_acting_osd(self):
+        pg = {"pgid": "19.2", "up": [882, 111], "acting": [ut.CRUSH_ITEM_NONE, 111]}
+        (shard,) = ut.find_diverted_shards(pg, is_ec=True)
+        self.assertEqual(shard.up_osd, 882)
+        self.assertIsNone(shard.acting_osd)
+
+    def test_replicated_names_acting_osd_when_pairing_is_unambiguous(self):
+        pg = {"pgid": "5.1", "up": [882, 111], "acting": [406, 111]}
+        (shard,) = ut.find_diverted_shards(pg, is_ec=False)
+        self.assertEqual((shard.shard, shard.up_osd, shard.acting_osd), ("-", 882, 406))
+
+    def test_replicated_leaves_acting_osd_unknown_when_ambiguous(self):
+        # Two replicas arriving and two leaving: no way to say which came
+        # from which, so neither row claims an acting OSD.
+        pg = {"pgid": "5.1", "up": [882, 883, 111], "acting": [406, 407, 111]}
+        shards = ut.find_diverted_shards(pg, is_ec=False)
+        self.assertEqual([s.up_osd for s in shards], [882, 883])
+        self.assertEqual([s.acting_osd for s in shards], [None, None])
+
+    def test_reordered_replicated_set_is_not_movement(self):
+        pg = {"pgid": "5.1", "up": [111, 882], "acting": [882, 111]}
+        self.assertEqual(ut.find_diverted_shards(pg, is_ec=False), [])
+
+
+def table_from_readme(fixture):
+    """Return the table block quoted after 'Table output:' in a fixture README.
+
+    Pulling the expected output out of the README, rather than duplicating
+    it here, is what keeps the two from drifting apart.
+    """
+    path = os.path.join(TEST_DATA, fixture, "README.txt")
+    with open(path) as f:
+        lines = f.read().splitlines()
+    # The marker ends a wrapped sentence rather than standing alone.
+    start = next(i for i, ln in enumerate(lines) if ln.endswith("Table output:")) + 1
+    block = []
+    for line in lines[start:]:
+        if line.startswith("  "):
+            block.append(line[2:])
+        elif block:
+            break
+    return "\n".join(block)
+
+
+class FixtureReplayTest(unittest.TestCase):
+    """End-to-end --load-state runs, checked against the fixtures' READMEs."""
+
+    def run_script(self, fixture, *extra):
+        proc = subprocess.run(
+            [sys.executable, SCRIPT, "--load-state", os.path.join(TEST_DATA, fixture)]
+            + list(extra),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return proc.stdout.rstrip("\n")
+
+    def test_osd457_down_table_matches_readme(self):
+        fixture = "upmaps-toofull-osd457-down"
+        self.assertEqual(self.run_script(fixture), table_from_readme(fixture))
+
+    def test_existing_upmap_chain_table_matches_readme(self):
+        fixture = "upmaps-toofull-osd263-existing-upmap-chain"
+        self.assertEqual(self.run_script(fixture), table_from_readme(fixture))
+
+    def test_pgremapper_emits_up_osd_not_acting_osd(self):
+        # 'pgremapper remap' takes the upmap's 'from', which is UP_OSD.
+        # Emitting ACTING_OSD here would remap the wrong OSD, and the table
+        # would still look right.
+        out = self.run_script("upmaps-toofull-osd457-down", "--pgremapper")
+        self.assertEqual(out, "19.21f 625 849")
+
+    def test_no_backfill_toofull_pgs_prints_nothing_on_stdout(self):
+        self.assertEqual(self.run_script("upmaps-toofull-nominal-synthetic"), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

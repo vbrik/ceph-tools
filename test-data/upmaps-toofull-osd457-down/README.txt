@@ -25,8 +25,13 @@ osd.457's) correctly reports 1 backfill_toofull PG cluster-wide, 1 shard
 arriving on host27, and proposes remapping 19.21f shard 7 from osd.625 to
 osd.849 (host35, 86.8% util). Table output:
 
-  PGID    SHARD  FROM_OSD  FROM_HOST  FROM_UTIL  TARGET_OSD  TARGET_HOST  TGT_UTIL  VACATED  EXISTING_UPMAPS
-  19.21f  7      osd.625   host27     89.4%      osd.849     host35       86.8%     none     -
+  PGID    SHARD  ACTING_OSD  ACTING_UTIL  ACTING_HOST  UP_OSD   UP_UTIL  UP_HOST  TARGET_OSD  TARGET_UTIL  TARGET_HOST  EXISTING_UPMAPS
+  19.21f  7      none        -            -            osd.625  89.4%    host27   osd.849     86.8%        host35       -
+
+This fixture is also the one that exercises the unknown-ACTING_OSD case:
+osd.457 is already out, so the slot it left in 'acting' reads as
+CRUSH_ITEM_NONE and the row shows 'none' with '-' for the utilization and
+host that would have been derived from it.
 
 Use this fixture to exercise the "found something to divert" path. It is
 NOT a no-problems fixture -- see upmaps-toofull-nominal-synthetic/ for that

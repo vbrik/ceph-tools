@@ -36,19 +36,35 @@ that is what backfill_toofull means, so no further filtering is needed. A
 backfill_toofull PG with no newly-arriving shard yields nothing; it is counted
 on stderr so the silence is not ambiguous.
 
-Note the vacated OSD often cannot be identified. Once an OSD is out, the slot
-it vacated in 'acting' reads as CRUSH_ITEM_NONE, not as its OSD id, so there
-is no way to prove from the PG map where the shard came from. That does not
-matter here — the arriving side is what is out of space, and it is always
-observable. VACATED is reported when it happens to be recoverable and 'none'
-otherwise.
-
 'up'/'acting' are diffed differently per pool type, for the same reason as in
 pg-movements.py: EC shards are identified by position, so index i is diffed
 against index i and the shard index is reported. Replicated replicas are
 interchangeable, so position carries no identity (a same-OSD-set reorder from
 primary-affinity or pg-upmap-items is not movement) and the sets are diffed
 instead, with SHARD shown as '-'.
+
+Which way a row points
+----------------------
+Each OSD column is named for the set it came from, and the columns are
+ordered along the shard's path:
+
+  ACTING_OSD  where the shard's data is right now — the backfill's source
+  UP_OSD      where CRUSH wants it, i.e. the arriving OSD whose host is too
+              full, which is what wedges the backfill
+  TARGET_OSD  where this script proposes it go instead
+
+So data flows ACTING_OSD -> UP_OSD today and is stuck; applying a row
+redirects that to ACTING_OSD -> TARGET_OSD. UP_OSD is the 'from' of the
+upmap pair that does the redirecting (and pgremapper's "source osd"), but
+that is a direction in the *mapping*, not in the data: nothing is ever
+copied off UP_OSD.
+
+ACTING_OSD often cannot be identified. Once an OSD is out, the slot it left
+in 'acting' reads as CRUSH_ITEM_NONE, not as its OSD id, so there is no way
+to prove from the PG map where the shard is coming from. That does not
+matter here — the arriving side is what is out of space, and it is always
+observable. ACTING_OSD is reported when it happens to be recoverable and
+'none' (with '-' for its utilization and host) otherwise.
 
 How targets are chosen
 ----------------------
@@ -62,7 +78,7 @@ utilization.
 --max-target-util PERCENT additionally drops every OSD whose current
 utilization is above PERCENT, so a target is never one that is itself nearly
 full. The cap is checked against the same current 'ceph osd df' figure the
-ranking and the TGT_UTIL column use, so it does not account for the shard
+ranking and the TARGET_UTIL column use, so it does not account for the shard
 about to be added; leave headroom for that. Set too low it simply leaves
 shards unplaceable.
 
@@ -103,7 +119,7 @@ chose. An arriving OSD that is *absent* from the raw mapping is one an
 existing upmap already put there (the balancer places these), so diverting
 it means rewriting that pair's 'to' rather than adding a new pair — Ceph's
 upmap validation silently drops a 'from' that CRUSH did not itself pick.
-Such rows are still proposed — FROM_OSD is marked with a trailing '*', and a
+Such rows are still proposed — UP_OSD is marked with a trailing '*', and a
 note on stderr points at EXISTING_UPMAPS — on the assumption that whoever
 applies this by hand will rewrite that pair's 'to' rather than paste the row
 in as a new one.
@@ -140,10 +156,10 @@ Applying the output
 -------------------
 Two output formats are available. The default is a human-readable table.
 --pgremapper instead emits one bare '<pgid> <from osd> <target osd>' line per
-remap — the table's PGID, FROM_OSD and TARGET_OSD columns, which are exactly
-the positional arguments of 'pgremapper remap' (which calls FROM_OSD the
-"source osd"). Only the rows go to stdout in either mode — everything else is
-on stderr — so the output stays parseable.
+remap — the table's PGID, UP_OSD and TARGET_OSD columns, which are exactly
+the positional arguments of 'pgremapper remap' (which calls UP_OSD the
+"source osd", meaning the upmap's 'from'). Only the rows go to stdout in
+either mode — everything else is on stderr — so the output stays parseable.
 
 Caveats for whatever consumes this:
 
@@ -167,10 +183,10 @@ Caveats for whatever consumes this:
     manually placed upmap entries. Consider 'ceph balancer off' while the
     diverted backfills drain.
 
-  - A FROM_OSD suffixed '*' is itself the 'to' of one of that row's
+  - An UP_OSD suffixed '*' is itself the 'to' of one of that row's
     EXISTING_UPMAPS pairs (see "Why the raw CRUSH mapping matters" above).
     Apply such a row by rewriting that pair's 'to' to TARGET_OSD, not by
-    adding 'FROM_OSD->TARGET_OSD' as a new pair — Ceph accepts a new pair
+    adding 'UP_OSD->TARGET_OSD' as a new pair — Ceph accepts a new pair
     like that and then silently drops it.
 
 Review the proposals before applying them. To hand them to pgremapper:
@@ -659,12 +675,14 @@ class DivertedShard(NamedTuple):
 
     pgid: str
     shard: "int | str"  # EC shard index, or '-' for replicated pools
-    arriving_osd: int  # OSD now receiving the shard; this is the 'from' of
-    # the upmap that would divert it, and its host is
-    # the one the shard is diverted away from
-    vacated_osd: "int | None"  # OSD that left this slot, or None when the
-    # slot reads as CRUSH_ITEM_NONE (the usual out-OSD case)
-    up: list  # the PG's full up set, for host exclusions and for
+    up_osd: int  # OSD the shard is arriving on: in 'up', not yet in
+    # 'acting'. This is the 'from' of the upmap that would
+    # divert it, and its host is the one being diverted away
+    # from. Despite that 'from', no data flows off it.
+    acting_osd: "int | None"  # OSD still holding the shard, i.e. the
+    # backfill's data source, or None when the slot reads as
+    # CRUSH_ITEM_NONE (the usual out-OSD case)
+    up_set: list  # the PG's full up set, for host exclusions and for
     # reconstructing the raw CRUSH mapping
 
 
@@ -680,23 +698,23 @@ def find_diverted_shards(pg: dict, is_ec: bool) -> list[DivertedShard]:
         # what lets the shard index be reported, and keeps two unrelated
         # shard moves in one PG from being conflated.
         for i in range(max(len(up), len(acting))):
-            arriving = _slot(up, i)
-            vacated = _slot(acting, i)
-            if arriving is None or arriving == vacated:
+            up_osd = _slot(up, i)
+            acting_osd = _slot(acting, i)
+            if up_osd is None or up_osd == acting_osd:
                 continue
-            found.append(DivertedShard(pgid, i, arriving, vacated, up))
+            found.append(DivertedShard(pgid, i, up_osd, acting_osd, up))
     else:
         # Replicated: replicas are interchangeable, so position means nothing
         # and only the set difference is real movement.
-        up_set = {o for o in up if _is_real_osd(o)}
-        acting_set = {o for o in acting if _is_real_osd(o)}
-        vacated_osds = sorted(acting_set - up_set)
-        for arriving in sorted(up_set - acting_set):
-            # A replicated PG can have several arriving/vacated replicas at
-            # once with no way to pair them up; report one vacated OSD only
-            # when the pairing is unambiguous.
-            vacated = vacated_osds[0] if len(vacated_osds) == 1 else None
-            found.append(DivertedShard(pgid, "-", arriving, vacated, up))
+        up_members = {o for o in up if _is_real_osd(o)}
+        acting_members = {o for o in acting if _is_real_osd(o)}
+        departing = sorted(acting_members - up_members)
+        for up_osd in sorted(up_members - acting_members):
+            # A replicated PG can have several arriving/departing replicas at
+            # once with no way to pair them up; name the acting OSD only when
+            # the pairing is unambiguous.
+            acting_osd = departing[0] if len(departing) == 1 else None
+            found.append(DivertedShard(pgid, "-", up_osd, acting_osd, up))
 
     return found
 
@@ -757,10 +775,10 @@ class Proposal(NamedTuple):
     target_osd: int
     target_host: str
     target_utilization: float
-    via_existing_upmap: bool  # arriving_osd is absent from the raw CRUSH
-    # mapping, i.e. it is itself the 'to' of an existing pair (see module
-    # docstring); applying this row means rewriting that pair's 'to', not
-    # adding a new pair
+    via_existing_upmap: bool  # up_osd is absent from the raw CRUSH mapping,
+    # i.e. it is itself the 'to' of an existing pair (see module docstring);
+    # applying this row means rewriting that pair's 'to', not adding a new
+    # pair
 
 
 def assign_targets(
@@ -786,14 +804,14 @@ def assign_targets(
     for shard in shards:
         forbidden_hosts = blocked_hosts.setdefault(
             shard.pgid,
-            {osd_host.get(o) for o in shard.up if _is_real_osd(o)},
+            {osd_host.get(o) for o in shard.up_set if _is_real_osd(o)},
         )
-        raw = raw_crush_osds(shard.up, upmap_items.get(shard.pgid, []))
+        raw = raw_crush_osds(shard.up_set, upmap_items.get(shard.pgid, []))
         # 'up' alone is not enough: an OSD displaced by an existing upmap is
         # absent from 'up' but still in the raw mapping, and re-proposing it
         # would put the same OSD in the mapping twice — which Ceph's upmap
         # validation drops silently (see module docstring).
-        forbidden_osds = raw | {o for o in shard.up if _is_real_osd(o)}
+        forbidden_osds = raw | {o for o in shard.up_set if _is_real_osd(o)}
 
         # The arriving OSD becomes the 'from' of the diverting upmap pair,
         # and 'from' must be an OSD CRUSH itself chose. If the arriving OSD
@@ -801,12 +819,12 @@ def assign_targets(
         # existing upmap (the balancer places these), so applying this row
         # as printed means rewriting that pair's 'to' rather than adding a
         # new pair — flagged rather than skipped (see module docstring).
-        via_existing_upmap = shard.arriving_osd not in raw
+        via_existing_upmap = shard.up_osd not in raw
 
         # Only OSDs of the arriving OSD's own class are legal targets. An
         # unknown class yields an empty pool, so the shard falls through to
         # unplaceable rather than being sent somewhere CRUSH would reject.
-        pool = available.get(osd_class(osd_df, shard.arriving_osd), [])
+        pool = available.get(osd_class(osd_df, shard.up_osd), [])
         for candidate in pool:
             if osd_host.get(candidate) in forbidden_hosts:
                 continue
@@ -834,18 +852,31 @@ def assign_targets(
 # Output
 # ---------------------------------------------------------------------------
 
+# Ordered so each row reads along the shard's path: where its data is now
+# (ACTING_*), where the stuck backfill is trying to put it (UP_*), and where
+# this script proposes it go instead (TARGET_*), with each OSD followed by
+# its utilization and host. EXISTING_UPMAPS stays last; print_table leaves
+# the final, variable-width column unpadded.
 COLUMNS = [
     "PGID",
     "SHARD",
-    "FROM_OSD",
-    "FROM_HOST",
-    "FROM_UTIL",
+    "ACTING_OSD",
+    "ACTING_UTIL",
+    "ACTING_HOST",
+    "UP_OSD",
+    "UP_UTIL",
+    "UP_HOST",
     "TARGET_OSD",
+    "TARGET_UTIL",
     "TARGET_HOST",
-    "TGT_UTIL",
-    "VACATED",
     "EXISTING_UPMAPS",
 ]
+
+# Printed in ACTING_UTIL/ACTING_HOST when the acting OSD is unknown (the
+# usual out-OSD case, where ACTING_OSD itself reads 'none'). Distinct from
+# format_utilization's '?', which means the OSD is known but 'ceph osd df'
+# had no figure for it.
+NOT_APPLICABLE = "-"
 
 
 def format_utilization(osd_df: dict[int, dict], osd_id: int) -> str:
@@ -863,26 +894,29 @@ def format_row(
     shard = proposal.shard
     pairs = upmap_items.get(shard.pgid, [])
 
-    # '*' means arriving_osd is itself the 'to' of one of this row's
+    # '*' means up_osd is itself the 'to' of one of this row's
     # EXISTING_UPMAPS pairs; applying the row means rewriting that pair's
-    # 'to' rather than adding 'FROM_OSD->TARGET_OSD' as a new pair (see
+    # 'to' rather than adding 'UP_OSD->TARGET_OSD' as a new pair (see
     # module docstring).
-    from_osd = f"osd.{shard.arriving_osd}" + (
-        "*" if proposal.via_existing_upmap else ""
-    )
+    up_osd = f"osd.{shard.up_osd}" + ("*" if proposal.via_existing_upmap else "")
 
+    known_acting = shard.acting_osd is not None
     return [
         shard.pgid,
         str(shard.shard),
-        from_osd,
+        f"osd.{shard.acting_osd}" if known_acting else "none",
+        format_utilization(osd_df, shard.acting_osd)
+        if known_acting
+        else NOT_APPLICABLE,
+        osd_host.get(shard.acting_osd, "?") if known_acting else NOT_APPLICABLE,
+        up_osd,
+        format_utilization(osd_df, shard.up_osd),
         # Varies per row now that the whole cluster is scanned, so unlike
         # the single-host version it cannot live in the stderr header.
-        osd_host.get(shard.arriving_osd, "?"),
-        format_utilization(osd_df, shard.arriving_osd),
+        osd_host.get(shard.up_osd, "?"),
         f"osd.{proposal.target_osd}",
-        proposal.target_host,
         f"{proposal.target_utilization:.1f}%",
-        f"osd.{shard.vacated_osd}" if shard.vacated_osd is not None else "none",
+        proposal.target_host,
         ",".join(f"{p['from']}->{p['to']}" for p in pairs) if pairs else "-",
     ]
 
@@ -912,14 +946,13 @@ def print_pgremapper(proposals: list[Proposal]) -> None:
 
     These are the positional arguments of 'pgremapper remap', in order and
     with nothing else on the line, so the output can be fed to it directly.
-    (What the table calls FROM_OSD is pgremapper's "source osd" argument.)
-    OSD ids are bare integers: pgremapper parses them with strconv.Atoi and
-    rejects the 'osd.N' form the table uses.
+    pgremapper's "source osd" is the upmap's 'from', i.e. the table's
+    UP_OSD — not ACTING_OSD, which is where the data actually sits. OSD ids
+    are bare integers: pgremapper parses them with strconv.Atoi and rejects
+    the 'osd.N' form the table uses.
     """
     for proposal in proposals:
-        print(
-            f"{proposal.shard.pgid} {proposal.shard.arriving_osd} {proposal.target_osd}"
-        )
+        print(f"{proposal.shard.pgid} {proposal.shard.up_osd} {proposal.target_osd}")
 
 
 # ---------------------------------------------------------------------------
@@ -940,9 +973,7 @@ def main() -> None:
         SAVE_STATE_DIR.mkdir(parents=True, exist_ok=True)
         existing = list(SAVE_STATE_DIR.iterdir())
         if existing:
-            sys.exit(
-                f"ERROR: --save-state directory is not empty: {SAVE_STATE_DIR}"
-            )
+            sys.exit(f"ERROR: --save-state directory is not empty: {SAVE_STATE_DIR}")
 
     osd_host = fetch_osd_hosts()
     osd_df = fetch_osd_df()
@@ -1011,10 +1042,10 @@ def main() -> None:
     flagged = [p for p in proposals if p.via_existing_upmap]
     if flagged:
         print(
-            f"\nNOTE: {len(flagged)} proposal(s) have a FROM_OSD marked '*': "
+            f"\nNOTE: {len(flagged)} proposal(s) have an UP_OSD marked '*': "
             "that OSD is itself the 'to' of an existing upmap pair, so "
             "apply the row by rewriting that pair's 'to' to TARGET_OSD, not "
-            "by adding 'FROM_OSD->TARGET_OSD' as a new pair (see "
+            "by adding 'UP_OSD->TARGET_OSD' as a new pair (see "
             "EXISTING_UPMAPS).",
             file=sys.stderr,
         )
@@ -1022,8 +1053,8 @@ def main() -> None:
     for shard in unplaceable:
         print(
             f"WARNING: no legal target left for {shard.pgid} shard "
-            f"{shard.shard} (arriving on osd.{shard.arriving_osd}, class "
-            f"{osd_class(osd_df, shard.arriving_osd) or 'unknown'}) — every "
+            f"{shard.shard} (arriving on osd.{shard.up_osd}, class "
+            f"{osd_class(osd_df, shard.up_osd) or 'unknown'}) — every "
             f"candidate OSD of that class is on a host already in the PG's up "
             f"set, already in its CRUSH mapping, already used by another PG"
             + (

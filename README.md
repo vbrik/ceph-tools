@@ -69,10 +69,12 @@ other environments.
   that cannot take it (in `up` but not `acting`), and picks the least-utilized
   OSD of that shard's own device class on a host not already in the PG's `up`
   set — a destination that satisfies the fault domain. Prints the proposed
-  remaps
-  (including each PG's existing `pg_upmap_items`, since
-  `ceph osd pg-upmap-items` replaces rather than adds to an entry) for
-  another script to apply; changes nothing itself. `--pgremapper` switches
+  remaps; changes nothing itself. Each row follows one shard's path, giving
+  the OSD, utilization and host at each step: `ACTING_*` where its data sits
+  now, `UP_*` the too-full OSD the stalled backfill is aimed at, `TARGET_*`
+  the proposed replacement. Rows also carry each PG's existing
+  `pg_upmap_items`, since `ceph osd pg-upmap-items` replaces rather than adds
+  to an entry. `--pgremapper` switches
   the output to headerless `<pgid> <from osd> <target osd>` lines, ready to
   feed to `pgremapper remap` (via `xargs -a remaps.txt -L1 …`). Each target
   OSD is used at most once, so a large run may report a tail as unplaceable;
@@ -185,6 +187,21 @@ being examined.
   Vendored here as a prebuilt x86-64 Linux binary; the Rust source lives in
   [vbrik/cephfs-find-wide-dirs](https://github.com/vbrik/cephfs-find-wide-dirs).
   `cephfs/cephfs-find-wide-dirs --min-num-files NUMBER [--threads NUMBER] <path>`
+
+## Tests
+
+Stdlib `unittest`, no dependencies. `cephfs/` is not a package, so it needs
+its own run:
+
+```
+python3 -m unittest discover -p 'test_*.py'
+python3 -m unittest discover -s cephfs -p 'test_*.py'
+```
+
+The `upmaps-to-unstick-toofull-backfills.py` tests replay the
+cluster-state snapshots under `test-data/` via `--load-state` and compare the
+output against the table each fixture's `README.txt` documents, so fixture
+and code cannot drift apart.
 
 ## License
 

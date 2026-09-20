@@ -1,6 +1,6 @@
 Fixture: real, live-cluster instance of the "arriving OSD is itself the 'to'
 of an existing upmap pair" case that upmaps-to-unstick-toofull-backfills.py's
-via_existing_upmap / FROM_OSD '*' handling exists for (see "Why the raw
+via_existing_upmap / UP_OSD '*' handling exists for (see "Why the raw
 CRUSH mapping matters" in the script's module docstring).
 
 Captured: 2026-08-17 ~06:17 from a live cluster, via:
@@ -24,15 +24,15 @@ validation would silently drop, since 263 was never CRUSH's own pick).
 
 Verified against the live cluster: running the script reports 6
 backfill_toofull PGs cluster-wide, 6 shards to divert, 0 unplaceable, and 4
-of the 6 proposals flagged with FROM_OSD '*'. Table output:
+of the 6 proposals flagged with UP_OSD '*'. Table output:
 
-  PGID     SHARD  FROM_OSD  FROM_HOST  FROM_UTIL  TARGET_OSD  TARGET_HOST  TGT_UTIL  VACATED  EXISTING_UPMAPS
-  19.7be   1      osd.263   host12     87.6%      osd.842     host36       86.9%     osd.863  554->687
-  19.bd5   8      osd.263*  host12     87.6%      osd.829     host34       87.0%     osd.625  344->570,625->263
-  19.d85   9      osd.263   host12     87.6%      osd.617     host11       87.0%     osd.189  243->618,154->668
-  19.118a  2      osd.263*  host12     87.6%      osd.446     host26       87.0%     osd.618  818->151,618->263
-  19.122e  7      osd.263*  host12     87.6%      osd.813     host35       87.0%     osd.487  866->356,487->263
-  19.1ce0  0      osd.263*  host12     87.6%      osd.45      host11       87.0%     osd.723  655->454,575->831,723->263
+  PGID     SHARD  ACTING_OSD  ACTING_UTIL  ACTING_HOST  UP_OSD    UP_UTIL  UP_HOST  TARGET_OSD  TARGET_UTIL  TARGET_HOST  EXISTING_UPMAPS
+  19.7be   1      osd.863     88.4%        host35       osd.263   87.6%    host12   osd.842     86.9%        host36       554->687
+  19.bd5   8      osd.625     88.7%        host27       osd.263*  87.6%    host12   osd.829     87.0%        host34       344->570,625->263
+  19.d85   9      osd.189     87.8%        host30       osd.263   87.6%    host12   osd.617     87.0%        host11       243->618,154->668
+  19.118a  2      osd.618     88.4%        host13       osd.263*  87.6%    host12   osd.446     87.0%        host26       818->151,618->263
+  19.122e  7      osd.487     88.7%        host12       osd.263*  87.6%    host12   osd.813     87.0%        host35       866->356,487->263
+  19.1ce0  0      osd.723     88.7%        host27       osd.263*  87.6%    host12   osd.45      87.0%        host11       655->454,575->831,723->263
 
 19.7be and 19.d85 are unflagged: their EXISTING_UPMAPS pairs don't have 263
 as a 'to', so osd.263 there really is CRUSH's own raw pick.
