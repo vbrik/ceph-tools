@@ -111,8 +111,7 @@ are applied.
 The cap is checked against the same current 'ceph osd df' figure the ranking
 and the TARGET UTIL column use, so it does not account for the shard about
 to be added; lower it if you want headroom for that. Set too low it simply
-leaves shards unplaceable — which is the honest answer when the cluster has
-nowhere to put them: such a shard needs capacity, not a different upmap.
+leaves shards unplaceable.
 
 A shard is only offered candidates of its *own* device class, that of the OSD
 it is arriving on. Pools' CRUSH rules are typically class-constrained, so an
@@ -128,12 +127,13 @@ Each chosen OSD is removed from its class's candidate pool, so no two shards
 are sent to the same OSD. If a PG has several diverted shards, each target
 host is added to that PG's exclusion set before its next shard is placed.
 
-That one-target-per-OSD rule can genuinely run out: a cluster-wide run may
-have more stuck shards than there are usable OSDs in a class, in which case
-the tail is reported as unplaceable rather than doubled up. With the default
-cap in place, running out means the cluster is out of room below
-backfillfull_ratio, so the remedy is capacity (or a drain-and-re-run), not a
-longer proposal list. Shards are processed in PG id order, so the lowest
+That one-target-per-OSD rule can run out: a cluster-wide run may have more
+stuck shards than there are usable OSDs in a class, in which case the tail is
+left unplaced rather than doubled up. Shards that get no target are listed on
+stderr after the table (not in --pgremapper mode), without a reason: that the
+greedy pass found nothing is a limitation of this heuristic, and a suitable
+OSD may well exist. Applying the proposals, letting them drain and re-running
+is the usual next step. Shards are processed in PG id order, so the lowest
 pool ids get the emptiest targets; the ordering is fixed rather than fair,
 which is what makes re-runs reproducible.
 
@@ -345,7 +345,7 @@ def parse_args() -> argparse.Namespace:
         "so a proposal is never aimed at an OSD Ceph would already refuse; "
         "pass 100 to disable the cap. Uses the current 'ceph osd df' "
         "utilization, without the shard being moved; shards left with no "
-        "eligible target are reported as unplaceable.",
+        "eligible target are listed after the table.",
     )
     state_group = parser.add_mutually_exclusive_group()
     state_group.add_argument(
@@ -1070,6 +1070,26 @@ def print_table(rows: list[list[str]]) -> None:
         emit(row)
 
 
+def print_unplaceable(unplaceable: list[DivertedShard]) -> None:
+    """List the shards no target was found for, on stderr after the table.
+
+    A caveat line followed by one line of '<pgid>:<shard>' items, so a big
+    run does not bury the table's tail. Deliberately says nothing about why:
+    the heuristic gave up on these, but that does not mean no legal placement
+    exists, only that finding one is beyond what this script implements.
+    """
+    print(
+        f"{len(unplaceable)} shard(s) could not be placed. This is a "
+        "limitation of the heuristic used here, not proof that no suitable "
+        "OSD exists; finding one is not implemented (<pgid>:<shard>):",
+        file=sys.stderr,
+    )
+    print(
+        ", ".join(f"{shard.pgid}:{shard.shard}" for shard in unplaceable),
+        file=sys.stderr,
+    )
+
+
 def print_pgremapper(proposals: list[Proposal]) -> None:
     """Print one '<pgid> <from osd> <target osd>' line per proposal.
 
@@ -1187,18 +1207,9 @@ def main() -> None:
         else:
             print_table([format_row(p, osd_host, osd_df) for p in proposals])
 
-    for shard in unplaceable:
-        print(
-            f"WARNING: no legal target left for {shard.pgid} shard "
-            f"{shard.shard} (arriving on osd.{shard.up_osd}, class "
-            f"{osd_class(osd_df, shard.up_osd) or 'unknown'}) — every "
-            f"candidate OSD of that class is above --max-target-util "
-            f"{max_target_util:g}%, on a host already in the PG's up set, "
-            f"already in the PG's CRUSH mapping, or already taken by another "
-            f"diverted shard (there may also be no candidate of that class "
-            f"at all)",
-            file=sys.stderr,
-        )
+    # --pgremapper output is meant for scripts, so it gets no such list.
+    if unplaceable and not args.pgremapper:
+        print_unplaceable(unplaceable)
 
     # Only reachable when the cap was raised past backfillfull_ratio: these
     # proposals aim at OSDs Ceph already refuses to backfill onto, so they
@@ -1223,8 +1234,7 @@ def main() -> None:
             "NOTE: each target OSD is used at most once, so a run with more "
             "stuck shards than there are OSDs below --max-target-util will "
             "leave a tail unplaceable. Apply these, let them drain, then "
-            "re-run; if a re-run places nothing, the cluster is out of room "
-            "and needs capacity rather than more upmaps.",
+            "re-run.",
             file=sys.stderr,
         )
 

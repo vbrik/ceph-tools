@@ -79,8 +79,9 @@ other environments.
   feed to `pgremapper remap` (via `xargs -a remaps.txt -L1 …`), which merges
   into a PG's existing `pg_upmap_items` — apply with it rather than by hand
   with `ceph osd pg-upmap-items`, which replaces the whole entry. Each target
-  OSD is used at most once, so a large run may report a tail as unplaceable;
-  apply, drain, re-run.
+  OSD is used at most once, so a large run may leave a tail unplaced; those
+  PG/shards are listed on stderr after the table (a limitation of the
+  heuristic, not proof that no OSD would do); apply, drain, re-run.
   Two safety thresholds default to the cluster's own ratios and can be
   overridden. `--min-up-util PERCENT` (default `nearfull_ratio`) only
   diverts a shard whose arriving OSD is that full: `backfill_toofull` is a

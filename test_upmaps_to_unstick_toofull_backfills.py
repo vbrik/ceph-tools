@@ -391,6 +391,36 @@ def percent(cell):
     return float(cell.rstrip("%"))
 
 
+class PrintUnplaceableTest(unittest.TestCase):
+    def capture(self, shards):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ut.print_unplaceable(shards)
+        return err.getvalue().splitlines()
+
+    def test_lists_all_shards_on_one_line_under_a_heuristic_caveat(self):
+        shards = [
+            ut.DivertedShard("9.2", 1, 882, None, [882]),
+            ut.DivertedShard("19.21f", 0, 882, 406, [882]),
+            ut.DivertedShard("19.21f", 3, 883, None, [883]),
+        ]
+        lines = self.capture(shards)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[1], "9.2:1, 19.21f:0, 19.21f:3")
+        self.assertIn("3 shard(s) could not be placed", lines[0])
+        self.assertIn("limitation of the heuristic", lines[0])
+
+    def test_replicated_shard_is_shown_as_a_dash(self):
+        lines = self.capture([ut.DivertedShard("1.0", "-", 5, None, [5])])
+        self.assertEqual(lines[1], "1.0:-")
+
+    def test_gives_no_specific_reason(self):
+        lines = self.capture([ut.DivertedShard("1.0", 0, 5, None, [5])])
+        text = "\n".join(lines)
+        for reason in ("--max-target-util", "up set", "CRUSH mapping", "capacity"):
+            self.assertNotIn(reason, text)
+
+
 class FixtureReplayTest(unittest.TestCase):
     """End-to-end --load-state runs, checked against the fixtures' READMEs."""
 
@@ -574,6 +604,37 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
             for r in self.rows
         ]
         self.assertEqual(lines, expected)
+
+    def test_unplaceable_shards_are_listed_once_after_the_table(self):
+        lines = self.proc.stderr.splitlines()
+        header = next(i for i, ln in enumerate(lines) if "could not be placed" in ln)
+        self.assertIn(
+            f"{CEPH2_UNPLACEABLE} shard(s) could not be placed. This is a "
+            "limitation of the heuristic",
+            lines[header],
+        )
+        # One line holding every item.
+        self.assertEqual(len(lines[header + 1].split(", ")), CEPH2_UNPLACEABLE)
+        # The old one-WARNING-per-shard flood is gone.
+        self.assertNotIn("no legal target left", self.proc.stderr)
+
+    def test_pgremapper_mode_does_not_list_unplaceable_shards(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--load-state",
+                os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                "--pgremapper",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertNotIn("could not be placed", proc.stderr)
+        self.assertNotRegex(proc.stderr, r"\d+\.\w+:\d+, ")
+        # The summary count is still reported.
+        self.assertIn(f"{CEPH2_UNPLACEABLE} unplaceable", proc.stderr)
 
 
 class UnknownPoolTest(unittest.TestCase):

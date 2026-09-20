@@ -57,8 +57,8 @@ The table is 480 rows, too long to quote here the way the small fixtures
 do, so the test asserts those counts and invariants instead of an exact
 table (see FixtureReplayTest in
 test_upmaps_to_unstick_toofull_backfills.py). The 496 unplaceable shards
-are the honest answer: this cluster has no room below backfillfull_ratio
-for them, so they need capacity rather than a different upmap.
+are listed on stderr after the table, without a reason: the heuristic found
+no target for them, which does not prove none exists.
 
 For reference, the pre-threshold behavior is still reachable and is what
 the invariant test guards against regressing to:
