@@ -216,6 +216,7 @@ def pg_progress_pct(pg: dict) -> "float | None":
     pct = 100.0 * (1 - remaining / total)
     return max(0.0, min(100.0, pct))
 
+
 # State flags that indicate active or pending data movement.
 # A PG can be in multiple states simultaneously (e.g. degraded+backfilling).
 _RECOVERY_FLAGS = {"recovering", "recovery_wait", "recovery_toofull"}
@@ -391,8 +392,15 @@ def main() -> None:
                 sources = frozenset() if source is None else frozenset({source})
                 rows.append(
                     MovementRow(
-                        pgid, i, sources, frozenset({destination}), mtype,
-                        state, primary, False, progress,
+                        pgid,
+                        i,
+                        sources,
+                        frozenset({destination}),
+                        mtype,
+                        state,
+                        primary,
+                        False,
+                        progress,
                     )
                 )
         else:
@@ -426,8 +434,15 @@ def main() -> None:
 
             rows.append(
                 MovementRow(
-                    pgid, "-", frozenset(sources), frozenset(destinations),
-                    mtype, state, primary, needs_primary_marker, progress,
+                    pgid,
+                    "-",
+                    frozenset(sources),
+                    frozenset(destinations),
+                    mtype,
+                    state,
+                    primary,
+                    needs_primary_marker,
+                    progress,
                 )
             )
 
@@ -457,7 +472,9 @@ def main() -> None:
 
     used_primary_marker = False
 
-    def fmt_from(sources: frozenset, primary, needs_primary_marker: bool = False) -> str:
+    def fmt_from(
+        sources: frozenset, primary, needs_primary_marker: bool = False
+    ) -> str:
         """
         FROM_OSD cell. Normally the OSD(s) actually losing data. When
         empty (pure degraded recovery — the shard/replica slot was

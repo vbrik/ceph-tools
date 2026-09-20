@@ -40,7 +40,9 @@ def rctime_checker(
                 need_ctime_checked_buffer.append(entry.path)
                 try:
                     if entry.is_dir(follow_symlinks=False):
-                        rctime = os.getxattr(entry.path, "ceph.dir.rctime", follow_symlinks=False)
+                        rctime = os.getxattr(
+                            entry.path, "ceph.dir.rctime", follow_symlinks=False
+                        )
                         if float(rctime) >= min_rctime:
                             need_rctime_checked_buffer.append(entry.path)
                 except FileNotFoundError:
@@ -57,7 +59,9 @@ def rctime_checker(
         need_rctime_checked.task_done()
 
 
-def ctime_checker(min_ctime: float, need_ctime_checked: JoinableQueue, ctime_matches: ListProxy):
+def ctime_checker(
+    min_ctime: float, need_ctime_checked: JoinableQueue, ctime_matches: ListProxy
+):
     while True:
         paths_batch = need_ctime_checked.get()
 
@@ -95,16 +99,25 @@ def main():
     )
     parser.add_argument("root_path", metavar="PATH", help="Where to look for files")
     parser.add_argument(
-        "--min-ctime", metavar="DATE", required=True, help="Minimum ctime in a reasonable format²"
+        "--min-ctime",
+        metavar="DATE",
+        required=True,
+        help="Minimum ctime in a reasonable format²",
     )
     parser.add_argument(
         "--relative", action="store_true", help="print matching paths relative to PATH"
     )
     parser.add_argument(
-        "--parents", action="store_true", help="print only parent directories of matches"
+        "--parents",
+        action="store_true",
+        help="print only parent directories of matches",
     )
     parser.add_argument(
-        "--threads", metavar="NUM", type=int, default=64, help="number of threads to use³"
+        "--threads",
+        metavar="NUM",
+        type=int,
+        default=64,
+        help="number of threads to use³",
     )
     args = parser.parse_args()
 
@@ -125,7 +138,8 @@ def main():
 
     rctime_checkers = [
         Process(
-            target=rctime_checker, args=(min_ctime, need_rctime_checked, need_ctime_checked, 100)
+            target=rctime_checker,
+            args=(min_ctime, need_rctime_checked, need_ctime_checked, 100),
         )
         for _ in range(args.threads // 2)
     ]
@@ -134,7 +148,9 @@ def main():
     # Output structure
     ctime_matches = Manager().list()
     ctime_checkers = [
-        Process(target=ctime_checker, args=(min_ctime, need_ctime_checked, ctime_matches))
+        Process(
+            target=ctime_checker, args=(min_ctime, need_ctime_checked, ctime_matches)
+        )
         for _ in range(args.threads // 2)
     ]
     [p.start() for p in ctime_checkers]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Show CephFS clients with the highest load, live from the cluster.
-"""
+"""Show CephFS clients with the highest load, live from the cluster."""
+
 import argparse
 import collections
 import json
@@ -15,13 +15,13 @@ import time
 
 # A client with this hostname hasn't reported a real one (e.g. it mounted
 # over loopback); fall back to a reverse DNS lookup of its IP instead.
-LOCALHOST_NAMES = {'localhost', 'localhost.localdomain'}
-DOMAIN_SUFFIX = '.icecube.wisc.edu'
+LOCALHOST_NAMES = {"localhost", "localhost.localdomain"}
+DOMAIN_SUFFIX = ".icecube.wisc.edu"
 
 
 def ceph_cmd(args):
     """Run a `ceph` CLI command and return its parsed JSON output."""
-    result = subprocess.run(['ceph'] + args, capture_output=True, text=True)
+    result = subprocess.run(["ceph"] + args, capture_output=True, text=True)
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
         sys.exit(result.returncode)
@@ -30,27 +30,27 @@ def ceph_cmd(args):
 
 def get_active_ranks():
     """Return the sorted list of MDS ranks currently 'in' any filesystem."""
-    data = ceph_cmd(['fs', 'dump', '--format', 'json'])
+    data = ceph_cmd(["fs", "dump", "--format", "json"])
     ranks = set()
-    for fs in data.get('filesystems', []):
-        ranks.update(fs.get('mdsmap', {}).get('in', []))
+    for fs in data.get("filesystems", []):
+        ranks.update(fs.get("mdsmap", {}).get("in", []))
     return sorted(ranks)
 
 
 def get_ip(session):
-    addr = session.get('entity', {}).get('addr', {}).get('addr', '')
-    return addr.rsplit(':', 1)[0] if addr else None
+    addr = session.get("entity", {}).get("addr", {}).get("addr", "")
+    return addr.rsplit(":", 1)[0] if addr else None
 
 
 def get_hostname(meta, ip):
-    hostname = meta.get('hostname')
+    hostname = meta.get("hostname")
     if hostname in LOCALHOST_NAMES and ip:
         try:
             hostname = socket.gethostbyaddr(ip)[0]
         except socket.herror:
             hostname = ip
     if hostname and hostname.endswith(DOMAIN_SUFFIX):
-        hostname = hostname[:-len(DOMAIN_SUFFIX)]
+        hostname = hostname[: -len(DOMAIN_SUFFIX)]
     return hostname
 
 
@@ -59,27 +59,27 @@ def get_caps_value(session, key):
     # {"value": ..., "halflife": ...} on some ceph versions and plain
     # numbers on others; handle both without caring which.
     val = session.get(key)
-    return val.get('value') if isinstance(val, dict) else val
+    return val.get("value") if isinstance(val, dict) else val
 
 
 def build_row(rank, session):
     """Flatten one `session ls` entry into the fixed set of display columns."""
-    meta = session.get('client_metadata', {})
+    meta = session.get("client_metadata", {})
     ip = get_ip(session)
     return {
-        'rank': rank,
-        'id': session.get('id'),
-        'hostname': get_hostname(meta, ip),
-        'ip': ip,
-        'request_load_avg': session.get('request_load_avg'),
-        'num_leases': session.get('num_leases'),
-        'num_caps': session.get('num_caps'),
-        'requests_in_flight': session.get('requests_in_flight'),
-        'num_completed_requests': session.get('num_completed_requests'),
-        'num_completed_flushes': session.get('num_completed_flushes'),
-        'recall_caps': get_caps_value(session, 'recall_caps'),
-        'release_caps': get_caps_value(session, 'release_caps'),
-        'mount_point': meta.get('root'),
+        "rank": rank,
+        "id": session.get("id"),
+        "hostname": get_hostname(meta, ip),
+        "ip": ip,
+        "request_load_avg": session.get("request_load_avg"),
+        "num_leases": session.get("num_leases"),
+        "num_caps": session.get("num_caps"),
+        "requests_in_flight": session.get("requests_in_flight"),
+        "num_completed_requests": session.get("num_completed_requests"),
+        "num_completed_flushes": session.get("num_completed_flushes"),
+        "recall_caps": get_caps_value(session, "recall_caps"),
+        "release_caps": get_caps_value(session, "release_caps"),
+        "mount_point": meta.get("root"),
     }
 
 
@@ -92,21 +92,22 @@ def build_row(rank, session):
 # design; --hide just removes columns, it never reorders them).
 # --------------------------------------------------------------------------
 
-Column = collections.namedtuple('Column', ['name', 'header', 'formatter', 'align'])
+Column = collections.namedtuple("Column", ["name", "header", "formatter", "align"])
 
 
 def fmt_int(value):
-    return '-' if value is None else str(value)
+    return "-" if value is None else str(value)
 
 
 def fmt_float(decimals):
     def _fmt(value):
-        return '-' if value is None else f'{value:.{decimals}f}'
+        return "-" if value is None else f"{value:.{decimals}f}"
+
     return _fmt
 
 
 def fmt_str(value):
-    return value if value else '-'
+    return value if value else "-"
 
 
 DEFAULT_MOUNT_POINT_WIDTH = 80
@@ -118,17 +119,19 @@ def truncate_middle(text, width):
         return text
     if width <= 3:
         return text[:width]
-    keep = width - len('...')
+    keep = width - len("...")
     left, right = -(-keep // 2), keep // 2  # left gets the extra char on odd widths
-    return text[:left] + '...' + (text[-right:] if right else '')
+    return text[:left] + "..." + (text[-right:] if right else "")
 
 
 def fmt_path(width):
     """Build a mount-point formatter; width=None disables truncation."""
+
     def _fmt(value):
         if not value:
-            return '-'
+            return "-"
         return value if width is None else truncate_middle(value, width)
+
     return _fmt
 
 
@@ -142,19 +145,19 @@ def build_columns(full_mount_point=False):
     """
     mount_point_width = None if full_mount_point else DEFAULT_MOUNT_POINT_WIDTH
     return [
-        Column('rank', 'mds\nrank', fmt_int, '>'),
-        Column('id', 'id', fmt_int, '>'),
-        Column('hostname', 'hostname', fmt_str, '<'),
-        Column('ip', 'ip', fmt_str, '<'),
-        Column('request_load_avg', 'request\nload avg', fmt_float(2), '>'),
-        Column('num_leases', 'num\nleases', fmt_int, '>'),
-        Column('num_caps', 'num\ncaps', fmt_int, '>'),
-        Column('requests_in_flight', 'requests\nin flight', fmt_int, '>'),
-        Column('num_completed_requests', 'num\ncompleted\nrequests', fmt_int, '>'),
-        Column('num_completed_flushes', 'num\ncompleted\nflushes', fmt_int, '>'),
-        Column('recall_caps', 'recall\ncaps', fmt_float(1), '>'),
-        Column('release_caps', 'release\ncaps', fmt_float(1), '>'),
-        Column('mount_point', 'mount point', fmt_path(mount_point_width), '<'),
+        Column("rank", "mds\nrank", fmt_int, ">"),
+        Column("id", "id", fmt_int, ">"),
+        Column("hostname", "hostname", fmt_str, "<"),
+        Column("ip", "ip", fmt_str, "<"),
+        Column("request_load_avg", "request\nload avg", fmt_float(2), ">"),
+        Column("num_leases", "num\nleases", fmt_int, ">"),
+        Column("num_caps", "num\ncaps", fmt_int, ">"),
+        Column("requests_in_flight", "requests\nin flight", fmt_int, ">"),
+        Column("num_completed_requests", "num\ncompleted\nrequests", fmt_int, ">"),
+        Column("num_completed_flushes", "num\ncompleted\nflushes", fmt_int, ">"),
+        Column("recall_caps", "recall\ncaps", fmt_float(1), ">"),
+        Column("release_caps", "release\ncaps", fmt_float(1), ">"),
+        Column("mount_point", "mount point", fmt_path(mount_point_width), "<"),
     ]
 
 
@@ -163,7 +166,7 @@ COLUMN_NAMES = [c.name for c in build_columns()]
 
 def parse_column_list(value):
     """Split a comma-separated --sort/--hide value into column names."""
-    return [item.strip() for item in value.split(',') if item.strip()]
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def sort_rows(rows, sort_keys):
@@ -188,11 +191,11 @@ def sort_rows(rows, sort_keys):
 
 def print_table(columns, rows):
     """Render rows as a plain-text table with (possibly multi-line) headers."""
-    header_lines = [c.header.split('\n') for c in columns]
+    header_lines = [c.header.split("\n") for c in columns]
     height = max((len(h) for h in header_lines), default=1)
     # Top-pad shorter headers with blank lines so all headers bottom-align
     # against the separator line below them.
-    header_lines = [[''] * (height - len(h)) + h for h in header_lines]
+    header_lines = [[""] * (height - len(h)) + h for h in header_lines]
 
     formatted_rows = [[c.formatter(row[c.name]) for c in columns] for row in rows]
 
@@ -204,14 +207,14 @@ def print_table(columns, rows):
         widths.append(width)
 
     def render(cells):
-        return '  '.join(
-            text.rjust(widths[i]) if columns[i].align == '>' else text.ljust(widths[i])
+        return "  ".join(
+            text.rjust(widths[i]) if columns[i].align == ">" else text.ljust(widths[i])
             for i, text in enumerate(cells)
         )
 
     for line_idx in range(height):
         print(render([header_lines[i][line_idx] for i in range(len(columns))]))
-    print('  '.join('-' * w for w in widths))
+    print("  ".join("-" * w for w in widths))
     for r in formatted_rows:
         print(render(r))
 
@@ -227,7 +230,7 @@ Column notes:
     back capabilities vs. how many it's actually giving back. recall_caps
     high with release_caps not keeping up means the client is holding onto
     caps under MDS cache pressure, hurting the whole cluster.
-""".strip('\n')
+""".strip("\n")
 
 
 def print_column_notes(columns):
@@ -238,8 +241,8 @@ def print_column_notes(columns):
     """
     shown = {c.name for c in columns}
     pairs = [
-        {'num_completed_requests', 'num_completed_flushes'},
-        {'recall_caps', 'release_caps'},
+        {"num_completed_requests", "num_completed_flushes"},
+        {"recall_caps", "release_caps"},
     ]
     if any(shown & pair for pair in pairs):
         print()
@@ -250,9 +253,10 @@ def print_column_notes(columns):
 # Live query + optional caching
 # --------------------------------------------------------------------------
 
+
 def default_cache_path(rank):
-    tag = f'rank{rank}' if rank is not None else 'all-ranks'
-    return os.path.join(tempfile.gettempdir(), f'cephfs-load-top.{tag}.cache.json')
+    tag = f"rank{rank}" if rank is not None else "all-ranks"
+    return os.path.join(tempfile.gettempdir(), f"cephfs-load-top.{tag}.cache.json")
 
 
 # Bump whenever the on-disk cache payload's shape changes, so a cache file
@@ -274,7 +278,7 @@ def get_cluster_fsid():
     `ceph fsid` is a single lightweight monitor RPC, unlike `session ls`, so
     checking it doesn't undercut the point of caching.
     """
-    return ceph_cmd(['fsid', '--format', 'json'])['fsid']
+    return ceph_cmd(["fsid", "--format", "json"])["fsid"]
 
 
 def query_live(rank):
@@ -283,7 +287,8 @@ def query_live(rank):
     entries = []
     for r in ranks:
         entries.extend(
-            {'rank': r, 'session': s} for s in ceph_cmd(['tell', f'mds.{r}', 'session', 'ls'])
+            {"rank": r, "session": s}
+            for s in ceph_cmd(["tell", f"mds.{r}", "session", "ls"])
         )
     return entries
 
@@ -314,18 +319,23 @@ def load_session_entries(rank, cache_ttl, cache_file):
         try:
             with open(path) as f:
                 cached = json.load(f)
-            if (cached['version'] == CACHE_VERSION
-                    and cached['rank'] == rank
-                    and cached['fsid'] == fsid):
-                return cached['entries']
+            if (
+                cached["version"] == CACHE_VERSION
+                and cached["rank"] == rank
+                and cached["fsid"] == fsid
+            ):
+                return cached["entries"]
         except (json.JSONDecodeError, KeyError, TypeError, OSError):
             pass  # incompatible, corrupt, or unreadable cache file; fall through to a live query
 
     entries = query_live(rank)
     if fsid is None:
         fsid = get_cluster_fsid()
-    with open(path, 'w') as f:
-        json.dump({'version': CACHE_VERSION, 'fsid': fsid, 'rank': rank, 'entries': entries}, f)
+    with open(path, "w") as f:
+        json.dump(
+            {"version": CACHE_VERSION, "fsid": fsid, "rank": rank, "entries": entries},
+            f,
+        )
     return entries
 
 
@@ -334,75 +344,76 @@ def load_session_entries(rank, cache_ttl, cache_file):
 # point here ("see supported columns below") instead of repeating the list,
 # so there's a single source of truth to keep in sync with build_columns().
 EPILOG = (
-    'Supported columns (for --sort and --hide):\n'
-    '  ' + ', '.join(COLUMN_NAMES) + '\n'
+    "Supported columns (for --sort and --hide):\n  " + ", ".join(COLUMN_NAMES) + "\n"
 )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Show CephFS clients with the highest load, live from the cluster.',
+        description="Show CephFS clients with the highest load, live from the cluster.",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        '-r', '--rank',
+        "-r",
+        "--rank",
         type=int,
         default=None,
-        metavar='RANK',
-        help='Only query this MDS rank (default: query all active ranks, per `ceph fs dump`)',
+        metavar="RANK",
+        help="Only query this MDS rank (default: query all active ranks, per `ceph fs dump`)",
     )
     parser.add_argument(
-        '-n',
+        "-n",
         type=int,
         default=40,
-        metavar='N',
-        help='Show only the top N clients after sorting (default: 40; use 0 to show all)',
+        metavar="N",
+        help="Show only the top N clients after sorting (default: 40; use 0 to show all)",
     )
     parser.add_argument(
-        '-s', '--sort',
-        default='request_load_avg',
-        metavar='COLUMN[,COLUMN...]',
+        "-s",
+        "--sort",
+        default="request_load_avg",
+        metavar="COLUMN[,COLUMN...]",
         help=(
-            'Column(s) to sort by, highest first (default: request_load_avg). '
-            'Comma-separated for primary, secondary, ... keys. '
-            'See supported columns below.'
+            "Column(s) to sort by, highest first (default: request_load_avg). "
+            "Comma-separated for primary, secondary, ... keys. "
+            "See supported columns below."
         ),
     )
     parser.add_argument(
-        '--hide',
-        default='',
-        metavar='COLUMN[,COLUMN...]',
+        "--hide",
+        default="",
+        metavar="COLUMN[,COLUMN...]",
         help=(
-            'Column(s) to hide from the output. All columns are shown by default. '
-            'Comma-separated. See supported columns below.'
+            "Column(s) to hide from the output. All columns are shown by default. "
+            "Comma-separated. See supported columns below."
         ),
     )
     parser.add_argument(
-        '--cache-ttl',
+        "--cache-ttl",
         type=int,
         default=0,
-        metavar='SECONDS',
+        metavar="SECONDS",
         help=(
-            'Reuse cluster data for up to SECONDS seconds instead of always '
-            'querying live (default: 0, caching disabled)'
+            "Reuse cluster data for up to SECONDS seconds instead of always "
+            "querying live (default: 0, caching disabled)"
         ),
     )
     parser.add_argument(
-        '--cache-file',
+        "--cache-file",
         default=None,
-        metavar='PATH',
+        metavar="PATH",
         help=(
-            'Cache file to use with --cache-ttl (default: a fixed path under the '
-            'system temp directory, chosen based on --rank)'
+            "Cache file to use with --cache-ttl (default: a fixed path under the "
+            "system temp directory, chosen based on --rank)"
         ),
     )
     parser.add_argument(
-        '--full-mount-point',
-        action='store_true',
+        "--full-mount-point",
+        action="store_true",
         help=(
-            'Show the full mount point path. By default it is abbreviated to '
-            f'{DEFAULT_MOUNT_POINT_WIDTH} characters by cutting out the middle.'
+            "Show the full mount point path. By default it is abbreviated to "
+            f"{DEFAULT_MOUNT_POINT_WIDTH} characters by cutting out the middle."
         ),
     )
     args = parser.parse_args()
@@ -417,15 +428,17 @@ def main():
             parser.error(f"unknown --hide column '{key}'; see supported columns below")
 
     entries = load_session_entries(args.rank, args.cache_ttl, args.cache_file)
-    rows = [build_row(e['rank'], e['session']) for e in entries]
+    rows = [build_row(e["rank"], e["session"]) for e in entries]
     rows = sort_rows(rows, sort_keys)
     if args.n > 0:
-        rows = rows[:args.n]
+        rows = rows[: args.n]
 
-    columns = [c for c in build_columns(args.full_mount_point) if c.name not in hide_columns]
+    columns = [
+        c for c in build_columns(args.full_mount_point) if c.name not in hide_columns
+    ]
     print_table(columns, rows)
     print_column_notes(columns)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
