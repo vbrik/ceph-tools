@@ -68,37 +68,47 @@ other environments.
   `backfill_toofull` PG cluster-wide, finds each shard newly landing on an OSD
   full enough to be what is blocking it (in `up` but not `acting`), and picks
   the least-utilized OSD of that shard's own device class on a host not
-  already in the PG's `up` set and strictly emptier than the OSD the shard
-  was arriving on — a destination that satisfies the fault domain and has room
-  for the shard. Prints the proposed
-  remaps; changes nothing itself. Each row follows one shard's path, giving
-  the OSD, utilization and host at each step, under a two-line header whose
-  first line spans each group: `ACTING` where its data sits now, `UP` the
-  too-full OSD the stalled backfill is aimed at, `TARGET` the proposed
-  replacement. `--pgremapper` switches
-  the output to headerless `<pgid> <from osd> <target osd>` lines, ready to
-  feed to `pgremapper remap` (via `xargs -a remaps.txt -L1 …`), which merges
-  into a PG's existing `pg_upmap_items` — apply with it rather than by hand
-  with `ceph osd pg-upmap-items`, which replaces the whole entry. Each target
-  OSD is used at most once, so a large run may leave a tail unplaced; how
-  many is reported on stderr, in `--pgremapper` mode too (a limitation of the
-  heuristic, not proof that no OSD would do); apply, drain, re-run.
-  Two safety thresholds default to the cluster's own ratios and can be
-  overridden. `--min-up-util PERCENT` (default `nearfull_ratio`) only
-  diverts a shard whose arriving OSD is that full: `backfill_toofull` is a
-  property of the PG, not of each shard arriving on it, so without this a PG
-  with one wedged shard has all its healthy arrivals diverted too, spending
-  target OSDs that genuinely stuck shards then cannot get.
-  `--max-target-util PERCENT` (default `backfillfull_ratio` minus 1) drops OSDs above
-  that current utilization from consideration as targets, so a proposal is
-  never aimed at an OSD Ceph would already refuse; pass `100` to disable it,
-  and any proposal past `backfillfull_ratio` is counted and warned about on
-  stderr. `--save-state DIR` writes the run's cluster state as JSON,
-  anonymized so it can be shared, and `--load-state DIR` replays such a
-  capture offline with no cluster access. Handles EC pools per-shard and
-  replicated pools by set difference. See the script's module docstring for
-  the full explanation and caveats (`--help` summarizes and points there).
-  `upmaps-to-unstick-toofull-backfills.py [--pgremapper] [--min-up-util PERCENT] [--max-target-util PERCENT] [--save-state DIR | --load-state DIR]`
+  already in the PG's `up` set and strictly emptier than the OSD the shard was
+  arriving on — a destination that satisfies the fault domain and has room for
+  the shard. Prints the proposed remaps; changes nothing itself. Each row
+  follows one shard's path, giving the OSD, utilization and host at each step,
+  under a two-line header whose first line spans each group: `ACTING` where
+  its data sits now, `UP` the too-full OSD the stalled backfill is aimed at,
+  `TARGET` the proposed replacement. `--pgremapper` switches the output to
+  headerless `<pgid> <from osd> <target osd>` lines, ready to feed to
+  `pgremapper remap` (via `xargs -a remaps.txt -L1 …`), which merges into a
+  PG's existing `pg_upmap_items` — apply with it rather than by hand with
+  `ceph osd pg-upmap-items`, which replaces the whole entry. An OSD can be the
+  target of several shards: each shard's size is estimated from its PG
+  (`num_bytes`, divided by `k` for EC pools) and projected onto the target —
+  together with the shards already sent to it and every shard still arriving
+  there, stuck ones included until they are diverted — and an OSD stops being
+  used once that projection reaches `backfillfull_ratio`, or after
+  `--max-target-uses N` shards (default 5; 1 gives every OSD at most one). The
+  `TARGET PROJ` column shows that projection. Shards are placed
+  fullest-`ACTING`-OSD first, re-ranked as each placement relieves its source,
+  so the scarce room goes to the OSDs most urgent to relieve (shards with no
+  known acting OSD go last, and rows are printed in PG order regardless). A
+  large run may still leave a tail unplaced; how many is reported on stderr,
+  in `--pgremapper` mode too (a limitation of the heuristic, not proof that no
+  OSD would do); apply, drain, re-run. Two safety thresholds default to the
+  cluster's own ratios and can be overridden. `--min-up-util PERCENT` (default
+  `nearfull_ratio`) only diverts a shard whose arriving OSD is that full:
+  `backfill_toofull` is a property of the PG, not of each shard arriving on
+  it, so without this a PG with one wedged shard has all its healthy arrivals
+  diverted too, spending target OSDs that genuinely stuck shards then cannot
+  get. `--max-target-util PERCENT` (default `backfillfull_ratio` minus 1)
+  drops OSDs above that current utilization from consideration as targets, so
+  a proposal is never aimed at an OSD Ceph would already refuse; pass `100` to
+  disable it (the projection against `backfillfull_ratio` still applies).
+  `--save-state DIR` writes the run's cluster state as JSON, anonymized so it
+  can be shared, and `--load-state DIR` replays such a capture offline with no
+  cluster access. Handles EC pools per-shard and replicated pools by set
+  difference. See the script's module docstring for the full explanation and
+  caveats (`--help` summarizes and points there).
+  `upmaps-to-unstick-toofull-backfills.py [--pgremapper] [--min-up-util
+  PERCENT] [--max-target-util PERCENT] [--max-target-uses N] [--save-state DIR
+  | --load-state DIR]`
 
 - **`scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /
@@ -220,7 +230,8 @@ output against what each fixture's `README.txt` documents, so fixture and
 code cannot drift apart: the exact table for the small fixtures, and for the
 cluster-sized one (808 stuck PGs, 1513 arriving shards) the counts plus the
 invariants that matter — no target above `backfillfull_ratio` minus 1, no
-shard diverted off an OSD below `nearfull_ratio`, no target OSD used twice.
+target projected past `backfillfull_ratio`, no target used more than
+`--max-target-uses` times, no shard diverted off an OSD below `nearfull_ratio`.
 
 ## License
 

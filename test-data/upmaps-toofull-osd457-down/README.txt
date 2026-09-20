@@ -23,11 +23,14 @@ Verified against the live cluster: running the script (it needs no
 argument to say where to look -- it scans every backfill_toofull PG
 cluster-wide, not just osd.457's) correctly reports 1 backfill_toofull PG
 cluster-wide, 1 arriving shard, and proposes remapping 19.21f shard 7 from
-osd.625 to osd.849 (host35, 86.8% util). Table output:
+osd.625 to osd.849 (host35, 86.8% util, projected to reach 87.5% once
+the shard has landed; checked by hand: the PG's 1384102474816 bytes over
+k=8 is a 173 GB shard, 0.72% of osd.849's 24.1 TB, on top of its 86.80%).
+Table output:
 
-                   ---- ACTING ----    --------- UP ---------    ------- TARGET -------
-  PGID    SHARD    OSD   UTIL  HOST    OSD      UTIL   HOST      OSD      UTIL   HOST
-  19.21f  7        none  -     -       osd.625  89.4%  host27    osd.849  86.8%  host35
+                   ---- ACTING ----    --------- UP ---------    ----------- TARGET ----------
+  PGID    SHARD    OSD   UTIL  HOST    OSD      UTIL   HOST      OSD      UTIL   PROJ   HOST
+  19.21f  7        none  -     -       osd.625  89.4%  host27    osd.849  86.8%  87.5%  host35
 
 This fixture also pins down where --min-up-util draws its line.
 osd.625 is at 89.4% against this cluster's backfillfull_ratio of 0.90, so

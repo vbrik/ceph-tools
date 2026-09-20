@@ -37,8 +37,8 @@ backfill_toofull is a property of the PG, not of each of its arriving
 shards. A ten-shard PG may have one shard wedged on a full host and the rest
 backfilling perfectly well, so "this PG is stuck" does not license diverting
 everything it is currently taking on. Diverting the healthy ones is worse
-than wasted motion: target OSDs are consumed from one cluster-wide pool (see
-below), so a spurious diversion takes a slot that a genuinely stuck shard
+than wasted motion: the room on target OSDs is one cluster-wide supply (see
+below), so a spurious diversion uses up room that a genuinely stuck shard
 then cannot get.
 
 Ceph does not report which shard was refused, so the arriving OSD's
@@ -64,8 +64,8 @@ instead, with SHARD shown as '-'.
 Which way a row points
 ----------------------
 The table's header has two lines: a group name (ACTING, UP or TARGET) spanning
-each OSD/UTIL/HOST triple, named for the set the OSD came from. The groups
-are ordered along the shard's path:
+each OSD/UTIL/HOST triple (TARGET adds a PROJ column, see below), named for
+the set the OSD came from. The groups are ordered along the shard's path:
 
   ACTING OSD  where the shard's data is right now — the backfill's source
   UP OSD      where CRUSH wants it: the arriving OSD, full enough (see
@@ -93,56 +93,110 @@ full enough to be a candidate for it (see "How PGs are identified").
 How targets are chosen
 ----------------------
 Candidates are OSDs that are up, in (reweight > 0), have a non-zero CRUSH
-weight, have a known device class and sit at or below --max-target-util,
+weight, a known device class and a known capacity (without one nothing can be
+projected onto them) and sit at or below --max-target-util,
 grouped by that class and sorted by utilization ascending within each class
 (OSD id breaks ties, so re-runs are reproducible). Down and out OSDs are
 excluded by those filters, which also keeps an out OSD from sorting *first*
 — 'ceph osd df' reports one at 0% utilization.
 
 --max-target-util PERCENT additionally drops every OSD whose current
-utilization is above PERCENT, so a target is never one that is itself
-already too full to accept the shard. It defaults to the cluster's
-backfillfull_ratio minus one percentage point, because without a cap the
-ranking is purely relative: on a uniformly full cluster "least utilized"
-degrades to "least catastrophic", the pool is drawn down until the tail of a
-run is targeting OSDs Ceph would refuse outright, and those remaps re-wedge
-the moment they are applied. The point of margin is because Ceph refuses on
-the target's *projected* usage (see --min-up-util above): an OSD just under
-backfillfull_ratio passes today's check yet may have no room for the shard.
-
-The cap is checked against the same current 'ceph osd df' figure the ranking
-and the TARGET UTIL column use, so it does not account for the shard about
-to be added; lower it if you want headroom for that. Set too low it simply
-leaves shards unplaceable.
+utilization is above PERCENT. It defaults to the cluster's backfillfull_ratio
+minus one percentage point and is a coarse pre-filter: it keeps the shortlist
+to OSDs a clear margin below the ratio, which absorbs the error in the shard
+size estimate and in the backfills the projection cannot see (see "How
+utilization is projected"). It is not what stops a proposal from re-wedging:
+the projection never lets a target reach backfillfull_ratio, however high
+this is set. Raised to backfillfull_ratio it only admits the OSDs so large
+that a shard still fits under the ratio. Set too low it simply leaves shards
+unplaceable.
 
 A shard is only offered candidates of its *own* device class, that of the OSD
 it is arriving on. Pools' CRUSH rules are typically class-constrained, so an
 hdd shard sent to an ssd OSD would be an illegal placement.
 
-For each shard the least-utilized such candidate is taken whose host is not
-already used by the PG's 'up' set. The arriving OSD is itself a member of
-'up', so the host being diverted away from is always excluded — that is the
-whole point of the tool. A candidate is also rejected if it already appears in
-the PG's *raw* CRUSH mapping (see below), or if it is not strictly less
-utilized than the arriving OSD: a redirect must move the shard somewhere
-emptier than where it was headed. An arriving OSD with no utilization figure
-imposes no limit. Since candidates are ranked ascending, this only bites when
-even the emptiest eligible candidate is at least as full as the arriving OSD,
-and then the shard is left unplaced.
+For each shard, of the candidates whose host is not already used by the PG's
+'up' set, the one whose projected utilization is lowest is taken (see "How
+utilization is projected"). The arriving OSD is itself a member of 'up', so
+the host being diverted away from is always excluded — that is the whole
+point of the tool. A candidate is also rejected if it already appears in the
+PG's *raw* CRUSH mapping (see below), or if it is not strictly less utilized
+than the arriving OSD: a redirect must move the shard somewhere emptier than
+where it was headed. That comparison uses the current 'ceph osd df'
+utilization of both, and an arriving OSD with no utilization figure imposes
+no limit. When even the emptiest eligible candidate is at least as full as
+the arriving OSD, the shard is left unplaced. If a PG has several diverted
+shards, each target host is added to that PG's exclusion set before its next
+shard is placed.
 
-Each chosen OSD is removed from its class's candidate pool, so no two shards
-are sent to the same OSD. If a PG has several diverted shards, each target
-host is added to that PG's exclusion set before its next shard is placed.
+How utilization is projected
+----------------------------
+An OSD may be the target of several shards, but only up to --max-target-uses
+of them (default 5), and only while it has room. Ceph refuses a backfill on
+the target's *projected* usage, so each candidate's utilization is projected
+as it would be if the shard were placed on it:
 
-That one-target-per-OSD rule can run out: a cluster-wide run may have more
-stuck shards than there are usable OSDs in a class, in which case the tail is
-left unplaced rather than doubled up. The number of shards that get no target
-is reported on stderr after the table (in --pgremapper mode too), without a
-reason or a list: that the greedy pass found nothing is a limitation of this
-heuristic, and a suitable OSD may well exist. Applying the proposals, letting them drain and re-running
-is the usual next step. Shards are processed in PG id order, so the lowest
-pool ids get the emptiest targets; the ordering is fixed rather than fair,
-which is what makes re-runs reproducible.
+  - its usage in 'ceph osd df' (kb_used), plus
+  - the size of every shard arriving on it, plus
+  - the size of every shard already proposed onto it in this run.
+
+The arriving shards are on their way and are not in kb_used yet. They include
+the stuck shards about to be diverted, which count on their arriving OSD
+until they are: one that is diverted stops counting there, and one that ends
+up unplaceable never does, since it still lands where it was headed. This
+makes the projection depend on the order shards are processed (an OSD whose
+own stuck shard is diverted only later looks fuller to the shards placed
+before that), which errs on the safe side; applying, draining and re-running
+picks up what that left over.
+
+A candidate whose projection reaches backfillfull_ratio is not eligible for
+that shard, so an OSD stops being used once the next shard would fill it
+that far. The projection is what the TARGET PROJ column shows for each row:
+the target's utilization after this shard and all the ones above it have
+completed. That column is why an OSD that appears in several rows is not
+mistaken for one that appears once. Candidates are ranked by that same figure,
+lowest first (OSD id breaks ties), so an OSD is reused only as the others
+fill up.
+
+A shard's size is not reported by Ceph. It is estimated from the PG's
+logical size ('num_bytes'): all of it for a replicated pool, 1/k of it for an
+erasure-coded one, with k taken from the pool's erasure code profile. Omap,
+metadata and EC stripe padding are not counted, so the estimate is slightly
+low. The projection can still be optimistic: backfills that are not in
+backfill_toofull (running or waiting elsewhere) are not counted, though data
+leaving an OSD is not credited either.
+
+The cluster-wide run can still have more stuck shards than the targets have
+room for, in which case the tail is left unplaced. The number of shards that
+get no target is reported on stderr after the table (in --pgremapper mode
+too), without a reason or a list: that the greedy pass found nothing is a
+limitation of this heuristic, and a suitable OSD may well exist. Applying the
+proposals, letting them drain and re-running is the usual next step.
+--max-target-uses 1 gives every OSD at most one shard.
+
+In what order shards are placed
+-------------------------------
+Since room is scarce, who gets it matters, and it goes to the shards whose
+ACTING OSD (the one the data is being backfilled from) is fullest: those are
+the OSDs it is most urgent to relieve, and the ones nearest the cluster's
+full_ratio. Each turn takes the shard whose acting OSD is projected to be
+fullest. A redirect does not itself take data off the acting OSD, but it is
+what lets the stalled backfill finish, after which the acting OSD drops its
+copy; so placing a shard lowers its acting OSD's projected utilization by the
+shard's size, and that OSD's other shards then rank lower. The priority thus
+rotates between acting OSDs as shards are placed, where a fixed sort would
+spend all the room on the same few.
+
+That projection is kept apart from the target-side one above and never feeds
+into it: the space is only freed once the backfill has finished, while Ceph
+refuses a backfill when it reserves, so counting it as room on a target would
+be optimistic.
+
+A shard whose acting OSD is unknown (the usual out-OSD case, see above) has
+no such utilization and goes after every shard whose acting OSD is known. Ties,
+and a run where no acting OSD is known, are placed in PG id order, so the
+result is reproducible; the rows are printed in PG id order too, whatever
+order they were placed in.
 
 Why the raw CRUSH mapping matters
 ---------------------------------
@@ -204,13 +258,11 @@ only the rows go to stdout — everything else is on stderr — so it stays
 parseable.
 
 Those bare triples carry no utilization, so nothing in that format tells an
-operator how full a proposed target is. That is why the capacity check is a
-default rather than a flag to remember: by the time the output is being
+operator how full a proposed target is. That is why the capacity check is
+built in rather than a flag to remember: by the time the output is being
 piped into 'pgremapper remap', the only thing standing between the operator
-and a batch of remaps that re-wedge is --max-target-util. Raising it (or
-disabling it with --max-target-util 100) re-opens that gap, so the run
-counts any proposal at or above backfillfull_ratio and warns about it on
-stderr in both output formats.
+and a batch of remaps that re-wedge is the projection, which never lets a
+target reach backfillfull_ratio, whatever --max-target-util is set to.
 
 Apply the proposals with 'pgremapper remap', not by hand-writing 'ceph osd
 pg-upmap-items' commands. The table deliberately does not carry each PG's
@@ -249,10 +301,13 @@ pgremapper to skip the prompt and its dry-run entirely.)
 import argparse
 import copy
 import hashlib
+import heapq
 import json
+import math
 import re
 import subprocess
 import sys
+from collections import Counter, deque
 from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
@@ -270,6 +325,12 @@ POOL_TYPE_ERASURE = 3
 # direction for both of them.
 DEFAULT_NEARFULL_RATIO = 0.85
 DEFAULT_BACKFILLFULL_RATIO = 0.90
+
+# How many shards one OSD may be proposed as the target of (--max-target-uses).
+DEFAULT_MAX_TARGET_USES = 5
+
+# 'ceph osd df' reports sizes in KiB.
+KIB = 1024
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces
 # it and the '<key>.json' filename it is saved/loaded as under --save-state/
@@ -307,6 +368,14 @@ SAVE_STATE_DIR: Path | None = None
 # ---------------------------------------------------------------------------
 
 
+def positive_int(text: str) -> int:
+    """argparse type: an integer of at least 1."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Propose upmap re-targets that divert stuck "
@@ -315,6 +384,11 @@ def parse_args() -> argparse.Namespace:
         "full enough to be the one blocking it is offered the least-utilized "
         "OSD of its own device class that it could legally be moved to and "
         "that has room for it and is strictly emptier than the OSD it is arriving on. "
+        "Shards whose ACTING OSD is fullest are placed first. "
+        "An OSD may be the target of several shards, up to --max-target-uses, "
+        "for as long as its projected utilization (counting the shards "
+        "already sent to it and those still arriving on it) stays below "
+        "backfillfull_ratio. "
         "Both thresholds default to the cluster's own "
         "ratios: shards arriving below nearfull_ratio are left alone, and no "
         "OSD within a point of backfillfull_ratio is proposed as a target. Only "
@@ -352,8 +426,20 @@ def parse_args() -> argparse.Namespace:
         "PERCENT as targets. Defaults to the cluster's backfillfull_ratio - 1, "
         "so a proposal is never aimed at an OSD Ceph would already refuse; "
         "pass 100 to disable the cap. Uses the current 'ceph osd df' "
-        "utilization, without the shard being moved; the number of shards "
+        "utilization, without the shards being moved; the projection "
+        "against backfillfull_ratio applies regardless. The number of shards "
         "left with no eligible target is reported on stderr.",
+    )
+    parser.add_argument(
+        "--max-target-uses",
+        type=positive_int,
+        default=DEFAULT_MAX_TARGET_USES,
+        metavar="N",
+        help="Hard limit on how many shards may be redirected to one OSD "
+        "(default: %(default)s). Independently of this limit, an OSD stops "
+        "being used once receiving another shard would bring its projected "
+        "utilization to backfillfull_ratio; 1 gives every OSD at most one "
+        "shard.",
     )
     state_group = parser.add_mutually_exclusive_group()
     state_group.add_argument(
@@ -495,6 +581,11 @@ def fetch_pool_details() -> list[dict]:
 def ec_pool_ids_from(pools: list[dict]) -> set[int]:
     """Return the set of pool ids that are erasure-coded (type == 3)."""
     return {p["pool_id"] for p in pools if p.get("type") == POOL_TYPE_ERASURE}
+
+
+def fetch_ec_profiles() -> dict[str, dict]:
+    """Return {profile_name: profile} from 'ceph osd dump'."""
+    return _ceph_json("osd_dump").get("erasure_code_profiles", {})
 
 
 def fetch_crush_rules() -> dict[int, dict]:
@@ -767,6 +858,28 @@ def raw_crush_osds(up: list, upmap_pairs: list[dict]) -> set[int]:
     return {osd_id for osd_id in raw if _is_real_osd(osd_id)}
 
 
+def shard_size_bytes(pg: dict, pool: dict, ec_profiles: dict[str, dict]) -> int:
+    """Estimate the bytes one shard of a PG occupies on its OSD.
+
+    The PG's 'num_bytes' is its logical size: a replica holds all of it, an
+    EC shard 1/k of it (rounded up). Omap, metadata and EC stripe padding are
+    not counted, so this slightly underestimates.
+    """
+    num_bytes = pg["stat_sum"]["num_bytes"]
+    if pool.get("type") != POOL_TYPE_ERASURE:
+        return num_bytes
+    profile = pool.get("erasure_code_profile")
+    try:
+        k = int(ec_profiles[profile]["k"])
+    except KeyError:
+        sys.exit(
+            f"ERROR: pool {pool['pool_id']} uses erasure code profile "
+            f"{profile!r}, which 'ceph osd dump' does not describe (or "
+            "describes without 'k'), so the size of its shards is unknown."
+        )
+    return -(-num_bytes // k)
+
+
 class DivertedShard(NamedTuple):
     """A shard newly arriving on a host that is too full to take it."""
 
@@ -781,10 +894,18 @@ class DivertedShard(NamedTuple):
     # CRUSH_ITEM_NONE (the usual out-OSD case)
     up_set: list  # the PG's full up set, for host exclusions and for
     # reconstructing the raw CRUSH mapping
+    size_bytes: int = 0  # what the shard will occupy once backfilled, see
+    # shard_size_bytes; 0 means "not known", which projects no usage
 
 
-def find_diverted_shards(pg: dict, is_ec: bool) -> list[DivertedShard]:
-    """Return the shards of one PG that are newly arriving on their up OSD."""
+def find_diverted_shards(
+    pg: dict, is_ec: bool, size_bytes: int = 0
+) -> list[DivertedShard]:
+    """Return the shards of one PG that are newly arriving on their up OSD.
+
+    size_bytes is the size of each of them (all shards of a PG are the same
+    size), recorded on the result for the utilization projection.
+    """
     pgid = pg["pgid"]
     up = pg["up"]
     acting = pg["acting"]
@@ -799,19 +920,23 @@ def find_diverted_shards(pg: dict, is_ec: bool) -> list[DivertedShard]:
             acting_osd = _slot(acting, i)
             if up_osd is None or up_osd == acting_osd:
                 continue
-            found.append(DivertedShard(pgid, i, up_osd, acting_osd, up))
+            found.append(DivertedShard(pgid, i, up_osd, acting_osd, up, size_bytes))
     else:
         # Replicated: replicas are interchangeable, so position means nothing
         # and only the set difference is real movement.
         up_members = {o for o in up if _is_real_osd(o)}
         acting_members = {o for o in acting if _is_real_osd(o)}
         departing = sorted(acting_members - up_members)
-        for up_osd in sorted(up_members - acting_members):
-            # A replicated PG can have several arriving/departing replicas at
-            # once with no way to pair them up; name the acting OSD only when
-            # the pairing is unambiguous.
-            acting_osd = departing[0] if len(departing) == 1 else None
-            found.append(DivertedShard(pgid, "-", up_osd, acting_osd, up))
+        arriving = sorted(up_members - acting_members)
+        # A replicated PG can have several arriving/departing replicas at once
+        # with no way to pair them up; name the acting OSD only when exactly
+        # one replica is leaving and one arriving. With one leaving and
+        # several arriving, naming it on all of them would claim it holds
+        # several replicas (and would relieve it several times over).
+        pairing_is_clear = len(departing) == 1 and len(arriving) == 1
+        for up_osd in arriving:
+            acting_osd = departing[0] if pairing_is_clear else None
+            found.append(DivertedShard(pgid, "-", up_osd, acting_osd, up, size_bytes))
 
     return found
 
@@ -829,9 +954,9 @@ def select_stuck_shards(
     on is itself at or above min_up_util (see module docstring for why
     that defaults to nearfull_ratio and not backfillfull_ratio).
 
-    This is not merely cosmetic. Target OSDs are consumed from one
-    cluster-wide pool, so diverting a shard that was never blocked spends a
-    target that a genuinely stuck shard then cannot have.
+    This is not merely cosmetic. The room on target OSDs is one
+    cluster-wide supply, so diverting a shard that was never blocked uses up
+    room that a genuinely stuck shard then cannot have.
 
     Returns (stuck, skipped), preserving the input order in both.
     """
@@ -847,10 +972,14 @@ def select_stuck_shards(
     return stuck, skipped
 
 
+def pgid_pool_id(pgid: str) -> int:
+    """Return the pool id (decimal) of a PG id like '19.2a1'."""
+    return int(pgid.split(".")[0])
+
+
 def pgid_sort_key(pgid: str) -> tuple[int, int]:
     """Sort PG IDs numerically: pool id (decimal), then pg id (hex)."""
-    pool_str, pg_hex = pgid.split(".")
-    return (int(pool_str), int(pg_hex, 16))
+    return (pgid_pool_id(pgid), int(pgid.split(".")[1], 16))
 
 
 # ---------------------------------------------------------------------------
@@ -879,7 +1008,7 @@ def build_candidate_osds(
     excluded too.
 
     Keyed by device class because a shard may only be diverted to an OSD of
-    its own class (see module docstring); each class's pool is drawn down
+    its own class (see module docstring); each class's OSDs fill up
     independently.
     """
     usable = [
@@ -889,6 +1018,7 @@ def build_candidate_osds(
         and node.get("reweight", 0) > 0
         and node.get("crush_weight", 0) > 0
         and node.get("device_class")
+        and node.get("kb")  # capacity unknown: nothing can be projected onto it
         and node.get("utilization") is not None
         and (max_util is None or node["utilization"] <= max_util)
     ]
@@ -901,11 +1031,103 @@ def build_candidate_osds(
     return by_class
 
 
+def usage_and_capacity(
+    osd_df: dict[int, dict],
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Return ({osd: bytes used}, {osd: bytes of capacity}) from 'ceph osd df'.
+
+    OSDs with no capacity figure are left out of both: nothing can be
+    projected for them.
+    """
+    sized = {i: n for i, n in osd_df.items() if n.get("kb")}
+    return (
+        {i: n["kb_used"] * KIB for i, n in sized.items()},
+        {i: n["kb"] * KIB for i, n in sized.items()},
+    )
+
+
+class SourcePressure:
+    """How full each shard's ACTING OSD is projected to be, for ordering shards.
+
+    Target room is scarce, so which shards get it matters. The pressure a shard
+    is under is how full the OSD its data sits on is: relieving the fullest
+    ones first is what matters most. A redirect does not move data off that
+    OSD by itself, but it is what lets the stalled backfill finish, after
+    which the acting OSD drops its copy; so placing a shard lowers its acting
+    OSD's projected utilization by the shard's size (relieve()), and that OSD's
+    other shards then rank lower.
+
+    Deliberately separate from ProjectedUsage and never fed back into it:
+    that space frees up only once the backfill has finished, whereas Ceph
+    refuses a backfill at reservation time, so crediting it to a target would
+    be optimistic.
+    """
+
+    def __init__(self, osd_df: dict[int, dict]):
+        self._used, self._capacity = usage_and_capacity(osd_df)
+
+    def utilization(self, shard: DivertedShard) -> float:
+        """Return the shard's acting OSD's projected utilization (percent).
+
+        -inf when it is not known (the usual out-OSD case, where the acting
+        slot reads as empty), which ranks the shard behind every known one.
+        """
+        osd_id = shard.acting_osd
+        if osd_id not in self._used:
+            return -math.inf
+        return self._used[osd_id] / self._capacity[osd_id] * 100
+
+    def relieve(self, shard: DivertedShard) -> None:
+        """Record that shard is placed, so its acting OSD will lose it."""
+        if shard.acting_osd in self._used:
+            self._used[shard.acting_osd] -= shard.size_bytes
+
+
+class ProjectedUsage:
+    """What each OSD will hold once the backfills already in motion complete.
+
+    Starts from the usage 'ceph osd df' reports plus the size of every shard
+    still arriving on the OSD: those bytes are not in 'kb_used' yet, and it is
+    the emptiest OSDs, the ones most attractive as targets, that have the
+    most in flight. That includes the stuck shards this script is about to
+    divert: until one is actually diverted it is still headed for its OSD, so
+    a shard that ends up unplaceable keeps counting there. redirect() then
+    takes a diverted shard's size off the OSD it was headed for and puts it on
+    its target.
+
+    The counting is order-dependent: an OSD whose own stuck shard is diverted
+    only later in the run looks fuller to the shards placed before that.
+    That errs on the safe side, so the run leaves room for a re-run.
+
+    Not accounted for: data leaving an OSD (never credited) and backfills that
+    are not in backfill_toofull (unknown to this script), so the projection
+    can still be optimistic. Ceph itself refuses a backfill on the target's
+    projected usage rather than today's (see module docstring).
+    """
+
+    def __init__(self, osd_df: dict[int, dict], arriving: list[DivertedShard]):
+        self._used, self._capacity = usage_and_capacity(osd_df)
+        for shard in arriving:
+            if shard.up_osd in self._used:
+                self._used[shard.up_osd] += shard.size_bytes
+
+    def utilization_after(self, osd_id: int, extra_bytes: int) -> float:
+        """Return the OSD's projected utilization (percent) with extra_bytes more."""
+        return (self._used[osd_id] + extra_bytes) / self._capacity[osd_id] * 100
+
+    def redirect(self, shard: DivertedShard, target_osd: int) -> None:
+        """Record that shard goes to target_osd instead of its UP OSD."""
+        if shard.up_osd in self._used:
+            self._used[shard.up_osd] -= shard.size_bytes
+        self._used[target_osd] += shard.size_bytes
+
+
 class Proposal(NamedTuple):
     shard: DivertedShard
     target_osd: int
     target_host: str
-    target_utilization: float
+    target_utilization: float  # current, from 'ceph osd df'
+    target_projected: float  # once this and all earlier proposals have completed
 
 
 def assign_targets(
@@ -914,27 +1136,65 @@ def assign_targets(
     osd_host: dict[int, str],
     osd_df: dict[int, dict],
     upmap_items: dict[str, list[dict]],
+    *,
+    projection: ProjectedUsage,
+    max_uses: int,
+    backfillfull: float,
 ) -> tuple[list[Proposal], list[DivertedShard]]:
-    """Greedily give each diverted shard the least-utilized legal target.
+    """Greedily give each diverted shard the legal target that ends up emptiest.
 
     Legal means: same device class, host and OSD not already used by the PG,
-    and strictly less utilized than the shard's UP OSD. Returns (proposals, unplaceable
-    shards). Each target OSD is consumed from its device class's pool, so no
-    two shards are sent to the same OSD.
+    strictly less utilized than the shard's UP OSD (currently, as in
+    'ceph osd df'), not already the target of max_uses shards, and still
+    below backfillfull (percent) once this shard has been added to what the
+    projection says it will hold. Of the legal candidates the one with the
+    lowest such projected utilization wins (OSD id breaks ties), so
+    reusing an OSD only happens as the others fill up.
+
+    The shards are not taken in the order given: each turn takes the one whose
+    ACTING OSD is projected to be fullest (see SourcePressure), so the
+    scarce target room goes to relieving the fullest sources, and that
+    priority rotates as shards are placed. Ties, and shards whose acting OSD is
+    unknown, go in the order given, so the caller's order is what makes a run
+    reproducible. Returns (proposals, unplaceable shards), each in the order
+    given regardless of the order they were placed in.
     """
-    available = {cls: list(osds) for cls, osds in candidates.items()}
+    uses: Counter[int] = Counter()
+    pressure = SourcePressure(osd_df)
     # Hosts already spoken for per PG: seeded from the up set, then extended
     # as each of the PG's shards is placed, so a PG with two diverted shards
     # cannot be given two targets on one host.
     blocked_hosts: dict[str, set[str]] = {}
-    proposals = []
-    unplaceable = []
+    proposed: dict[int, Proposal] = {}
+    unplaceable = set()
 
-    for shard in shards:
-        forbidden_hosts = blocked_hosts.setdefault(
-            shard.pgid,
-            {osd_host.get(o) for o in shard.up_set if _is_real_osd(o)},
-        )
+    # A shard's priority is its acting OSD's utilization, and placing a shard
+    # changes that for that OSD's shards only. So shards are queued per acting
+    # OSD (each queue in the order given) and it is the queues that are
+    # ranked, in a heap holding exactly one entry per non-empty queue: no
+    # entry ever goes stale. Ranking is fullest first, the earliest waiting
+    # shard breaking ties, which is the same as picking the best shard
+    # overall.
+    queues: dict[int | None, deque[int]] = {}
+    for i, shard in enumerate(shards):
+        queues.setdefault(shard.acting_osd, deque()).append(i)
+    heap = [
+        (-pressure.utilization(shards[q[0]]), q[0], acting)
+        for acting, q in queues.items()
+    ]
+    heapq.heapify(heap)
+
+    while heap:
+        _, i, acting = heapq.heappop(heap)
+        queue = queues[acting]
+        queue.popleft()
+        shard = shards[i]
+
+        if shard.pgid not in blocked_hosts:
+            blocked_hosts[shard.pgid] = {
+                osd_host.get(o) for o in shard.up_set if _is_real_osd(o)
+            }
+        forbidden_hosts = blocked_hosts[shard.pgid]
         raw = raw_crush_osds(shard.up_set, upmap_items.get(shard.pgid, []))
         # 'up' alone is not enough: an OSD displaced by an existing upmap is
         # absent from 'up' but still in the raw mapping, and re-proposing it
@@ -945,33 +1205,52 @@ def assign_targets(
         # Only OSDs of the arriving OSD's own class are legal targets. An
         # unknown class yields an empty pool, so the shard falls through to
         # unplaceable rather than being sent somewhere CRUSH would reject.
-        pool = available.get(osd_class(osd_df, shard.up_osd), [])
+        pool = candidates.get(osd_class(osd_df, shard.up_osd), [])
         # A target must be strictly emptier than the OSD being diverted from,
         # or the redirect gains nothing. Unknown UP utilization cannot be
         # compared, so it imposes no limit (as in select_stuck_shards).
         max_util = osd_df.get(shard.up_osd, {}).get("utilization")
+        legal = []
         for candidate in pool:
             if osd_host.get(candidate) in forbidden_hosts:
                 continue
             if candidate in forbidden_osds:
                 continue
+            if uses[candidate] >= max_uses:
+                continue
             if max_util is not None and osd_df[candidate]["utilization"] >= max_util:
                 continue
-            pool.remove(candidate)
-            forbidden_hosts.add(osd_host.get(candidate))
-            proposals.append(
-                Proposal(
-                    shard,
-                    candidate,
-                    osd_host.get(candidate, "?"),
-                    osd_df[candidate]["utilization"],
-                )
-            )
-            break
-        else:
-            unplaceable.append(shard)
+            projected = projection.utilization_after(candidate, shard.size_bytes)
+            if projected >= backfillfull:
+                continue
+            legal.append((projected, candidate))
 
-    return proposals, unplaceable
+        if legal:
+            projected, target = min(legal)
+            projection.redirect(shard, target)
+            pressure.relieve(shard)
+            uses[target] += 1
+            forbidden_hosts.add(osd_host.get(target))
+            proposed[i] = Proposal(
+                shard,
+                target,
+                osd_host.get(target, "?"),
+                osd_df[target]["utilization"],
+                projected,
+            )
+        else:
+            unplaceable.add(i)
+
+        # The queue's rank may have changed (placing relieved it); requeue it.
+        if queue:
+            heapq.heappush(
+                heap, (-pressure.utilization(shards[queue[0]]), queue[0], acting)
+            )
+
+    return (
+        [proposed[i] for i in sorted(proposed)],
+        [shards[i] for i in sorted(unplaceable)],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -981,7 +1260,10 @@ def assign_targets(
 # Ordered so each row reads along the shard's path: where its data is now
 # (ACTING), where the stalled backfill is trying to put it (UP), and where
 # this script proposes it go instead (TARGET), with each OSD followed by its
-# utilization and host. Each entry is (group, label); the header is printed
+# utilization and host; TARGET also gets PROJ, the utilization it is projected
+# to reach once this and all earlier rows have completed (see ProjectedUsage),
+# which is what tells an OSD used by several rows apart from one used once.
+# Each entry is (group, label); the header is printed
 # on two lines, the group name spanning its columns above their labels, and
 # an empty group means the column has no group line. print_table leaves the
 # final column unpadded.
@@ -996,6 +1278,7 @@ COLUMNS = [
     ("UP", "HOST"),
     ("TARGET", "OSD"),
     ("TARGET", "UTIL"),
+    ("TARGET", "PROJ"),
     ("TARGET", "HOST"),
 ]
 
@@ -1038,6 +1321,7 @@ def format_row(
         osd_host.get(shard.up_osd, "?"),
         f"osd.{proposal.target_osd}",
         f"{proposal.target_utilization:.1f}%",
+        f"{proposal.target_projected:.1f}%",
         proposal.target_host,
     ]
 
@@ -1143,6 +1427,7 @@ def main() -> None:
     ec_pool_ids = ec_pool_ids_from(pools)
     toofull_pgs = fetch_backfill_toofull_pgs()
     crush_rules = fetch_crush_rules()
+    ec_profiles = fetch_ec_profiles()
 
     # All six SNAPSHOT_COMMANDS keys are now in _SNAPSHOT_CACHE (every
     # fetch_* above has run), so this is the earliest point an anonymized
@@ -1162,7 +1447,7 @@ def main() -> None:
         else args.max_target_util
     )
 
-    toofull_pool_ids = {int(pg["pgid"].split(".")[0]) for pg in toofull_pgs}
+    toofull_pool_ids = {pgid_pool_id(pg["pgid"]) for pg in toofull_pgs}
     pools_by_id = {p["pool_id"]: p for p in pools}
     # A pool that has stuck PGs but is absent from 'ceph osd pool ls detail'
     # would skip the failure-domain check and, not being in ec_pool_ids, have
@@ -1183,8 +1468,12 @@ def main() -> None:
     arriving = []
     pgs_with_shards = 0
     for pg in toofull_pgs:
-        is_ec = int(pg["pgid"].split(".")[0]) in ec_pool_ids
-        found = find_diverted_shards(pg, is_ec)
+        pool_id = pgid_pool_id(pg["pgid"])
+        found = find_diverted_shards(
+            pg,
+            pool_id in ec_pool_ids,
+            shard_size_bytes(pg, pools_by_id[pool_id], ec_profiles),
+        )
         arriving.extend(found)
         pgs_with_shards += bool(found)
     shards, not_full_enough = select_stuck_shards(arriving, osd_df, min_up_util)
@@ -1196,8 +1485,17 @@ def main() -> None:
     )
 
     candidates = build_candidate_osds(osd_df, max_target_util)
+    # Every arriving shard counts towards its OSD until it is diverted.
+    projection = ProjectedUsage(osd_df, arriving)
     proposals, unplaceable = assign_targets(
-        shards, candidates, osd_host, osd_df, upmap_items
+        shards,
+        candidates,
+        osd_host,
+        osd_df,
+        upmap_items,
+        projection=projection,
+        max_uses=args.max_target_uses,
+        backfillfull=ratios.backfillfull,
     )
 
     # Everything informational goes to stderr so stdout stays parseable.
@@ -1211,7 +1509,9 @@ def main() -> None:
         f"at or above --min-up-util {min_up_util:g}% "
         f"({len(not_full_enough)} left alone as not the blocker); "
         f"candidate target OSDs at or below --max-target-util "
-        f"{max_target_util:g}%: {by_class or 'none'}",
+        f"{max_target_util:g}%: {by_class or 'none'}; each may take up to "
+        f"--max-target-uses {args.max_target_uses} shard(s), while projected "
+        f"below backfillfull_ratio ({ratios.backfillfull:g}%)",
         file=sys.stderr,
     )
 
@@ -1224,30 +1524,16 @@ def main() -> None:
     if unplaceable:
         print_unplaceable(len(unplaceable))
 
-    # Only reachable when the cap was raised to backfillfull_ratio or above: these
-    # proposals aim at OSDs Ceph already refuses to backfill onto, so they
-    # would re-wedge on arrival. Worth saying loudly because --pgremapper's
-    # bare triples carry no utilization for the operator to notice it in.
-    doomed = [p for p in proposals if p.target_utilization >= ratios.backfillfull]
-    if doomed:
-        print(
-            f"WARNING: {len(doomed)} of {len(proposals)} proposed target(s) "
-            f"are at or above the cluster's backfillfull_ratio "
-            f"({ratios.backfillfull:g}%), so those backfills will wedge again "
-            f"on arrival. Lower --max-target-util to exclude them.",
-            file=sys.stderr,
-        )
-
     print(
         f"proposed {len(proposals)} remap(s), {len(unplaceable)} unplaceable",
         file=sys.stderr,
     )
     if unplaceable:
         print(
-            "NOTE: each target OSD is used at most once, so a run with more "
-            "stuck shards than there are OSDs below --max-target-util will "
-            "leave a tail unplaceable. Apply these, let them drain, then "
-            "re-run.",
+            "NOTE: each target OSD takes at most --max-target-uses shards and "
+            "none is filled to backfillfull_ratio, so a run with more stuck "
+            "shards than that leaves room for will leave a tail unplaceable. "
+            "Apply these, let them drain, then re-run.",
             file=sys.stderr,
         )
 
