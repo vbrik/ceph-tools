@@ -41,23 +41,25 @@ thresholds, and it is the capture that exposed the two bugs they fix.
     --max-target-util disabled this capture proposes every one of the 822
     usable hdd OSDs, 342 of them at or above backfillfull_ratio -- remaps
     that re-wedge the moment they are applied. --max-target-util
-    (default: backfillfull_ratio) excludes them.
+    (default: backfillfull_ratio minus 1) excludes them, and the OSDs
+    within a point of the ratio, which may lack room for the shard.
 
 Expected results with the default thresholds (--min-up-util 85,
---max-target-util 91, both derived from this cluster's own ratios):
+--max-target-util 90, both derived from this cluster's own ratios):
 
   808 backfill_toofull PGs, 808 with newly-arriving shards
   1513 arriving shards, 976 at or above --min-up-util, 537 left alone
-  candidate target OSDs: hdd=480, ssd=78
-  480 remaps proposed, 496 unplaceable
-  no proposed target at or above backfillfull_ratio
+  candidate target OSDs: hdd=242, ssd=78
+  242 remaps proposed, 734 unplaceable
+  no proposed target above --max-target-util (so none within a point of
+  backfillfull_ratio)
   no diverted shard arriving on an OSD below nearfull_ratio
 
-The table is 480 rows, too long to quote here the way the small fixtures
+The table is 242 rows, too long to quote here the way the small fixtures
 do, so the test asserts those counts and invariants instead of an exact
 table (see FixtureReplayTest in
-test_upmaps_to_unstick_toofull_backfills.py). The 496 unplaceable shards
-are listed on stderr after the table, without a reason: the heuristic found
+test_upmaps_to_unstick_toofull_backfills.py). The 734 unplaceable shards
+are counted on stderr after the table, without a reason: the heuristic found
 no target for them, which does not prove none exists.
 
 For reference, the pre-threshold behavior is still reachable and is what

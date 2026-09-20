@@ -102,11 +102,13 @@ excluded by those filters, which also keeps an out OSD from sorting *first*
 --max-target-util PERCENT additionally drops every OSD whose current
 utilization is above PERCENT, so a target is never one that is itself
 already too full to accept the shard. It defaults to the cluster's
-backfillfull_ratio, because without a cap the ranking is purely relative:
-on a uniformly full cluster "least utilized" degrades to "least
-catastrophic", the pool is drawn down until the tail of a run is targeting
-OSDs Ceph would refuse outright, and those remaps re-wedge the moment they
-are applied.
+backfillfull_ratio minus one percentage point, because without a cap the
+ranking is purely relative: on a uniformly full cluster "least utilized"
+degrades to "least catastrophic", the pool is drawn down until the tail of a
+run is targeting OSDs Ceph would refuse outright, and those remaps re-wedge
+the moment they are applied. The point of margin is because Ceph refuses on
+the target's *projected* usage (see --min-up-util above): an OSD just under
+backfillfull_ratio passes today's check yet may have no room for the shard.
 
 The cap is checked against the same current 'ceph osd df' figure the ranking
 and the TARGET UTIL column use, so it does not account for the shard about
@@ -129,10 +131,10 @@ host is added to that PG's exclusion set before its next shard is placed.
 
 That one-target-per-OSD rule can run out: a cluster-wide run may have more
 stuck shards than there are usable OSDs in a class, in which case the tail is
-left unplaced rather than doubled up. Shards that get no target are listed on
-stderr after the table (not in --pgremapper mode), without a reason: that the
-greedy pass found nothing is a limitation of this heuristic, and a suitable
-OSD may well exist. Applying the proposals, letting them drain and re-running
+left unplaced rather than doubled up. The number of shards that get no target
+is reported on stderr after the table (in --pgremapper mode too), without a
+reason or a list: that the greedy pass found nothing is a limitation of this
+heuristic, and a suitable OSD may well exist. Applying the proposals, letting them drain and re-running
 is the usual next step. Shards are processed in PG id order, so the lowest
 pool ids get the emptiest targets; the ordering is fixed rather than fair,
 which is what makes re-runs reproducible.
@@ -309,7 +311,7 @@ def parse_args() -> argparse.Namespace:
         "OSD of its own device class that it could legally be moved to and "
         "that has room for it. Both thresholds default to the cluster's own "
         "ratios: shards arriving below nearfull_ratio are left alone, and no "
-        "OSD at or above backfillfull_ratio is proposed as a target. Only "
+        "OSD within a point of backfillfull_ratio is proposed as a target. Only "
         "the proposals are printed; nothing is changed. Assumes the affected "
         "pools' CRUSH failure domain is 'host', and exits with an error if "
         "it is not.",
@@ -344,8 +346,8 @@ def parse_args() -> argparse.Namespace:
         "PERCENT as targets. Defaults to the cluster's backfillfull_ratio - 1, "
         "so a proposal is never aimed at an OSD Ceph would already refuse; "
         "pass 100 to disable the cap. Uses the current 'ceph osd df' "
-        "utilization, without the shard being moved; shards left with no "
-        "eligible target are listed after the table.",
+        "utilization, without the shard being moved; the number of shards "
+        "left with no eligible target is reported on stderr.",
     )
     state_group = parser.add_mutually_exclusive_group()
     state_group.add_argument(
@@ -1070,22 +1072,18 @@ def print_table(rows: list[list[str]]) -> None:
         emit(row)
 
 
-def print_unplaceable(unplaceable: list[DivertedShard]) -> None:
-    """List the shards no target was found for, on stderr after the table.
+def print_unplaceable(count: int) -> None:
+    """Report on stderr how many shards no target was found for.
 
-    A caveat line followed by one line of '<pgid>:<shard>' items, so a big
-    run does not bury the table's tail. Deliberately says nothing about why:
-    the heuristic gave up on these, but that does not mean no legal placement
-    exists, only that finding one is beyond what this script implements.
+    Only the count, not the shards: a big run would bury the table's tail.
+    Deliberately says nothing about why: the heuristic gave up on these, but
+    that does not mean no legal placement exists, only that finding one is
+    beyond what this script implements.
     """
     print(
-        f"{len(unplaceable)} shard(s) could not be placed. This is a "
-        "limitation of the heuristic used here, not proof that no suitable "
-        "OSD exists; finding one is not implemented (<pgid>:<shard>):",
-        file=sys.stderr,
-    )
-    print(
-        ", ".join(f"{shard.pgid}:{shard.shard}" for shard in unplaceable),
+        f"{count} shard(s) could not be placed. This is a limitation of the "
+        "heuristic used here, not proof that no suitable OSD exists; finding "
+        "one is not implemented.",
         file=sys.stderr,
     )
 
@@ -1145,7 +1143,9 @@ def main() -> None:
     ratios = fetch_full_ratios()
     min_up_util = ratios.nearfull if args.min_up_util is None else args.min_up_util
     max_target_util = (
-        ratios.backfillfull - 1 if args.max_target_util is None else args.max_target_util
+        ratios.backfillfull - 1
+        if args.max_target_util is None
+        else args.max_target_util
     )
 
     toofull_pool_ids = {int(pg["pgid"].split(".")[0]) for pg in toofull_pgs}
@@ -1207,11 +1207,10 @@ def main() -> None:
         else:
             print_table([format_row(p, osd_host, osd_df) for p in proposals])
 
-    # --pgremapper output is meant for scripts, so it gets no such list.
-    if unplaceable and not args.pgremapper:
-        print_unplaceable(unplaceable)
+    if unplaceable:
+        print_unplaceable(len(unplaceable))
 
-    # Only reachable when the cap was raised past backfillfull_ratio: these
+    # Only reachable when the cap was raised to backfillfull_ratio or above: these
     # proposals aim at OSDs Ceph already refuses to backfill onto, so they
     # would re-wedge on arrival. Worth saying loudly because --pgremapper's
     # bare triples carry no utilization for the operator to notice it in.

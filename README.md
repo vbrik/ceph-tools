@@ -79,8 +79,8 @@ other environments.
   feed to `pgremapper remap` (via `xargs -a remaps.txt -L1 …`), which merges
   into a PG's existing `pg_upmap_items` — apply with it rather than by hand
   with `ceph osd pg-upmap-items`, which replaces the whole entry. Each target
-  OSD is used at most once, so a large run may leave a tail unplaced; those
-  PG/shards are listed on stderr after the table (a limitation of the
+  OSD is used at most once, so a large run may leave a tail unplaced; how
+  many is reported on stderr, in `--pgremapper` mode too (a limitation of the
   heuristic, not proof that no OSD would do); apply, drain, re-run.
   Two safety thresholds default to the cluster's own ratios and can be
   overridden. `--min-up-util PERCENT` (default `nearfull_ratio`) only
@@ -88,7 +88,7 @@ other environments.
   property of the PG, not of each shard arriving on it, so without this a PG
   with one wedged shard has all its healthy arrivals diverted too, spending
   target OSDs that genuinely stuck shards then cannot get.
-  `--max-target-util PERCENT` (default `backfillfull_ratio`) drops OSDs above
+  `--max-target-util PERCENT` (default `backfillfull_ratio` minus 1) drops OSDs above
   that current utilization from consideration as targets, so a proposal is
   never aimed at an OSD Ceph would already refuse; pass `100` to disable it,
   and any proposal past `backfillfull_ratio` is counted and warned about on
@@ -218,7 +218,7 @@ cluster-state snapshots under `test-data/` via `--load-state` and check the
 output against what each fixture's `README.txt` documents, so fixture and
 code cannot drift apart: the exact table for the small fixtures, and for the
 cluster-sized one (808 stuck PGs, 1513 arriving shards) the counts plus the
-invariants that matter — no target at or above `backfillfull_ratio`, no
+invariants that matter — no target above `backfillfull_ratio` minus 1, no
 shard diverted off an OSD below `nearfull_ratio`, no target OSD used twice.
 
 ## License

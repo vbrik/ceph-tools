@@ -36,7 +36,7 @@ backfill on the target's projected usage once the shard lands, not on its
 usage today. That is why the default threshold is nearfull_ratio (85%) and
 not backfillfull_ratio: at backfillfull_ratio this genuinely stuck shard
 would be filtered out and the fixture would propose nothing. The default
---max-target-util here is 90%, and osd.849 at 86.8% clears it.
+--max-target-util here is 89%, and osd.849 at 86.8% clears it.
 
 This fixture is also the one that exercises the unknown-ACTING-OSD case:
 osd.457 is already out, so the slot it left in 'acting' reads as

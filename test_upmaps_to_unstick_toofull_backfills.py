@@ -359,15 +359,21 @@ def table_from_readme(fixture):
 CEPH2_FIXTURE = "upmaps-toofull-ceph2-util-emergency-2-new-hosts"
 
 # What the fixture's README.txt documents, and what the thresholds buy:
-# 1513 arriving shards, 976 of them plausibly blocked, 480 placeable below
-# backfillfull_ratio. Asserted as counts and invariants rather than an
-# exact 480-row table, which would be unreadable in a README.
+# 1513 arriving shards, 976 of them plausibly blocked, 242 placeable at or
+# below the default cap of backfillfull_ratio - 1. Asserted as counts and
+# invariants rather than an exact 242-row table, which would be unreadable
+# in a README.
 CEPH2_ARRIVING = 1513
 CEPH2_STUCK = 976
-CEPH2_PROPOSED = 480
-CEPH2_UNPLACEABLE = 496
+CEPH2_PROPOSED = 242
+CEPH2_UNPLACEABLE = 734
 CEPH2_NEARFULL = 85.0
 CEPH2_BACKFILLFULL = 91.0
+# Ceph refuses on a target's projected usage, so the default cap keeps one
+# point of margin below backfillfull_ratio.
+CEPH2_MAX_TARGET_UTIL = CEPH2_BACKFILLFULL - 1
+# Proposals when the cap is instead set to backfillfull_ratio itself.
+CEPH2_NO_MARGIN_PROPOSED = 480
 
 # What the tool did on this capture before the thresholds existed, kept so
 # the regression is pinned rather than merely described: every usable hdd
@@ -392,33 +398,17 @@ def percent(cell):
 
 
 class PrintUnplaceableTest(unittest.TestCase):
-    def capture(self, shards):
+    def capture(self, count):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            ut.print_unplaceable(shards)
+            ut.print_unplaceable(count)
         return err.getvalue().splitlines()
 
-    def test_lists_all_shards_on_one_line_under_a_heuristic_caveat(self):
-        shards = [
-            ut.DivertedShard("9.2", 1, 882, None, [882]),
-            ut.DivertedShard("19.21f", 0, 882, 406, [882]),
-            ut.DivertedShard("19.21f", 3, 883, None, [883]),
-        ]
-        lines = self.capture(shards)
-        self.assertEqual(len(lines), 2)
-        self.assertEqual(lines[1], "9.2:1, 19.21f:0, 19.21f:3")
+    def test_reports_only_the_count_under_a_heuristic_caveat(self):
+        lines = self.capture(3)
+        self.assertEqual(len(lines), 1)
         self.assertIn("3 shard(s) could not be placed", lines[0])
         self.assertIn("limitation of the heuristic", lines[0])
-
-    def test_replicated_shard_is_shown_as_a_dash(self):
-        lines = self.capture([ut.DivertedShard("1.0", "-", 5, None, [5])])
-        self.assertEqual(lines[1], "1.0:-")
-
-    def test_gives_no_specific_reason(self):
-        lines = self.capture([ut.DivertedShard("1.0", 0, 5, None, [5])])
-        text = "\n".join(lines)
-        for reason in ("--max-target-util", "up set", "CRUSH mapping", "capacity"):
-            self.assertNotIn(reason, text)
 
 
 class FixtureReplayTest(unittest.TestCase):
@@ -476,14 +466,15 @@ class FixtureReplayTest(unittest.TestCase):
     def test_default_thresholds_come_from_the_clusters_own_ratios(self):
         # osd457-down has backfillfull_ratio 0.90, ceph2 has it raised to
         # 0.91: the reported caps must track the capture, not a constant.
-        for fixture, nearfull, backfillfull in [
-            ("upmaps-toofull-osd457-down", "85", "90"),
-            (CEPH2_FIXTURE, "85", "91"),
+        # The target cap is backfillfull_ratio minus one point.
+        for fixture, nearfull, max_target in [
+            ("upmaps-toofull-osd457-down", "85", "89"),
+            (CEPH2_FIXTURE, "85", "90"),
         ]:
             with self.subTest(fixture=fixture):
                 err = self.run_proc(fixture).stderr
                 self.assertIn(f"--min-up-util {nearfull}%", err)
-                self.assertIn(f"--max-target-util {backfillfull}%", err)
+                self.assertIn(f"--max-target-util {max_target}%", err)
 
 
 class Ceph2FixtureInvariantTest(unittest.TestCase):
@@ -526,13 +517,40 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         )
         self.assertIn(f"({skipped} left alone as not the blocker)", self.proc.stderr)
 
-    def test_no_target_is_at_or_above_backfillfull(self):
+    def test_no_target_is_above_the_default_cap(self):
         # The headline invariant: every one of these remaps can actually
         # complete. Before --max-target-util defaulted, 342 could not.
         over = [
-            r for r in self.rows if percent(r[("TARGET", "UTIL")]) >= CEPH2_BACKFILLFULL
+            r
+            for r in self.rows
+            if percent(r[("TARGET", "UTIL")]) > CEPH2_MAX_TARGET_UTIL
         ]
         self.assertEqual(over, [])
+
+    def test_default_cap_keeps_a_margin_below_backfillfull(self):
+        # Capping at backfillfull_ratio itself would admit OSDs within a
+        # point of it, which pass today's check but may lack room for the
+        # shard (Ceph refuses on projected usage). Pin that the margin is
+        # what excludes them, not merely that the cap is below the ratio.
+        proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--load-state",
+                os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                "--max-target-util",
+                f"{CEPH2_BACKFILLFULL:g}",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        rows = parse_table(proc.stdout)
+        self.assertEqual(len(rows), CEPH2_NO_MARGIN_PROPOSED)
+        in_margin = [
+            r for r in rows if CEPH2_MAX_TARGET_UTIL < percent(r[("TARGET", "UTIL")])
+        ]
+        self.assertTrue(in_margin)
 
     def test_no_shard_is_diverted_off_a_healthy_osd(self):
         # The two new hosts sit around 70% and are absorbing shards, not
@@ -605,20 +623,19 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         ]
         self.assertEqual(lines, expected)
 
-    def test_unplaceable_shards_are_listed_once_after_the_table(self):
+    def test_unplaceable_shards_are_only_counted(self):
         lines = self.proc.stderr.splitlines()
-        header = next(i for i, ln in enumerate(lines) if "could not be placed" in ln)
+        matching = [ln for ln in lines if "could not be placed" in ln]
+        self.assertEqual(len(matching), 1)
         self.assertIn(
             f"{CEPH2_UNPLACEABLE} shard(s) could not be placed. This is a "
             "limitation of the heuristic",
-            lines[header],
+            matching[0],
         )
-        # One line holding every item.
-        self.assertEqual(len(lines[header + 1].split(", ")), CEPH2_UNPLACEABLE)
-        # The old one-WARNING-per-shard flood is gone.
-        self.assertNotIn("no legal target left", self.proc.stderr)
+        # No per-shard '<pgid>:<shard>' list, however long the tail is.
+        self.assertNotRegex(self.proc.stderr, r"\d+\.\w+:[\d-]+, ")
 
-    def test_pgremapper_mode_does_not_list_unplaceable_shards(self):
+    def test_pgremapper_mode_reports_the_unplaceable_count_on_stderr(self):
         proc = subprocess.run(
             [
                 sys.executable,
@@ -631,10 +648,10 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertNotIn("could not be placed", proc.stderr)
-        self.assertNotRegex(proc.stderr, r"\d+\.\w+:\d+, ")
-        # The summary count is still reported.
-        self.assertIn(f"{CEPH2_UNPLACEABLE} unplaceable", proc.stderr)
+        self.assertIn(f"{CEPH2_UNPLACEABLE} shard(s) could not be placed", proc.stderr)
+        self.assertNotRegex(proc.stderr, r"\d+\.\w+:[\d-]+, ")
+        # Stdout stays parseable: only remap triples.
+        self.assertNotIn("could not be placed", proc.stdout)
 
 
 class UnknownPoolTest(unittest.TestCase):
