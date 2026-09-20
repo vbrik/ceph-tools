@@ -31,10 +31,9 @@ OSD_DF = {
     882: {"id": 882, "utilization": 69.1, "device_class": "hdd"},
     898: {"id": 898, "utilization": 61.7, "device_class": "hdd"},
 }
-UPMAPS = {"19.2": [{"from": 519, "to": 368}]}
 
 
-def make_proposal(acting_osd=406, via_existing_upmap=False):
+def make_proposal(acting_osd=406):
     shard = ut.DivertedShard(
         pgid="19.2",
         shard=0,
@@ -42,12 +41,12 @@ def make_proposal(acting_osd=406, via_existing_upmap=False):
         acting_osd=acting_osd,
         up_set=[882, 111, 222],
     )
-    return ut.Proposal(shard, 898, "host51", 61.7, via_existing_upmap)
+    return ut.Proposal(shard, 898, "host51", 61.7)
 
 
 class FormatRowTest(unittest.TestCase):
     def test_row_matches_column_order(self):
-        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF, UPMAPS)
+        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
         self.assertEqual(
             row,
             [
@@ -62,20 +61,19 @@ class FormatRowTest(unittest.TestCase):
                 "osd.898",
                 "61.7%",
                 "host51",
-                "519->368",
             ],
         )
 
     def test_row_length_tracks_columns(self):
         # Guards against a column being added to COLUMNS (or to the row)
         # without the other side following.
-        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF, UPMAPS)
+        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
         self.assertEqual(len(row), len(ut.COLUMNS))
 
     def test_unknown_acting_osd_renders_as_none_and_dashes(self):
         # The usual out-OSD case: the slot the shard is coming from reads as
         # CRUSH_ITEM_NONE, so neither its utilization nor its host exists.
-        row = ut.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF, UPMAPS)
+        row = ut.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF)
         cells = dict(zip(ut.COLUMNS, row))
         self.assertEqual(cells["ACTING_OSD"], "none")
         self.assertEqual(cells["ACTING_UTIL"], ut.NOT_APPLICABLE)
@@ -83,18 +81,6 @@ class FormatRowTest(unittest.TestCase):
         # The up side is still fully known — that is the whole premise.
         self.assertEqual(cells["UP_OSD"], "osd.882")
         self.assertEqual(cells["UP_UTIL"], "69.1%")
-
-    def test_existing_upmap_flag_marks_up_osd_only(self):
-        row = ut.format_row(
-            make_proposal(via_existing_upmap=True), OSD_HOST, OSD_DF, UPMAPS
-        )
-        cells = dict(zip(ut.COLUMNS, row))
-        self.assertEqual(cells["UP_OSD"], "osd.882*")
-        self.assertEqual(cells["ACTING_OSD"], "osd.406")
-
-    def test_pg_without_upmaps_renders_dash(self):
-        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF, {})
-        self.assertEqual(dict(zip(ut.COLUMNS, row))["EXISTING_UPMAPS"], "-")
 
 
 class FindDivertedShardsTest(unittest.TestCase):
@@ -150,15 +136,17 @@ def table_from_readme(fixture):
 class FixtureReplayTest(unittest.TestCase):
     """End-to-end --load-state runs, checked against the fixtures' READMEs."""
 
-    def run_script(self, fixture, *extra):
-        proc = subprocess.run(
+    def run_proc(self, fixture, *extra):
+        return subprocess.run(
             [sys.executable, SCRIPT, "--load-state", os.path.join(TEST_DATA, fixture)]
             + list(extra),
             capture_output=True,
             text=True,
             check=True,
         )
-        return proc.stdout.rstrip("\n")
+
+    def run_script(self, fixture, *extra):
+        return self.run_proc(fixture, *extra).stdout.rstrip("\n")
 
     def test_osd457_down_table_matches_readme(self):
         fixture = "upmaps-toofull-osd457-down"
@@ -167,6 +155,25 @@ class FixtureReplayTest(unittest.TestCase):
     def test_existing_upmap_chain_table_matches_readme(self):
         fixture = "upmaps-toofull-osd263-existing-upmap-chain"
         self.assertEqual(self.run_script(fixture), table_from_readme(fixture))
+
+    def test_existing_upmap_row_is_unmarked_and_has_no_upmap_column(self):
+        # UP_OSD is a plain 'osd.N' even when it is the 'to' of an existing
+        # pair; pgremapper handles that case itself.
+        out = self.run_script("upmaps-toofull-osd263-existing-upmap-chain")
+        self.assertNotIn("*", out)
+        self.assertNotIn("EXISTING_UPMAPS", out)
+
+    def test_pgremapper_lists_existing_upmap_rows_like_any_other(self):
+        # 19.bd5's existing pair is 625->263, so 263 is a 'to': the line must
+        # still be '<pgid> 263 <target>' for 'pgremapper remap' to rewrite
+        # that pair's 'to'.
+        proc = self.run_proc(
+            "upmaps-toofull-osd263-existing-upmap-chain", "--pgremapper"
+        )
+        lines = proc.stdout.splitlines()
+        self.assertEqual(len(lines), 6)
+        self.assertIn("19.bd5 263 829", lines)
+        self.assertEqual(proc.stderr.count("NOTE"), 0)
 
     def test_pgremapper_emits_up_osd_not_acting_osd(self):
         # 'pgremapper remap' takes the upmap's 'from', which is UP_OSD.

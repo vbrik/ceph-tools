@@ -113,16 +113,13 @@ OSD in the mapping twice; Ceph's upmap validation drops such an entry silently,
 so the command appears to succeed and then has no effect. Targets are
 therefore checked against 'up' union the reconstructed raw mapping.
 
-The same reconstruction also flags a subtler case. The arriving OSD becomes
-the 'from' of the new upmap pair, and 'from' must be an OSD CRUSH itself
-chose. An arriving OSD that is *absent* from the raw mapping is one an
-existing upmap already put there (the balancer places these), so diverting
-it means rewriting that pair's 'to' rather than adding a new pair — Ceph's
-upmap validation silently drops a 'from' that CRUSH did not itself pick.
-Such rows are still proposed — UP_OSD is marked with a trailing '*', and a
-note on stderr points at EXISTING_UPMAPS — on the assumption that whoever
-applies this by hand will rewrite that pair's 'to' rather than paste the row
-in as a new one.
+A subtler case needs no special handling here. The arriving OSD becomes the
+'from' of the new upmap pair, and Ceph only honors a 'from' that CRUSH itself
+chose; an arriving OSD absent from the raw mapping is one an existing upmap
+already put there (the balancer places these). Diverting it means rewriting
+that existing pair's 'to' rather than adding a new pair, which is exactly
+what 'pgremapper remap' does when its source osd is the 'to' of an existing
+pair, so such rows are proposed like any other (see "Applying the output").
 
 Testing against saved cluster state
 ------------------------------------
@@ -154,40 +151,36 @@ directly as --load-state arguments.
 
 Applying the output
 -------------------
-Two output formats are available. The default is a human-readable table.
---pgremapper instead emits one bare '<pgid> <from osd> <target osd>' line per
-remap — the table's PGID, UP_OSD and TARGET_OSD columns, which are exactly
-the positional arguments of 'pgremapper remap' (which calls UP_OSD the
-"source osd", meaning the upmap's 'from'). Only the rows go to stdout in
-either mode — everything else is on stderr — so the output stays parseable.
+Two output formats are available. The default is a human-readable table
+for review. --pgremapper instead emits one bare '<pgid> <from osd> <target
+osd>' line per remap — the table's PGID, UP_OSD and TARGET_OSD columns, which
+are exactly the positional arguments of 'pgremapper remap' (which calls
+UP_OSD the "source osd", meaning the upmap's 'from'). In --pgremapper mode
+only the rows go to stdout — everything else is on stderr — so it stays
+parseable.
 
-Caveats for whatever consumes this:
+Apply the proposals with 'pgremapper remap', not by hand-writing 'ceph osd
+pg-upmap-items' commands. The table deliberately does not carry each PG's
+existing upmap pairs, and 'pg-upmap-items' cannot be driven without them:
 
   - 'ceph osd pg-upmap-items' *replaces* a PG's entire upmap entry rather than
-    adding to it. PGs here frequently already carry unrelated upmap pairs, so
-    a command that states only the new pair silently discards the others and
-    triggers fresh remapping. The EXISTING_UPMAPS column reports each PG's
-    current pairs so they can be restated. 'pgremapper remap' merges into the
-    existing entry rather than replacing it, so it needs no such restatement —
-    which is why --pgremapper omits that column.
+    adding to it, so a command stating only the new pair silently discards
+    the PG's other pairs and triggers fresh remapping. Rows are also not
+    independent when a PG has more than one diverted shard: one command per
+    row makes the last replace what the earlier ones wrote.
 
-  - For the same reason, rows are not independent when a PG has more than one
-    diverted shard. Such a PG gets one row per shard, each repeating that PG's
-    same EXISTING_UPMAPS, so running one 'pg-upmap-items' command per row makes
-    the last command replace the entry the earlier ones wrote and only the
-    final diversion survives. All rows sharing a PGID must be folded into a
-    single command listing EXISTING_UPMAPS plus every one of that PG's new
-    pairs. ('pgremapper remap' is per-pair and merges, so it is unaffected.)
+  - When UP_OSD is itself the 'to' of an existing pair (the balancer places
+    these), adding 'UP_OSD->TARGET_OSD' as a new pair is accepted and then
+    silently dropped by Ceph, because UP_OSD is not an OSD CRUSH chose. The
+    existing pair's 'to' has to be rewritten instead.
+
+'pgremapper remap' is per-pair and merges into the existing entry, and when
+its source osd is the 'to' of an existing pair it rewrites that pair's 'to'
+to the target (mappingstate.go, tryRemap), so it handles both.
 
   - If the upmap balancer is active ('ceph balancer status'), it may undo
     manually placed upmap entries. Consider 'ceph balancer off' while the
     diverted backfills drain.
-
-  - An UP_OSD suffixed '*' is itself the 'to' of one of that row's
-    EXISTING_UPMAPS pairs (see "Why the raw CRUSH mapping matters" above).
-    Apply such a row by rewriting that pair's 'to' to TARGET_OSD, not by
-    adding 'UP_OSD->TARGET_OSD' as a new pair — Ceph accepts a new pair
-    like that and then silently drops it.
 
 Review the proposals before applying them. To hand them to pgremapper:
 
@@ -264,8 +257,7 @@ def parse_args() -> argparse.Namespace:
         "error if it is not.",
         epilog="See the docstring at the top of this script for how targets "
         "are chosen, which shards get skipped and why, and the caveats that "
-        "apply when turning these rows into 'ceph osd pg-upmap-items' or "
-        "'pgremapper remap' commands.",
+        "apply when turning these rows into 'pgremapper remap' commands.",
     )
     parser.add_argument(
         "--pgremapper",
@@ -775,10 +767,6 @@ class Proposal(NamedTuple):
     target_osd: int
     target_host: str
     target_utilization: float
-    via_existing_upmap: bool  # up_osd is absent from the raw CRUSH mapping,
-    # i.e. it is itself the 'to' of an existing pair (see module docstring);
-    # applying this row means rewriting that pair's 'to', not adding a new
-    # pair
 
 
 def assign_targets(
@@ -813,14 +801,6 @@ def assign_targets(
         # validation drops silently (see module docstring).
         forbidden_osds = raw | {o for o in shard.up_set if _is_real_osd(o)}
 
-        # The arriving OSD becomes the 'from' of the diverting upmap pair,
-        # and 'from' must be an OSD CRUSH itself chose. If the arriving OSD
-        # is absent from the raw mapping it is itself the product of an
-        # existing upmap (the balancer places these), so applying this row
-        # as printed means rewriting that pair's 'to' rather than adding a
-        # new pair — flagged rather than skipped (see module docstring).
-        via_existing_upmap = shard.up_osd not in raw
-
         # Only OSDs of the arriving OSD's own class are legal targets. An
         # unknown class yields an empty pool, so the shard falls through to
         # unplaceable rather than being sent somewhere CRUSH would reject.
@@ -838,7 +818,6 @@ def assign_targets(
                     candidate,
                     osd_host.get(candidate, "?"),
                     osd_df[candidate]["utilization"],
-                    via_existing_upmap,
                 )
             )
             break
@@ -855,8 +834,7 @@ def assign_targets(
 # Ordered so each row reads along the shard's path: where its data is now
 # (ACTING_*), where the stuck backfill is trying to put it (UP_*), and where
 # this script proposes it go instead (TARGET_*), with each OSD followed by
-# its utilization and host. EXISTING_UPMAPS stays last; print_table leaves
-# the final, variable-width column unpadded.
+# its utilization and host. print_table leaves the final column unpadded.
 COLUMNS = [
     "PGID",
     "SHARD",
@@ -869,7 +847,6 @@ COLUMNS = [
     "TARGET_OSD",
     "TARGET_UTIL",
     "TARGET_HOST",
-    "EXISTING_UPMAPS",
 ]
 
 # Printed in ACTING_UTIL/ACTING_HOST when the acting OSD is unknown (the
@@ -889,17 +866,8 @@ def format_row(
     proposal: Proposal,
     osd_host: dict[int, str],
     osd_df: dict[int, dict],
-    upmap_items: dict[str, list[dict]],
 ) -> list[str]:
     shard = proposal.shard
-    pairs = upmap_items.get(shard.pgid, [])
-
-    # '*' means up_osd is itself the 'to' of one of this row's
-    # EXISTING_UPMAPS pairs; applying the row means rewriting that pair's
-    # 'to' rather than adding 'UP_OSD->TARGET_OSD' as a new pair (see
-    # module docstring).
-    up_osd = f"osd.{shard.up_osd}" + ("*" if proposal.via_existing_upmap else "")
-
     known_acting = shard.acting_osd is not None
     return [
         shard.pgid,
@@ -909,7 +877,7 @@ def format_row(
         if known_acting
         else NOT_APPLICABLE,
         osd_host.get(shard.acting_osd, "?") if known_acting else NOT_APPLICABLE,
-        up_osd,
+        f"osd.{shard.up_osd}",
         format_utilization(osd_df, shard.up_osd),
         # Varies per row now that the whole cluster is scanned, so unlike
         # the single-host version it cannot live in the stderr header.
@@ -917,7 +885,6 @@ def format_row(
         f"osd.{proposal.target_osd}",
         f"{proposal.target_utilization:.1f}%",
         proposal.target_host,
-        ",".join(f"{p['from']}->{p['to']}" for p in pairs) if pairs else "-",
     ]
 
 
@@ -1035,20 +1002,7 @@ def main() -> None:
         if args.pgremapper:
             print_pgremapper(proposals)
         else:
-            print_table(
-                [format_row(p, osd_host, osd_df, upmap_items) for p in proposals]
-            )
-
-    flagged = [p for p in proposals if p.via_existing_upmap]
-    if flagged:
-        print(
-            f"\nNOTE: {len(flagged)} proposal(s) have an UP_OSD marked '*': "
-            "that OSD is itself the 'to' of an existing upmap pair, so "
-            "apply the row by rewriting that pair's 'to' to TARGET_OSD, not "
-            "by adding 'UP_OSD->TARGET_OSD' as a new pair (see "
-            "EXISTING_UPMAPS).",
-            file=sys.stderr,
-        )
+            print_table([format_row(p, osd_host, osd_df) for p in proposals])
 
     for shard in unplaceable:
         print(

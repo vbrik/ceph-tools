@@ -72,11 +72,11 @@ other environments.
   remaps; changes nothing itself. Each row follows one shard's path, giving
   the OSD, utilization and host at each step: `ACTING_*` where its data sits
   now, `UP_*` the too-full OSD the stalled backfill is aimed at, `TARGET_*`
-  the proposed replacement. Rows also carry each PG's existing
-  `pg_upmap_items`, since `ceph osd pg-upmap-items` replaces rather than adds
-  to an entry. `--pgremapper` switches
+  the proposed replacement. `--pgremapper` switches
   the output to headerless `<pgid> <from osd> <target osd>` lines, ready to
-  feed to `pgremapper remap` (via `xargs -a remaps.txt -L1 …`). Each target
+  feed to `pgremapper remap` (via `xargs -a remaps.txt -L1 …`), which merges
+  into a PG's existing `pg_upmap_items` — apply with it rather than by hand
+  with `ceph osd pg-upmap-items`, which replaces the whole entry. Each target
   OSD is used at most once, so a large run may report a tail as unplaceable;
   apply, drain, re-run. `--max-target-util PERCENT` drops OSDs already above
   that current utilization from consideration as targets. Handles EC pools per-shard and replicated pools by
