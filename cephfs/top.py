@@ -12,7 +12,6 @@ import sys
 import tempfile
 import time
 
-
 # A client with this hostname hasn't reported a real one (e.g. it mounted
 # over loopback); fall back to a reverse DNS lookup of its IP instead.
 LOCALHOST_NAMES = {"localhost", "localhost.localdomain"}
@@ -21,7 +20,9 @@ DOMAIN_SUFFIX = ".icecube.wisc.edu"
 
 def ceph_cmd(args):
     """Run a `ceph` CLI command and return its parsed JSON output."""
-    result = subprocess.run(["ceph"] + args, capture_output=True, text=True)
+    result = subprocess.run(
+        ["ceph"] + args, capture_output=True, text=True, check=False
+    )
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
         sys.exit(result.returncode)

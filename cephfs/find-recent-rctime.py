@@ -2,10 +2,11 @@
 import argparse
 import os
 import sys
-from dateutil.parser import parse  # noqa
-from itertools import islice, chain
-from multiprocessing import Process, JoinableQueue, Manager
-from multiprocessing.managers import ListProxy  # noqa
+from itertools import chain, islice
+from multiprocessing import JoinableQueue, Manager, Process
+from multiprocessing.managers import ListProxy
+
+from dateutil.parser import parse
 
 
 def batched(iterable, n):
@@ -168,7 +169,7 @@ def main():
 
     results_iter = chain(*ctime_matches)
     if args.parents:
-        results = sorted(set(os.path.dirname(path) for path in results_iter))
+        results = sorted({os.path.dirname(path) for path in results_iter})
     else:
         results = sorted(results_iter)
     if args.relative:

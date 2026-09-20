@@ -58,7 +58,6 @@ import subprocess
 import sys
 from typing import NamedTuple
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -531,7 +530,7 @@ def main() -> None:
     def format_row(row: MovementRow) -> str:
         return (
             f"{row.pgid:<{col_pg}}  "
-            f"{str(row.shard):<{col_shard}}  "
+            f"{row.shard!s:<{col_shard}}  "
             f"{fmt_from(row.sources, row.primary, row.needs_primary_marker):<{col_from}}"
             f"{SEP}"
             f"{fmt_osds(row.destinations):<{col_to}}  "

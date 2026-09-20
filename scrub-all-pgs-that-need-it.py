@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 import argparse
-import sys
 import json
 import subprocess
+import sys
 
 
 def main():
@@ -13,7 +13,7 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("args", nargs="*")
-    args = parser.parse_args()
+    parser.parse_args()
 
     cmd = ["ceph", "health", "detail", "-f", "json-pretty"]
     health = json.loads(subprocess.check_output(cmd))

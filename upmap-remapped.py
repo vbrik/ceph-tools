@@ -38,14 +38,16 @@
 # Hacked by: Dan van der Ster <daniel.vanderster@cern.ch>
 
 
-import json, subprocess, sys
+import json
+import subprocess
+import sys
 
 try:
     import rados
 
     cluster = rados.Rados(conffile="/etc/ceph/ceph.conf")
     cluster.connect()
-except:
+except Exception:  # noqa: BLE001 -- any rados failure falls back to the ceph CLI
     use_shell = True
 else:
     use_shell = False
@@ -100,8 +102,8 @@ def gen_upmap(up, acting, replicated=False):
     # e.g. ceph osd pg-upmap-items 4.5fd 603 383 499 804 804 530 &
     if replicated:
         p = list(mappings)
-        u = set([x[0] for x in p])
-        a = set([x[1] for x in p])
+        u = {x[0] for x in p}
+        a = {x[1] for x in p}
         mappings = list(zip(u - a, a - u))
     # Order the mappings on erasure-coded pools so that data is moved off an osd
     # before it is moved on to it.
@@ -136,14 +138,14 @@ def gen_upmap(up, acting, replicated=False):
 
 def upmap_pg_items(pgid, mapping):
     if len(mapping):
-        print("ceph osd pg-upmap-items %s " % pgid, end="")
+        print(f"ceph osd pg-upmap-items {pgid} ", end="")
         for pair in mapping:
-            print("%s %s " % pair, end="")
+            print(f"{pair[0]} {pair[1]} ", end="")
         print("&")
 
 
 def rm_upmap_pg_items(pgid):
-    print("ceph osd rm-pg-upmap-items %s &" % pgid)
+    print(f"ceph osd rm-pg-upmap-items {pgid} &")
 
 
 # start here
@@ -191,7 +193,7 @@ try:
         if "pool" in line:
             x = line.split(" ")
             pool_type[x[1]] = x[3]
-except:
+except Exception:  # noqa: BLE001 -- rados/CLI/parse errors are all fatal here
     eprint("Error parsing pool types")
     sys.exit(1)
 
@@ -202,18 +204,17 @@ for pg in upmaps:
     has_upmap[pgid] = True
 
 # handle each remapped pg
-print('while ceph status | grep -q "peering\|activating\|laggy"; do sleep 2; done')
+print(r'while ceph status | grep -q "peering\|activating\|laggy"; do sleep 2; done')
 num = 0
 for pg in remapped:
     if num == 50:
         print(
-            'wait; sleep 4; while ceph status | grep -q "peering\|activating\|laggy"; do sleep 2; done'
+            r'wait; sleep 4; while ceph status | grep -q "peering\|activating\|laggy"; do sleep 2; done'
         )
         num = 0
 
-    if ignore_backfilling:
-        if "backfilling" in pg["state"]:
-            continue
+    if ignore_backfilling and "backfilling" in pg["state"]:
+        continue
 
     pgid = pg["pgid"]
 
@@ -231,20 +232,20 @@ for pg in remapped:
     if pool_type[pool] == "replicated":
         try:
             pairs = gen_upmap(up, acting, replicated=True)
-        except:
+        except AssertionError:  # skip PGs with inconsistent up/acting
             continue
     elif pool_type[pool] == "erasure":
         try:
             pairs = gen_upmap(up, acting)
-        except:
+        except (AssertionError, ValueError):  # skip unmappable PGs
             continue
     else:
-        eprint("Unknown pool type for %s" % pool)
+        eprint(f"Unknown pool type for {pool}")
         sys.exit(1)
     upmap_pg_items(pgid, pairs)
     num += 1
 
 print(
-    'wait; sleep 4; while ceph status | grep -q "peering\|activating\|laggy"; do sleep 2; done'
+    r'wait; sleep 4; while ceph status | grep -q "peering\|activating\|laggy"; do sleep 2; done'
 )
 cluster.shutdown()

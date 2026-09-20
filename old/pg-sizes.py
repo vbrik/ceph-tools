@@ -13,8 +13,8 @@ def main():
         summary = pg["stat_sum"]
         print(
             pg["pgid"],
-            "%s%s" % (round(summary["num_bytes"] / 10**9, 1), "GB"),
-            "%s%s" % (round(summary["num_objects"] / 1000, 1), "K objects"),
+            f"{round(summary['num_bytes'] / 10**9, 1)}GB",
+            f"{round(summary['num_objects'] / 1000, 1)}K objects",
         )
 
 

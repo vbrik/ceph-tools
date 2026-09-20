@@ -12,7 +12,6 @@ with --json-file.
 
 import argparse
 import concurrent.futures
-from dataclasses import dataclass
 import json
 import os
 import re
@@ -22,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 
 try:
     import ldap3 as _ldap3
@@ -123,7 +123,7 @@ class LdapResolver:
             try:
                 srv = _ldap3.Server(self._server_url, get_info=_ldap3.NONE)
                 self._conn = _ldap3.Connection(srv, auto_bind=True)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- any failure falls back to ldapsearch
                 print(
                     f"warning: ldap3 connect to {self._server_url} failed"
                     f"{' (will use ldapsearch)' if _LDAPSEARCH else ''}: {exc}",
@@ -141,7 +141,7 @@ class LdapResolver:
             if self._conn.entries:
                 val = self._conn.entries[0][attr].value
                 return str(val) if val is not None else None
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 -- lookup is best-effort; None means unknown
             pass
         return None
 
@@ -160,6 +160,7 @@ class LdapResolver:
             ],
             capture_output=True,
             text=True,
+            check=False,
         )
         if r.returncode != 0:
             return None
@@ -208,6 +209,7 @@ def query_mds_dump(op_type, mds_rank, fatal=True):
         ["ceph", "tell", f"mds.{mds_rank}", op_type, "--format=json"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if r.returncode != 0:
         print(
@@ -228,7 +230,10 @@ def get_active_ranks():
     are the ones that actually serve client requests and thus have op dumps
     worth showing."""
     r = subprocess.run(
-        ["ceph", "fs", "status", "--format=json"], capture_output=True, text=True
+        ["ceph", "fs", "status", "--format=json"],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if r.returncode != 0:
         print(f"error: ceph fs status failed: {r.stderr.strip()}", file=sys.stderr)
@@ -279,6 +284,7 @@ def query_client_ls_live(mds_rank):
         ["ceph", "tell", f"mds.{mds_rank}", "client", "ls", "--format=json"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if r.returncode != 0:
         print(
@@ -391,6 +397,7 @@ def _rados_inode_path(inode_hex, meta_pool):
     r = subprocess.run(
         ["rados", "-p", meta_pool, "getxattr", f"{ino}.00000000", "parent"],
         capture_output=True,
+        check=False,
     )
     if r.returncode != 0:
         return None
@@ -406,6 +413,7 @@ def _rados_inode_path(inode_hex, meta_pool):
         ],
         input=r.stdout,
         capture_output=True,
+        check=False,
     )
     if dec.returncode != 0:
         return None
@@ -421,7 +429,9 @@ def _rados_inode_path(inode_hex, meta_pool):
 def get_fsid():
     """Return the live cluster's fsid, or None if it can't be determined."""
     try:
-        r = subprocess.run(["ceph", "fsid"], capture_output=True, text=True)
+        r = subprocess.run(
+            ["ceph", "fsid"], capture_output=True, text=True, check=False
+        )
     except OSError:
         return None
     if r.returncode != 0:
@@ -464,9 +474,12 @@ def save_inode_cache(path, cache):
             on_disk = {}
         if isinstance(on_disk, dict):
             for k, v in on_disk.items():
-                if isinstance(v, dict) and v.get("path") is not None:
-                    if k not in entries or v.get("ts", 0) > entries[k].get("ts", 0):
-                        entries[k] = v
+                if (
+                    isinstance(v, dict)
+                    and v.get("path") is not None
+                    and (k not in entries or v.get("ts", 0) > entries[k].get("ts", 0))
+                ):
+                    entries[k] = v
         # mkstemp avoids the symlink attack a predictable f'{path}.tmp' would invite in a shared /tmp.
         fd, tmp_path = tempfile.mkstemp(
             prefix=f".{os.path.basename(path)}.", dir=dir_path
@@ -550,8 +563,7 @@ def fmt_cache_age(secs):
 
 
 def fmt_flag(flag):
-    if flag.startswith("submit entry: "):
-        flag = flag[len("submit entry: ") :]
+    flag = flag.removeprefix("submit entry: ")
     return flag[:_W_FLAG]
 
 

@@ -18,7 +18,9 @@ def is_ino(v):
 def ceph_cmd(args):
     """Run a `ceph` CLI command and return its parsed JSON output."""
     try:
-        result = subprocess.run(["ceph"] + args, capture_output=True, text=True)
+        result = subprocess.run(
+            ["ceph"] + args, capture_output=True, text=True, check=False
+        )
     except OSError as e:
         print(f"error: cannot run `ceph`: {e}", file=sys.stderr)
         sys.exit(1)
@@ -136,6 +138,7 @@ def ino_to_path(ino_hex, pools, cache):
         rados = subprocess.run(
             ["rados", "-p", pool, "getxattr", f"{ino}.00000000", "parent"],
             capture_output=True,
+            check=False,
         )
         if rados.returncode == 0:
             break
@@ -154,6 +157,7 @@ def ino_to_path(ino_hex, pools, cache):
         ],
         input=rados.stdout,
         capture_output=True,
+        check=False,
     )
     if dencoder.returncode != 0:
         cache[ino_hex] = None
