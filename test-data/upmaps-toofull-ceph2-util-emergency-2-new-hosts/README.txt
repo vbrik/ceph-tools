@@ -38,7 +38,7 @@ thresholds, and it is the capture that exposed the two bugs they fix.
 
   - Target ranking is relative, so with no cap "least utilized" degrades
     to "least catastrophic" once the candidate pool is drawn down. With
-    --max-target-util disabled this capture proposes every one of the 822
+    --max-target-util disabled this capture proposed every one of the 822
     usable hdd OSDs, 342 of them at or above backfillfull_ratio -- remaps
     that re-wedge the moment they are applied. --max-target-util
     (default: backfillfull_ratio minus 1) excludes them, and the OSDs
@@ -67,7 +67,10 @@ the invariant test guards against regressing to:
 
   upmaps-to-unstick-toofull-backfills.py --load-state . \
       --min-up-util 0 --max-target-util 100
-  -> 822 remaps proposed, 691 unplaceable, 342 targets past backfillfull
+  -> 573 remaps proposed, 940 unplaceable, 93 targets past backfillfull
+
+(Before the "target strictly emptier than the arriving OSD" rule this was 822
+remaps proposed, 691 unplaceable, 342 past backfillfull.)
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 

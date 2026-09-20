@@ -68,8 +68,9 @@ other environments.
   `backfill_toofull` PG cluster-wide, finds each shard newly landing on an OSD
   full enough to be what is blocking it (in `up` but not `acting`), and picks
   the least-utilized OSD of that shard's own device class on a host not
-  already in the PG's `up` set — a destination that satisfies the fault
-  domain and has room for the shard. Prints the proposed
+  already in the PG's `up` set and strictly emptier than the OSD the shard
+  was arriving on — a destination that satisfies the fault domain and has room
+  for the shard. Prints the proposed
   remaps; changes nothing itself. Each row follows one shard's path, giving
   the OSD, utilization and host at each step, under a two-line header whose
   first line spans each group: `ACTING` where its data sits now, `UP` the

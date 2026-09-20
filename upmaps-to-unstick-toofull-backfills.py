@@ -123,7 +123,12 @@ For each shard the least-utilized such candidate is taken whose host is not
 already used by the PG's 'up' set. The arriving OSD is itself a member of
 'up', so the host being diverted away from is always excluded — that is the
 whole point of the tool. A candidate is also rejected if it already appears in
-the PG's *raw* CRUSH mapping (see below).
+the PG's *raw* CRUSH mapping (see below), or if it is not strictly less
+utilized than the arriving OSD: a redirect must move the shard somewhere
+emptier than where it was headed. An arriving OSD with no utilization figure
+imposes no limit. Since candidates are ranked ascending, this only bites when
+even the emptiest eligible candidate is at least as full as the arriving OSD,
+and then the shard is left unplaced.
 
 Each chosen OSD is removed from its class's candidate pool, so no two shards
 are sent to the same OSD. If a PG has several diverted shards, each target
@@ -309,7 +314,8 @@ def parse_args() -> argparse.Namespace:
         "the cluster is examined, and each shard newly arriving on an OSD "
         "full enough to be the one blocking it is offered the least-utilized "
         "OSD of its own device class that it could legally be moved to and "
-        "that has room for it. Both thresholds default to the cluster's own "
+        "that has room for it and is strictly emptier than the OSD it is arriving on. "
+        "Both thresholds default to the cluster's own "
         "ratios: shards arriving below nearfull_ratio are left alone, and no "
         "OSD within a point of backfillfull_ratio is proposed as a target. Only "
         "the proposals are printed; nothing is changed. Assumes the affected "
@@ -911,8 +917,10 @@ def assign_targets(
 ) -> tuple[list[Proposal], list[DivertedShard]]:
     """Greedily give each diverted shard the least-utilized legal target.
 
-    Returns (proposals, unplaceable shards). Each target OSD is consumed
-    from its device class's pool, so no two shards are sent to the same OSD.
+    Legal means: same device class, host and OSD not already used by the PG,
+    and strictly less utilized than the shard's UP OSD. Returns (proposals, unplaceable
+    shards). Each target OSD is consumed from its device class's pool, so no
+    two shards are sent to the same OSD.
     """
     available = {cls: list(osds) for cls, osds in candidates.items()}
     # Hosts already spoken for per PG: seeded from the up set, then extended
@@ -938,10 +946,16 @@ def assign_targets(
         # unknown class yields an empty pool, so the shard falls through to
         # unplaceable rather than being sent somewhere CRUSH would reject.
         pool = available.get(osd_class(osd_df, shard.up_osd), [])
+        # A target must be strictly emptier than the OSD being diverted from,
+        # or the redirect gains nothing. Unknown UP utilization cannot be
+        # compared, so it imposes no limit (as in select_stuck_shards).
+        max_util = osd_df.get(shard.up_osd, {}).get("utilization")
         for candidate in pool:
             if osd_host.get(candidate) in forbidden_hosts:
                 continue
             if candidate in forbidden_osds:
+                continue
+            if max_util is not None and osd_df[candidate]["utilization"] >= max_util:
                 continue
             pool.remove(candidate)
             forbidden_hosts.add(osd_host.get(candidate))

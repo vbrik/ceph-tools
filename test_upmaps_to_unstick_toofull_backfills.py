@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from typing import ClassVar
 
 SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -375,11 +376,12 @@ CEPH2_MAX_TARGET_UTIL = CEPH2_BACKFILLFULL - 1
 # Proposals when the cap is instead set to backfillfull_ratio itself.
 CEPH2_NO_MARGIN_PROPOSED = 480
 
-# What the tool did on this capture before the thresholds existed, kept so
-# the regression is pinned rather than merely described: every usable hdd
-# OSD consumed, 342 of them already past backfillfull_ratio.
-CEPH2_UNCAPPED_PROPOSED = 822
-CEPH2_UNCAPPED_DOOMED = 342
+# With both thresholds disabled the tool used to propose every usable hdd OSD
+# (822), 342 of them already past backfillfull_ratio. The "target strictly emptier
+# than UP" rule now trims that, but the doomed targets that remain must still
+# be flagged loudly.
+CEPH2_UNCAPPED_PROPOSED = 573
+CEPH2_UNCAPPED_DOOMED = 93
 
 
 def parse_table(stdout):
@@ -477,6 +479,59 @@ class FixtureReplayTest(unittest.TestCase):
                 self.assertIn(f"--max-target-util {max_target}%", err)
 
 
+class AssignTargetsTest(unittest.TestCase):
+    """assign_targets: legality rules for a shard's target OSD."""
+
+    HOSTS: ClassVar[dict[int, str]] = {1: "h1", 2: "h2", 3: "h3", 4: "h4"}
+
+    @staticmethod
+    def df(utils):
+        """Build a minimal 'ceph osd df' map from {osd: utilization}."""
+        return {
+            osd: {"id": osd, "utilization": util, "device_class": "hdd"}
+            for osd, util in utils.items()
+        }
+
+    def assign(self, utils, candidates, shards=None):
+        shards = shards or [ut.DivertedShard("1.0", 0, 1, None, [1])]
+        return ut.assign_targets(
+            shards, {"hdd": candidates}, self.HOSTS, self.df(utils), {}
+        )
+
+    def test_target_fuller_than_up_osd_is_rejected(self):
+        proposals, unplaceable = self.assign({1: 86.0, 2: 87.0}, [2])
+        self.assertEqual(proposals, [])
+        self.assertEqual(len(unplaceable), 1)
+
+    def test_target_with_equal_utilization_is_rejected(self):
+        proposals, unplaceable = self.assign({1: 86.0, 2: 86.0}, [2])
+        self.assertEqual(proposals, [])
+        self.assertEqual(len(unplaceable), 1)
+
+    def test_fuller_candidate_is_skipped_for_a_later_emptier_one(self):
+        # Candidates are normally sorted ascending, but the rule must not
+        # depend on that: skip the offender, don't give up on the shard.
+        proposals, _ = self.assign({1: 86.0, 2: 88.0, 3: 85.0}, [2, 3])
+        self.assertEqual([p.target_osd for p in proposals], [3])
+
+    def test_unknown_up_utilization_imposes_no_limit(self):
+        proposals, _ = self.assign({1: None, 2: 89.0}, [2])
+        self.assertEqual([p.target_osd for p in proposals], [2])
+
+    def test_rejected_candidate_stays_available_for_a_fuller_up_osd(self):
+        # A skipped candidate must not be consumed: the next shard, arriving
+        # on a fuller OSD, can still take it.
+        shards = [
+            ut.DivertedShard("1.0", 0, 1, None, [1]),
+            ut.DivertedShard("1.1", 0, 3, None, [3]),
+        ]
+        proposals, unplaceable = self.assign({1: 86.0, 2: 88.0, 3: 90.0}, [2], shards)
+        self.assertEqual(
+            [(p.shard.pgid, p.target_osd) for p in proposals], [("1.1", 2)]
+        )
+        self.assertEqual([s.pgid for s in unplaceable], ["1.0"])
+
+
 class Ceph2FixtureInvariantTest(unittest.TestCase):
     """The cluster-sized capture, checked by invariant rather than by table.
 
@@ -562,6 +617,22 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         targets = {r[("TARGET", "HOST")] for r in self.rows}
         self.assertTrue({"host50", "host51"} <= targets)
 
+    def test_every_target_is_strictly_emptier_than_the_osd_it_replaces(self):
+        # Compared on the fixture's own figures: the table rounds to one
+        # decimal, so two OSDs can print alike while differing underneath.
+        with open(os.path.join(TEST_DATA, CEPH2_FIXTURE, "osd_df.json")) as f:
+            util = {n["id"]: n["utilization"] for n in json.load(f)["nodes"]}
+
+        def osd_id(cell):
+            return int(cell.removeprefix("osd."))
+
+        not_emptier = [
+            r
+            for r in self.rows
+            if util[osd_id(r[("TARGET", "OSD")])] >= util[osd_id(r[("UP", "OSD")])]
+        ]
+        self.assertEqual(not_emptier, [])
+
     def test_each_target_osd_is_used_at_most_once(self):
         targets = [r[("TARGET", "OSD")] for r in self.rows]
         self.assertEqual(len(targets), len(set(targets)))
@@ -570,9 +641,8 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         for row in self.rows:
             self.assertNotEqual(row[("TARGET", "HOST")], row[("UP", "HOST")])
 
-    def test_disabling_both_thresholds_restores_the_old_unsafe_behavior(self):
-        # Guards the regression path: this is what the tool used to do by
-        # default, and it must now be both opt-in and loudly flagged.
+    def test_disabling_both_thresholds_reopens_doomed_targets_and_warns(self):
+        # Opting out of the thresholds must stay possible and loudly flagged.
         proc = subprocess.run(
             [
                 sys.executable,
