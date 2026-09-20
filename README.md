@@ -82,7 +82,7 @@ other environments.
   OSD is used at most once, so a large run may report a tail as unplaceable;
   apply, drain, re-run.
   Two safety thresholds default to the cluster's own ratios and can be
-  overridden. `--min-source-util PERCENT` (default `nearfull_ratio`) only
+  overridden. `--min-up-util PERCENT` (default `nearfull_ratio`) only
   diverts a shard whose arriving OSD is that full: `backfill_toofull` is a
   property of the PG, not of each shard arriving on it, so without this a PG
   with one wedged shard has all its healthy arrivals diverted too, spending
@@ -96,7 +96,7 @@ other environments.
   capture offline with no cluster access. Handles EC pools per-shard and
   replicated pools by set difference. See the script's module docstring for
   the full explanation and caveats (`--help` summarizes and points there).
-  `upmaps-to-unstick-toofull-backfills.py [--pgremapper] [--min-source-util PERCENT] [--max-target-util PERCENT] [--save-state DIR | --load-state DIR]`
+  `upmaps-to-unstick-toofull-backfills.py [--pgremapper] [--min-up-util PERCENT] [--max-target-util PERCENT] [--save-state DIR | --load-state DIR]`
 
 - **`scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /

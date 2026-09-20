@@ -33,7 +33,7 @@ thresholds, and it is the capture that exposed the two bugs they fix.
     nearfull_ratio, and every one of those 537 is on host50 (274) or
     host51 (263) -- the two new hosts, at ~70%, which plainly are not what
     is blocking anything. Diverting them wastes target OSDs that genuinely
-    stuck shards then cannot get, so --min-source-util (default:
+    stuck shards then cannot get, so --min-up-util (default:
     nearfull_ratio) leaves them alone.
 
   - Target ranking is relative, so with no cap "least utilized" degrades
@@ -43,11 +43,11 @@ thresholds, and it is the capture that exposed the two bugs they fix.
     that re-wedge the moment they are applied. --max-target-util
     (default: backfillfull_ratio) excludes them.
 
-Expected results with the default thresholds (--min-source-util 85,
+Expected results with the default thresholds (--min-up-util 85,
 --max-target-util 91, both derived from this cluster's own ratios):
 
   808 backfill_toofull PGs, 808 with newly-arriving shards
-  1513 arriving shards, 976 at or above --min-source-util, 537 left alone
+  1513 arriving shards, 976 at or above --min-up-util, 537 left alone
   candidate target OSDs: hdd=480, ssd=78
   480 remaps proposed, 496 unplaceable
   no proposed target at or above backfillfull_ratio
@@ -64,7 +64,7 @@ For reference, the pre-threshold behavior is still reachable and is what
 the invariant test guards against regressing to:
 
   upmaps-to-unstick-toofull-backfills.py --load-state . \
-      --min-source-util 0 --max-target-util 100
+      --min-up-util 0 --max-target-util 100
   -> 822 remaps proposed, 691 unplaceable, 342 targets past backfillfull
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:

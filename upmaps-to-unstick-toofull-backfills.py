@@ -43,7 +43,7 @@ then cannot get.
 
 Ceph does not report which shard was refused, so the arriving OSD's
 utilization stands in for it: a candidate is kept only if that OSD is at or
-above --min-source-util, which defaults to the cluster's own nearfull_ratio.
+above --min-up-util, which defaults to the cluster's own nearfull_ratio.
 The test is deliberately not backfillfull_ratio, because Ceph refuses a
 backfill on the target's *projected* usage once the shard has landed, not on
 its usage today — an OSD several percent below backfillfull_ratio can still
@@ -51,7 +51,7 @@ be the one rejecting the reservation. nearfull_ratio is the loosest line
 that still excludes OSDs which plainly are not the blocker.
 
 A backfill_toofull PG with no newly-arriving shard yields nothing, and
-candidates dropped by --min-source-util are counted separately; both are
+candidates dropped by --min-up-util are counted separately; both are
 reported on stderr so the silence is not ambiguous.
 
 'up'/'acting' are diffed differently per pool type, for the same reason as in
@@ -69,7 +69,7 @@ are ordered along the shard's path:
 
   ACTING OSD  where the shard's data is right now — the backfill's source
   UP OSD      where CRUSH wants it: the arriving OSD, full enough (see
-              --min-source-util) to be what is wedging the backfill
+              --min-up-util) to be what is wedging the backfill
   TARGET OSD  where this script proposes it go instead
 
 So data flows ACTING OSD -> UP OSD today and is stuck; applying a row
@@ -257,7 +257,7 @@ CRUSH_ITEM_NONE = 0x7FFFFFFF
 POOL_TYPE_ERASURE = 3
 
 # Ceph's own defaults for these ratios (OSDMap::build_simple). Used only if
-# 'ceph osd dump' somehow omits them, so that --min-source-util and
+# 'ceph osd dump' somehow omits them, so that --min-up-util and
 # --max-target-util still get a sane cluster-independent default rather than
 # silently falling back to "no threshold at all", which is the unsafe
 # direction for both of them.
@@ -325,15 +325,16 @@ def parse_args() -> argparse.Namespace:
         "of 'pgremapper remap' (the script's docstring has the xargs form).",
     )
     parser.add_argument(
-        "--min-source-util",
+        "--min-up-util",
         type=float,
         metavar="PERCENT",
-        help="Only divert a shard whose arriving OSD is at or above PERCENT "
-        "utilization. Defaults to the cluster's nearfull_ratio. "
-        "backfill_toofull is a property of the PG, not of each shard "
-        "arriving on it, so without this a PG with one wedged shard has all "
-        "of its healthy arrivals diverted too — wasting the target OSDs a "
-        "genuinely stuck shard needs. Pass 0 to divert every arriving shard.",
+        help="Ceph reports backfill_toofull per PG. It doesn't say which "
+        "arriving shard's reservation was refused. A PG can have several "
+        "shards arriving at once, and only one of them may be wedged. The "
+        "script can't see which one, so it uses the arriving OSD's "
+        "utilization as a proxy. A shard is diverted only if its arriving "
+        'OSD (the "UP OSD") is at or above the threshold. The default is '
+        "the cluster's nearfull_ratio, usually 85%%.",
     )
     parser.add_argument(
         "--max-target-util",
@@ -456,7 +457,7 @@ def fetch_upmap_items() -> dict[str, list[dict]]:
 class FullRatios(NamedTuple):
     """The cluster's fullness thresholds, as percentages.
 
-    These are what --min-source-util and --max-target-util default to, so
+    These are what --min-up-util and --max-target-util default to, so
     the script's two safety margins track whatever the cluster itself
     considers 'getting full' and 'too full to backfill onto' rather than
     hard-coded numbers that would be wrong on a tuned cluster.
@@ -810,14 +811,14 @@ def find_diverted_shards(pg: dict, is_ec: bool) -> list[DivertedShard]:
 def select_stuck_shards(
     shards: list[DivertedShard],
     osd_df: dict[int, dict],
-    min_source_util: float,
+    min_up_util: float,
 ) -> tuple[list[DivertedShard], list[DivertedShard]]:
     """Split arriving shards into those worth diverting and those to leave be.
 
     backfill_toofull is reported per PG, but a PG can have several shards
     arriving at once and only one of them refused. Ceph does not say which,
     so a shard is treated as the stuck one only when the OSD it is arriving
-    on is itself at or above min_source_util (see module docstring for why
+    on is itself at or above min_up_util (see module docstring for why
     that defaults to nearfull_ratio and not backfillfull_ratio).
 
     This is not merely cosmetic. Target OSDs are consumed from one
@@ -831,7 +832,7 @@ def select_stuck_shards(
         util = osd_df.get(shard.up_osd, {}).get("utilization")
         # An arriving OSD missing from 'ceph osd df' cannot be ruled out as
         # the blocker, so keep it rather than silently dropping the shard.
-        if util is None or util >= min_source_util:
+        if util is None or util >= min_up_util:
             stuck.append(shard)
         else:
             skipped.append(shard)
@@ -1122,9 +1123,7 @@ def main() -> None:
 
     # Both thresholds track the cluster's own idea of full unless overridden.
     ratios = fetch_full_ratios()
-    min_source_util = (
-        ratios.nearfull if args.min_source_util is None else args.min_source_util
-    )
+    min_up_util = ratios.nearfull if args.min_up_util is None else args.min_up_util
     max_target_util = (
         ratios.backfillfull if args.max_target_util is None else args.max_target_util
     )
@@ -1154,7 +1153,7 @@ def main() -> None:
         found = find_diverted_shards(pg, is_ec)
         arriving.extend(found)
         pgs_with_shards += bool(found)
-    shards, not_full_enough = select_stuck_shards(arriving, osd_df, min_source_util)
+    shards, not_full_enough = select_stuck_shards(arriving, osd_df, min_up_util)
     shards.sort(
         key=lambda s: (
             pgid_sort_key(s.pgid),
@@ -1175,7 +1174,7 @@ def main() -> None:
         f"{len(toofull_pgs)} backfill_toofull PG(s) cluster-wide, "
         f"{pgs_with_shards} with newly-arriving shard(s); "
         f"{len(arriving)} arriving shard(s), of which {len(shards)} on an OSD "
-        f"at or above --min-source-util {min_source_util:g}% "
+        f"at or above --min-up-util {min_up_util:g}% "
         f"({len(not_full_enough)} left alone as not the blocker); "
         f"candidate target OSDs at or below --max-target-util "
         f"{max_target_util:g}%: {by_class or 'none'}",

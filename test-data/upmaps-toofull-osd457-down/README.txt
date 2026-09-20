@@ -29,7 +29,7 @@ osd.625 to osd.849 (host35, 86.8% util). Table output:
   PGID    SHARD    OSD   UTIL  HOST    OSD      UTIL   HOST      OSD      UTIL   HOST
   19.21f  7        none  -     -       osd.625  89.4%  host27    osd.849  86.8%  host35
 
-This fixture also pins down where --min-source-util draws its line.
+This fixture also pins down where --min-up-util draws its line.
 osd.625 is at 89.4% against this cluster's backfillfull_ratio of 0.90, so
 it is below the ratio and yet is demonstrably the blocker -- Ceph refuses a
 backfill on the target's projected usage once the shard lands, not on its

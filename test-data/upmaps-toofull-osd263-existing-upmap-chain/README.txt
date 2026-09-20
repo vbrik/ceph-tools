@@ -24,7 +24,7 @@ validation would silently drop, since 263 was never CRUSH's own pick).
 
 Verified against the live cluster: running the script reports 6
 backfill_toofull PGs cluster-wide, 6 arriving shards, all 6 at or above the
-default --min-source-util (osd.263 is at 87.6%, this cluster's
+default --min-up-util (osd.263 is at 87.6%, this cluster's
 nearfull_ratio is 85%), and 0 unplaceable. Every proposed target clears the
 default --max-target-util of 90%. Table output:
 

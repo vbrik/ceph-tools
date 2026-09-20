@@ -7,7 +7,7 @@ The table's column layout: the columns are grouped under the PG set they
 come from (ACTING/UP/TARGET) and ordered along the shard's path, so a row
 that silently drifts out of that order still looks like a valid proposal.
 
-The two safety thresholds: --min-source-util keeps shards that were never
+The two safety thresholds: --min-up-util keeps shards that were never
 blocked from being diverted (backfill_toofull is a property of the PG, not
 of each shard arriving on it), and --max-target-util keeps proposals off
 OSDs Ceph already refuses to backfill onto. Both default to the cluster's
@@ -235,7 +235,7 @@ class FullRatiosTest(unittest.TestCase):
         )
 
 
-# Arriving OSDs spanning the --min-source-util decision: well over the
+# Arriving OSDs spanning the --min-up-util decision: well over the
 # threshold, exactly on it, plainly below it, and one 'ceph osd df' has no
 # figure for.
 SOURCE_DF = {
@@ -452,7 +452,7 @@ class FixtureReplayTest(unittest.TestCase):
         ]:
             with self.subTest(fixture=fixture):
                 err = self.run_proc(fixture).stderr
-                self.assertIn(f"--min-source-util {nearfull}%", err)
+                self.assertIn(f"--min-up-util {nearfull}%", err)
                 self.assertIn(f"--max-target-util {backfillfull}%", err)
 
 
@@ -531,7 +531,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
                 SCRIPT,
                 "--load-state",
                 os.path.join(TEST_DATA, CEPH2_FIXTURE),
-                "--min-source-util",
+                "--min-up-util",
                 "0",
                 "--max-target-util",
                 "100",
