@@ -26,13 +26,13 @@ Verified against the live cluster: running the script reports 6
 backfill_toofull PGs cluster-wide, 6 shards to divert, 0 unplaceable, and 4
 of the 6 proposals flagged with FROM_OSD '*'. Table output:
 
-  PGID     SHARD  FROM_OSD  FROM_HOST  TARGET_OSD  TARGET_HOST  TGT_UTIL  VACATED  EXISTING_UPMAPS
-  19.7be   1      osd.263   host12     osd.842     host36       86.9%     osd.863  554->687
-  19.bd5   8      osd.263*  host12     osd.829     host34       87.0%     osd.625  344->570,625->263
-  19.d85   9      osd.263   host12     osd.617     host11       87.0%     osd.189  243->618,154->668
-  19.118a  2      osd.263*  host12     osd.446     host26       87.0%     osd.618  818->151,618->263
-  19.122e  7      osd.263*  host12     osd.813     host35       87.0%     osd.487  866->356,487->263
-  19.1ce0  0      osd.263*  host12     osd.45      host11       87.0%     osd.723  655->454,575->831,723->263
+  PGID     SHARD  FROM_OSD  FROM_HOST  FROM_UTIL  TARGET_OSD  TARGET_HOST  TGT_UTIL  VACATED  EXISTING_UPMAPS
+  19.7be   1      osd.263   host12     87.6%      osd.842     host36       86.9%     osd.863  554->687
+  19.bd5   8      osd.263*  host12     87.6%      osd.829     host34       87.0%     osd.625  344->570,625->263
+  19.d85   9      osd.263   host12     87.6%      osd.617     host11       87.0%     osd.189  243->618,154->668
+  19.118a  2      osd.263*  host12     87.6%      osd.446     host26       87.0%     osd.618  818->151,618->263
+  19.122e  7      osd.263*  host12     87.6%      osd.813     host35       87.0%     osd.487  866->356,487->263
+  19.1ce0  0      osd.263*  host12     87.6%      osd.45      host11       87.0%     osd.723  655->454,575->831,723->263
 
 19.7be and 19.d85 are unflagged: their EXISTING_UPMAPS pairs don't have 263
 as a 'to', so osd.263 there really is CRUSH's own raw pick.

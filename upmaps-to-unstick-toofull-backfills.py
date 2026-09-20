@@ -817,6 +817,7 @@ COLUMNS = [
     "SHARD",
     "FROM_OSD",
     "FROM_HOST",
+    "FROM_UTIL",
     "TARGET_OSD",
     "TARGET_HOST",
     "TGT_UTIL",
@@ -825,9 +826,16 @@ COLUMNS = [
 ]
 
 
+def format_utilization(osd_df: dict[int, dict], osd_id: int) -> str:
+    """Format an OSD's utilization as 'NN.N%', or '?' if 'ceph osd df' lacks it."""
+    util = osd_df.get(osd_id, {}).get("utilization")
+    return f"{util:.1f}%" if util is not None else "?"
+
+
 def format_row(
     proposal: Proposal,
     osd_host: dict[int, str],
+    osd_df: dict[int, dict],
     upmap_items: dict[str, list[dict]],
 ) -> list[str]:
     shard = proposal.shard
@@ -848,6 +856,7 @@ def format_row(
         # Varies per row now that the whole cluster is scanned, so unlike
         # the single-host version it cannot live in the stderr header.
         osd_host.get(shard.arriving_osd, "?"),
+        format_utilization(osd_df, shard.arriving_osd),
         f"osd.{proposal.target_osd}",
         proposal.target_host,
         f"{proposal.target_utilization:.1f}%",
@@ -973,7 +982,9 @@ def main() -> None:
         if args.pgremapper:
             print_pgremapper(proposals)
         else:
-            print_table([format_row(p, osd_host, upmap_items) for p in proposals])
+            print_table(
+                [format_row(p, osd_host, osd_df, upmap_items) for p in proposals]
+            )
 
     flagged = [p for p in proposals if p.via_existing_upmap]
     if flagged:

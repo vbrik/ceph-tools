@@ -25,8 +25,8 @@ osd.457's) correctly reports 1 backfill_toofull PG cluster-wide, 1 shard
 arriving on host27, and proposes remapping 19.21f shard 7 from osd.625 to
 osd.849 (host35, 86.8% util). Table output:
 
-  PGID    SHARD  FROM_OSD  FROM_HOST  TARGET_OSD  TARGET_HOST  TGT_UTIL  VACATED  EXISTING_UPMAPS
-  19.21f  7      osd.625   host27     osd.849     host35       86.8%     none     -
+  PGID    SHARD  FROM_OSD  FROM_HOST  FROM_UTIL  TARGET_OSD  TARGET_HOST  TGT_UTIL  VACATED  EXISTING_UPMAPS
+  19.21f  7      osd.625   host27     89.4%      osd.849     host35       86.8%     none     -
 
 Use this fixture to exercise the "found something to divert" path. It is
 NOT a no-problems fixture -- see upmaps-toofull-nominal-synthetic/ for that
