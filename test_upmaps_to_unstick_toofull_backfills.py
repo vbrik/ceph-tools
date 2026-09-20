@@ -9,17 +9,18 @@ that silently drifts out of that order still looks like a valid proposal.
 
 The two safety thresholds: --min-up-util keeps shards that were never
 blocked from being diverted (backfill_toofull is a property of the PG, not
-of each shard arriving on it), and --max-target-util keeps proposals off
-OSDs Ceph already refuses to backfill onto. Both default to the cluster's
-own ratios, so the tests check the defaults are read from the capture, and
-the cluster-sized fixture is checked by invariant -- no target at or above
-backfillfull_ratio, no shard diverted off an OSD below nearfull_ratio.
+of each shard arriving on it), and --max-target-util caps a target's
+projected utilization (and may not exceed backfillfull_ratio, which Ceph
+refuses to backfill past). Both default to the cluster's own ratios, so the
+tests check the defaults are read from the capture, and the cluster-sized
+fixture is checked by invariant -- no target projected above the cap, no
+shard diverted off an OSD below nearfull_ratio.
 
 Target reuse: an OSD may take several shards (--max-target-uses), each one
-sized from its PG and projected onto the OSD until backfillfull_ratio would
-be reached. The unit tests use round numbers (an OSD of 1,000,000 KiB, so
+sized from its PG and projected onto the OSD until --max-target-util would
+be exceeded. The unit tests use round numbers (an OSD of 1,000,000 KiB, so
 that 25% is an exact byte count) so the projection arithmetic is exact and
-the boundary "reaches backfillfull_ratio" can be pinned without float slack.
+the cap boundary can be pinned without float slack.
 """
 
 import contextlib
@@ -339,9 +340,11 @@ class BuildCandidateOsdsTest(unittest.TestCase):
     def test_usable_osd_is_offered_under_its_class(self):
         self.assertEqual(ut.build_candidate_osds(self.df()), {"hdd": [1]})
 
-    def test_max_util_is_inclusive(self):
-        self.assertEqual(ut.build_candidate_osds(self.df(), 50.0), {"hdd": [1]})
-        self.assertEqual(ut.build_candidate_osds(self.df(), 49.9), {})
+    def test_a_full_osd_is_still_a_candidate(self):
+        # The cap applies to the projection, per shard, not to the shortlist.
+        self.assertEqual(
+            ut.build_candidate_osds(self.df(utilization=99.0)), {"hdd": [1]}
+        )
 
     def test_osd_without_a_utilization_figure_is_excluded(self):
         # It cannot be ranked, and treating a missing value as 0% would make
@@ -406,34 +409,35 @@ CEPH2_FIXTURE = "upmaps-toofull-ceph2-util-emergency-2-new-hosts"
 
 # What the fixture's README.txt documents, and what the thresholds buy:
 # 1513 arriving shards, 976 of them plausibly blocked. With the defaults each
-# of the 242 OSDs at or below the default cap of backfillfull_ratio - 1 may
-# take up to 5 shards while its projected utilization -- counting every shard
-# already arriving on it, the stuck ones included until they are diverted --
-# stays below backfillfull_ratio, and shards are placed fullest acting OSD
-# first, which places 186 of the 976. Asserted as counts and invariants
-# rather than an exact 186-row table, which would be unreadable in a README.
+# of the 900 up/in OSDs may take up to 5 shards while its projected
+# utilization -- counting every shard already arriving on it, the stuck ones
+# included until they are diverted -- stays at or below the default cap of
+# backfillfull_ratio - 1, and shards are placed fullest acting OSD first,
+# which places 52 of the 976. Asserted as counts and invariants
+# rather than an exact 52-row table, which would be unreadable in a README.
 CEPH2_ARRIVING = 1513
 CEPH2_STUCK = 976
-CEPH2_CANDIDATES = 242
+CEPH2_CANDIDATES = 900
 CEPH2_MAX_USES = 5
-CEPH2_PROPOSED = 186
-CEPH2_UNPLACEABLE = 790
+CEPH2_PROPOSED = 52
+CEPH2_UNPLACEABLE = 924
 # --max-target-uses 1: one shard per OSD, but projected like the rest, so
-# not the 242 the script proposed before the projection existed.
-CEPH2_SINGLE_USE_PROPOSED = 113
-CEPH2_SINGLE_USE_UNPLACEABLE = 863
+# not one per candidate, as before the projection existed.
+CEPH2_SINGLE_USE_PROPOSED = 26
+CEPH2_SINGLE_USE_UNPLACEABLE = 950
 CEPH2_NEARFULL = 85.0
 CEPH2_BACKFILLFULL = 91.0
 # Ceph refuses on a target's projected usage, so the default cap keeps one
 # point of margin below backfillfull_ratio.
 CEPH2_MAX_TARGET_UTIL = CEPH2_BACKFILLFULL - 1
-# Proposals when the cap is instead set to backfillfull_ratio itself: a few
-# more OSDs qualify, those large enough that a shard still fits under the ratio.
+# Proposals when the cap is instead set to backfillfull_ratio itself: targets
+# may be projected right up to the ratio, with no margin.
 CEPH2_NO_MARGIN_PROPOSED = 199
 
-# With both thresholds disabled the tool used to propose every usable hdd OSD
-# (822), 342 of them already past backfillfull_ratio. The projection now
-# keeps every target below backfillfull_ratio whatever the thresholds say.
+# With both thresholds at their loosest (--min-up-util 0, cap at
+# backfillfull_ratio) the tool used to propose every usable hdd OSD (822),
+# 342 of them already past backfillfull_ratio. The projection now keeps every
+# target at or below the cap.
 CEPH2_UNCAPPED_PROPOSED = 210
 
 
@@ -720,7 +724,7 @@ class AssignTargetsTest(unittest.TestCase):
         *,
         arriving=None,
         max_uses=5,
-        backfillfull=91.0,
+        max_target_util=91.0,
     ):
         shards = shards or [stuck("1.0")]
         # By default the shards being placed are all there is arriving.
@@ -734,7 +738,7 @@ class AssignTargetsTest(unittest.TestCase):
             {},
             projection=ut.ProjectedUsage(df, list(arriving)),
             max_uses=max_uses,
-            backfillfull=backfillfull,
+            max_target_util=max_target_util,
         )
 
     def targets(self, proposals):
@@ -812,7 +816,7 @@ class AssignTargetsTest(unittest.TestCase):
         # 40% -> 65% -> 90%, and a third 25% would make 115%.
         shards = [stuck(f"1.{i}", size_pct=25) for i in range(3)]
         proposals, unplaceable = self.assign(
-            {1: 99.0, 2: 40.0}, [2], shards, backfillfull=95.0
+            {1: 99.0, 2: 40.0}, [2], shards, max_target_util=95.0
         )
         self.assertEqual(self.targets(proposals), [2, 2])
         self.assertEqual([p.target_projected for p in proposals], [65.0, 90.0])
@@ -825,15 +829,24 @@ class AssignTargetsTest(unittest.TestCase):
         self.assertEqual(proposal.target_utilization, 40.0)
         self.assertEqual(proposal.target_projected, 65.0)
 
-    def test_reaching_backfillfull_exactly_is_refused(self):
-        # 50% + 25% is exactly 75%: "reaches", so refused; just above, allowed.
+    def test_projecting_exactly_to_the_cap_is_allowed_and_beyond_is_refused(self):
+        # 50% + 25% is exactly 75%: "not exceed", so allowed at 75, refused
+        # for a cap just below.
         shard = [stuck("1.0", size_pct=25)]
+        allowed, _ = self.assign({1: 99.0, 2: 50.0}, [2], shard, max_target_util=75.0)
+        self.assertEqual(self.targets(allowed), [2])
         refused, unplaceable = self.assign(
-            {1: 99.0, 2: 50.0}, [2], shard, backfillfull=75.0
+            {1: 99.0, 2: 50.0}, [2], shard, max_target_util=74.5
         )
         self.assertEqual((refused, len(unplaceable)), ([], 1))
-        allowed, _ = self.assign({1: 99.0, 2: 50.0}, [2], shard, backfillfull=75.5)
-        self.assertEqual(self.targets(allowed), [2])
+
+    def test_a_target_already_above_the_cap_is_refused_even_for_an_empty_shard(self):
+        # Projection can only go up, so this is what the old current-utilization
+        # pre-filter used to catch.
+        refused, unplaceable = self.assign(
+            {1: 99.0, 2: 80.0}, [2], max_target_util=75.0
+        )
+        self.assertEqual((refused, len(unplaceable)), ([], 1))
 
     def test_a_shard_too_big_for_every_candidate_is_unplaceable_even_below_the_cap(
         self,
@@ -870,7 +883,7 @@ class AssignTargetsTest(unittest.TestCase):
             {},
             projection=ut.ProjectedUsage(df, shards),
             max_uses=5,
-            backfillfull=91.0,
+            max_target_util=91.0,
         )
         self.assertEqual(self.targets(proposals), [3])
 
@@ -1008,7 +1021,7 @@ class AssignTargetsTest(unittest.TestCase):
             [2],
             shard,
             arriving=shard + left_alone,
-            backfillfull=85.0,
+            max_target_util=85.0,
         )
         self.assertEqual(with_it[0].target_projected, 80.0)
         # ... which leaves no room under a 75% ratio, where 60% alone would.
@@ -1017,10 +1030,10 @@ class AssignTargetsTest(unittest.TestCase):
             [2],
             shard,
             arriving=shard + left_alone,
-            backfillfull=75.0,
+            max_target_util=75.0,
         )
         self.assertEqual(refused, [])
-        alone, _ = self.assign({1: 99.0, 2: 50.0}, [2], shard, backfillfull=75.0)
+        alone, _ = self.assign({1: 99.0, 2: 50.0}, [2], shard, max_target_util=75.0)
         self.assertEqual(self.targets(alone), [2])
 
     def test_an_osds_own_unplaceable_stuck_shard_still_counts_against_it(self):
@@ -1124,28 +1137,26 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         )
         self.assertIn(f"({skipped} left alone as not the blocker)", self.proc.stderr)
 
-    def test_no_target_is_above_the_default_cap(self):
+    def test_no_target_is_projected_above_the_default_cap(self):
         # The headline invariant: every one of these remaps can actually
         # complete. Before --max-target-util defaulted, 342 could not.
         over = [
             r
             for r in self.rows
-            if percent(r[("TARGET", "UTIL")]) > CEPH2_MAX_TARGET_UTIL
+            if percent(r[("TARGET", "PROJ")]) > CEPH2_MAX_TARGET_UTIL
         ]
         self.assertEqual(over, [])
 
     def test_default_cap_keeps_a_margin_below_backfillfull(self):
-        # Capping at backfillfull_ratio itself would admit OSDs within a
-        # point of it, which pass today's check but may lack room for the
-        # shard (Ceph refuses on projected usage). Pin that the margin is
-        # what excludes them, not merely that the cap is below the ratio.
-        # The projection still turns away the ones with no room for a shard.
+        # Capping at backfillfull_ratio itself lets targets be projected
+        # into the last point below it. Pin that the margin is what keeps
+        # them out, not merely that the cap is below the ratio.
         rows = parse_table(
             run_ceph2("--max-target-util", f"{CEPH2_BACKFILLFULL:g}").stdout
         )
         self.assertEqual(len(rows), CEPH2_NO_MARGIN_PROPOSED)
         in_margin = [
-            r for r in rows if CEPH2_MAX_TARGET_UTIL < percent(r[("TARGET", "UTIL")])
+            r for r in rows if CEPH2_MAX_TARGET_UTIL < percent(r[("TARGET", "PROJ")])
         ]
         self.assertTrue(in_margin)
 
@@ -1180,14 +1191,14 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         self.assertEqual(max(uses.values()), CEPH2_MAX_USES)
 
     def test_targets_are_reused(self):
-        # 186 shards land on 122 of the 242 candidates: some are reused.
+        # 52 shards land on 27 of the 900 candidates: some are reused.
         targets = {r[("TARGET", "OSD")] for r in self.rows}
         self.assertLess(len(targets), len(self.rows))
         self.assertLessEqual(len(targets), CEPH2_CANDIDATES)
 
-    def test_projection_stays_below_backfillfull_and_grows_with_each_use(self):
-        # The table rounds to one decimal, so a projection just under the ratio
-        # can print as exactly the ratio; it is never printed above it. Rows
+    def test_projection_stays_within_the_cap_and_grows_with_each_use(self):
+        # The table rounds to one decimal, so a projection just under the cap
+        # can print as exactly the cap; it is never printed above it. Rows
         # are in PG order, not the order shards were placed in, so an OSD's
         # successive uses are compared as a set: each adds a shard, so its
         # projections are all different and all above its current utilization.
@@ -1195,7 +1206,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         for r in self.rows:
             projected = percent(r[("TARGET", "PROJ")])
             self.assertGreater(projected, percent(r[("TARGET", "UTIL")]))
-            self.assertLessEqual(projected, CEPH2_BACKFILLFULL)
+            self.assertLessEqual(projected, CEPH2_MAX_TARGET_UTIL)
             projections.setdefault(r[("TARGET", "OSD")], []).append(projected)
         for osd, values in projections.items():
             with self.subTest(osd=osd):
@@ -1210,8 +1221,8 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
 
     def test_only_shards_on_the_fullest_acting_osds_get_the_scarce_room(self):
         # 578 of the 976 stuck shards have an acting OSD at or above
-        # backfillfull_ratio and there is room for only 186, so every placed
-        # shard should come from one. In PG order only 111 of 188 did.
+        # backfillfull_ratio and there is room for only 52, so every placed
+        # shard should come from one. (In PG order far fewer did.)
         # (Compared with slack: the table rounds a 90.96% OSD up to 91.0%.)
         below = [
             r
@@ -1262,23 +1273,71 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
 
     def test_the_limit_and_ratio_are_reported_on_stderr(self):
         self.assertIn(f"--max-target-uses {CEPH2_MAX_USES}", self.proc.stderr)
-        self.assertIn("backfillfull_ratio (91%)", self.proc.stderr)
+        self.assertIn(
+            f"--max-target-util {CEPH2_MAX_TARGET_UTIL:g}% (backfillfull_ratio 91%)",
+            self.proc.stderr,
+        )
 
     def test_no_row_targets_a_host_already_in_its_pgs_up_set(self):
         for row in self.rows:
             self.assertNotEqual(row[("TARGET", "HOST")], row[("UP", "HOST")])
 
-    def test_disabling_both_thresholds_still_never_targets_past_backfillfull(self):
+    def test_loosest_thresholds_still_never_target_past_backfillfull(self):
         # Opting out of the thresholds used to re-open targets that re-wedge on
-        # arrival (93 of them), with a warning. The projection is not a
-        # threshold that can be turned off, so nothing is doomed any more.
-        proc = run_ceph2("--min-up-util", "0", "--max-target-util", "100")
+        # arrival (93 of them), with a warning. The loosest cap allowed is
+        # backfillfull_ratio itself, so nothing is doomed any more.
+        proc = run_ceph2(
+            "--min-up-util", "0", "--max-target-util", f"{CEPH2_BACKFILLFULL:g}"
+        )
         rows = parse_table(proc.stdout)
         self.assertEqual(len(rows), CEPH2_UNCAPPED_PROPOSED)
         for r in rows:
             self.assertLess(percent(r[("TARGET", "UTIL")]), CEPH2_BACKFILLFULL)
             self.assertLessEqual(percent(r[("TARGET", "PROJ")]), CEPH2_BACKFILLFULL)
         self.assertNotIn("WARNING", proc.stderr)
+
+    def test_a_cap_above_backfillfull_is_an_error(self):
+        # 100 used to mean "no cap"; it must now fail rather than be honored.
+        for value in ("91.1", "100"):
+            with self.subTest(value=value):
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        SCRIPT,
+                        "--load-state",
+                        os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                        "--max-target-util",
+                        value,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, "")
+                self.assertIn("ERROR: max target utilization", proc.stderr)
+                self.assertIn("backfillfull_ratio (91%)", proc.stderr)
+
+    def test_a_cap_equal_to_backfillfull_is_accepted(self):
+        run_ceph2("--max-target-util", f"{CEPH2_BACKFILLFULL:g}")
+
+    def test_a_non_positive_cap_is_an_error(self):
+        for value in ("0", "-5"):
+            with self.subTest(value=value):
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        SCRIPT,
+                        "--load-state",
+                        os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                        f"--max-target-util={value}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("ERROR: max target utilization", proc.stderr)
 
     def test_pgremapper_mode_agrees_with_the_table(self):
         proc = subprocess.run(

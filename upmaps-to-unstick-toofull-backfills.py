@@ -94,22 +94,19 @@ How targets are chosen
 ----------------------
 Candidates are OSDs that are up, in (reweight > 0), have a non-zero CRUSH
 weight, a known device class and a known capacity (without one nothing can be
-projected onto them) and sit at or below --max-target-util,
-grouped by that class and sorted by utilization ascending within each class
-(OSD id breaks ties, so re-runs are reproducible). Down and out OSDs are
+projected onto them), grouped by that class and sorted by utilization
+ascending within each class (OSD id breaks ties, so re-runs are reproducible). Down and out OSDs are
 excluded by those filters, which also keeps an out OSD from sorting *first*
 — 'ceph osd df' reports one at 0% utilization.
 
---max-target-util PERCENT additionally drops every OSD whose current
-utilization is above PERCENT. It defaults to the cluster's backfillfull_ratio
-minus one percentage point and is a coarse pre-filter: it keeps the shortlist
-to OSDs a clear margin below the ratio, which absorbs the error in the shard
-size estimate and in the backfills the projection cannot see (see "How
-utilization is projected"). It is not what stops a proposal from re-wedging:
-the projection never lets a target reach backfillfull_ratio, however high
-this is set. Raised to backfillfull_ratio it only admits the OSDs so large
-that a shard still fits under the ratio. Set too low it simply leaves shards
-unplaceable.
+--max-target-util PERCENT is the ceiling on a target's *projected*
+utilization (see "How utilization is projected"): a shard is only placed on
+a candidate that stays at or below PERCENT once the shard is on it. It
+defaults to the cluster's backfillfull_ratio minus one percentage point, a
+margin that absorbs the error in the shard size estimate and in the backfills
+the projection cannot see. It may not exceed backfillfull_ratio, which Ceph
+refuses to backfill past: the script exits with an error if it does. Set too
+low it simply leaves shards unplaceable.
 
 A shard is only offered candidates of its *own* device class, that of the OSD
 it is arriving on. Pools' CRUSH rules are typically class-constrained, so an
@@ -149,7 +146,7 @@ own stuck shard is diverted only later looks fuller to the shards placed
 before that), which errs on the safe side; applying, draining and re-running
 picks up what that left over.
 
-A candidate whose projection reaches backfillfull_ratio is not eligible for
+A candidate whose projection is above --max-target-util is not eligible for
 that shard, so an OSD stops being used once the next shard would fill it
 that far. The projection is what the TARGET PROJ column shows for each row:
 the target's utilization after this shard and all the ones above it have
@@ -262,7 +259,7 @@ operator how full a proposed target is. That is why the capacity check is
 built in rather than a flag to remember: by the time the output is being
 piped into 'pgremapper remap', the only thing standing between the operator
 and a batch of remaps that re-wedge is the projection, which never lets a
-target reach backfillfull_ratio, whatever --max-target-util is set to.
+target exceed --max-target-util (itself capped at backfillfull_ratio).
 
 Apply the proposals with 'pgremapper remap', not by hand-writing 'ceph osd
 pg-upmap-items' commands. The table deliberately does not carry each PG's
@@ -387,11 +384,11 @@ def parse_args() -> argparse.Namespace:
         "Shards whose ACTING OSD is fullest are placed first. "
         "An OSD may be the target of several shards, up to --max-target-uses, "
         "for as long as its projected utilization (counting the shards "
-        "already sent to it and those still arriving on it) stays below "
-        "backfillfull_ratio. "
+        "already sent to it and those still arriving on it) stays at or below "
+        "--max-target-util. "
         "Both thresholds default to the cluster's own "
         "ratios: shards arriving below nearfull_ratio are left alone, and no "
-        "OSD within a point of backfillfull_ratio is proposed as a target. Only "
+        "target is projected within a point of backfillfull_ratio. Only "
         "the proposals are printed; nothing is changed. Assumes the affected "
         "pools' CRUSH failure domain is 'host', and exits with an error if "
         "it is not.",
@@ -422,13 +419,13 @@ def parse_args() -> argparse.Namespace:
         "--max-target-util",
         type=float,
         metavar="PERCENT",
-        help="Do not consider OSDs whose current utilization is above "
-        "PERCENT as targets. Defaults to the cluster's backfillfull_ratio - 1, "
-        "so a proposal is never aimed at an OSD Ceph would already refuse; "
-        "pass 100 to disable the cap. Uses the current 'ceph osd df' "
-        "utilization, without the shards being moved; the projection "
-        "against backfillfull_ratio applies regardless. The number of shards "
-        "left with no eligible target is reported on stderr.",
+        help="Never let a target's projected utilization (its 'ceph osd df' "
+        "usage plus the shards arriving on it and those already proposed "
+        "onto it, including the shard being placed) exceed PERCENT. Defaults "
+        "to the cluster's backfillfull_ratio - 1; a value above "
+        "backfillfull_ratio is an error, since Ceph refuses to backfill past "
+        "it. The number of shards left with no eligible target is reported "
+        "on stderr.",
     )
     parser.add_argument(
         "--max-target-uses",
@@ -438,7 +435,7 @@ def parse_args() -> argparse.Namespace:
         help="Hard limit on how many shards may be redirected to one OSD "
         "(default: %(default)s). Independently of this limit, an OSD stops "
         "being used once receiving another shard would bring its projected "
-        "utilization to backfillfull_ratio; 1 gives every OSD at most one "
+        "utilization above --max-target-util; 1 gives every OSD at most one "
         "shard.",
     )
     state_group = parser.add_mutually_exclusive_group()
@@ -992,9 +989,7 @@ def osd_class(osd_df: dict[int, dict], osd_id: int) -> str | None:
     return osd_df.get(osd_id, {}).get("device_class")
 
 
-def build_candidate_osds(
-    osd_df: dict[int, dict], max_util: float | None = None
-) -> dict[str, list[int]]:
+def build_candidate_osds(osd_df: dict[int, dict]) -> dict[str, list[int]]:
     """Return usable target OSD ids per device class, least-utilized first.
 
     Excludes OSDs that are down, out (reweight 0) or have no CRUSH weight.
@@ -1003,9 +998,6 @@ def build_candidate_osds(
     'ceph osd df' reports one at 0% utilization. An OSD with no utilization
     figure at all is excluded for the same reason — it cannot be ranked, and
     treating a missing value as 0% would make it the first pick.
-
-    If max_util is given, OSDs whose utilization is above it (percent) are
-    excluded too.
 
     Keyed by device class because a shard may only be diverted to an OSD of
     its own class (see module docstring); each class's OSDs fill up
@@ -1020,7 +1012,6 @@ def build_candidate_osds(
         and node.get("device_class")
         and node.get("kb")  # capacity unknown: nothing can be projected onto it
         and node.get("utilization") is not None
-        and (max_util is None or node["utilization"] <= max_util)
     ]
     # OSD id as secondary key: utilizations tie constantly on a uniformly
     # full cluster, and the operator will re-run this.
@@ -1139,15 +1130,15 @@ def assign_targets(
     *,
     projection: ProjectedUsage,
     max_uses: int,
-    backfillfull: float,
+    max_target_util: float,
 ) -> tuple[list[Proposal], list[DivertedShard]]:
     """Greedily give each diverted shard the legal target that ends up emptiest.
 
     Legal means: same device class, host and OSD not already used by the PG,
     strictly less utilized than the shard's UP OSD (currently, as in
-    'ceph osd df'), not already the target of max_uses shards, and still
-    below backfillfull (percent) once this shard has been added to what the
-    projection says it will hold. Of the legal candidates the one with the
+    'ceph osd df'), not already the target of max_uses shards, and at or
+    below max_target_util (percent) once this shard has been added to what
+    the projection says it will hold. Of the legal candidates the one with the
     lowest such projected utilization wins (OSD id breaks ties), so
     reusing an OSD only happens as the others fill up.
 
@@ -1212,6 +1203,10 @@ def assign_targets(
         max_util = osd_df.get(shard.up_osd, {}).get("utilization")
         legal = []
         for candidate in pool:
+            # Pool is sorted by utilization, and a projection is never below
+            # the current figure: everything from here on is over the cap.
+            if osd_df[candidate]["utilization"] > max_target_util:
+                break
             if osd_host.get(candidate) in forbidden_hosts:
                 continue
             if candidate in forbidden_osds:
@@ -1221,7 +1216,7 @@ def assign_targets(
             if max_util is not None and osd_df[candidate]["utilization"] >= max_util:
                 continue
             projected = projection.utilization_after(candidate, shard.size_bytes)
-            if projected >= backfillfull:
+            if projected > max_target_util:
                 continue
             legal.append((projected, candidate))
 
@@ -1446,6 +1441,14 @@ def main() -> None:
         if args.max_target_util is None
         else args.max_target_util
     )
+    if not 0 < max_target_util <= ratios.backfillfull:
+        sys.exit(
+            f"ERROR: max target utilization {max_target_util:g}% (--max-target-util, "
+            "or its backfillfull_ratio - 1 default) must be above 0 and "
+            f"at most the cluster's backfillfull_ratio ({ratios.backfillfull:g}%): "
+            "Ceph refuses to backfill onto an OSD past that, so a higher cap "
+            "would let the script propose targets that re-wedge."
+        )
 
     toofull_pool_ids = {pgid_pool_id(pg["pgid"]) for pg in toofull_pgs}
     pools_by_id = {p["pool_id"]: p for p in pools}
@@ -1484,7 +1487,7 @@ def main() -> None:
         )
     )
 
-    candidates = build_candidate_osds(osd_df, max_target_util)
+    candidates = build_candidate_osds(osd_df)
     # Every arriving shard counts towards its OSD until it is diverted.
     projection = ProjectedUsage(osd_df, arriving)
     proposals, unplaceable = assign_targets(
@@ -1495,12 +1498,14 @@ def main() -> None:
         upmap_items,
         projection=projection,
         max_uses=args.max_target_uses,
-        backfillfull=ratios.backfillfull,
+        max_target_util=max_target_util,
     )
 
     # Everything informational goes to stderr so stdout stays parseable.
     by_class = ", ".join(
-        f"{cls}={len(osds)}" for cls, osds in sorted(candidates.items())
+        f"{cls}={sum(osd_df[o]['utilization'] <= max_target_util for o in osds)}"
+        f"/{len(osds)}"
+        for cls, osds in sorted(candidates.items())
     )
     print(
         f"{len(toofull_pgs)} backfill_toofull PG(s) cluster-wide, "
@@ -1508,10 +1513,11 @@ def main() -> None:
         f"{len(arriving)} arriving shard(s), of which {len(shards)} on an OSD "
         f"at or above --min-up-util {min_up_util:g}% "
         f"({len(not_full_enough)} left alone as not the blocker); "
-        f"candidate target OSDs at or below --max-target-util "
-        f"{max_target_util:g}%: {by_class or 'none'}; each may take up to "
-        f"--max-target-uses {args.max_target_uses} shard(s), while projected "
-        f"below backfillfull_ratio ({ratios.backfillfull:g}%)",
+        f"candidate target OSDs at or below the cap now / in all: "
+        f"{by_class or 'none'}; each may take up to "
+        f"--max-target-uses {args.max_target_uses} shard(s), while its "
+        f"projected utilization stays at or below --max-target-util "
+        f"{max_target_util:g}% (backfillfull_ratio {ratios.backfillfull:g}%)",
         file=sys.stderr,
     )
 
@@ -1531,7 +1537,7 @@ def main() -> None:
     if unplaceable:
         print(
             "NOTE: each target OSD takes at most --max-target-uses shards and "
-            "none is filled to backfillfull_ratio, so a run with more stuck "
+            "none is filled past --max-target-util, so a run with more stuck "
             "shards than that leaves room for will leave a tail unplaceable. "
             "Apply these, let them drain, then re-run.",
             file=sys.stderr,

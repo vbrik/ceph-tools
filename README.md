@@ -83,7 +83,7 @@ other environments.
   (`num_bytes`, divided by `k` for EC pools) and projected onto the target —
   together with the shards already sent to it and every shard still arriving
   there, stuck ones included until they are diverted — and an OSD stops being
-  used once that projection reaches `backfillfull_ratio`, or after
+  used once that projection would exceed `--max-target-util`, or after
   `--max-target-uses N` shards (default 5; 1 gives every OSD at most one). The
   `TARGET PROJ` column shows that projection. Shards are placed
   fullest-`ACTING`-OSD first, re-ranked as each placement relieves its source,
@@ -97,10 +97,11 @@ other environments.
   `backfill_toofull` is a property of the PG, not of each shard arriving on
   it, so without this a PG with one wedged shard has all its healthy arrivals
   diverted too, spending target OSDs that genuinely stuck shards then cannot
-  get. `--max-target-util PERCENT` (default `backfillfull_ratio` minus 1)
-  drops OSDs above that current utilization from consideration as targets, so
-  a proposal is never aimed at an OSD Ceph would already refuse; pass `100` to
-  disable it (the projection against `backfillfull_ratio` still applies).
+  get. `--max-target-util PERCENT` (default `backfillfull_ratio` minus 1) caps
+  a target's *projected* utilization: an OSD stops being used once the next
+  shard would take it above that, so a proposal never re-wedges. It cannot
+  exceed `backfillfull_ratio`, and the script exits with an error if it is
+  set higher (`100` no longer disables it).
   `--save-state DIR` writes the run's cluster state as JSON, anonymized so it
   can be shared, and `--load-state DIR` replays such a capture offline with no
   cluster access. Handles EC pools per-shard and replicated pools by set
@@ -229,8 +230,8 @@ cluster-state snapshots under `test-data/` via `--load-state` and check the
 output against what each fixture's `README.txt` documents, so fixture and
 code cannot drift apart: the exact table for the small fixtures, and for the
 cluster-sized one (808 stuck PGs, 1513 arriving shards) the counts plus the
-invariants that matter — no target above `backfillfull_ratio` minus 1, no
-target projected past `backfillfull_ratio`, no target used more than
+invariants that matter — no target projected above `--max-target-util`
+(`backfillfull_ratio` minus 1 by default), no target used more than
 `--max-target-uses` times, no shard diverted off an OSD below `nearfull_ratio`.
 
 ## License

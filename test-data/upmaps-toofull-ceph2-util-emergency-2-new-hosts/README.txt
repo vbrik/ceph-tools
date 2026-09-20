@@ -41,8 +41,10 @@ thresholds, and it is the capture that exposed the two bugs they fix.
     --max-target-util disabled this capture proposed every one of the 822
     usable hdd OSDs, 342 of them at or above backfillfull_ratio -- remaps
     that re-wedge the moment they are applied. --max-target-util
-    (default: backfillfull_ratio minus 1) excludes them, and the OSDs
-    within a point of the ratio, which may lack room for the shard.
+    (default: backfillfull_ratio minus 1) caps a target's *projected*
+    utilization, so an OSD is used only while it stays a point clear of
+    the ratio once the shard is on it. It may not exceed backfillfull_ratio;
+    a higher value (100 included) is an error.
 
 Expected results with the default settings (--min-up-util 85,
 --max-target-util 90, both derived from this cluster's own ratios, and
@@ -50,48 +52,53 @@ Expected results with the default settings (--min-up-util 85,
 
   808 backfill_toofull PGs, 808 with newly-arriving shards
   1513 arriving shards, 976 at or above --min-up-util, 537 left alone
-  candidate target OSDs: hdd=242, ssd=78
-  186 remaps proposed, 790 unplaceable
-  186 shards go to 122 distinct OSDs; none is used more than 5 times
-  no proposed target projected to reach backfillfull_ratio, counting the
+  candidate target OSDs: hdd=822, ssd=78
+  52 remaps proposed, 924 unplaceable
+  52 shards go to 27 distinct OSDs; none is used more than 5 times
+  no proposed target projected above --max-target-util, counting the
     shards already sent to it and every shard arriving on it (the 537
     left-alone ones, and the stuck ones until they are diverted; a shard is
     ~184 GB, 0.93% of an OSD, so an OSD near the cap has room for only a few)
-  no proposed target above --max-target-util (so none within a point of
-  backfillfull_ratio)
+  (so none is projected within a point of backfillfull_ratio)
   no diverted shard arriving on an OSD below nearfull_ratio
 
 Counting the stuck shards on the OSD they are headed for matters here: many
-of the 242 candidates are themselves the arriving OSD of a stuck shard, and
-that shard still lands there if nothing emptier can take it. Only projecting
-the 537 left-alone shards places 324 (and 242 with one use per OSD), which is
-optimistic; the run is order-dependent, and errs on the safe side.
+of the candidates are themselves the arriving OSD of a stuck shard, and that
+shard still lands there if nothing emptier can take it. The run is
+order-dependent, and errs on the safe side.
 
 Shards are placed fullest ACTING OSD first, re-ranked as each placement
 relieves its source. 578 of the 976 stuck shards have an acting OSD at or
-above backfillfull_ratio and there is room for only 186, so every placed
-shard comes from one (the least full acting OSD among them is at 91.5%),
-spread over 148 distinct acting OSDs rather than piled onto a few.
+above backfillfull_ratio and there is room for only 52, so every placed
+shard comes from one (the least full acting OSD among them is at 92.4%),
+spread over 45 distinct acting OSDs rather than piled onto a few.
 
-The count limit is not what runs out: --max-target-uses 2 places 151, 5
-places 186, 10 places 190, because the projection is. --max-target-uses 1
+The count limit is not what runs out: --max-target-uses 2 places 37, 5
+places 52, 10 places 54, because the projection is. --max-target-uses 1
 gives every OSD at most one shard:
 
   upmaps-to-unstick-toofull-backfills.py --load-state . --max-target-uses 1
-  -> 113 remaps proposed, 863 unplaceable
+  -> 26 remaps proposed, 950 unplaceable
 
-The table is 186 rows, too long to quote here the way the small fixtures
+Raising the cap to backfillfull_ratio itself admits targets projected right
+up to the ratio, with no margin:
+
+  upmaps-to-unstick-toofull-backfills.py --load-state . --max-target-util 91
+  -> 199 remaps proposed, 777 unplaceable
+
+The table is 52 rows, too long to quote here the way the small fixtures
 do, so the test asserts those counts and invariants instead of an exact
 table (see Ceph2FixtureInvariantTest in
-test_upmaps_to_unstick_toofull_backfills.py). The 790 unplaceable shards
+test_upmaps_to_unstick_toofull_backfills.py). The 924 unplaceable shards
 are counted on stderr after the table, without a reason: the heuristic found
 no target for them, which does not prove none exists.
 
-For reference, the pre-threshold behavior is still reachable and is what
-the invariant test guards against regressing to:
+For reference, the closest to the pre-threshold behavior that is still
+reachable (--max-target-util can no longer exceed backfillfull_ratio, and 100
+is an error), and what the invariant test guards against regressing past:
 
   upmaps-to-unstick-toofull-backfills.py --load-state . \
-      --min-up-util 0 --max-target-util 100
+      --min-up-util 0 --max-target-util 91
   -> 210 remaps proposed, 1303 unplaceable, none projected past backfillfull
 
 (With one use per OSD and no projection this was 573 remaps proposed, 940
