@@ -278,6 +278,162 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(self.plan([pg("19.9", [1, 2, 3, 4], [1, 2, 3, 4])]), ([], []))
 
 
+RATIO = 91.0
+
+
+class ProjectedUtilizationTest(unittest.TestCase):
+    def test_adds_the_shard_to_current_usage(self):
+        df = {5: osd_df_node(5, 90.0, kb=1000)}  # 1000 KiB, 900 KiB used
+        self.assertAlmostEqual(cb.projected_utilization(df, 5, 0), 90.0)
+        self.assertAlmostEqual(cb.projected_utilization(df, 5, 10 * 1024), 91.0)
+
+    def test_unknown_size_counts_as_nothing(self):
+        df = {5: osd_df_node(5, 90.0)}
+        self.assertAlmostEqual(cb.projected_utilization(df, 5, None), 90.0)
+
+    def test_unknown_osd_or_capacity_gives_none(self):
+        self.assertIsNone(cb.projected_utilization({}, 5, 1))
+        self.assertIsNone(cb.projected_utilization({5: {"kb": 0, "kb_used": 0}}, 5, 1))
+
+
+class FindBlockersTest(unittest.TestCase):
+    def find(self, up, acting, df, pinned=None):
+        return cb.find_blockers(up, acting, pinned or {0: acting[0]}, df, RATIO, 1_000)
+
+    def test_lists_moving_shards_whose_target_reaches_the_ratio(self):
+        up, acting = [OSD, 2, 77, 88], [8, 2, 66, 99]
+        df = {77: osd_df_node(77, 92.0), 88: osd_df_node(88, 80.0)}
+        self.assertEqual(self.find(up, acting, df), [2])
+
+    def test_at_the_ratio_counts(self):
+        df = {77: osd_df_node(77, 91.0)}
+        self.assertEqual(self.find([OSD, 77], [8, 66], df), [1])
+
+    def test_a_shard_that_is_not_moving_is_not_a_blocker(self):
+        df = {77: osd_df_node(77, 95.0)}
+        self.assertEqual(self.find([OSD, 77], [8, 77], df), [])
+
+    def test_a_shard_with_no_acting_osd_cannot_be_pinned_so_is_not_listed(self):
+        df = {77: osd_df_node(77, 95.0)}
+        self.assertEqual(self.find([OSD, 77], [8, NONE], df), [])
+
+    def test_already_pinned_shards_are_not_listed(self):
+        df = {77: osd_df_node(77, 95.0)}
+        self.assertEqual(self.find([OSD, 77], [8, 66], df, pinned={0: 8, 1: 66}), [])
+
+    def test_an_osd_missing_from_osd_df_is_not_a_blocker(self):
+        self.assertEqual(self.find([OSD, 77], [8, 66], {}), [])
+
+    def test_the_size_of_the_shard_can_tip_it_over(self):
+        # 90.9% used is under the ratio, but a 0.2% shard takes it to 91.1%.
+        df = {77: osd_df_node(77, 90.9)}
+        up, acting = [OSD, 77], [8, 66]
+        small = cb.find_blockers(up, acting, {0: 8}, df, RATIO, 1_000)
+        big = cb.find_blockers(up, acting, {0: 8}, df, RATIO, 3 * 1024 * 1024)
+        self.assertEqual((small, big), ([], [1]))
+
+
+class PlanBlockersTest(unittest.TestCase):
+    """plan_cancellations with the OSD utilizations and backfillfull_ratio given."""
+
+    def plan(self, pgs, df, osd_host=None, ratio=RATIO):
+        pools = {19: EC_POOL, 7: REP_POOL}
+        return cb.plan_cancellations(
+            pgs, pools, EC_PROFILES, OSD, osd_host or {}, RULES, df, ratio
+        )
+
+    def test_blocker_is_pinned_and_marked_with_its_projected_utilization(self):
+        p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
+        cancellations, skipped = self.plan([p], {77: osd_df_node(77, 92.0)})
+        self.assertEqual(skipped, [])
+        self.assertEqual(
+            [(c.shard, c.up_osd, c.acting_osd, c.companion_of) for c in cancellations],
+            [(0, OSD, 8, None), (3, 77, 66, 0)],
+        )
+        self.assertIsNone(cancellations[0].blocker_util)
+        self.assertAlmostEqual(cancellations[1].blocker_util, 92.0, places=2)
+
+    def test_the_requested_shard_is_never_marked_a_blocker(self):
+        p = pg("19.5", [OSD, 2], [8, 2])
+        (c,), _ = self.plan([p], {OSD: osd_df_node(OSD, 99.0)})
+        self.assertIsNone(c.blocker_util)
+
+    def test_pgs_without_a_shard_into_the_osd_are_left_alone(self):
+        p = pg("19.5", [1, 2, 3, 77], [1, 2, 3, 66])
+        self.assertEqual(self.plan([p], {77: osd_df_node(77, 99.0)}), ([], []))
+
+    def test_no_blockers_without_utilizations_or_ratio(self):
+        p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
+        pools = {19: EC_POOL}
+        for df, ratio in ((None, RATIO), ({77: osd_df_node(77, 99.0)}, None)):
+            cancellations, _ = cb.plan_cancellations(
+                [p], pools, EC_PROFILES, OSD, {}, RULES, df, ratio
+            )
+            self.assertEqual([c.shard for c in cancellations], [0])
+
+    def test_a_blocker_that_cannot_be_pinned_is_reported_and_the_pin_is_kept(self):
+        # pinning shard 3 back to osd.66 would share host H with shard 1
+        # (osd.2), which is not moving, so the blocker is skipped.
+        p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
+        cancellations, skipped = self.plan(
+            [p], {77: osd_df_node(77, 92.0)}, osd_host={66: "H", 2: "H"}
+        )
+        self.assertEqual([c.shard for c in cancellations], [0])
+        self.assertEqual([(s.pgid, s.shard) for s in skipped], [("19.5", 3)])
+        self.assertTrue(skipped[0].reason.startswith("blocker:"))
+
+    def test_pinning_a_blocker_can_pull_in_a_companion(self):
+        # shard 2 (77) is the blocker; its acting osd.66 shares a host with
+        # shard 3's target osd.88, so shard 3 comes along as a plain companion.
+        p = pg("19.5", [OSD, 2, 77, 88], [8, 2, 66, 99])
+        df = {77: osd_df_node(77, 92.0), 88: osd_df_node(88, 50.0)}
+        cancellations, skipped = self.plan([p], df, osd_host={66: "H", 88: "H"})
+        self.assertEqual(skipped, [])
+        self.assertEqual([c.shard for c in cancellations], [0, 2, 3])
+        self.assertIsNotNone(cancellations[1].blocker_util)
+        self.assertIsNone(cancellations[2].blocker_util)  # companion, not blocker
+        self.assertEqual(cancellations[2].companion_of, 0)
+
+    def test_a_companion_whose_target_is_over_the_ratio_counts_as_a_blocker(self):
+        p = pg("19.5", [OSD, 149], [627, 497])
+        cancellations, _ = self.plan(
+            [p], {149: osd_df_node(149, 92.0)}, osd_host={627: "H", 149: "H"}
+        )
+        self.assertEqual([c.shard for c in cancellations], [0, 1])
+        self.assertAlmostEqual(cancellations[1].blocker_util, 92.0, places=2)
+
+    def test_several_blockers_come_in_shard_order(self):
+        p = pg("19.5", [OSD, 77, 3, 88], [8, 66, 3, 99])
+        df = {77: osd_df_node(77, 92.0), 88: osd_df_node(88, 93.0)}
+        cancellations, _ = self.plan([p], df)
+        self.assertEqual([c.shard for c in cancellations], [0, 1, 3])
+
+    def test_replicated_pgs_get_no_blockers(self):
+        p = pg("7.1", [1, 2, OSD], [1, 2, 9])
+        cancellations, _ = self.plan([p], {2: osd_df_node(2, 99.0)})
+        self.assertEqual(
+            [(c.shard, c.blocker_util) for c in cancellations], [("-", None)]
+        )
+
+
+class NoteTest(unittest.TestCase):
+    def note(self, **kw):
+        c = cb.Cancellation("19.1", 3, 77, 66, 1_000, "s", None, **kw)
+        return cb.format_note(c)
+
+    def test_requested_shards_have_no_note(self):
+        self.assertEqual(self.note(), "")
+
+    def test_companion(self):
+        self.assertEqual(self.note(companion_of=0), "companion of shard 0")
+
+    def test_blocker_names_the_shard_it_blocks_and_the_projection(self):
+        self.assertEqual(
+            self.note(companion_of=0, blocker_util=92.04),
+            "blocks shard 0: target osd.77 would be at 92.0%, over backfillfull",
+        )
+
+
 class PlanCompanionsTest(unittest.TestCase):
     """Planning that involves same-host clashes."""
 
@@ -482,7 +638,17 @@ class ParseOsdTest(unittest.TestCase):
                 cb.parse_osd(text)
 
 
-def canned_snapshots(pg_stats):
+def osd_df_node(osd_id, util, kb=1_000_000):
+    """A 'ceph osd df' node at util percent of kb KiB."""
+    return {
+        "id": osd_id,
+        "utilization": util,
+        "kb": kb,
+        "kb_used": int(kb * util / 100),
+    }
+
+
+def canned_snapshots(pg_stats, extra_osds=()):
     """The six snapshots (cb.SNAPSHOT_COMMANDS keys) of a tiny cluster."""
     return {
         "pg_ls_remapped": {"pg_ready": True, "pg_stats": pg_stats},
@@ -491,6 +657,7 @@ def canned_snapshots(pg_stats):
             "nodes": [
                 {"id": OSD, "utilization": 88.0, "kb": 1000, "kb_used": 880},
                 {"id": 8, "utilization": 90.5, "kb": 1000, "kb_used": 905},
+                *extra_osds,
             ]
         },
         "osd_tree": {
@@ -505,15 +672,23 @@ def canned_snapshots(pg_stats):
         "crush_rule_dump": [{**HOST_RULE, "rule_name": "secret-rule"}],
         "osd_dump": {
             "fsid": "11111111-2222-3333-4444-555555555555",
+            "full_ratio": 0.95,
+            "backfillfull_ratio": 0.91,
+            "nearfull_ratio": 0.85,
             "erasure_code_profiles": EC_PROFILES,
             "osds": [{"osd": 8, "public_addr": "10.1.2.3:6800/1", "uuid": "abc"}],
         },
     }
 
 
-def canned_ceph(pg_stats):
-    """Return a stand-in for _ceph_json serving a tiny cluster."""
-    data = canned_snapshots(pg_stats)
+def canned_ceph(pg_stats, extra_osds=(), drop=()):
+    """Return a stand-in for _ceph_json serving a tiny cluster.
+
+    drop names 'osd dump' keys to leave out.
+    """
+    data = canned_snapshots(pg_stats, extra_osds)
+    for key in drop:
+        del data["osd_dump"][key]
 
     def fake(key):
         return json.loads(json.dumps(data[key]))
@@ -531,9 +706,9 @@ class MainTest(unittest.TestCase):
         pg("19.d", [OSD, 2, 3, 9], [8, 2, 3, 4]),
     ]
 
-    def run_main(self, *argv, pgs=None):
+    def run_main(self, *argv, pgs=None, extra_osds=(), drop=()):
         out, err = io.StringIO(), io.StringIO()
-        fake = canned_ceph(self.PGS if pgs is None else pgs)
+        fake = canned_ceph(self.PGS if pgs is None else pgs, extra_osds, drop)
         with (
             mock.patch.object(cb, "_ceph_json", fake),
             mock.patch("sys.argv", ["cancel-backfills-into-osd.py", *argv]),
@@ -549,7 +724,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(out, "19.9 682 8\n19.d 682 8\n19.d 9 4\n")
         # the unpinnable shard is reported, not silently dropped
         self.assertIn("19.a", err)
-        self.assertIn("1 companion", err)
+        self.assertIn("1 more shard(s)", err)
 
     def test_table_shows_acting_osd_state_and_host(self):
         out, _ = self.run_main("682")
@@ -591,6 +766,45 @@ class MainTest(unittest.TestCase):
         _, err = self.run_main("682")
         self.assertNotIn("WARNING", err)
 
+    def test_blocker_in_the_same_pg_is_proposed_and_explained(self):
+        # osd.77 is at 92%, over the 91% backfillfull_ratio, so shard 3 (66->77)
+        # would hold 19.e in backfill_toofull and must be pinned back too.
+        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        out, err = self.run_main(
+            "--pgremapper", "682", pgs=pgs, extra_osds=[osd_df_node(77, 92.0)]
+        )
+        self.assertEqual(out, "19.e 682 8\n19.e 77 66\n")
+        self.assertIn("1 more shard(s)", err)
+        self.assertIn("1 because their target would be over backfillfull_ratio", err)
+
+    def test_table_says_which_shard_a_blocker_blocks(self):
+        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        out, _ = self.run_main("682", pgs=pgs, extra_osds=[osd_df_node(77, 92.0)])
+        rows = out.splitlines()
+        self.assertEqual(len(rows), 3)
+        self.assertIn("blocks shard 0: target osd.77 would be at 92.0%", rows[2])
+        self.assertNotIn("blocks", rows[1])
+
+    def test_a_target_below_the_ratio_is_not_a_blocker(self):
+        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        out, err = self.run_main(
+            "--pgremapper", "682", pgs=pgs, extra_osds=[osd_df_node(77, 80.0)]
+        )
+        self.assertEqual(out, "19.e 682 8\n")
+        self.assertNotIn("more shard(s)", err)
+
+    def test_without_a_backfillfull_ratio_no_blockers_are_looked_for(self):
+        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        out, err = self.run_main(
+            "--pgremapper",
+            "682",
+            pgs=pgs,
+            extra_osds=[osd_df_node(77, 92.0)],
+            drop=["backfillfull_ratio"],
+        )
+        self.assertEqual(out, "19.e 682 8\n")
+        self.assertIn("no backfillfull_ratio", err)
+
     def test_no_backfills_prints_nothing_on_stdout(self):
         out, err = self.run_main("--pgremapper", "682", pgs=[self.PGS[2]])
         self.assertEqual(out, "")
@@ -629,10 +843,24 @@ class AnonymizeTest(unittest.TestCase):
         for name in ("host51", cb._fake_hostname("nodigits.example")):
             self.assertEqual(cb._fake_hostname(name), name)
 
-    def test_osd_dump_is_reduced_to_erasure_code_profiles(self):
+    def test_osd_dump_is_reduced_to_what_the_analysis_reads(self):
         snaps = self.snapshots()
         cb.anonymize_snapshots(snaps)
-        self.assertEqual(snaps["osd_dump"], {"erasure_code_profiles": EC_PROFILES})
+        self.assertEqual(
+            snaps["osd_dump"],
+            {
+                "erasure_code_profiles": EC_PROFILES,
+                "full_ratio": 0.95,
+                "backfillfull_ratio": 0.91,
+                "nearfull_ratio": 0.85,
+            },
+        )
+
+    def test_osd_dump_without_ratios_stays_valid(self):
+        snaps = self.snapshots()
+        del snaps["osd_dump"]["backfillfull_ratio"]
+        cb.anonymize_snapshots(snaps)
+        self.assertNotIn("backfillfull_ratio", snaps["osd_dump"])
 
     def test_analysis_inputs_are_left_alone(self):
         before = self.snapshots()
@@ -787,13 +1015,20 @@ FIXTURE = (
     / ("cancel-backfills-into-osd-ceph2-osd896-host-clash-companions")
 )
 
-# Documented in the fixture's README.txt.
+FIXTURE_BLOCKER = (
+    FIXTURE.parent / "cancel-backfills-into-osd-ceph2-osd896-blocker-in-same-pg"
+)
+
+# Documented in the fixture's README.txt. The pins that are neither into 896 nor
+# needed for host validity alone are the blockers (targets over backfillfull).
 EXPECTED_896 = """\
 19.7e9 896 627
 19.7e9 149 497
 19.92e 896 231
+19.92e 337 99
 19.94c 896 522
 19.94c 716 266
+19.14cd 314 347
 19.14cd 232 337
 19.14cd 896 614
 19.1b16 896 591
@@ -828,10 +1063,9 @@ class FixtureReplayTest(unittest.TestCase):
 
     def test_osd_896_pgremapper_lines_carry_the_warning(self):
         err = self.replay(896, "--pgremapper").stderr
-        self.assertIn("WARNING: 5 PG(s) need more than one remap", err)
-        for pgid in ("19.7e9", "19.94c", "19.14cd", "19.1b16", "19.1fed"):
+        self.assertIn("WARNING: 6 PG(s) need more than one remap", err)
+        for pgid in ("19.7e9", "19.92e", "19.94c", "19.14cd", "19.1b16", "19.1fed"):
             self.assertIn(pgid, err)
-        self.assertNotIn("19.92e,", err)  # the one PG with a single line
 
     def test_osd_74_pgremapper_lines_need_no_warning(self):
         self.assertNotIn("WARNING", self.replay(74, "--pgremapper").stderr)
@@ -839,10 +1073,11 @@ class FixtureReplayTest(unittest.TestCase):
     def test_osd_896_table_and_summary(self):
         result = self.replay(896)
         rows = result.stdout.splitlines()
-        self.assertEqual(len(rows), 1 + 11)  # header + the 11 pins
-        self.assertEqual(sum("companion of shard" in r for r in rows), 5)
+        self.assertEqual(len(rows), 1 + 13)  # header + the 13 pins
+        self.assertEqual(sum("blocks shard" in r for r in rows), 7)
         self.assertIn("6 arriving shard(s)", result.stderr)
-        self.assertIn("5 companion shard(s)", result.stderr)
+        self.assertIn("7 more shard(s)", result.stderr)
+        self.assertIn("(7 because their target would be over", result.stderr)
         self.assertIn("0 cannot be pinned", result.stderr)
 
     def test_osd_74_needs_no_companions(self):
@@ -887,9 +1122,61 @@ class FixtureReplayTest(unittest.TestCase):
                 hosts = [host[o] for o in up]
                 self.assertEqual(len(set(hosts)), len(hosts), (osd, pgid, hosts))
 
-    def test_fixture_holds_no_real_hostnames(self):
-        text = "".join(f.read_text() for f in FIXTURE.glob("*.json"))
-        self.assertNotIn("ceph2", text)
+    def test_fixtures_hold_no_real_hostnames_addresses_or_uuids(self):
+        for fixture in (FIXTURE, FIXTURE_BLOCKER):
+            text = "".join(f.read_text() for f in fixture.glob("*.json"))
+            self.assertNotIn("ceph2", text, fixture.name)
+            self.assertNotRegex(text, r"\b\d{1,3}(\.\d{1,3}){3}\b", fixture.name)
+            self.assertNotRegex(
+                text, r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-", fixture.name
+            )
+
+    def test_the_older_fixture_only_gained_the_ratios_it_lacked(self):
+        dump = json.loads((FIXTURE / "osd_dump.json").read_text())
+        self.assertEqual(dump["backfillfull_ratio"], 0.91)
+
+
+class BlockerFixtureReplayTest(unittest.TestCase):
+    """The state that prompted blockers: osd.896 has ONE arriving shard
+    (19.92e shard 4, from osd.231) yet its PG stays in backfill_toofull, because
+    shard 6 of the same PG is going to osd.337, which is over backfillfull."""
+
+    def replay(self, *flags):
+        result = run_cli("--load-state", str(FIXTURE_BLOCKER), *flags, "896")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def test_the_blocking_shard_is_proposed_next_to_the_requested_one(self):
+        self.assertEqual(
+            self.replay("--pgremapper").stdout, "19.92e 896 231\n19.92e 337 99\n"
+        )
+
+    def test_import_mappings_output(self):
+        self.assertEqual(
+            json.loads(self.replay("--import-mappings").stdout),
+            [
+                {"pgid": "19.92e", "mapping": {"from": 896, "to": 231}},
+                {"pgid": "19.92e", "mapping": {"from": 337, "to": 99}},
+            ],
+        )
+
+    def test_the_table_explains_the_second_line(self):
+        rows = self.replay().stdout.splitlines()
+        self.assertEqual(len(rows), 3)
+        self.assertIn("blocks shard 4: target osd.337 would be at 93.4%", rows[2])
+        self.assertNotIn("blocks", rows[1])
+
+    def test_summary_says_it_is_one_arriving_shard_plus_one_blocker(self):
+        err = self.replay().stderr
+        self.assertIn("1 arriving shard(s)", err)
+        self.assertIn("1 more shard(s)", err)
+        self.assertIn("1 because their target would be over backfillfull_ratio", err)
+
+    def test_keeping_the_wanted_backfill_means_dropping_only_its_own_entry(self):
+        # the user's case: keep 231->896, so drop that entry and keep the blocker
+        entries = json.loads(self.replay("--import-mappings").stdout)
+        kept = [e for e in entries if e["mapping"]["from"] != 896]
+        self.assertEqual(kept, [{"pgid": "19.92e", "mapping": {"from": 337, "to": 99}}])
 
 
 if __name__ == "__main__":
