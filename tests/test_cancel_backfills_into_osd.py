@@ -416,6 +416,127 @@ class PlanBlockersTest(unittest.TestCase):
         )
 
 
+class OrderMovesTest(unittest.TestCase):
+    """Ceph applies an entry's pairs in order and skips one whose target is
+    still in the mapping, so a pair must follow the pair that moves its target
+    away."""
+
+    def test_independent_moves_keep_shard_order(self):
+        moves = [(3, 30, 31), (0, 10, 11), (1, 20, 21)]
+        self.assertEqual(
+            cb.order_moves(moves), ([(0, 10, 11), (1, 20, 21), (3, 30, 31)], None)
+        )
+
+    def test_a_chain_puts_the_pair_that_frees_the_osd_first(self):
+        # 19.1299's shape: shard 1 goes 891->579 but 579 is still shard 8's OSD
+        moves = [(1, 891, 579), (8, 579, 825)]
+        self.assertEqual(cb.order_moves(moves), ([(8, 579, 825), (1, 891, 579)], None))
+
+    def test_a_chain_of_three(self):
+        moves = [(0, 1, 2), (1, 2, 3), (2, 3, 4)]
+        ordered, why = cb.order_moves(moves)
+        self.assertIsNone(why)
+        self.assertEqual([m[0] for m in ordered], [2, 1, 0])
+
+    def test_unrelated_moves_do_not_get_reordered_by_a_chain(self):
+        moves = [(0, 1, 2), (1, 2, 3), (2, 50, 51)]
+        ordered, _ = cb.order_moves(moves)
+        self.assertEqual([m[0] for m in ordered], [1, 0, 2])
+
+    def test_a_ring_cannot_be_expressed(self):
+        ordered, why = cb.order_moves([(0, 1, 2), (1, 2, 1)])
+        self.assertEqual(ordered, [])
+        self.assertIn("cycle", why)
+
+    def test_a_ring_inside_a_longer_list_is_still_found(self):
+        ordered, why = cb.order_moves([(0, 10, 11), (1, 1, 2), (2, 2, 3), (3, 3, 1)])
+        self.assertEqual(ordered, [])
+        self.assertIn("cycle", why)
+
+    def test_empty_and_single(self):
+        self.assertEqual(cb.order_moves([]), ([], None))
+        self.assertEqual(cb.order_moves([(0, 1, 2)]), ([(0, 1, 2)], None))
+
+
+class PlanChainTest(unittest.TestCase):
+    plan = staticmethod(run_plan)
+
+    def test_a_chained_pin_comes_out_in_the_valid_order(self):
+        # shard 0 moves to osd.20 while osd.20 still holds shard 1, which is
+        # itself going to osd.30: (20->30) has to be applied before (OSD->20)
+        p = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
+        cancellations, skipped = self.plan([p])
+        self.assertEqual(skipped, [])
+        self.assertEqual(
+            [(c.shard, c.up_osd, c.acting_osd) for c in cancellations],
+            [(1, 20, 30), (0, OSD, 20)],
+        )
+
+    def test_a_ring_skips_the_pin_and_says_why(self):
+        # osd.20 and OSD would swap places between shards 0 and 1
+        p = pg("19.f", [OSD, 20, 3, 4], [20, OSD, 3, 4])
+        cancellations, skipped = self.plan([p])
+        self.assertEqual(cancellations, [])
+        self.assertEqual([(s.pgid, s.shard) for s in skipped], [("19.f", 0)])
+        self.assertIn("cycle", skipped[0].reason)
+
+    def test_the_order_survives_sorting_across_pgs(self):
+        chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
+        plain = pg("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        cancellations, _ = self.plan([chain, plain])
+        self.assertEqual(
+            [(c.pgid, c.shard) for c in cancellations],
+            [("19.2", 0), ("19.f", 1), ("19.f", 0)],
+        )
+
+    def test_a_blocker_that_would_make_a_ring_is_skipped_but_the_pin_stays(self):
+        # shard 3 (77->66) is a blocker (osd.77 is over the ratio) but pinning
+        # it back would ring with shard 2 (66 <-> 77 swap): skip it only.
+        p = pg("19.5", [OSD, 2, 66, 77], [8, 2, 77, 66])
+        cancellations, skipped = run_plan_with_df(
+            [p], {77: osd_df_node(77, 92.0), 66: osd_df_node(66, 50.0)}
+        )
+        self.assertEqual([c.shard for c in cancellations], [0])
+        self.assertEqual([(s.pgid, s.shard) for s in skipped], [("19.5", 3)])
+        self.assertIn("cycle", skipped[0].reason)
+
+
+def run_plan_with_df(pgs, df, ratio=RATIO):
+    return cb.plan_cancellations(
+        pgs, {19: EC_POOL, 7: REP_POOL}, EC_PROFILES, OSD, {}, RULES, df, ratio
+    )
+
+
+class ChainedPgsTest(unittest.TestCase):
+    def c(self, pgid, shard, up, acting):
+        return cb.Cancellation(pgid, shard, up, acting, None, "s", None)
+
+    def test_finds_only_pgs_with_chained_pairs_in_order(self):
+        cs = [
+            self.c("19.1", 0, 1, 2),
+            self.c("19.1", 1, 5, 6),  # independent
+            self.c("19.9", 0, 20, 30),
+            self.c("19.9", 1, 682, 20),  # chains with the pair above
+        ]
+        chained = cb.chained_pgs(cs)
+        self.assertEqual(list(chained), ["19.9"])
+        self.assertEqual(len(chained["19.9"]), 2)
+
+    def test_none_when_nothing_chains(self):
+        self.assertEqual(cb.chained_pgs([self.c("19.1", 0, 1, 2)]), {})
+
+    def test_warning_gives_the_commands_in_apply_order(self):
+        chained = {"19.9": [self.c("19.9", 1, 20, 30), self.c("19.9", 0, 682, 20)]}
+        for left_out in (True, False):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                cb.warn_chained_pgs(chained, left_out=left_out)
+            text = err.getvalue()
+            self.assertIn("ceph osd pg-upmap-items 19.9 20 30 682 20", text)
+            self.assertIn("panic", text)
+            self.assertEqual("left out of this output" in text, left_out)
+
+
 class NoteTest(unittest.TestCase):
     def note(self, **kw):
         c = cb.Cancellation("19.1", 3, 77, 66, 1_000, "s", None, **kw)
@@ -805,6 +926,39 @@ class MainTest(unittest.TestCase):
         self.assertEqual(out, "19.e 682 8\n")
         self.assertIn("no backfillfull_ratio", err)
 
+    def test_chained_pgs_are_left_out_of_the_machine_formats(self):
+        chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
+        plain = pg("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        out, err = self.run_main("--import-mappings", "682", pgs=[chain, plain])
+        self.assertEqual(
+            json.loads(out), [{"pgid": "19.2", "mapping": {"from": 682, "to": 8}}]
+        )
+        self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
+        out, err = self.run_main("--pgremapper", "682", pgs=[chain, plain])
+        self.assertEqual(out, "19.2 682 8\n")
+        self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
+        self.assertNotIn("need more than one remap", err)  # 19.2 has one line
+
+    def test_the_table_still_shows_a_chained_pg_in_apply_order(self):
+        chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
+        out, err = self.run_main("682", pgs=[chain])
+        rows = out.splitlines()
+        self.assertEqual(
+            [r.split()[:2] for r in rows[1:]], [["19.f", "1"], ["19.f", "0"]]
+        )
+        self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
+        self.assertNotIn("left out", err)
+
+    def test_import_mappings_is_valid_json_even_with_nothing_to_apply(self):
+        # nothing arriving at all
+        out, err = self.run_main("--import-mappings", "682", pgs=[self.PGS[2]])
+        self.assertEqual(json.loads(out), [])
+        self.assertIn("No backfills", err)
+        # only an unpinnable shard (no acting OSD)
+        out, err = self.run_main("--import-mappings", "682", pgs=[self.PGS[1]])
+        self.assertEqual(json.loads(out), [])
+        self.assertIn("19.a", err)
+
     def test_no_backfills_prints_nothing_on_stdout(self):
         out, err = self.run_main("--pgremapper", "682", pgs=[self.PGS[2]])
         self.assertEqual(out, "")
@@ -889,7 +1043,73 @@ class AnonymizeTest(unittest.TestCase):
         self.assertEqual(snaps, self.snapshots())  # run's own data not anonymized
 
 
+class HostnameCollisionTest(unittest.TestCase):
+    """Two hosts must never anonymize to one: the analysis depends on sharing."""
+
+    def test_same_trailing_number_gets_distinct_names(self):
+        fakes = cb._fake_hostnames({"ceph1-5", "ceph2-5", "ceph2-6"})
+        self.assertEqual(len(set(fakes.values())), 3)
+        self.assertEqual(fakes["ceph2-6"], "host06")  # a unique number keeps its name
+        self.assertRegex(fakes["ceph1-5"], r"host-[0-9a-f]{8}")
+
+    def test_unique_names_keep_the_numbered_form(self):
+        self.assertEqual(
+            cb._fake_hostnames({"ceph2-1", "ceph2-2"}),
+            {"ceph2-1": "host01", "ceph2-2": "host02"},
+        )
+
+    def test_two_hosts_stay_two_hosts_in_the_saved_tree(self):
+        snaps = {
+            "osd_tree": {
+                "nodes": [
+                    {"id": -1, "type": "host", "name": "ceph1-5", "children": [1]},
+                    {"id": -2, "type": "host", "name": "ceph2-5", "children": [2]},
+                    {"id": 1, "type": "osd"},
+                    {"id": 2, "type": "osd"},
+                ]
+            },
+            "osd_dump": {},
+            "pool_ls_detail": [],
+            "crush_rule_dump": [],
+        }
+        cb.anonymize_snapshots(snaps)
+        names = [n["name"] for n in snaps["osd_tree"]["nodes"] if n["type"] == "host"]
+        self.assertEqual(len(set(names)), 2)
+
+    def test_still_idempotent_when_names_collided(self):
+        def tree():
+            return {
+                "osd_tree": {
+                    "nodes": [
+                        {"id": -1, "type": "host", "name": "a-5", "children": []},
+                        {"id": -2, "type": "host", "name": "b-5", "children": []},
+                    ]
+                },
+                "osd_dump": {},
+                "pool_ls_detail": [],
+                "crush_rule_dump": [],
+            }
+
+        once = tree()
+        cb.anonymize_snapshots(once)
+        twice = json.loads(json.dumps(once))
+        cb.anonymize_snapshots(twice)
+        self.assertEqual(once, twice)
+
+
 class NoPgsTest(unittest.TestCase):
+    def test_pg_ls_that_is_not_ready_is_an_error_not_no_pgs(self):
+        with (
+            mock.patch.object(cb, "_ceph_json", lambda key: {"pg_ready": False}),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            cb.fetch_pg_stats()
+        self.assertIn("not ready", str(ctx.exception))
+
+    def test_pg_ready_true_with_no_pgs_is_still_empty(self):
+        with mock.patch.object(cb, "_ceph_json", lambda key: {"pg_ready": True}):
+            self.assertEqual(cb.fetch_pg_stats(), [])
+
     def test_pg_ls_with_no_matching_pgs_returns_only_pg_ready(self):
         with mock.patch.object(cb, "_ceph_json", lambda key: {"pg_ready": True}):
             self.assertEqual(cb.fetch_pg_stats(), [])
@@ -1134,6 +1354,61 @@ class FixtureReplayTest(unittest.TestCase):
     def test_the_older_fixture_only_gained_the_ratios_it_lacked(self):
         dump = json.loads((FIXTURE / "osd_dump.json").read_text())
         self.assertEqual(dump["backfillfull_ratio"], 0.91)
+
+
+class ChainFixtureReplayTest(unittest.TestCase):
+    """Real chains: 19.1299 (asked about osd.891) has shard 1 going to osd.579
+    while osd.579 still holds shard 8, which is going to osd.825."""
+
+    def replay(self, *flags):
+        result = run_cli("--load-state", str(FIXTURE), *flags, "891")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def test_the_table_lists_the_pair_that_frees_osd_579_first(self):
+        rows = [r.split() for r in self.replay().stdout.splitlines() if "19.1299" in r]
+        self.assertEqual(
+            [(r[1], r[2], r[5]) for r in rows],
+            [("8", "osd.579", "osd.825"), ("1", "osd.891", "osd.579")],
+        )
+
+    def test_machine_formats_leave_it_out_and_the_warning_gives_the_command(self):
+        for flag in ("--import-mappings", "--pgremapper"):
+            result = self.replay(flag)
+            self.assertNotIn("19.1299", result.stdout, flag)
+            self.assertIn(
+                "ceph osd pg-upmap-items 19.1299 579 825 891 579", result.stderr, flag
+            )
+
+    def test_every_chained_pg_in_the_cluster_is_ordered_or_reported(self):
+        """Across every OSD that is a target of a remapped shard: no output ever
+        lists a pair before the pair that frees its target OSD."""
+        snap = {p.stem: json.loads(p.read_text()) for p in FIXTURE.glob("*.json")}
+        with mock.patch.object(cb, "_ceph_json", lambda key: snap[key]):
+            osd_df, osd_host = cb.fetch_osd_df(), cb.fetch_osd_hosts()
+            pgs, pools = cb.fetch_pg_stats(), cb.fetch_pools()
+            ecp, rules = cb.fetch_ec_profiles(), cb.fetch_crush_rules()
+            pct = cb.fetch_backfillfull_pct()
+        targets = {
+            o
+            for p in pgs
+            for i, o in enumerate(p["up"])
+            if o != NONE and o != p["acting"][i]
+        }
+        chained = 0
+        for osd in sorted(targets):
+            cancellations, _ = cb.plan_cancellations(
+                pgs, pools, ecp, osd, osd_host, rules, osd_df, pct
+            )
+            by_pg = {}
+            for c in cancellations:
+                by_pg.setdefault(c.pgid, []).append(c)
+            for pgid, cs in by_pg.items():
+                for i, c in enumerate(cs):
+                    later_sources = {o.up_osd for o in cs[i + 1 :]}
+                    self.assertNotIn(c.acting_osd, later_sources, (osd, pgid))
+                chained += pgid in cb.chained_pgs(cancellations)
+        self.assertGreaterEqual(chained, 13)  # the real chains this test is about
 
 
 class BlockerFixtureReplayTest(unittest.TestCase):

@@ -136,7 +136,11 @@ other environments.
   and drop companions with the entry they belong to.
   `--import-mappings` prints a JSON array for `pgremapper import-mappings`
   (prune it with `jq`, then `pgremapper import-mappings file.json`), which
-  applies all pairs of a PG together; this is the way to apply the output.
+  takes all pairs in one run and, as dry runs showed, keeps a PG's existing
+  pairs; this is the way to apply the output. PGs whose pairs chain (an OSD
+  that moves between shard slots, about 2% of PGs on the test cluster) are left
+  out, since pgremapper cannot apply them in either order; the tool prints
+  `ceph osd pg-upmap-items` commands for them on stderr.
   `--pgremapper` prints bare `<pgid> <up osd> <acting osd>` lines for
   `pgremapper remap` instead, but separate `remap` runs on one PG can overwrite
   each other's pairs (seen on a live cluster), so it warns on stderr whenever a

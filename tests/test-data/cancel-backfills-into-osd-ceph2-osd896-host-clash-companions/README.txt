@@ -68,6 +68,19 @@ in this order). Applying them with separate 'pgremapper remap' runs is what
 fails on this cluster, so --pgremapper warns that all 6 PGs need more than one
 line.
 
+Chained pairs ("Chained pairs" in the module docstring): 13 of the 688 remapped
+PGs have an OSD that CRUSH wants in one shard slot while it currently holds
+another shard of the PG, e.g. 19.1299: shard 1 is going to osd.579 while
+osd.579 still holds shard 8, which is going to osd.825. Pinning them gives the
+chain 891->579, 579->825, which Ceph only applies in the order 579->825 first.
+Dry runs of pgremapper 1.0.0 on exactly this PG: in the valid order
+import-mappings panics ("conflicting mapping 579->825 found when trying to map
+891->579"), and in the order 891->579, 579->825 it plans the single pair
+891->825, a different mapping. So the tool leaves such PGs out of
+--import-mappings/--pgremapper and prints 'ceph osd pg-upmap-items 19.1299 579 825
+891 579' on stderr. Replay with osd 891 (or 274, 883, 884, ... for the others);
+none of the 13 is a ring.
+
 Other OSDs worth replaying:
   osd 74   2 pins, nothing else (19.16fc shard 6, 19.1eb3 shard 8)
   osd 682  1 pin (19.16fc shard 7 from osd.231) plus 19.16fc shard 6 (osd.74,

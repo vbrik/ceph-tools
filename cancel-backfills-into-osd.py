@@ -94,14 +94,18 @@ Applying the output
 {pgid, mapping: {from, to}} entry per line (all other output goes to stderr):
 
     cancel-backfills-into-osd.py --import-mappings 682 > mappings.json
-    # drop the entries you want to keep backfilling (keep their blockers):
-    jq 'map(select(.pgid != "19.92e"))' mappings.json > pruned.json
+    # drop the entry into the OSD for each backfill you want to keep, but not
+    # its blockers (other entries of the same PG), e.g. keep 19.92e's 896->231:
+    jq 'map(select(.pgid != "19.92e" or .mapping.from != 896))' mappings.json \\
+        > pruned.json
     pgremapper import-mappings pruned.json
 
 Give it the file path, not stdin, or its confirmation prompt reads EOF.
-import-mappings reads the cluster's upmaps once and applies all pairs of a PG
-together, merging into any existing pg_upmap_items (which is why pgremapper is
-used rather than 'ceph osd pg-upmap-items', that replaces the whole entry).
+import-mappings takes all the pairs in one run. Dry runs (pgremapper 1.0.0)
+showed that it plans one combined change per PG, and that it keeps a PG's
+existing pairs and adds the new ones to them, which is why pgremapper is used
+rather than 'ceph osd pg-upmap-items' (that replaces the whole entry). What it
+sends to the mons when actually applying was not observed.
 
 --pgremapper prints bare '<pgid> <up osd> <acting osd>' lines instead, for
 'pgremapper remap', but a PG that needs several lines (a companion pin always
@@ -109,6 +113,24 @@ does) is not safe to apply that way: run as separate commands, a later run can
 overwrite the pair an earlier one just added, and a lone pair can be invalid (two
 shards on one host) and is then silently dropped by the mons. Both were seen
 on a live cluster, so the option warns whenever it prints such a PG.
+
+Chained pairs
+-------------
+A few PGs (13 of 688 on the cluster the tests were captured from) have an OSD
+that CRUSH wants in one shard slot while it holds another shard of the PG now,
+so the pins chain: osd.A -> B and B -> C. Ceph applies the pairs of an upmap
+entry in order and skips a pair whose target is still in the mapping, so the
+pair that moves B away (B -> C) has to come first, and a ring (A -> B, B -> A)
+cannot be expressed at all. The pairs of a PG are printed in a valid order and a
+ring is reported on stderr as unpinnable.
+
+pgremapper cannot apply a chain, in either order: import-mappings aborts with a
+panic ("conflicting mapping ... found when trying to map") on the valid order,
+which would take a whole batch with it, and in the reverse order it silently
+turns the chain into one different pair. So --import-mappings and --pgremapper
+leave such PGs out and print 'ceph osd pg-upmap-items <pgid> <pairs>' commands
+for them on stderr (not tried on a live cluster; that command replaces the PG's
+whole entry). The table shows them.
 
 Consider 'ceph balancer off' while the cancelled PGs are pinned: the upmap
 balancer may otherwise undo them.
@@ -320,6 +342,13 @@ def fetch_pg_stats() -> list[dict]:
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
+        if raw.get("pg_ready") is False:
+            # Reading this as "no PGs" would answer "no backfills" wrongly.
+            sys.exit(
+                "ERROR: 'ceph pg ls remapped' reports the PG stats are not "
+                "ready (the mgr has just started or failed over?); retry in a "
+                "moment."
+            )
         if "pg_stats" in raw:
             return raw["pg_stats"]
         if "pg_stats" in raw.get("pg_map", {}):
@@ -369,6 +398,24 @@ def _fake_hostname(real_name: str) -> str:
     return "host-" + hashlib.sha256(real_name.encode()).hexdigest()[:8]
 
 
+def _fake_hostnames(real_names: set[str]) -> dict[str, str]:
+    """Map every real hostname to a fake one, never two to the same.
+
+    The analysis depends on which OSDs share a host, so two hosts must not
+    become one (ceph1-5 and ceph2-5 would both be 'host05'). Names that collide
+    under _fake_hostname all take the hash form instead. Idempotent: the fake
+    names it produces map to themselves.
+    """
+    fakes = {name: _fake_hostname(name) for name in real_names}
+    counts = Counter(fakes.values())
+    for name, fake in fakes.items():
+        if counts[fake] > 1:
+            fakes[name] = "host-" + hashlib.sha256(name.encode()).hexdigest()[:8]
+    if len(set(fakes.values())) != len(fakes):
+        raise RuntimeError("cannot anonymize the hostnames without merging two hosts")
+    return fakes
+
+
 def anonymize_snapshots(snapshots: dict[str, object]) -> None:
     """Anonymize a complete set of parsed snapshots in place.
 
@@ -383,9 +430,14 @@ def anonymize_snapshots(snapshots: dict[str, object]) -> None:
     value already present, so a second pass changes nothing.
     """
     osd_tree = snapshots["osd_tree"]
-    for node in osd_tree.get("nodes", []) + osd_tree.get("stray", []):
-        if node.get("type") == "host":
-            node["name"] = _fake_hostname(node["name"])
+    hosts = [
+        node
+        for node in osd_tree.get("nodes", []) + osd_tree.get("stray", [])
+        if node.get("type") == "host"
+    ]
+    fakes = _fake_hostnames({node["name"] for node in hosts})
+    for node in hosts:
+        node["name"] = fakes[node["name"]]
 
     dump = snapshots["osd_dump"]
     snapshots["osd_dump"] = {
@@ -638,6 +690,32 @@ def find_blockers(
     return blockers
 
 
+def order_moves(
+    moves: list[tuple[int, int, int]],
+) -> tuple[list[tuple[int, int, int]], str | None]:
+    """Order (shard, from_osd, to_osd) moves so Ceph applies all of them.
+
+    Ceph applies the pairs of a pg_upmap_items entry in order and skips a pair
+    whose 'to' OSD is still in the mapping. So a pair may only come after the
+    pair that moves its 'to' OSD away (the one whose 'from' it is). Shard order
+    is kept wherever nothing depends on anything else. Pairs that depend on each
+    other in a ring (osd.A -> B and B -> A) cannot be expressed as upmaps at
+    all: returns ([], reason) for those.
+    """
+    remaining = sorted(moves, key=lambda move: move[0])
+    ordered = []
+    while remaining:
+        for move in remaining:
+            if not any(other[1] == move[2] for other in remaining if other is not move):
+                break
+        else:
+            ring = ", ".join(f"osd.{f}->osd.{t}" for _, f, t in remaining)
+            return [], f"the pins form a cycle ({ring}), which upmaps cannot express"
+        ordered.append(move)
+        remaining.remove(move)
+    return ordered, None
+
+
 def pin_replica(
     up: list, osd: int, acting_osd: int, osd_host: dict[int, str]
 ) -> str | None:
@@ -753,12 +831,17 @@ def plan_cancellations(
                         trial = {**resolved, blocker: acting[blocker]}
                         closed, blocker_why = _close_pins(up, acting, trial, osd_host)
                         if blocker_why is None:
+                            _, blocker_why = order_moves(
+                                [(s, up[s], a) for s, a in closed.items()]
+                            )
+                        if blocker_why is None:
                             resolved = closed
                         else:
                             skipped.append(
                                 Skipped(pgid, blocker, f"blocker: {blocker_why}")
                             )
-                moves = [(s, up[s], a) for s, a in resolved.items()]
+                moves, ring = order_moves([(s, up[s], a) for s, a in resolved.items()])
+                why = why or ring
             else:
                 why = pin_replica(up, osd, acting_osd, osd_host)
                 moves = [("-", osd, acting_osd)]
@@ -785,10 +868,14 @@ def plan_cancellations(
                     )
                 )
 
-    def order(item: Cancellation | Skipped) -> tuple:
+    def skipped_order(item: Skipped) -> tuple:
         return (*pgid_sort_key(item.pgid), item.shard if item.shard != "-" else -1)
 
-    return sorted(cancellations, key=order), sorted(skipped, key=order)
+    # Stable, by PG only: within a PG the order is the one to apply the pairs in.
+    return (
+        sorted(cancellations, key=lambda c: pgid_sort_key(c.pgid)),
+        sorted(skipped, key=skipped_order),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -891,16 +978,70 @@ def print_import_mappings(cancellations: list[Cancellation]) -> None:
     """Print the cancellations as JSON for 'pgremapper import-mappings'.
 
     One {pgid, mapping: {from, to}} entry per pair, in a JSON array with one
-    entry per line, so it is easy to read and to prune with jq. import-mappings
+    entry per line, so it is easy to read and to prune with jq ("[]" when there
+    are none, so the output is always valid JSON). import-mappings
     reads the cluster's upmaps once and applies all pairs of a PG together, so
     unlike separate 'pgremapper remap' runs the pairs of a PG cannot overwrite
     each other.
     """
+    if not cancellations:
+        print("[]")
+        return
     print("[")
     for i, c in enumerate(cancellations):
         entry = {"pgid": c.pgid, "mapping": {"from": c.up_osd, "to": c.acting_osd}}
         print(f"  {json.dumps(entry)}{',' if i < len(cancellations) - 1 else ''}")
     print("]")
+
+
+def chained_pgs(cancellations: list[Cancellation]) -> dict[str, list[Cancellation]]:
+    """Return {pgid: its cancellations}, in PG order, for PGs whose pairs chain.
+
+    Pairs chain when one's target OSD is another's source (osd.A -> B and
+    B -> C), which order_moves puts in the order Ceph needs. pgremapper cannot
+    apply those, see warn_chained_pgs.
+    """
+    by_pg: dict[str, list[Cancellation]] = {}
+    for c in cancellations:
+        by_pg.setdefault(c.pgid, []).append(c)
+    return {
+        pgid: cs
+        for pgid, cs in by_pg.items()
+        if any(
+            c.acting_osd == other.up_osd for c in cs for other in cs if other is not c
+        )
+    }
+
+
+def warn_chained_pgs(chained: dict[str, list[Cancellation]], left_out: bool) -> None:
+    """Warn on stderr about PGs with chained pairs, with how to apply them.
+
+    Ceph applies the pairs of an entry in order and skips a pair whose target is
+    still in the mapping, so a chain has to go in the order order_moves gives.
+    Dry runs of pgremapper (1.0.0) on a real chain showed it cannot: in that
+    order 'import-mappings' aborts with a panic ("conflicting mapping"), which
+    would take a whole batch down with it, and in the reverse order it silently
+    folds the chain into one different pair. So in the machine formats these
+    PGs are left out (left_out) and the pairs are given here as commands
+    instead.
+    """
+    lines = [
+        f"WARNING: {len(chained)} PG(s) have chained pairs (one pair's target is "
+        f"another's source, e.g. osd.A->B and osd.B->C): {', '.join(chained)}. "
+        "Ceph applies an entry's pairs in order and skips one whose target is "
+        "still in the mapping, so they must be given in the order below. "
+        "pgremapper cannot apply them: import-mappings aborts with a panic on "
+        "this order, and in the other order rewrites the chain into a different "
+        "mapping (seen in dry runs)."
+        + (" They are therefore left out of this output." if left_out else "")
+        + " Apply each with 'ceph osd pg-upmap-items', which replaces the PG's "
+        "whole upmap entry, so add the PG's existing pairs from 'ceph osd dump' "
+        "first (this has not been tried on your cluster):"
+    ]
+    for pgid, cs in chained.items():
+        pairs = " ".join(f"{c.up_osd} {c.acting_osd}" for c in cs)
+        lines.append(f"  ceph osd pg-upmap-items {pgid} {pairs}")
+    print("\n".join(lines), file=sys.stderr)
 
 
 def pgs_needing_several_pins(cancellations: list[Cancellation]) -> list[str]:
@@ -1028,18 +1169,30 @@ def main() -> None:
     )
     if not cancellations and not skipped:
         print(f"No backfills into osd.{osd}.", file=sys.stderr)
+        if args.import_mappings:
+            print_import_mappings([])
         return
 
     print_summary(osd, osd_df, osd_host, cancellations, skipped)
-    if cancellations:
-        if args.import_mappings:
-            print_import_mappings(cancellations)
-        elif args.pgremapper:
-            print_pgremapper(cancellations)
-            if multi := pgs_needing_several_pins(cancellations):
-                warn_separate_remaps(multi)
-        else:
-            print_table([format_row(c, osd_df, osd_host) for c in cancellations])
+    chained = chained_pgs(cancellations)
+    machine_format = args.import_mappings or args.pgremapper
+    # pgremapper cannot apply chained pairs (see warn_chained_pgs), so they are
+    # kept out of what is meant to be fed to it.
+    printable = (
+        [c for c in cancellations if c.pgid not in chained]
+        if machine_format
+        else cancellations
+    )
+    if args.import_mappings:
+        print_import_mappings(printable)
+    elif args.pgremapper:
+        print_pgremapper(printable)
+        if multi := pgs_needing_several_pins(printable):
+            warn_separate_remaps(multi)
+    elif cancellations:
+        print_table([format_row(c, osd_df, osd_host) for c in cancellations])
+    if chained:
+        warn_chained_pgs(chained, left_out=machine_format)
     print(
         "NOTE: cancelling a running backfill discards its progress. Consider "
         "'ceph balancer off' while these are pinned.",
