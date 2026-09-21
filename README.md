@@ -44,9 +44,13 @@ other environments.
 
 ### RADOS / OSD
 
-- **`osds-of-pg`** — Show the `up` and `acting` OSD sets for a
-  given PG, with each OSD's host.
-  `osds-of-pg <pgid>`
+- **`osds-of-pg.py`** — Show a PG's `acting` and `up` OSDs, one row per
+  shard, with each OSD's utilization and host, the PG's primaries
+  marked `*`, remap PROGRESS for shards that are moving (same estimate as
+  `pg-movements.py`, per PG), and the PG's `pg_upmap_items` pairs that touch
+  each row (UPMAPS). Same grouped ACTING/UP table style as
+  `backfill-toofull-unwedge-upmaps.py`.
+  `osds-of-pg.py <pgid>`
 
 - **`pg-movements.py`** — For every PG where `up` != `acting`,
   print source/destination OSDs, movement type, per-PG progress, and PG
