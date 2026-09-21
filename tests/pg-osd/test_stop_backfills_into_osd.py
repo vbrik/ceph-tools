@@ -10,7 +10,6 @@ output.
 
 import argparse
 import contextlib
-import importlib.util
 import io
 import json
 import os
@@ -22,13 +21,12 @@ import unittest
 from typing import ClassVar
 from unittest import mock
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SCRIPT = os.path.join(REPO_ROOT, "pg-osd", "stop-backfills-into-osd.py")
-spec = importlib.util.spec_from_file_location("stop_backfills_into_osd", SCRIPT)
-cb = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(cb)
+from _support import SCRIPT_DIR, FakeStore, load_script, script_path, shared
 
-NONE = cb.CRUSH_ITEM_NONE
+SCRIPT = script_path("stop-backfills-into-osd.py")
+cb = load_script("stop-backfills-into-osd.py")
+
+NONE = shared.CRUSH_ITEM_NONE
 OSD = 682
 EC_POOL = {
     "pool_id": 19,
@@ -138,32 +136,6 @@ class ReplicatedArrivalsTest(unittest.TestCase):
 
     def test_osd_not_arriving(self):
         self.assertEqual(self.find([1, 2, 3], [1, 2, 9]), ([], []))
-
-
-class CopiesMovingTest(unittest.TestCase):
-    def test_ec_counts_moves_and_unassigned_slots(self):
-        # slot 0 moves, slot 1 stays, slot 2 has no OSD anywhere, slot 3 moves
-        up = [5, 2, NONE, 7]
-        acting = [1, 2, NONE, 4]
-        self.assertEqual(cb.copies_moving(up, acting, True, 4), 3)
-
-    def test_replicated_counts_arrivals_and_missing_replicas(self):
-        # one arrives; size 3 with 2 acting and 1 arriving leaves nothing missing
-        self.assertEqual(cb.copies_moving([1, 2, 5], [1, 2], False, 3), 1)
-        # one arrives and one more replica is still unassigned
-        self.assertEqual(cb.copies_moving([1, 5], [1], False, 3), 2)
-
-
-class ShardSizeTest(unittest.TestCase):
-    def test_replicated_is_whole_pg(self):
-        self.assertEqual(cb.shard_size_bytes(pg("7.1", [], []), REP_POOL, {}), 4_000)
-
-    def test_ec_is_ceil_of_one_kth(self):
-        p = pg("19.1", [], [], num_bytes=4_001)
-        self.assertEqual(cb.shard_size_bytes(p, EC_POOL, EC_PROFILES), 1_001)
-
-    def test_unknown_ec_profile_gives_none(self):
-        self.assertIsNone(cb.shard_size_bytes(pg("19.1", [], []), EC_POOL, {}))
 
 
 class PinWithCompanionsTest(unittest.TestCase):
@@ -747,7 +719,7 @@ class PrintTableTest(unittest.TestCase):
     def printed(self, rows):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            cb.print_table(rows)
+            shared.print_table(cb.COLUMNS, rows)
         return out.getvalue().splitlines()
 
     def test_no_rows_prints_just_the_two_header_lines(self):
@@ -779,8 +751,8 @@ class PrintTableTest(unittest.TestCase):
 
     def test_groups_are_set_apart_by_wider_gaps_than_columns(self):
         _, label_line = self.printed([])
-        self.assertIn("OSD" + cb.COLUMN_SEP + "UTIL", label_line)
-        self.assertIn("HOST" + cb.GROUP_SEP + "OSD", label_line)
+        self.assertIn("OSD" + shared.COLUMN_SEP + "UTIL", label_line)
+        self.assertIn("HOST" + shared.GROUP_SEP + "OSD", label_line)
 
 
 class ParseOsdTest(unittest.TestCase):
@@ -838,7 +810,7 @@ def canned_snapshots(pg_stats, extra_osds=()):
 
 
 def canned_ceph(pg_stats, extra_osds=(), drop=()):
-    """Return a stand-in for _ceph_json serving a tiny cluster.
+    """Return a stand-in for SnapshotStore.json serving a tiny cluster.
 
     drop names 'osd dump' keys to leave out.
     """
@@ -846,7 +818,7 @@ def canned_ceph(pg_stats, extra_osds=(), drop=()):
     for key in drop:
         del data["osd_dump"][key]
 
-    def fake(key):
+    def fake(store, key):
         return json.loads(json.dumps(data[key]))
 
     return fake
@@ -866,7 +838,7 @@ class MainTest(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         fake = canned_ceph(self.PGS if pgs is None else pgs, extra_osds, drop)
         with (
-            mock.patch.object(cb, "_ceph_json", fake),
+            mock.patch.object(shared.SnapshotStore, "json", fake),
             mock.patch("sys.argv", ["stop-backfills-into-osd.py", *argv]),
             contextlib.redirect_stdout(out),
             contextlib.redirect_stderr(err),
@@ -1019,18 +991,18 @@ class AnonymizeTest(unittest.TestCase):
         self.assertEqual(snaps["crush_rule_dump"][0]["rule_name"], "rule0")
 
     def test_hostname_with_trailing_number_maps_to_that_number(self):
-        self.assertEqual(cb._fake_hostname("ceph2-7"), "host07")
-        self.assertEqual(cb._fake_hostname("ceph2-51"), "host51")
+        self.assertEqual(shared._fake_hostname("ceph2-7"), "host07")
+        self.assertEqual(shared._fake_hostname("ceph2-51"), "host51")
 
     def test_hostname_without_trailing_number_is_hashed_deterministically(self):
-        fake = cb._fake_hostname("nodigits.example")
+        fake = shared._fake_hostname("nodigits.example")
         self.assertRegex(fake, r"host-[0-9a-f]{8}")
-        self.assertEqual(fake, cb._fake_hostname("nodigits.example"))
-        self.assertNotEqual(fake, cb._fake_hostname("other.example"))
+        self.assertEqual(fake, shared._fake_hostname("nodigits.example"))
+        self.assertNotEqual(fake, shared._fake_hostname("other.example"))
 
     def test_fake_names_map_to_themselves(self):
-        for name in ("host51", cb._fake_hostname("nodigits.example")):
-            self.assertEqual(cb._fake_hostname(name), name)
+        for name in ("host51", shared._fake_hostname("nodigits.example")):
+            self.assertEqual(shared._fake_hostname(name), name)
 
     def test_osd_dump_is_reduced_to_what_the_analysis_reads(self):
         snaps = self.snapshots()
@@ -1068,7 +1040,15 @@ class AnonymizeTest(unittest.TestCase):
     def test_write_saves_all_keys_and_leaves_the_input_untouched(self):
         snaps = self.snapshots()
         with tempfile.TemporaryDirectory() as tmp:
-            cb.write_anonymized_state(pathlib.Path(tmp), snaps)
+            store = shared.SnapshotStore(
+                cb.SNAPSHOT_COMMANDS,
+                save_dir=pathlib.Path(tmp),
+                anonymize=cb.anonymize_snapshots,
+            )
+            with mock.patch.object(
+                shared.SnapshotStore, "json", lambda self, key: snaps[key]
+            ):
+                store.save()
             self.assertEqual(
                 {f.stem for f in pathlib.Path(tmp).glob("*.json")},
                 set(cb.SNAPSHOT_COMMANDS),
@@ -1082,14 +1062,14 @@ class HostnameCollisionTest(unittest.TestCase):
     """Two hosts must never anonymize to one: the analysis depends on sharing."""
 
     def test_same_trailing_number_gets_distinct_names(self):
-        fakes = cb._fake_hostnames({"ceph1-5", "ceph2-5", "ceph2-6"})
+        fakes = shared._fake_hostnames({"ceph1-5", "ceph2-5", "ceph2-6"})
         self.assertEqual(len(set(fakes.values())), 3)
         self.assertEqual(fakes["ceph2-6"], "host06")  # a unique number keeps its name
         self.assertRegex(fakes["ceph1-5"], r"host-[0-9a-f]{8}")
 
     def test_unique_names_keep_the_numbered_form(self):
         self.assertEqual(
-            cb._fake_hostnames({"ceph2-1", "ceph2-2"}),
+            shared._fake_hostnames({"ceph2-1", "ceph2-2"}),
             {"ceph2-1": "host01", "ceph2-2": "host02"},
         )
 
@@ -1133,28 +1113,24 @@ class HostnameCollisionTest(unittest.TestCase):
 
 
 class NoPgsTest(unittest.TestCase):
+    def fetch(self, raw):
+        store = FakeStore({"pg_ls_remapped": raw})
+        return cb.fetch_pg_stats(store, "pg_ls_remapped")
+
     def test_pg_ls_that_is_not_ready_is_an_error_not_no_pgs(self):
-        with (
-            mock.patch.object(cb, "_ceph_json", lambda key: {"pg_ready": False}),
-            self.assertRaises(SystemExit) as ctx,
-        ):
-            cb.fetch_pg_stats()
+        with self.assertRaises(SystemExit) as ctx:
+            self.fetch({"pg_ready": False})
         self.assertIn("not ready", str(ctx.exception))
 
     def test_pg_ready_true_with_no_pgs_is_still_empty(self):
-        with mock.patch.object(cb, "_ceph_json", lambda key: {"pg_ready": True}):
-            self.assertEqual(cb.fetch_pg_stats(), [])
+        self.assertEqual(self.fetch({"pg_ready": True}), [])
 
     def test_pg_ls_with_no_matching_pgs_returns_only_pg_ready(self):
-        with mock.patch.object(cb, "_ceph_json", lambda key: {"pg_ready": True}):
-            self.assertEqual(cb.fetch_pg_stats(), [])
+        self.assertEqual(self.fetch({"pg_ready": True}), [])
 
     def test_unrecognised_json_is_an_error(self):
-        with (
-            mock.patch.object(cb, "_ceph_json", lambda key: {"what": 1}),
-            self.assertRaises(SystemExit),
-        ):
-            cb.fetch_pg_stats()
+        with self.assertRaises(SystemExit):
+            self.fetch({"what": 1})
 
 
 def run_cli(*argv, path=None):
@@ -1264,7 +1240,7 @@ class StateOptionsCliTest(unittest.TestCase):
 
 
 FIXTURE = (
-    pathlib.Path(REPO_ROOT)
+    SCRIPT_DIR.parent
     / "tests"
     / "pg-osd"
     / "test-data"
@@ -1420,11 +1396,11 @@ class ChainFixtureReplayTest(unittest.TestCase):
         """Across every OSD that is a target of a remapped shard: no output ever
         lists a pair before the pair that frees its target OSD."""
         snap = {p.stem: json.loads(p.read_text()) for p in FIXTURE.glob("*.json")}
-        with mock.patch.object(cb, "_ceph_json", lambda key: snap[key]):
-            osd_df, osd_host = cb.fetch_osd_df(), cb.fetch_osd_hosts()
-            pgs, pools = cb.fetch_pg_stats(), cb.fetch_pools()
-            ecp, rules = cb.fetch_ec_profiles(), cb.fetch_crush_rules()
-            pct = cb.fetch_backfillfull_pct()
+        store = FakeStore(snap)
+        osd_df, osd_host = cb.fetch_osd_df(store), cb.fetch_osd_hosts(store)
+        pgs, pools = cb.fetch_pg_stats(store, "pg_ls_remapped"), cb.fetch_pools(store)
+        ecp, rules = cb.fetch_ec_profiles(store), cb.fetch_crush_rules(store)
+        pct = cb.fetch_backfillfull_pct(store)
         targets = {
             o
             for p in pgs

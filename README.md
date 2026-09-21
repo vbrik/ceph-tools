@@ -11,9 +11,13 @@ statistics (`ceph.dir.*` extended attributes) directly off a mount. They
 answer questions that come up repeatedly during cluster operation but
 aren't answered directly by a single `ceph` subcommand.
 
-Every script is standalone and can be copied out and run on its own; there
-is no shared library or install step beyond the requirements below. CephFS
-tools live in the `cephfs/` directory and PG/OSD tools in `pg-osd/`; everything else is at the top level.
+Every script is standalone and can be copied out and run on its own, with
+one exception: `osds-of-pg.py`, `pg-movements.py`, `stop-backfills-into-osd.py`
+and `divert-toofull-backfills.py` in `pg-osd/` share code through
+`pg-osd/shared.py` and must be kept in the same directory (symlinks to them
+work). There is no install step beyond the requirements below. CephFS tools
+live in the `cephfs/` directory and PG/OSD tools in `pg-osd/`; everything else
+is at the top level.
 
 ## Requirements
 
@@ -49,8 +53,10 @@ other environments.
   marked `*`, remap PROGRESS for shards that are moving (same estimate as
   `pg-osd/pg-movements.py`, per PG), and the PG's `pg_upmap_items` pairs that touch
   each row (UPMAPS). Same grouped ACTING/UP table style as
-  `pg-osd/divert-toofull-backfills.py`.
-  `pg-osd/osds-of-pg.py <pgid>`
+  `pg-osd/divert-toofull-backfills.py`. `--save-state DIR` / `--load-state DIR`
+  save the cluster state it read (anonymized, and cut down to the fields the
+  script uses), and replay it offline.
+  `pg-osd/osds-of-pg.py [--save-state DIR | --load-state DIR] <pgid>`
 
 - **`pg-osd/pg-movements.py`** — For every PG where `up` != `acting`,
   print source/destination OSDs, movement type, per-PG progress, and PG
@@ -59,7 +65,9 @@ other environments.
   moving. Handles EC (per-shard) and replicated (set-diff) pools
   differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
-  `pg-osd/pg-movements.py [--sort-by {pgid,from-osd,to-osd}]`
+  `--save-state DIR` / `--load-state DIR` save the cluster state it read
+  (anonymized, and cut down to the fields the script uses), and replay it offline.
+  `pg-osd/pg-movements.py [--sort-by {pgid,from-osd,to-osd}] [--save-state DIR | --load-state DIR]`
 
 - **`pg-osd/upmaps-of-osd.sh`** — Show `pg_upmap_items` entries where a
   given OSD is a source or destination.
@@ -273,6 +281,14 @@ directories, so run it once per group:
 python3 -m unittest discover -s tests/pg-osd
 python3 -m unittest discover -s tests/cephfs
 ```
+
+The tests load the hyphen-named scripts through `tests/pg-osd/_support.py`,
+which also puts `pg-osd/` on `sys.path` so their `import shared` resolves.
+`tests/pg-osd/test_shared.py` covers `pg-osd/shared.py`: the progress
+arithmetic (EC and replicated copy counting), PG/pool helpers, the shared table
+printer and cell formatters, the `--load-state`/`--save-state` snapshot layer,
+and its anonymizer (idempotent, keeps two hosts distinct, scrubs fsid, addresses,
+uuids and names).
 
 The `pg-osd/divert-toofull-backfills.py` tests replay the
 cluster-state snapshots under `tests/pg-osd/test-data/` via `--load-state` and check the

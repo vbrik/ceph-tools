@@ -52,11 +52,37 @@ fan-ing out to a second destination.
 """
 
 import argparse
-import json
-import math
-import subprocess
-import sys
 from typing import NamedTuple
+
+from shared import (
+    PROGRESS_COUNTERS,
+    SnapshotStore,
+    add_state_args,
+    copies_moving,
+    ec_shard_moves,
+    extract_pg_stats,
+    fetch_osd_df,
+    fetch_osd_hosts,
+    fetch_pg_stats,
+    fetch_pools,
+    format_progress,
+    is_erasure,
+    is_real_osd,
+    pg_progress_pct,
+    pgid_pool_id,
+    pgid_sort_key,
+    real_osd_set,
+)
+from shared import anonymize_snapshots as anonymize_common
+
+# Maps each snapshot to the 'ceph ... --format json' command that produces it
+# and the '<key>.json' filename it is saved/loaded as (--save-state/--load-state).
+SNAPSHOT_COMMANDS: dict[str, list[str]] = {
+    "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
+    "osd_df": ["ceph", "osd", "df", "--format", "json"],
+    "pool_ls_detail": ["ceph", "osd", "pool", "ls", "detail", "--format", "json"],
+    "pg_dump_pgs": ["ceph", "pg", "dump", "pgs", "--format", "json"],
+}
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -74,212 +100,41 @@ def parse_args() -> argparse.Namespace:
         default="pgid",
         help="column to sort output rows by (default: pgid)",
     )
+    add_state_args(parser, SNAPSHOT_COMMANDS)
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Data collection
-# ---------------------------------------------------------------------------
+# The parts of each pg_stat this script reads.
+KEPT_PG_STAT_KEYS = ("pgid", "state", "up", "acting", "acting_primary")
 
 
-def _ceph_json(cmd: list[str]) -> object:
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError as exc:
-        sys.exit(f"ERROR: ceph command failed:\n{exc.stderr.strip()}")
-    except FileNotFoundError:
-        sys.exit("ERROR: 'ceph' binary not found in PATH.")
-    return json.loads(proc.stdout)
+def anonymize_snapshots(snapshots: dict[str, object]) -> None:
+    """Anonymize the snapshots for --save-state, in place.
 
-
-def fetch_osd_utilization() -> dict[int, float]:
-    """Return {osd_id: utilization_pct} from 'ceph osd df'. Down OSDs may be absent."""
-    data = _ceph_json(["ceph", "osd", "df", "--format", "json"])
-    return {node["id"]: node["utilization"] for node in data.get("nodes", [])}
-
-
-POOL_TYPE_ERASURE = 3
-
-
-class Pool(NamedTuple):
-    erasure: bool
-    size: int  # replica count, or k+m for EC
-
-
-def fetch_pools() -> dict[int, Pool]:
-    """Return {pool_id: Pool} from 'ceph osd pool ls detail'.
-
-    The erasure flag selects the diffing mode: positional (shard-index-
-    significant) up/acting diffing is only valid for EC pools. Replicated
-    pools' replicas are interchangeable, so a same-OSD-set reorder (e.g.
-    from primary-affinity or pg-upmap-items) would otherwise show up as
-    phantom paired movements. The size is needed to spot replicas that are
-    missing without any OSD assigned (see replicated_unassigned_copies).
+    'ceph pg dump pgs' carries dozens of fields per PG, of which this script
+    reads a handful; only those are kept, which also keeps the capture small
+    on a big cluster.
     """
-    data = _ceph_json(["ceph", "osd", "pool", "ls", "detail", "--format", "json"])
-    return {
-        p["pool_id"]: Pool(p.get("type") == POOL_TYPE_ERASURE, p.get("size", 0))
-        for p in data
+    anonymize_common(snapshots)
+    pg_stats = extract_pg_stats(snapshots["pg_dump_pgs"], "ceph pg dump pgs")
+    snapshots["pg_dump_pgs"] = {
+        "pg_stats": [
+            {
+                **{k: pg[k] for k in KEPT_PG_STAT_KEYS if k in pg},
+                "stat_sum": {
+                    k: v
+                    for k, v in pg.get("stat_sum", {}).items()
+                    if k in PROGRESS_COUNTERS
+                },
+            }
+            for pg in pg_stats
+        ]
     }
-
-
-def fetch_osd_hosts() -> dict[int, str]:
-    """Return {osd_id: short_hostname} from 'ceph osd tree'."""
-    data = _ceph_json(["ceph", "osd", "tree", "--format", "json"])
-    nodes = data.get("nodes", [])
-    by_id = {n["id"]: n for n in nodes}
-    result = {}
-    for n in nodes:
-        if n.get("type") == "host":
-            short = n["name"].split(".")[0]
-            for child_id in n.get("children", []):
-                if by_id.get(child_id, {}).get("type") == "osd":
-                    result[child_id] = short
-    return result
-
-
-def fetch_pg_stats() -> list[dict]:
-    """Return pg_stat dicts from 'ceph pg dump pgs'. Handles several JSON shapes across releases."""
-    raw = _ceph_json(["ceph", "pg", "dump", "pgs", "--format", "json"])
-    return _extract_pg_stats(raw)
-
-
-def _extract_pg_stats(raw) -> list[dict]:
-    # Some releases return a bare list directly.
-    if isinstance(raw, list):
-        return raw
-
-    if isinstance(raw, dict):
-        # Quincy typical: top-level 'pg_stats' key
-        if "pg_stats" in raw:
-            return raw["pg_stats"]
-
-        # Older layout: nested under 'pg_map'
-        pg_map = raw.get("pg_map", {})
-        if "pg_stats" in pg_map:
-            return pg_map["pg_stats"]
-
-        # Last resort: find any list whose first element looks like a pg_stat
-        for val in raw.values():
-            if (
-                isinstance(val, list)
-                and val
-                and isinstance(val[0], dict)
-                and "pgid" in val[0]
-            ):
-                return val
-
-    raise SystemExit(
-        f"ERROR: unrecognised JSON structure from 'ceph pg dump pgs'.\n"
-        f"Top-level type: {type(raw).__name__}"
-        + (f", keys: {list(raw.keys())}" if isinstance(raw, dict) else "")
-    )
 
 
 # ---------------------------------------------------------------------------
 # Movement classification
 # ---------------------------------------------------------------------------
-
-# Sentinel used by CRUSH/Ceph for "no OSD in this slot" (crush/crush.h).
-# 'ceph pg dump' JSON uses this value, not -1, to mark unfilled up/acting slots.
-CRUSH_ITEM_NONE = 0x7FFFFFFF
-
-
-def _is_real_osd(o: int) -> bool:
-    return o not in (CRUSH_ITEM_NONE, -1)
-
-
-def _real_osd_set(osd_list: list) -> set[int]:
-    """Return the set of real (non-placeholder) OSD ids in an up/acting array."""
-    return {o for o in osd_list if _is_real_osd(o)}
-
-
-def _slot(osd_list: list, i: int) -> "int | None":
-    """Return the real OSD at position i of an up/acting array, else None."""
-    if i >= len(osd_list):
-        return None
-    return osd_list[i] if _is_real_osd(osd_list[i]) else None
-
-
-def ec_shard_moves(up: list, acting: list) -> list[tuple[int, "int | None", int]]:
-    """Return (shard, source, destination) for each EC shard being moved.
-
-    source is None when the acting slot is empty (degraded). Shards that
-    stay put (clean or in-place recovery) and shards whose up slot is empty
-    (cluster still waiting for an OSD) are omitted.
-    """
-    moves = []
-    for i in range(max(len(up), len(acting))):
-        source, destination = _slot(acting, i), _slot(up, i)
-        if destination is not None and source != destination:
-            moves.append((i, source, destination))
-    return moves
-
-
-def ec_unassigned_shards(up: list, acting: list) -> int:
-    """Count EC shards with no OSD in either up or acting.
-
-    Nothing can move for these yet, but Ceph still counts their objects as
-    degraded, so they belong in the progress denominator.
-    """
-    return sum(
-        1
-        for i in range(max(len(up), len(acting)))
-        if _slot(up, i) is None and _slot(acting, i) is None
-    )
-
-
-def replicated_unassigned_copies(up_set: set, acting_set: set, size: int) -> int:
-    """Count replicas that are degraded but have no destination OSD yet.
-
-    Ceph counts size - len(acting) copies per object as degraded. Each
-    destination (an up OSD outside acting) fills one of those, and any
-    remainder is waiting for an OSD to appear, so it is extra work that
-    isn't visible in up/acting. Replicated slots carry no identity, so this
-    is a count difference rather than the per-slot check used for EC.
-    """
-    return max(0, size - len(acting_set) - len(up_set - acting_set))
-
-
-def pg_progress_pct(pg: dict, n_copies: int) -> "float | None":
-    """Estimate % of a PG's data already at its target location.
-
-    Approximated from pg_stat.stat_sum object counts (already fetched via
-    'ceph pg dump pgs' — no extra ceph calls needed): num_objects_misplaced
-    covers backfill (data relocating, redundancy already satisfied) and
-    num_objects_degraded covers recovery (missing copies being restored).
-    Both counters count down to 0 as movement completes, unlike
-    num_objects_recovered/num_bytes_recovered in the same dict, which are
-    lifetime cumulative counters that only ever increase and can't answer
-    "how much of this move is left".
-
-    Both counters are in *copy* units (an object with 2 copies to place
-    counts twice), so the PG's total work is num_objects * n_copies, where
-    n_copies is the number of shards/replicas being moved (up slots that
-    differ from acting) plus, for EC, shards not yet assigned any OSD (see
-    ec_unassigned_shards). That number stays fixed until the PG finishes —
-    acting only switches to up at the end — so it is a stable denominator.
-    Dividing by num_objects alone would show 0% until more than 1/n_copies
-    of the work was done.
-
-    This is an object-count approximation, not a byte-exact figure: Ceph
-    doesn't track misplaced/degraded state at byte granularity, so the
-    result assumes objects in the PG are roughly similar in size (true
-    for RBD-style pools, less so for pools with wildly mixed object
-    sizes).
-    """
-    stat_sum = pg.get("stat_sum", {})
-    total = stat_sum.get("num_objects", 0) * n_copies
-    if total <= 0:
-        return None
-    # Misplaced and degraded are not guaranteed disjoint (a PG can be both
-    # at once, e.g. state "degraded+remapped+backfilling"), so an object
-    # counted in both could make remaining > total without this clamp.
-    remaining = stat_sum.get("num_objects_misplaced", 0) + stat_sum.get(
-        "num_objects_degraded", 0
-    )
-    pct = 100.0 * (1 - remaining / total)
-    return max(0.0, min(100.0, pct))
 
 
 # State flags that indicate active or pending data movement.
@@ -350,12 +205,6 @@ def movement_type(state: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def pgid_sort_key(pgid: str) -> tuple[int, int]:
-    """Sort PG IDs numerically: pool id (decimal), then pg id (hex)."""
-    pool_str, pg_hex = pgid.split(".")
-    return (int(pool_str), int(pg_hex, 16))
-
-
 class MovementRow(NamedTuple):
     pgid: str
     shard: "int | str"  # shard index for EC pools (per-shard row), or "-" for
@@ -407,10 +256,14 @@ _SORT_KEYS = {
 def main() -> None:
     args = parse_args()
 
-    pg_stats = fetch_pg_stats()
-    osd_util = fetch_osd_utilization()
-    osd_host = fetch_osd_hosts()
-    pools = fetch_pools()
+    store = SnapshotStore.from_args(
+        args, SNAPSHOT_COMMANDS, anonymize=anonymize_snapshots
+    )
+    pg_stats = fetch_pg_stats(store, "pg_dump_pgs")
+    osd_df = fetch_osd_df(store)
+    osd_host = fetch_osd_hosts(store)
+    pools = fetch_pools(store)
+    store.save()
 
     rows: list[MovementRow] = []
 
@@ -419,25 +272,23 @@ def main() -> None:
         state = pg["state"]
         up = pg["up"]
         acting = pg["acting"]
-        pool_id = int(pgid.split(".")[0])
+        pool_id = pgid_pool_id(pgid)
 
         primary = pg.get("acting_primary")
-        if primary in (None, -1, CRUSH_ITEM_NONE):
-            primary = next(iter(sorted(_real_osd_set(acting))), None)
+        if not is_real_osd(primary):
+            primary = next(iter(sorted(real_osd_set(acting))), None)
 
         mtype = movement_type(state)
         pool = pools.get(pool_id)
 
-        if pool is not None and pool.erasure:
+        if is_erasure(pool):
             # EC: shard identity is positional, so diff up/acting index by
             # index — one row per shard whose OSD changed. This is what
             # keeps unrelated shard moves (e.g. PG 27.96: shard 0 remapped
             # A->B, shard 4 separately backfilled into a previously-missing
             # slot) from being merged into one misleading multi-dest row.
             moves = ec_shard_moves(up, acting)
-            progress = pg_progress_pct(
-                pg, len(moves) + ec_unassigned_shards(up, acting)
-            )
+            progress = pg_progress_pct(pg, copies_moving(up, acting, True, 0))
             for i, source, destination in moves:
                 sources = frozenset() if source is None else frozenset({source})
                 rows.append(
@@ -457,8 +308,8 @@ def main() -> None:
             # Replicated: replicas are interchangeable, so shard position
             # carries no identity — a same-OSD-set reorder is not real
             # movement. Diff as sets instead, one aggregate row per PG.
-            up_set = _real_osd_set(up)
-            acting_set = _real_osd_set(acting)
+            up_set = real_osd_set(up)
+            acting_set = real_osd_set(acting)
 
             if up_set == acting_set:
                 continue
@@ -483,10 +334,7 @@ def main() -> None:
             needs_primary_marker = len(destinations) > len(sources)
             progress = pg_progress_pct(
                 pg,
-                len(destinations)
-                + replicated_unassigned_copies(
-                    up_set, acting_set, pool.size if pool else 0
-                ),
+                copies_moving(up, acting, False, pool.get("size", 0) if pool else 0),
             )
 
             rows.append(
@@ -520,7 +368,8 @@ def main() -> None:
         host = osd_host.get(o, "?")
         if not show_util:
             return f"{o}({host})"
-        util = f"{osd_util[o]:.0f}%" if o in osd_util else "?%"
+        util_pct = osd_df.get(o, {}).get("utilization")
+        util = f"{util_pct:.0f}%" if util_pct is not None else "?%"
         return f"{o}({host},{util})"
 
     def fmt_osds(osd_ids: frozenset) -> str:
@@ -567,11 +416,6 @@ def main() -> None:
                 parts.append(f"{fmt_osd(primary, show_util=False)}*")
         return ",".join(parts)
 
-    def fmt_progress(pct: "float | None") -> str:
-        # floor (not round) so a PG that's still moving (e.g. 99.7%) never
-        # displays as "100%" before it's actually done.
-        return "-" if pct is None else f"{math.floor(pct)}%"
-
     # Column widths fitted to actual data
     col_pg = max(len("PGID"), max(len(r.pgid) for r in rows))
     col_shard = max(len("SHARD"), max(len(str(r.shard)) for r in rows))
@@ -582,7 +426,7 @@ def main() -> None:
     col_to = max(len("TO_OSD"), max(len(fmt_osds(r.destinations)) for r in rows))
     col_type = max(len("TYPE"), max(len(r.move_type) for r in rows))
     col_progress = max(
-        len("PROGRESS"), max(len(fmt_progress(r.progress_pct)) for r in rows)
+        len("PROGRESS"), max(len(format_progress(r.progress_pct)) for r in rows)
     )
 
     def format_row(row: MovementRow) -> str:
@@ -593,7 +437,7 @@ def main() -> None:
             f"{SEP}"
             f"{fmt_osds(row.destinations):<{col_to}}  "
             f"{row.move_type:<{col_type}}  "
-            f"{fmt_progress(row.progress_pct):<{col_progress}}  "
+            f"{format_progress(row.progress_pct):<{col_progress}}  "
             f"{abbreviate_state(row.state)}"
         )
 

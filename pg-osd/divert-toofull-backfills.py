@@ -223,7 +223,7 @@ an otherwise normal run — analysis and output proceed as usual against the
 real data, so the run's own proposals are unaffected by the save. DIR must
 be empty or not yet exist.
 
-The saved copy is anonymized (see anonymize_snapshots): cluster fsid, OSD
+The saved copy is anonymized (see shared.anonymize_snapshots): cluster fsid, OSD
 IP addresses, OSD uuids, hostnames and pool/CRUSH-rule names are replaced
 with deterministic fake values before writing, so a --save-state capture is
 safe to hand to someone outside the cluster (or commit to a public repo)
@@ -296,24 +296,33 @@ pgremapper to skip the prompt and its dry-run entirely.)
 """
 
 import argparse
-import copy
-import hashlib
 import heapq
-import json
 import math
-import re
-import subprocess
 import sys
 from collections import Counter, deque
-from itertools import groupby
-from pathlib import Path
 from typing import NamedTuple
 
-# Sentinel used by CRUSH/Ceph for "no OSD in this slot" (crush/crush.h).
-# 'ceph pg ls'/'ceph pg dump' JSON uses this value, not -1, for empty slots.
-CRUSH_ITEM_NONE = 0x7FFFFFFF
-
-POOL_TYPE_ERASURE = 3
+import shared
+from shared import (
+    KIB,
+    POOL_TYPE_ERASURE,
+    SnapshotStore,
+    add_state_args,
+    fetch_crush_rules,
+    fetch_ec_profiles,
+    fetch_osd_df,
+    fetch_osd_hosts,
+    fetch_pg_stats,
+    fetch_pools,
+    fetch_upmap_items,
+    is_real_osd,
+    osd_cells,
+    pgid_pool_id,
+    pgid_sort_key,
+    print_table,
+    rule_failure_domain,
+    slot,
+)
 
 # Ceph's own defaults for these ratios (OSDMap::build_simple). Used only if
 # 'ceph osd dump' somehow omits them, so that --min-up-util and
@@ -326,8 +335,6 @@ DEFAULT_BACKFILLFULL_RATIO = 0.90
 # How many shards one OSD may be proposed as the target of (--max-target-uses).
 DEFAULT_MAX_TARGET_USES = 5
 
-# 'ceph osd df' reports sizes in KiB.
-KIB = 1024
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces
 # it and the '<key>.json' filename it is saved/loaded as under --save-state/
@@ -348,16 +355,6 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
         "json",
     ],
 }
-
-# Set from args at the top of main(): None means "call the live ceph CLI as
-# normal"; a Path means "read '<key>.json' from this directory instead of
-# running SNAPSHOT_COMMANDS[key]" (see --load-state).
-LOAD_STATE_DIR: Path | None = None
-
-# Set from args at the top of main(): None means "don't save"; a Path means
-# "once all six snapshots are collected, write an anonymized copy of each to
-# '<dir>/<key>.json'" (see --save-state and anonymize_snapshots).
-SAVE_STATE_DIR: Path | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -438,111 +435,13 @@ def parse_args() -> argparse.Namespace:
         "utilization above --max-target-util; 1 gives every OSD at most one "
         "shard.",
     )
-    state_group = parser.add_mutually_exclusive_group()
-    state_group.add_argument(
-        "--load-state",
-        metavar="DIR",
-        help="Analyze a saved cluster state instead of a live cluster. DIR "
-        "must contain the six '<key>.json' files documented at "
-        "SNAPSHOT_COMMANDS (osd_tree.json, osd_df.json, osd_dump.json, "
-        "pool_ls_detail.json, crush_rule_dump.json and "
-        "pg_ls_backfill_toofull.json) — the same layout as the fixtures "
-        "under tests/pg-osd/test-data/divert-toofull-backfills-*/, and what --save-state produces. "
-        "No 'ceph' commands are run.",
-    )
-    state_group.add_argument(
-        "--save-state",
-        metavar="DIR",
-        help="Also save the live cluster state this run collects into DIR, "
-        "as the six '<key>.json' files --load-state reads back (created if "
-        "missing; must be empty or not exist, so a snapshot is never "
-        "partially overwritten). Analysis and normal output proceed as "
-        "usual against the real data — only the saved copy is anonymized "
-        "(cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule names "
-        "replaced with deterministic fake values; see anonymize_snapshots), "
-        "so it is safe to share outside the cluster without hand-editing.",
-    )
+    add_state_args(parser, SNAPSHOT_COMMANDS)
     return parser.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Data collection
 # ---------------------------------------------------------------------------
-
-
-# Populated lazily by _ceph_json, keyed by SNAPSHOT_COMMANDS key. main()
-# ends up fetching all six keys unconditionally, so by the time a
-# --save-state write happens the cache always holds the complete set — that
-# completeness (not just laziness) is what write_anonymized_state relies on.
-_SNAPSHOT_CACHE: dict[str, object] = {}
-
-
-def _ceph_json(key: str) -> object:
-    """Return parsed JSON for one of SNAPSHOT_COMMANDS's keys.
-
-    Read from '<LOAD_STATE_DIR>/<key>.json' if --load-state was given,
-    otherwise run the live ceph command. Cached after the first call, so
-    each key is read/run at most once per process even though the fetch_*
-    functions are called from a few different places in main().
-    """
-    if key in _SNAPSHOT_CACHE:
-        return _SNAPSHOT_CACHE[key]
-
-    if LOAD_STATE_DIR is not None:
-        path = LOAD_STATE_DIR / f"{key}.json"
-        try:
-            text = path.read_text()
-        except FileNotFoundError:
-            cmd = " ".join(SNAPSHOT_COMMANDS[key])
-            sys.exit(
-                f"ERROR: --load-state directory is missing {path} (the "
-                f"output of '{cmd}')."
-            )
-    else:
-        cmd = SNAPSHOT_COMMANDS[key]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError as exc:
-            sys.exit(f"ERROR: ceph command failed:\n{exc.stderr.strip()}")
-        except FileNotFoundError:
-            sys.exit("ERROR: 'ceph' binary not found in PATH.")
-        text = proc.stdout
-
-    _SNAPSHOT_CACHE[key] = json.loads(text)
-    return _SNAPSHOT_CACHE[key]
-
-
-def fetch_osd_hosts() -> dict[int, str]:
-    """Return {osd_id: short_hostname} from 'ceph osd tree'."""
-    data = _ceph_json("osd_tree")
-    nodes = data.get("nodes", []) + data.get("stray", [])
-    by_id = {n["id"]: n for n in nodes}
-    result = {}
-    for n in nodes:
-        if n.get("type") == "host":
-            short = n["name"].split(".")[0]
-            for child_id in n.get("children", []):
-                if by_id.get(child_id, {}).get("type") == "osd":
-                    result[child_id] = short
-    return result
-
-
-def fetch_osd_df() -> dict[int, dict]:
-    """Return {osd_id: node} from 'ceph osd df'.
-
-    Each node carries device_class, utilization, status, reweight and
-    crush_weight, which together are everything needed to decide whether an
-    OSD is a usable backfill target — no separate 'ceph osd dump' pass.
-    """
-    data = _ceph_json("osd_df")
-    nodes = data.get("nodes", []) + data.get("stray", [])
-    return {n["id"]: n for n in nodes}
-
-
-def fetch_upmap_items() -> dict[str, list[dict]]:
-    """Return {pgid: [{'from': osd, 'to': osd}, ...]} from 'ceph osd dump'."""
-    data = _ceph_json("osd_dump")
-    return {e["pgid"]: e["mappings"] for e in data.get("pg_upmap_items", [])}
 
 
 class FullRatios(NamedTuple):
@@ -558,21 +457,16 @@ class FullRatios(NamedTuple):
     backfillfull: float
 
 
-def fetch_full_ratios() -> FullRatios:
+def fetch_full_ratios(store: SnapshotStore) -> FullRatios:
     """Return the cluster's nearfull/backfillfull ratios from 'ceph osd dump'.
 
     Reported by Ceph as fractions (0.85); returned here as the percentages
     the CLI flags and 'ceph osd df' utilizations are expressed in.
     """
-    data = _ceph_json("osd_dump")
+    data = store.json("osd_dump")
     nearfull = data.get("nearfull_ratio") or DEFAULT_NEARFULL_RATIO
     backfillfull = data.get("backfillfull_ratio") or DEFAULT_BACKFILLFULL_RATIO
     return FullRatios(nearfull * 100, backfillfull * 100)
-
-
-def fetch_pool_details() -> list[dict]:
-    """Return the list of pool dicts from 'ceph osd pool ls detail'."""
-    return _ceph_json("pool_ls_detail")
 
 
 def ec_pool_ids_from(pools: list[dict]) -> set[int]:
@@ -580,217 +474,9 @@ def ec_pool_ids_from(pools: list[dict]) -> set[int]:
     return {p["pool_id"] for p in pools if p.get("type") == POOL_TYPE_ERASURE}
 
 
-def fetch_ec_profiles() -> dict[str, dict]:
-    """Return {profile_name: profile} from 'ceph osd dump'."""
-    return _ceph_json("osd_dump").get("erasure_code_profiles", {})
-
-
-def fetch_crush_rules() -> dict[int, dict]:
-    """Return {rule_id: rule} from 'ceph osd crush rule dump'."""
-    data = _ceph_json("crush_rule_dump")
-    return {r["rule_id"]: r for r in data}
-
-
-def fetch_backfill_toofull_pgs() -> list[dict]:
-    """Return pg_stat dicts for PGs in backfill_toofull.
-
-    Filtered server-side by 'ceph pg ls', which is dramatically cheaper than
-    dumping every PG in the cluster and filtering here.
-    """
-    raw = _ceph_json("pg_ls_backfill_toofull")
-    return _extract_pg_stats(raw)
-
-
-def _extract_pg_stats(raw) -> list[dict]:
-    """Pull the pg_stat list out of the several shapes ceph releases return."""
-    if isinstance(raw, list):
-        return raw
-
-    if isinstance(raw, dict):
-        if "pg_stats" in raw:
-            return raw["pg_stats"]
-
-        pg_map = raw.get("pg_map", {})
-        if "pg_stats" in pg_map:
-            return pg_map["pg_stats"]
-
-        for val in raw.values():
-            if (
-                isinstance(val, list)
-                and val
-                and isinstance(val[0], dict)
-                and "pgid" in val[0]
-            ):
-                return val
-
-        # When no PGs match the filter, 'ceph pg ls' omits 'pg_stats'
-        # entirely and returns just {"pg_ready": true}.
-        if "pg_ready" in raw:
-            return []
-
-    raise SystemExit(
-        f"ERROR: unrecognised JSON structure from 'ceph pg ls'.\n"
-        f"Top-level type: {type(raw).__name__}"
-        + (f", keys: {list(raw.keys())}" if isinstance(raw, dict) else "")
-    )
-
-
-# ---------------------------------------------------------------------------
-# Anonymization for --save-state
-# ---------------------------------------------------------------------------
-
-# A reserved-for-documentation range (RFC 5737 TEST-NET-2): guaranteed not
-# to be a real routable address, so a saved capture can't be mistaken for
-# one and can't leak the real network's layout.
-_FAKE_IP_PREFIX = "198.51.100."
-
-_ADDR_IP_RE = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
-_TRAILING_NUM_RE = re.compile(r"(\d+)$")
-
-FAKE_FSID = "00000000-0000-0000-0000-000000000000"
-
-
-def _fake_ip(real_ip: str) -> str:
-    """Map a real IP to a deterministic, non-routable stand-in.
-
-    Keyed off the real address's own last octet, so the same real IP always
-    anonymizes to the same fake one with no lookup table required. Distinct
-    real IPs that happen to share a last octet collide onto the same fake
-    one; that's harmless here since the script never parses these fields —
-    they're descriptive only (see fetch_osd_df et al., none of which read
-    any *_addr* key).
-    """
-    last_octet = int(real_ip.rsplit(".", 1)[-1])
-    return f"{_FAKE_IP_PREFIX}{max(1, min(254, last_octet))}"
-
-
-def _anonymize_addr_string(addr: str) -> str:
-    """Replace the IP inside an 'IP:PORT' or 'IP:PORT/NONCE' address string."""
-    return _ADDR_IP_RE.sub(lambda m: _fake_ip(m.group()), addr)
-
-
-def _fake_uuid(osd_id: int) -> str:
-    # '1's rather than '0's so osd.0's fake uuid can't collide with FAKE_FSID.
-    return f"11111111-1111-1111-1111-{osd_id:012d}"
-
-
-def _fake_hostname(real_name: str) -> str:
-    """Map a real hostname to a deterministic stand-in.
-
-    Most ceph hostnames end in a distinguishing number (e.g. 'ceph2-11');
-    keying off that number, rather than the encounter order of any one run,
-    is what lets independent runs against the same cluster (or independent
-    anonymization passes over related fixture directories) agree on the
-    same fake name for the same real host with no shared state. A hostname
-    with no trailing number falls back to a hash of the whole name, which
-    is still deterministic, just not as readable.
-    """
-    m = _TRAILING_NUM_RE.search(real_name)
-    if m:
-        return f"host{int(m.group(1)):02d}"
-    return "host-" + hashlib.sha256(real_name.encode()).hexdigest()[:8]
-
-
-def anonymize_snapshots(snapshots: dict[str, object]) -> None:
-    """Anonymize a complete set of six parsed snapshots in place.
-
-    Replaces the cluster fsid, OSD IP addresses, OSD uuids, hostnames and
-    pool/CRUSH-rule names with deterministic fake values (see _fake_ip,
-    _fake_uuid, _fake_hostname above) — everything in these snapshots that
-    could fingerprint the real cluster or site. PG ids, OSD ids,
-    utilizations, weights and device classes are left untouched: they carry
-    no site-identifying information and are exactly what the analysis (and
-    any --load-state replay) depends on.
-
-    pool_name and rule_name are display-only in this script (used solely in
-    an error message in check_host_failure_domain; every lookup elsewhere
-    is by pool_id/rule_id/crush_rule id), so renaming them to 'pool<id>'/
-    'rule<id>' is safe and needs no cross-reference fixups.
-
-    snapshots must hold parsed JSON for all six SNAPSHOT_COMMANDS keys
-    together (not a subset) — hostnames live only in osd_tree, but the IPs
-    and uuids they'd otherwise help identify live in osd_dump, so partial
-    input would anonymize inconsistently.
-
-    Idempotent: every substitution is keyed off a value already present in
-    the record (osd id, pool id, rule id) or, for IPs and hostnames, off the
-    real value itself — re-running this on already-anonymized snapshots
-    reproduces the same fake values rather than mangling them further. That
-    is what lets independent anonymization passes (e.g. over several
-    related fixture directories, or a second pass after this function
-    changes) agree without needing to share state.
-    """
-    osd_tree = snapshots["osd_tree"]
-    for node in osd_tree.get("nodes", []) + osd_tree.get("stray", []):
-        if node.get("type") == "host":
-            node["name"] = _fake_hostname(node["name"])
-
-    osd_dump = snapshots["osd_dump"]
-    osd_dump["fsid"] = FAKE_FSID
-    # 'ceph osd dump' embeds its own copy of each pool's name (separate from
-    # pool_ls_detail's), keyed by 'pool' rather than 'pool_id' here.
-    for pool in osd_dump.get("pools", []):
-        pool["pool_name"] = f"pool{pool['pool']}"
-    for osd in osd_dump.get("osds", []):
-        osd["uuid"] = _fake_uuid(osd["osd"])
-        for key in (
-            "public_addr",
-            "cluster_addr",
-            "heartbeat_back_addr",
-            "heartbeat_front_addr",
-        ):
-            if key in osd:
-                osd[key] = _anonymize_addr_string(osd[key])
-        for key in (
-            "public_addrs",
-            "cluster_addrs",
-            "heartbeat_back_addrs",
-            "heartbeat_front_addrs",
-        ):
-            for entry in osd.get(key, {}).get("addrvec", []):
-                entry["addr"] = _anonymize_addr_string(entry["addr"])
-
-    for pool in snapshots["pool_ls_detail"]:
-        pool["pool_name"] = f"pool{pool['pool_id']}"
-
-    for rule in snapshots["crush_rule_dump"]:
-        rule["rule_name"] = f"rule{rule['rule_id']}"
-
-
-def write_anonymized_state(dir_: Path, snapshots: dict[str, object]) -> None:
-    """Write an anonymized copy of every collected snapshot under dir_.
-
-    Called once, after all six snapshots have been collected (see
-    _SNAPSHOT_CACHE), so anonymize_snapshots sees the complete set it
-    requires. Operates on a deep copy — the cache that fed the run's own
-    analysis and output is left untouched, so --save-state never changes
-    what a run itself reports.
-    """
-    anonymized = copy.deepcopy(snapshots)
-    anonymize_snapshots(anonymized)
-    for key, obj in anonymized.items():
-        (dir_ / f"{key}.json").write_text(json.dumps(obj, separators=(",", ":")))
-
-
 # ---------------------------------------------------------------------------
 # Failure domain validation
 # ---------------------------------------------------------------------------
-
-
-def rule_failure_domain(rule: dict) -> str | None:
-    """Return the bucket type CRUSH spreads shards over for redundancy.
-
-    This is the 'type' of the first choose*/chooseleaf* step in the rule
-    (after 'take'). For a plain replicated rule that is its one chooseleaf
-    step; for the common EC shape ('choose indep 0 type host' followed by
-    'chooseleaf indep 1 type osd') it is the outer choose step, which is the
-    one that determines the failure domain — the inner osd pick is just
-    which leaf within that bucket, not what CRUSH spreads shards over.
-    """
-    for step in rule.get("steps", []):
-        if step.get("op", "").startswith("choose"):
-            return step.get("type")
-    return None
 
 
 def check_host_failure_domain(pools: list[dict], crush_rules: dict[int, dict]) -> None:
@@ -828,18 +514,6 @@ def check_host_failure_domain(pools: list[dict], crush_rules: dict[int, dict]) -
 # ---------------------------------------------------------------------------
 
 
-def _is_real_osd(osd_id) -> bool:
-    return osd_id not in (CRUSH_ITEM_NONE, -1, None)
-
-
-def _slot(osd_list: list, index: int) -> int | None:
-    """Return the real OSD id at a position, or None for a missing/empty slot."""
-    if index >= len(osd_list):
-        return None
-    osd_id = osd_list[index]
-    return osd_id if _is_real_osd(osd_id) else None
-
-
 def raw_crush_osds(up: list, upmap_pairs: list[dict]) -> set[int]:
     """Reconstruct the OSDs CRUSH itself chose, by undoing the PG's upmaps.
 
@@ -852,29 +526,25 @@ def raw_crush_osds(up: list, upmap_pairs: list[dict]) -> set[int]:
     for pair in upmap_pairs:
         if pair["to"] in raw:
             raw[raw.index(pair["to"])] = pair["from"]
-    return {osd_id for osd_id in raw if _is_real_osd(osd_id)}
+    return {osd_id for osd_id in raw if is_real_osd(osd_id)}
 
 
 def shard_size_bytes(pg: dict, pool: dict, ec_profiles: dict[str, dict]) -> int:
-    """Estimate the bytes one shard of a PG occupies on its OSD.
+    """Estimate the bytes one shard of a PG occupies on its OSD (see shared).
 
-    The PG's 'num_bytes' is its logical size: a replica holds all of it, an
-    EC shard 1/k of it (rounded up). Omap, metadata and EC stripe padding are
-    not counted, so this slightly underestimates.
+    Exits with an error where shared.shard_size_bytes reports "unknown": every
+    diversion's utilization projection needs a size, and a silent 0 would
+    project no usage at all.
     """
-    num_bytes = pg["stat_sum"]["num_bytes"]
-    if pool.get("type") != POOL_TYPE_ERASURE:
-        return num_bytes
-    profile = pool.get("erasure_code_profile")
-    try:
-        k = int(ec_profiles[profile]["k"])
-    except KeyError:
+    size = shared.shard_size_bytes(pg, pool, ec_profiles)
+    if size is None:
+        profile = pool.get("erasure_code_profile")
         sys.exit(
             f"ERROR: pool {pool['pool_id']} uses erasure code profile "
             f"{profile!r}, which 'ceph osd dump' does not describe (or "
             "describes without 'k'), so the size of its shards is unknown."
         )
-    return -(-num_bytes // k)
+    return size
 
 
 class DivertedShard(NamedTuple):
@@ -913,16 +583,16 @@ def find_diverted_shards(
         # what lets the shard index be reported, and keeps two unrelated
         # shard moves in one PG from being conflated.
         for i in range(max(len(up), len(acting))):
-            up_osd = _slot(up, i)
-            acting_osd = _slot(acting, i)
+            up_osd = slot(up, i)
+            acting_osd = slot(acting, i)
             if up_osd is None or up_osd == acting_osd:
                 continue
             found.append(DivertedShard(pgid, i, up_osd, acting_osd, up, size_bytes))
     else:
         # Replicated: replicas are interchangeable, so position means nothing
         # and only the set difference is real movement.
-        up_members = {o for o in up if _is_real_osd(o)}
-        acting_members = {o for o in acting if _is_real_osd(o)}
+        up_members = {o for o in up if is_real_osd(o)}
+        acting_members = {o for o in acting if is_real_osd(o)}
         departing = sorted(acting_members - up_members)
         arriving = sorted(up_members - acting_members)
         # A replicated PG can have several arriving/departing replicas at once
@@ -967,16 +637,6 @@ def select_stuck_shards(
         else:
             skipped.append(shard)
     return stuck, skipped
-
-
-def pgid_pool_id(pgid: str) -> int:
-    """Return the pool id (decimal) of a PG id like '19.2a1'."""
-    return int(pgid.split(".")[0])
-
-
-def pgid_sort_key(pgid: str) -> tuple[int, int]:
-    """Sort PG IDs numerically: pool id (decimal), then pg id (hex)."""
-    return (pgid_pool_id(pgid), int(pgid.split(".")[1], 16))
 
 
 # ---------------------------------------------------------------------------
@@ -1183,7 +843,7 @@ def assign_targets(
 
         if shard.pgid not in blocked_hosts:
             blocked_hosts[shard.pgid] = {
-                osd_host.get(o) for o in shard.up_set if _is_real_osd(o)
+                osd_host.get(o) for o in shard.up_set if is_real_osd(o)
             }
         forbidden_hosts = blocked_hosts[shard.pgid]
         raw = raw_crush_osds(shard.up_set, upmap_items.get(shard.pgid, []))
@@ -1191,7 +851,7 @@ def assign_targets(
         # absent from 'up' but still in the raw mapping, and re-proposing it
         # would put the same OSD in the mapping twice — which Ceph's upmap
         # validation drops silently (see module docstring).
-        forbidden_osds = raw | {o for o in shard.up_set if _is_real_osd(o)}
+        forbidden_osds = raw | {o for o in shard.up_set if is_real_osd(o)}
 
         # Only OSDs of the arriving OSD's own class are legal targets. An
         # unknown class yields an empty pool, so the shard falls through to
@@ -1277,22 +937,6 @@ COLUMNS = [
     ("TARGET", "HOST"),
 ]
 
-# Between table columns of one group, and between columns of different groups.
-COLUMN_SEP = "  "
-GROUP_SEP = "    "
-
-# Printed in the ACTING UTIL/HOST columns when the acting OSD is unknown (the
-# usual out-OSD case, where the ACTING OSD itself reads 'none'). Distinct from
-# format_utilization's '?', which means the OSD is known but 'ceph osd df'
-# had no figure for it.
-NOT_APPLICABLE = "-"
-
-
-def format_utilization(osd_df: dict[int, dict], osd_id: int) -> str:
-    """Format an OSD's utilization as 'NN.N%', or '?' if 'ceph osd df' lacks it."""
-    util = osd_df.get(osd_id, {}).get("utilization")
-    return f"{util:.1f}%" if util is not None else "?"
-
 
 def format_row(
     proposal: Proposal,
@@ -1300,69 +944,19 @@ def format_row(
     osd_df: dict[int, dict],
 ) -> list[str]:
     shard = proposal.shard
-    known_acting = shard.acting_osd is not None
     return [
         shard.pgid,
         str(shard.shard),
-        f"osd.{shard.acting_osd}" if known_acting else "none",
-        format_utilization(osd_df, shard.acting_osd)
-        if known_acting
-        else NOT_APPLICABLE,
-        osd_host.get(shard.acting_osd, "?") if known_acting else NOT_APPLICABLE,
-        f"osd.{shard.up_osd}",
-        format_utilization(osd_df, shard.up_osd),
-        # Varies per row now that the whole cluster is scanned, so unlike
-        # the single-host version it cannot live in the stderr header.
-        osd_host.get(shard.up_osd, "?"),
+        # An unknown acting OSD (the usual out-OSD case) reads 'none', '-', '-'.
+        *osd_cells(osd_df, osd_host, shard.acting_osd),
+        # The UP host varies per row now that the whole cluster is scanned, so
+        # unlike the single-host version it cannot live in the stderr header.
+        *osd_cells(osd_df, osd_host, shard.up_osd),
         f"osd.{proposal.target_osd}",
         f"{proposal.target_utilization:.1f}%",
         f"{proposal.target_projected:.1f}%",
         proposal.target_host,
     ]
-
-
-def print_table(rows: list[list[str]]) -> None:
-    """Print rows under a two-line header: group spans, then column labels.
-
-    A group's name is centered in dashes across the full width of its
-    columns, so it visibly covers all of them. The span is always wider than
-    the name (the labels under it alone are wider), so no fitting is needed.
-    Columns of different groups are separated by the wider GROUP_SEP, on every
-    line, to set the groups visually apart.
-    """
-    # A list, not max(a, *b): with no rows the star-args form degrades to
-    # max(int) and raises.
-    widths = [
-        max([len(label), *(len(row[i]) for row in rows)])
-        for i, (_, label) in enumerate(COLUMNS)
-    ]
-    # seps[i] is what precedes column i.
-    seps = [""] + [
-        COLUMN_SEP if COLUMNS[i][0] == COLUMNS[i - 1][0] else GROUP_SEP
-        for i in range(1, len(COLUMNS))
-    ]
-
-    group_line = ""
-    for group, indexes in groupby(range(len(COLUMNS)), key=lambda i: COLUMNS[i][0]):
-        cols = list(indexes)
-        span = sum(widths[i] for i in cols) + sum(len(seps[i]) for i in cols[1:])
-        group_line += seps[cols[0]]
-        group_line += f" {group} ".center(span, "-") if group else " " * span
-    print(group_line.rstrip())
-
-    # Last column is variable-width and rightmost; leave it unpadded.
-    def emit(cells):
-        last = len(cells) - 1
-        print(
-            "".join(
-                sep + (cell.ljust(widths[i]) if i < last else cell)
-                for i, (sep, cell) in enumerate(zip(seps, cells))
-            )
-        )
-
-    emit([label for _, label in COLUMNS])
-    for row in rows:
-        emit(row)
 
 
 def print_unplaceable(count: int) -> None:
@@ -1403,38 +997,26 @@ def print_pgremapper(proposals: list[Proposal]) -> None:
 def main() -> None:
     args = parse_args()
 
-    global LOAD_STATE_DIR, SAVE_STATE_DIR
-    if args.load_state:
-        LOAD_STATE_DIR = Path(args.load_state)
-        if not LOAD_STATE_DIR.is_dir():
-            sys.exit(f"ERROR: --load-state directory not found: {LOAD_STATE_DIR}")
-    if args.save_state:
-        SAVE_STATE_DIR = Path(args.save_state)
-        SAVE_STATE_DIR.mkdir(parents=True, exist_ok=True)
-        existing = list(SAVE_STATE_DIR.iterdir())
-        if existing:
-            sys.exit(f"ERROR: --save-state directory is not empty: {SAVE_STATE_DIR}")
+    store = SnapshotStore.from_args(args, SNAPSHOT_COMMANDS)
 
-    osd_host = fetch_osd_hosts()
-    osd_df = fetch_osd_df()
-    upmap_items = fetch_upmap_items()
-    pools = fetch_pool_details()
+    osd_host = fetch_osd_hosts(store)
+    osd_df = fetch_osd_df(store)
+    upmap_items = fetch_upmap_items(store)
+    pools_by_id = fetch_pools(store)
+    pools = list(pools_by_id.values())
     ec_pool_ids = ec_pool_ids_from(pools)
-    toofull_pgs = fetch_backfill_toofull_pgs()
-    crush_rules = fetch_crush_rules()
-    ec_profiles = fetch_ec_profiles()
+    toofull_pgs = fetch_pg_stats(store, "pg_ls_backfill_toofull")
+    crush_rules = fetch_crush_rules(store)
+    ec_profiles = fetch_ec_profiles(store)
 
-    # All six SNAPSHOT_COMMANDS keys are now in _SNAPSHOT_CACHE (every
-    # fetch_* above has run), so this is the earliest point an anonymized
-    # save can be written. Deliberately done before the validation below,
-    # which can sys.exit: a cluster that fails those checks is exactly the
-    # kind of surprising state worth having captured, so the save must not
-    # be skipped just because the rest of the analysis can't proceed.
-    if SAVE_STATE_DIR is not None:
-        write_anonymized_state(SAVE_STATE_DIR, _SNAPSHOT_CACHE)
+    # Saved before the validation below, which can sys.exit: a cluster that
+    # fails those checks is exactly the kind of surprising state worth having
+    # captured, so the save must not be skipped just because the rest of the
+    # analysis can't proceed.
+    store.save()
 
     # Both thresholds track the cluster's own idea of full unless overridden.
-    ratios = fetch_full_ratios()
+    ratios = fetch_full_ratios(store)
     min_up_util = ratios.nearfull if args.min_up_util is None else args.min_up_util
     max_target_util = (
         ratios.backfillfull - 1
@@ -1451,7 +1033,6 @@ def main() -> None:
         )
 
     toofull_pool_ids = {pgid_pool_id(pg["pgid"]) for pg in toofull_pgs}
-    pools_by_id = {p["pool_id"]: p for p in pools}
     # A pool that has stuck PGs but is absent from 'ceph osd pool ls detail'
     # would skip the failure-domain check and, not being in ec_pool_ids, have
     # its EC shards diffed as interchangeable replicas. Both failures are
@@ -1525,7 +1106,7 @@ def main() -> None:
         if args.pgremapper:
             print_pgremapper(proposals)
         else:
-            print_table([format_row(p, osd_host, osd_df) for p in proposals])
+            print_table(COLUMNS, [format_row(p, osd_host, osd_df) for p in proposals])
 
     if unplaceable:
         print_unplaceable(len(unplaceable))

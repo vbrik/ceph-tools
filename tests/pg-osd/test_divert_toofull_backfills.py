@@ -24,7 +24,6 @@ the cap boundary can be pinned without float slack.
 """
 
 import contextlib
-import importlib.util
 import io
 import json
 import math
@@ -39,17 +38,13 @@ import unittest
 from collections import Counter
 from typing import ClassVar
 
+from _support import FakeStore, load_script, script_path, shared
+
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(
-    os.path.dirname(os.path.dirname(TESTS_DIR)),
-    "pg-osd",
-    "divert-toofull-backfills.py",
-)
+SCRIPT = script_path("divert-toofull-backfills.py")
 TEST_DATA = os.path.join(TESTS_DIR, "test-data")
 
-spec = importlib.util.spec_from_file_location("divert_toofull_backfills", SCRIPT)
-ut = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ut)
+ut = load_script("divert-toofull-backfills.py")
 
 
 # The column labels in order, as print_table's label line splits: the OSD/UTIL/
@@ -119,8 +114,8 @@ class FormatRowTest(unittest.TestCase):
         row = ut.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF)
         cells = dict(zip(ut.COLUMNS, row))
         self.assertEqual(cells[("ACTING", "OSD")], "none")
-        self.assertEqual(cells[("ACTING", "UTIL")], ut.NOT_APPLICABLE)
-        self.assertEqual(cells[("ACTING", "HOST")], ut.NOT_APPLICABLE)
+        self.assertEqual(cells[("ACTING", "UTIL")], shared.NOT_APPLICABLE)
+        self.assertEqual(cells[("ACTING", "HOST")], shared.NOT_APPLICABLE)
         # The up side is still fully known — that is the whole premise.
         self.assertEqual(cells[("UP", "OSD")], "osd.882")
         self.assertEqual(cells[("UP", "UTIL")], "69.1%")
@@ -130,7 +125,7 @@ def table_lines(rows):
     """Return the lines print_table writes for rows."""
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        ut.print_table(rows)
+        shared.print_table(ut.COLUMNS, rows)
     return buf.getvalue().splitlines()
 
 
@@ -149,7 +144,7 @@ class PrintTableTest(unittest.TestCase):
         self.assertEqual([m.start() for m in spans], osd_starts)
         # A span ends a group separator before the next group's first column,
         # and the last one at the end of the data row.
-        gap = len(ut.GROUP_SEP)
+        gap = len(shared.GROUP_SEP)
         self.assertEqual(
             [m.end() for m in spans[:2]], [start - gap for start in osd_starts[1:]]
         )
@@ -210,7 +205,7 @@ class FindDivertedShardsTest(unittest.TestCase):
         self.assertEqual((shard.shard, shard.up_osd, shard.acting_osd), (0, 882, 406))
 
     def test_ec_empty_acting_slot_yields_unknown_acting_osd(self):
-        pg = {"pgid": "19.2", "up": [882, 111], "acting": [ut.CRUSH_ITEM_NONE, 111]}
+        pg = {"pgid": "19.2", "up": [882, 111], "acting": [shared.CRUSH_ITEM_NONE, 111]}
         (shard,) = ut.find_diverted_shards(pg, is_ec=True)
         self.assertEqual(shard.up_osd, 882)
         self.assertIsNone(shard.acting_osd)
@@ -255,12 +250,7 @@ class FullRatiosTest(unittest.TestCase):
     """The thresholds both defaults derive from."""
 
     def _ratios(self, dump):
-        ut._SNAPSHOT_CACHE.clear()
-        ut._SNAPSHOT_CACHE["osd_dump"] = dump
-        try:
-            return ut.fetch_full_ratios()
-        finally:
-            ut._SNAPSHOT_CACHE.clear()
+        return ut.fetch_full_ratios(FakeStore({"osd_dump": dump}))
 
     def test_ratios_are_converted_to_percent(self):
         # Ceph reports fractions; the flags and 'ceph osd df' are in percent.
@@ -685,19 +675,6 @@ class ShardSizeTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             ut.shard_size_bytes(self.pg(800), pool, self.PROFILES)
         self.assertIn("'gone'", str(cm.exception))
-
-
-class PgidTest(unittest.TestCase):
-    def test_pool_id_is_the_decimal_part_before_the_dot(self):
-        self.assertEqual(ut.pgid_pool_id("19.2a1"), 19)
-        self.assertEqual(ut.pgid_pool_id("5.0"), 5)
-
-    def test_sort_key_orders_pool_numerically_then_pg_in_hex(self):
-        pgids = ["19.a", "9.ff", "19.2", "9.10", "19.1ce0"]
-        self.assertEqual(
-            sorted(pgids, key=ut.pgid_sort_key),
-            ["9.10", "9.ff", "19.2", "19.a", "19.1ce0"],
-        )
 
 
 class PositiveIntTest(unittest.TestCase):
