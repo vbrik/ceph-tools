@@ -101,16 +101,26 @@ def fetch_osd_utilization() -> dict[int, float]:
 POOL_TYPE_ERASURE = 3
 
 
-def fetch_ec_pool_ids() -> set[int]:
-    """Return the set of pool ids that are erasure-coded (type == 3).
+class Pool(NamedTuple):
+    erasure: bool
+    size: int  # replica count, or k+m for EC
 
-    Positional up/acting diffing (shard-index-significant) is only valid
-    for EC pools. Replicated pools' replicas are interchangeable, so a
-    same-OSD-set reorder (e.g. from primary-affinity or pg-upmap-items)
-    would otherwise show up as phantom paired movements.
+
+def fetch_pools() -> dict[int, Pool]:
+    """Return {pool_id: Pool} from 'ceph osd pool ls detail'.
+
+    The erasure flag selects the diffing mode: positional (shard-index-
+    significant) up/acting diffing is only valid for EC pools. Replicated
+    pools' replicas are interchangeable, so a same-OSD-set reorder (e.g.
+    from primary-affinity or pg-upmap-items) would otherwise show up as
+    phantom paired movements. The size is needed to spot replicas that are
+    missing without any OSD assigned (see replicated_unassigned_copies).
     """
     data = _ceph_json(["ceph", "osd", "pool", "ls", "detail", "--format", "json"])
-    return {p["pool_id"] for p in data if p.get("type") == POOL_TYPE_ERASURE}
+    return {
+        p["pool_id"]: Pool(p.get("type") == POOL_TYPE_ERASURE, p.get("size", 0))
+        for p in data
+    }
 
 
 def fetch_osd_hosts() -> dict[int, str]:
@@ -184,8 +194,55 @@ def _real_osd_set(osd_list: list) -> set[int]:
     return {o for o in osd_list if _is_real_osd(o)}
 
 
-def pg_progress_pct(pg: dict) -> "float | None":
-    """Estimate % of a PG's objects already at their target location.
+def _slot(osd_list: list, i: int) -> "int | None":
+    """Return the real OSD at position i of an up/acting array, else None."""
+    if i >= len(osd_list):
+        return None
+    return osd_list[i] if _is_real_osd(osd_list[i]) else None
+
+
+def ec_shard_moves(up: list, acting: list) -> list[tuple[int, "int | None", int]]:
+    """Return (shard, source, destination) for each EC shard being moved.
+
+    source is None when the acting slot is empty (degraded). Shards that
+    stay put (clean or in-place recovery) and shards whose up slot is empty
+    (cluster still waiting for an OSD) are omitted.
+    """
+    moves = []
+    for i in range(max(len(up), len(acting))):
+        source, destination = _slot(acting, i), _slot(up, i)
+        if destination is not None and source != destination:
+            moves.append((i, source, destination))
+    return moves
+
+
+def ec_unassigned_shards(up: list, acting: list) -> int:
+    """Count EC shards with no OSD in either up or acting.
+
+    Nothing can move for these yet, but Ceph still counts their objects as
+    degraded, so they belong in the progress denominator.
+    """
+    return sum(
+        1
+        for i in range(max(len(up), len(acting)))
+        if _slot(up, i) is None and _slot(acting, i) is None
+    )
+
+
+def replicated_unassigned_copies(up_set: set, acting_set: set, size: int) -> int:
+    """Count replicas that are degraded but have no destination OSD yet.
+
+    Ceph counts size - len(acting) copies per object as degraded. Each
+    destination (an up OSD outside acting) fills one of those, and any
+    remainder is waiting for an OSD to appear, so it is extra work that
+    isn't visible in up/acting. Replicated slots carry no identity, so this
+    is a count difference rather than the per-slot check used for EC.
+    """
+    return max(0, size - len(acting_set) - len(up_set - acting_set))
+
+
+def pg_progress_pct(pg: dict, n_copies: int) -> "float | None":
+    """Estimate % of a PG's data already at its target location.
 
     Approximated from pg_stat.stat_sum object counts (already fetched via
     'ceph pg dump pgs' — no extra ceph calls needed): num_objects_misplaced
@@ -196,6 +253,15 @@ def pg_progress_pct(pg: dict) -> "float | None":
     lifetime cumulative counters that only ever increase and can't answer
     "how much of this move is left".
 
+    Both counters are in *copy* units (an object with 2 copies to place
+    counts twice), so the PG's total work is num_objects * n_copies, where
+    n_copies is the number of shards/replicas being moved (up slots that
+    differ from acting) plus, for EC, shards not yet assigned any OSD (see
+    ec_unassigned_shards). That number stays fixed until the PG finishes —
+    acting only switches to up at the end — so it is a stable denominator.
+    Dividing by num_objects alone would show 0% until more than 1/n_copies
+    of the work was done.
+
     This is an object-count approximation, not a byte-exact figure: Ceph
     doesn't track misplaced/degraded state at byte granularity, so the
     result assumes objects in the PG are roughly similar in size (true
@@ -203,12 +269,12 @@ def pg_progress_pct(pg: dict) -> "float | None":
     sizes).
     """
     stat_sum = pg.get("stat_sum", {})
-    total = stat_sum.get("num_objects", 0)
+    total = stat_sum.get("num_objects", 0) * n_copies
     if total <= 0:
         return None
     # Misplaced and degraded are not guaranteed disjoint (a PG can be both
     # at once, e.g. state "degraded+remapped+backfilling"), so an object
-    # counted in both would make remaining > total without this clamp.
+    # counted in both could make remaining > total without this clamp.
     remaining = stat_sum.get("num_objects_misplaced", 0) + stat_sum.get(
         "num_objects_degraded", 0
     )
@@ -344,13 +410,7 @@ def main() -> None:
     pg_stats = fetch_pg_stats()
     osd_util = fetch_osd_utilization()
     osd_host = fetch_osd_hosts()
-    ec_pool_ids = fetch_ec_pool_ids()
-
-    def _slot(osd_list: list, i: int) -> int | None:
-        if i >= len(osd_list):
-            return None
-        o = osd_list[i]
-        return o if _is_real_osd(o) else None
+    pools = fetch_pools()
 
     rows: list[MovementRow] = []
 
@@ -366,28 +426,19 @@ def main() -> None:
             primary = next(iter(sorted(_real_osd_set(acting))), None)
 
         mtype = movement_type(state)
-        progress = pg_progress_pct(pg)
+        pool = pools.get(pool_id)
 
-        if pool_id in ec_pool_ids:
+        if pool is not None and pool.erasure:
             # EC: shard identity is positional, so diff up/acting index by
             # index — one row per shard whose OSD changed. This is what
             # keeps unrelated shard moves (e.g. PG 27.96: shard 0 remapped
             # A->B, shard 4 separately backfilled into a previously-missing
             # slot) from being merged into one misleading multi-dest row.
-            for i in range(max(len(up), len(acting))):
-                source = _slot(acting, i)
-                destination = _slot(up, i)
-
-                if source == destination:
-                    # No movement at this shard: clean, or in-place
-                    # recovery (primary sending missing objects to a
-                    # replica on the same OSD). Skip.
-                    continue
-                if destination is None:
-                    # up[i] is CRUSH_ITEM_NONE — cluster is waiting for an
-                    # OSD to fill this shard slot; nothing actionable yet.
-                    continue
-
+            moves = ec_shard_moves(up, acting)
+            progress = pg_progress_pct(
+                pg, len(moves) + ec_unassigned_shards(up, acting)
+            )
+            for i, source, destination in moves:
                 sources = frozenset() if source is None else frozenset({source})
                 rows.append(
                     MovementRow(
@@ -430,6 +481,13 @@ def main() -> None:
             # no counterpart source anywhere, since a pure swap always
             # keeps sources/destinations equal in size.
             needs_primary_marker = len(destinations) > len(sources)
+            progress = pg_progress_pct(
+                pg,
+                len(destinations)
+                + replicated_unassigned_copies(
+                    up_set, acting_set, pool.size if pool else 0
+                ),
+            )
 
             rows.append(
                 MovementRow(

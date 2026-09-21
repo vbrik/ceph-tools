@@ -49,8 +49,11 @@ other environments.
   `osds-of-pg <pgid>`
 
 - **`pg-movements.py`** — For every PG where `up` != `acting`,
-  print source/destination OSDs, movement type, and PG state. Handles EC
-  (per-shard) and replicated (set-diff) pools differently; see
+  print source/destination OSDs, movement type, per-PG progress, and PG
+  state. Progress is derived from the misplaced/degraded object counters,
+  which count copies, so it is scaled by the number of shards/replicas
+  moving. Handles EC (per-shard) and replicated (set-diff) pools
+  differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
   `pg-movements.py [--sort-by {pgid,from-osd,to-osd}]`
 
