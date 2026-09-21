@@ -618,6 +618,11 @@ class PlanCompanionsTest(unittest.TestCase):
         )
 
 
+def column_names() -> list[str]:
+    """The table columns as one name each, e.g. 'UP OSD'; 'SIZE' has no group."""
+    return [f"{group} {label}".strip() for group, label in cb.COLUMNS]
+
+
 class OutputTest(unittest.TestCase):
     def cancellation(self, companion_of=None):
         return cb.Cancellation("19.7e9", 3, 149, 497, 1_000, "s", 50.0, companion_of)
@@ -629,11 +634,11 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(out.getvalue(), "19.7e9 149 497\n19.7e9 149 497\n")
 
     def test_row_marks_companions_in_the_note_column(self):
-        cells = dict(zip(cb.COLUMNS, cb.format_row(self.cancellation(0), {}, {})))
+        cells = dict(zip(column_names(), cb.format_row(self.cancellation(0), {}, {})))
         self.assertEqual(cells["UP OSD"], "osd.149")
         self.assertEqual((cells["UP UTIL"], cells["UP HOST"]), ("?", "?"))
         self.assertEqual(cells["NOTE"], "companion of shard 0")
-        plain = dict(zip(cb.COLUMNS, cb.format_row(self.cancellation(), {}, {})))
+        plain = dict(zip(column_names(), cb.format_row(self.cancellation(), {}, {})))
         self.assertEqual(plain["NOTE"], "")
 
 
@@ -641,7 +646,7 @@ class UpAndActingColumnsTest(unittest.TestCase):
     def test_each_osd_gets_its_own_utilization_and_host(self):
         c = cb.Cancellation("19.1", 0, 5, 7, 1_000, "s", None)
         osd_df = {5: {"utilization": 91.25}, 7: {"utilization": 80.0}}
-        cells = dict(zip(cb.COLUMNS, cb.format_row(c, osd_df, {5: "hu", 7: "ha"})))
+        cells = dict(zip(column_names(), cb.format_row(c, osd_df, {5: "hu", 7: "ha"})))
         self.assertEqual(
             (cells["UP OSD"], cells["UP UTIL"], cells["UP HOST"]),
             ("osd.5", "91.2%", "hu"),
@@ -653,7 +658,7 @@ class UpAndActingColumnsTest(unittest.TestCase):
 
     def test_missing_figures_show_a_question_mark(self):
         c = cb.Cancellation("19.1", 0, 5, 7, 1_000, "s", None)
-        cells = dict(zip(cb.COLUMNS, cb.format_row(c, {}, {})))
+        cells = dict(zip(column_names(), cb.format_row(c, {}, {})))
         self.assertEqual(
             [cells[k] for k in ("UP UTIL", "UP HOST", "ACTING UTIL", "ACTING HOST")],
             ["?"] * 4,
@@ -739,13 +744,43 @@ class SeveralPinsTest(unittest.TestCase):
 
 
 class PrintTableTest(unittest.TestCase):
-    def test_no_rows_prints_just_the_header(self):
+    def printed(self, rows):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            cb.print_table([])
-        self.assertEqual(
-            out.getvalue().split(), [w for c in cb.COLUMNS for w in c.split()]
-        )
+            cb.print_table(rows)
+        return out.getvalue().splitlines()
+
+    def test_no_rows_prints_just_the_two_header_lines(self):
+        group_line, label_line = self.printed([])
+        self.assertEqual(label_line.split(), [label for _, label in cb.COLUMNS])
+        self.assertEqual(group_line.replace("-", " ").split(), ["UP", "ACTING"])
+
+    def test_group_names_are_centered_in_dashes_over_their_columns(self):
+        row = ["19.1", "0", "osd.5", "91.2%", "host05", "osd.7", "80.0%", "host07"]
+        row += ["1.0 GiB", "50%", "active+remapped+backfilling", ""]
+        group_line, label_line, data_line = self.printed([row])
+        # each group's name sits centered in dashes over its OSD..HOST columns
+        # (as wide as their widest cells), and nothing spans the ungrouped ones
+        up_start = label_line.index("OSD")
+        up_end = data_line.index("host05") + len("host05")
+        span = group_line[up_start:up_end]
+        self.assertEqual(span.strip("- "), "UP")
+        self.assertTrue(span.startswith("-") and span.endswith("-"))
+        acting_start = label_line.index("OSD", up_end)
+        acting_end = data_line.index("host07") + len("host07")
+        span = group_line[acting_start:acting_end]
+        self.assertEqual(span.strip("- "), "ACTING")
+        self.assertTrue(span.startswith("-") and span.endswith("-"))
+        self.assertEqual(group_line[:up_start].strip(), "")
+        self.assertEqual(len(group_line.rstrip()), acting_end)
+        # each cell sits under its own label
+        self.assertEqual(data_line.index("osd.5"), up_start)
+        self.assertEqual(data_line.index("osd.7"), acting_start)
+
+    def test_groups_are_set_apart_by_wider_gaps_than_columns(self):
+        _, label_line = self.printed([])
+        self.assertIn("OSD" + cb.COLUMN_SEP + "UTIL", label_line)
+        self.assertIn("HOST" + cb.GROUP_SEP + "OSD", label_line)
 
 
 class ParseOsdTest(unittest.TestCase):
@@ -850,13 +885,13 @@ class MainTest(unittest.TestCase):
     def test_table_shows_acting_osd_state_and_host(self):
         out, _ = self.run_main("682")
         lines = out.splitlines()
-        self.assertIn("PGID", lines[0])
-        self.assertEqual(len(lines), 4)
+        self.assertIn("PGID", lines[1])
+        self.assertEqual(len(lines), 5)  # two header lines + the 3 pins
         for cell in ("19.9", "osd.682", "osd.8", "90.5%", "h2", "backfilling"):
-            self.assertIn(cell, lines[1])
+            self.assertIn(cell, lines[2])
         # the UP OSD (osd.682) gets its own utilization and host too
-        self.assertRegex(lines[1], r"osd\.682\s+88\.0%\s+h1\s+osd\.8\s+90\.5%\s+h2")
-        self.assertIn("companion of shard 0", lines[3])
+        self.assertRegex(lines[2], r"osd\.682\s+88\.0%\s+h1\s+osd\.8\s+90\.5%\s+h2")
+        self.assertIn("companion of shard 0", lines[4])
 
     def test_import_mappings_is_json_with_every_pair_and_no_warning(self):
         out, err = self.run_main("--import-mappings", "682")
@@ -902,9 +937,9 @@ class MainTest(unittest.TestCase):
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, _ = self.run_main("682", pgs=pgs, extra_osds=[osd_df_node(77, 92.0)])
         rows = out.splitlines()
-        self.assertEqual(len(rows), 3)
-        self.assertIn("blocks shard 0: target osd.77 would be at 92.0%", rows[2])
-        self.assertNotIn("blocks", rows[1])
+        self.assertEqual(len(rows), 4)  # two header lines + the 2 pins
+        self.assertIn("blocks shard 0: target osd.77 would be at 92.0%", rows[3])
+        self.assertNotIn("blocks", rows[2])
 
     def test_a_target_below_the_ratio_is_not_a_blocker(self):
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
@@ -944,7 +979,7 @@ class MainTest(unittest.TestCase):
         out, err = self.run_main("682", pgs=[chain])
         rows = out.splitlines()
         self.assertEqual(
-            [r.split()[:2] for r in rows[1:]], [["19.f", "1"], ["19.f", "0"]]
+            [r.split()[:2] for r in rows[2:]], [["19.f", "1"], ["19.f", "0"]]
         )
         self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
         self.assertNotIn("left out", err)
@@ -1293,7 +1328,7 @@ class FixtureReplayTest(unittest.TestCase):
     def test_osd_896_table_and_summary(self):
         result = self.replay(896)
         rows = result.stdout.splitlines()
-        self.assertEqual(len(rows), 1 + 13)  # header + the 13 pins
+        self.assertEqual(len(rows), 2 + 13)  # two header lines + the 13 pins
         self.assertEqual(sum("blocks shard" in r for r in rows), 7)
         self.assertIn("6 arriving shard(s)", result.stderr)
         self.assertIn("7 more shard(s)", result.stderr)
@@ -1437,9 +1472,9 @@ class BlockerFixtureReplayTest(unittest.TestCase):
 
     def test_the_table_explains_the_second_line(self):
         rows = self.replay().stdout.splitlines()
-        self.assertEqual(len(rows), 3)
-        self.assertIn("blocks shard 4: target osd.337 would be at 93.4%", rows[2])
-        self.assertNotIn("blocks", rows[1])
+        self.assertEqual(len(rows), 4)  # two header lines + the 2 pins
+        self.assertIn("blocks shard 4: target osd.337 would be at 93.4%", rows[3])
+        self.assertNotIn("blocks", rows[2])
 
     def test_summary_says_it_is_one_arriving_shard_plus_one_blocker(self):
         err = self.replay().stderr

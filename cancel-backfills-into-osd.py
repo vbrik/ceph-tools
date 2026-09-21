@@ -145,6 +145,7 @@ import re
 import subprocess
 import sys
 from collections import Counter
+from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
 
@@ -882,20 +883,29 @@ def plan_cancellations(
 # Output
 # ---------------------------------------------------------------------------
 
+# Each entry is (group, label); the header is printed on two lines, the group
+# name spanning its columns above their labels, and an empty group means the
+# column has no group line. The UP group is where CRUSH wants the shard (the
+# 'from' of the upmap pair), ACTING where its data is now (the 'to').
+# print_table leaves the final column unpadded.
 COLUMNS = [
-    "PGID",
-    "SHARD",
-    "UP OSD",
-    "UP UTIL",
-    "UP HOST",
-    "ACTING OSD",
-    "ACTING UTIL",
-    "ACTING HOST",
-    "SIZE",
-    "PROGRESS",
-    "STATE",
-    "NOTE",
+    ("", "PGID"),
+    ("", "SHARD"),
+    ("UP", "OSD"),
+    ("UP", "UTIL"),
+    ("UP", "HOST"),
+    ("ACTING", "OSD"),
+    ("ACTING", "UTIL"),
+    ("ACTING", "HOST"),
+    ("", "SIZE"),
+    ("", "PROGRESS"),
+    ("", "STATE"),
+    ("", "NOTE"),
 ]
+
+# Between table columns of one group, and between columns of different groups.
+COLUMN_SEP = "  "
+GROUP_SEP = "    "
 
 
 def format_bytes(num: int | None) -> str:
@@ -949,19 +959,47 @@ def format_row(
 
 
 def print_table(rows: list[list[str]]) -> None:
-    """Print rows under a header, columns padded to fit (last one unpadded)."""
+    """Print rows under a two-line header: group spans, then column labels.
+
+    A group's name is centered in dashes across the full width of its
+    columns, so it visibly covers all of them. The span is always wider than
+    the name (the labels under it alone are wider), so no fitting is needed.
+    Columns of different groups are separated by the wider GROUP_SEP, on every
+    line, to set the groups visually apart.
+    """
     # A list, not max(a, *b): with no rows the star-args form degrades to
     # max(int) and raises.
     widths = [
-        max([len(label), *(len(r[i]) for r in rows)]) for i, label in enumerate(COLUMNS)
+        max([len(label), *(len(row[i]) for row in rows)])
+        for i, (_, label) in enumerate(COLUMNS)
     ]
-    for cells in (COLUMNS, *rows):
+    # seps[i] is what precedes column i.
+    seps = [""] + [
+        COLUMN_SEP if COLUMNS[i][0] == COLUMNS[i - 1][0] else GROUP_SEP
+        for i in range(1, len(COLUMNS))
+    ]
+
+    group_line = ""
+    for group, indexes in groupby(range(len(COLUMNS)), key=lambda i: COLUMNS[i][0]):
+        cols = list(indexes)
+        span = sum(widths[i] for i in cols) + sum(len(seps[i]) for i in cols[1:])
+        group_line += seps[cols[0]]
+        group_line += f" {group} ".center(span, "-") if group else " " * span
+    print(group_line.rstrip())
+
+    # Last column is variable-width and rightmost; leave it unpadded.
+    def emit(cells: list[str]) -> None:
+        last = len(cells) - 1
         print(
-            "  ".join(
-                cell.ljust(width) if i < len(cells) - 1 else cell
-                for i, (cell, width) in enumerate(zip(cells, widths))
+            "".join(
+                sep + (cell.ljust(widths[i]) if i < last else cell)
+                for i, (sep, cell) in enumerate(zip(seps, cells))
             )
         )
+
+    emit([label for _, label in COLUMNS])
+    for row in rows:
+        emit(row)
 
 
 def print_pgremapper(cancellations: list[Cancellation]) -> None:

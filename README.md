@@ -130,7 +130,8 @@ other environments.
     blocking `231 -> 896`).
 
   It does not pick which backfills to keep: the table shows each shard's up and
-  acting OSD (with utilization and host), size, PG progress and state
+  acting OSD (with utilization and host, under a two-line header whose first
+  line spans each of the `UP` and `ACTING` groups), size, PG progress and state
   (cancelling a running backfill discards its progress). You drop the entries
   for the ones to let proceed, but keep the blockers of any shard you keep,
   and drop companions with the entry they belong to.
