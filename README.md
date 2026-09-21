@@ -28,9 +28,9 @@ tools live in the `cephfs/` directory; everything else is at the top level.
     LDAP, using the `ldap3` package if installed, falling back to the
     `ldapsearch` CLI otherwise. This is off by default and only activates
     when both `--ldap-server` and `--ldap-base` are given (see `--help`).
-  - `upmap-remapped.py` uses the `rados` Python bindings if importable and
+  - `external/upmap-remapped.py` uses the `rados` Python bindings if importable and
     otherwise falls back to shelling out to `ceph ... | jq`.
-- `jq` for the `.sh` scripts and for `upmap-remapped.py`'s fallback path.
+- `jq` for the `.sh` scripts and for `external/upmap-remapped.py`'s fallback path.
 - A mounted CephFS (kernel client or ceph-fuse) for `cephfs/du`,
   `cephfs/find-growing-dirs.py`, `cephfs/find-recent-rctime.py` and
   `cephfs/cephfs-find-wide-dirs`; plus `getfattr` (from `attr`/`acl` packages) for `cephfs/du`.
@@ -125,7 +125,7 @@ other environments.
 - **`find-large-omap-objects.sh`** — List PGs with objects flagged
   for having large omap entries.
 
-- **`upmap-remapped.py`** (third-party, from
+- **`external/upmap-remapped.py`** (third-party, from
   [cernceph/ceph-scripts](https://github.com/cernceph/ceph-scripts/blob/master/tools/upmap/upmap-remapped.py))
   — Print `ceph osd pg-upmap-items` / `rm-pg-upmap-items` commands that make all
   currently remapped PGs immediately `active+clean`, pinning data where it
@@ -138,9 +138,9 @@ other environments.
   for the full procedure and its disclaimers. The copy here predates the
   current upstream version, which has since fixed error handling on the
   no-`rados` fallback path.
-  `upmap-remapped.py [--ignore-backfilling]`
+  `external/upmap-remapped.py [--ignore-backfilling]`
 
-- **`pgremapper-v1.0.0-linux-amd64`** (prebuilt binary,
+- **`external/pgremapper-v1.0.0-linux-amd64`** (prebuilt binary,
   [digitalocean/pgremapper](https://github.com/digitalocean/pgremapper)) —
   Third-party tool for controlling PG backfill/remapping without CRUSH map
   changes. Vendored as a static Linux amd64 binary; see its own project for
@@ -239,10 +239,11 @@ invariants that matter — no target projected above `--max-target-util`
 
 ## License
 
-MIT (see `LICENSE`), except for the vendored third-party tools:
+MIT (see `LICENSE`), except for the vendored third-party tools in `external/`
+(unmodified copies from their upstream repos):
 
-- `pgremapper-v1.0.0-linux-amd64` carries its own Apache 2.0 license.
-- `upmap-remapped.py` comes from
+- `external/pgremapper-v1.0.0-linux-amd64` carries its own Apache 2.0 license.
+- `external/upmap-remapped.py` comes from
   [cernceph/ceph-scripts](https://github.com/cernceph/ceph-scripts), which
   is GPL-2.0 licensed; the file itself credits Dan van der Ster (CERN) and
   carries a no-warranty disclaimer.
