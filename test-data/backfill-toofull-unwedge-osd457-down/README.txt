@@ -1,5 +1,5 @@
 Fixture: real, small-scale instance of the exact scenario
-upmaps-to-unstick-toofull-backfills.py targets (single OSD down, its host's
+backfill-toofull-unwedge-upmaps.py targets (single OSD down, its host's
 siblings absorb the vacated PG and blow past backfillfull_ratio).
 
 Captured: 2026-08-11 ~09:05 from a live cluster, via:
@@ -47,14 +47,14 @@ CRUSH_ITEM_NONE and the row shows 'none' with '-' for the utilization and
 host that would have been derived from it.
 
 Use this fixture to exercise the "found something to divert" path. It is
-NOT a no-problems fixture -- see upmaps-toofull-nominal-synthetic/ for that
+NOT a no-problems fixture -- see backfill-toofull-unwedge-nominal-synthetic/ for that
 (same topology files, but pg_ls_backfill_toofull.json is a hand-edited
 empty result, since the live cluster had no genuinely problem-free moment
 available at capture time).
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 
-  upmaps-to-unstick-toofull-backfills.py --load-state .
+  backfill-toofull-unwedge-upmaps.py --load-state .
 
 ANONYMIZED: cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule
 names have been replaced with deterministic fake values (see

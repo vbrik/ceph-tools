@@ -61,8 +61,8 @@ other environments.
   given OSD is a source or destination.
   `upmaps-of-osd.sh <osd>`
 
-- **`upmaps-to-unstick-toofull-backfills.py`** —
-  Propose upmap re-targets that unstick PGs wedged in `backfill_toofull` on
+- **`backfill-toofull-unwedge-upmaps.py`** —
+  Propose upmap re-targets that unwedge PGs stuck in `backfill_toofull` on
   full hosts. When an OSD goes out, a `chooseleaf ... type host` CRUSH rule
   retries *inside the same host bucket*, so the dead OSD's PGs pile onto its
   same-host siblings instead of spreading across the cluster; on an
@@ -110,7 +110,7 @@ other environments.
   cluster access. Handles EC pools per-shard and replicated pools by set
   difference. See the script's module docstring for the full explanation and
   caveats (`--help` summarizes and points there).
-  `upmaps-to-unstick-toofull-backfills.py [--pgremapper] [--min-up-util
+  `backfill-toofull-unwedge-upmaps.py [--pgremapper] [--min-up-util
   PERCENT] [--max-target-util PERCENT] [--max-target-uses N] [--save-state DIR
   | --load-state DIR]`
 
@@ -228,7 +228,7 @@ python3 -m unittest discover -p 'test_*.py'
 python3 -m unittest discover -s cephfs -p 'test_*.py'
 ```
 
-The `upmaps-to-unstick-toofull-backfills.py` tests replay the
+The `backfill-toofull-unwedge-upmaps.py` tests replay the
 cluster-state snapshots under `test-data/` via `--load-state` and check the
 output against what each fixture's `README.txt` documents, so fixture and
 code cannot drift apart: the exact table for the small fixtures, and for the

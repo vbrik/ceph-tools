@@ -1,4 +1,4 @@
-"""Unit tests for upmaps-to-unstick-toofull-backfills.py.
+"""Unit tests for backfill-toofull-unwedge-upmaps.py.
 
 Two kinds of bug drive what is tested here, both of which read as
 plausible output rather than as an obvious failure.
@@ -41,11 +41,11 @@ from typing import ClassVar
 
 SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "upmaps-to-unstick-toofull-backfills.py",
+    "backfill-toofull-unwedge-upmaps.py",
 )
 TEST_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-data")
 
-spec = importlib.util.spec_from_file_location("upmaps_toofull", SCRIPT)
+spec = importlib.util.spec_from_file_location("unwedge_upmaps", SCRIPT)
 ut = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ut)
 
@@ -405,7 +405,7 @@ def table_from_readme(fixture):
     return "\n".join(block)
 
 
-CEPH2_FIXTURE = "upmaps-toofull-ceph2-util-emergency-2-new-hosts"
+CEPH2_FIXTURE = "backfill-toofull-unwedge-ceph2-util-emergency-2-new-hosts"
 
 # What the fixture's README.txt documents, and what the thresholds buy:
 # 1513 arriving shards, 976 of them plausibly blocked. With the defaults each
@@ -486,17 +486,17 @@ class FixtureReplayTest(unittest.TestCase):
         return self.run_proc(fixture, *extra).stdout.rstrip("\n")
 
     def test_osd457_down_table_matches_readme(self):
-        fixture = "upmaps-toofull-osd457-down"
+        fixture = "backfill-toofull-unwedge-osd457-down"
         self.assertEqual(self.run_script(fixture), table_from_readme(fixture))
 
     def test_existing_upmap_chain_table_matches_readme(self):
-        fixture = "upmaps-toofull-osd263-existing-upmap-chain"
+        fixture = "backfill-toofull-unwedge-osd263-existing-upmap-chain"
         self.assertEqual(self.run_script(fixture), table_from_readme(fixture))
 
     def test_existing_upmap_row_is_unmarked_and_has_no_upmap_column(self):
         # The UP OSD is a plain 'osd.N' even when it is the 'to' of an
         # existing pair; pgremapper handles that case itself.
-        out = self.run_script("upmaps-toofull-osd263-existing-upmap-chain")
+        out = self.run_script("backfill-toofull-unwedge-osd263-existing-upmap-chain")
         self.assertNotIn("*", out)
         self.assertNotIn("EXISTING_UPMAPS", out)
 
@@ -505,7 +505,7 @@ class FixtureReplayTest(unittest.TestCase):
         # still be '<pgid> 263 <target>' for 'pgremapper remap' to rewrite
         # that pair's 'to'.
         proc = self.run_proc(
-            "upmaps-toofull-osd263-existing-upmap-chain", "--pgremapper"
+            "backfill-toofull-unwedge-osd263-existing-upmap-chain", "--pgremapper"
         )
         lines = proc.stdout.splitlines()
         self.assertEqual(len(lines), 6)
@@ -516,18 +516,20 @@ class FixtureReplayTest(unittest.TestCase):
         # 'pgremapper remap' takes the upmap's 'from', which is the UP OSD.
         # Emitting the ACTING OSD here would remap the wrong OSD, and the table
         # would still look right.
-        out = self.run_script("upmaps-toofull-osd457-down", "--pgremapper")
+        out = self.run_script("backfill-toofull-unwedge-osd457-down", "--pgremapper")
         self.assertEqual(out, "19.21f 625 849")
 
     def test_no_backfill_toofull_pgs_prints_nothing_on_stdout(self):
-        self.assertEqual(self.run_script("upmaps-toofull-nominal-synthetic"), "")
+        self.assertEqual(
+            self.run_script("backfill-toofull-unwedge-nominal-synthetic"), ""
+        )
 
     def test_default_thresholds_come_from_the_clusters_own_ratios(self):
         # osd457-down has backfillfull_ratio 0.90, ceph2 has it raised to
         # 0.91: the reported caps must track the capture, not a constant.
         # The target cap is backfillfull_ratio minus one point.
         for fixture, nearfull, max_target in [
-            ("upmaps-toofull-osd457-down", "85", "89"),
+            ("backfill-toofull-unwedge-osd457-down", "85", "89"),
             (CEPH2_FIXTURE, "85", "90"),
         ]:
             with self.subTest(fixture=fixture):
@@ -1400,7 +1402,7 @@ class UnknownPoolTest(unittest.TestCase):
         # diff the pool's EC shards as interchangeable replicas — both
         # failures produce plausible-looking rows.
         with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(TEST_DATA, "upmaps-toofull-osd457-down")
+            src = os.path.join(TEST_DATA, "backfill-toofull-unwedge-osd457-down")
             dst = os.path.join(tmp, "fixture")
             shutil.copytree(src, dst)
             path = os.path.join(dst, "pool_ls_detail.json")
