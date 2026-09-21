@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+Propose upmaps that cancel every backfill into a given OSD.
+
+Why
+---
+Ceph refuses to start a backfill when the target OSD's *projected* usage would
+exceed backfillfull_ratio, and every other backfill queued or running into that
+OSD counts towards the projection. On a nearly full cluster, stopping the
+backfills into one OSD therefore frees the room for the ones you care about
+(e.g. moving PGs off the fullest OSD onto it).
+
+How
+---
+A backfill into OSD X is stopped by pinning the shard to where its data is
+now: an upmap pair '<X> -> <acting OSD>' makes 'up' equal 'acting' for that
+shard, so nothing moves. That is 'pgremapper remap <pgid> <X> <acting osd>'.
+
+This script lists those remaps for every PG shard that is arriving on the
+OSD. It changes nothing. It does not decide which backfills to keep: review
+the output and delete the lines for the ones you want to let proceed.
+
+Cancelling a backfill that is already running throws away its progress; the
+PROGRESS and STATE columns are there to help judge that. The script cannot
+tell whether the backfills you keep will then fit under backfillfull_ratio;
+it only reports the OSD's utilization and how much data is arriving.
+
+(pgremapper's own 'cancel-backfill --include-osds N --target' does the same
+job at OSD/pool granularity; this script exists to review and pick per shard.)
+
+'up'/'acting' are diffed differently per pool type, as in pg-movements.py:
+EC shards are identified by position, so index i is diffed against index i.
+Replicated replicas are interchangeable, so the sets are diffed and SHARD is
+'-'; a replica can only be paired with the acting OSD it replaces when
+exactly one replica is arriving and one is leaving.
+
+Companion pins
+--------------
+A pin is only accepted if the resulting mapping is valid, and Ceph drops an
+upmap that puts two shards of a PG on one host (the pool's failure domain,
+which must be 'host') or one OSD twice. That happens when another shard of the
+PG is moving too and its destination shares a host with the acting OSD being
+pinned back to: CRUSH re-placed the two together, so pinning only one leaves
+the clash. The other shard is then pinned back as well, listed as a "companion
+of shard N" (which can chain, if its acting OSD clashes with a third shard).
+Companions are backfills into *other* OSDs that you did not ask about: check
+the NOTE column, and note that dropping a companion entry invalidates the pin
+it goes with.
+
+Shards that cannot be pinned are listed on stderr, never dropped silently:
+  - the acting slot is empty (degraded): there is no OSD to pin the shard to;
+  - a replicated PG has several replicas moving and the pairing is ambiguous;
+  - a same-host clash cannot be resolved because the clashing shard is not
+    moving or has no acting OSD, so it cannot be pinned back too.
+
+Testing against saved cluster state
+-----------------------------------
+By default every run calls the live 'ceph' CLI (see SNAPSHOT_COMMANDS for the
+six commands and their JSON output). --save-state DIR also writes that JSON,
+one '<key>.json' file per command, into DIR (empty or not yet existing) as a
+side effect of an otherwise normal run. The copy is anonymized (see
+anonymize_snapshots), so it can be shared or committed. --load-state DIR reads
+such a directory back instead of calling 'ceph', so a captured state can be
+replayed offline with no cluster access. The two options are mutually
+exclusive. tests/test-data/cancel-backfills-into-osd-*/ hold captures for use
+as --load-state arguments, each with a README.txt describing the scenario.
+
+Applying the output
+-------------------
+--import-mappings prints a JSON array for 'pgremapper import-mappings', one
+{pgid, mapping: {from, to}} entry per line (all other output goes to stderr):
+
+    cancel-backfills-into-osd.py --import-mappings 682 > mappings.json
+    # drop the entries you want to keep backfilling, with their companions:
+    jq 'map(select(.pgid != "19.92e"))' mappings.json > pruned.json
+    pgremapper import-mappings pruned.json
+
+Give it the file path, not stdin, or its confirmation prompt reads EOF.
+import-mappings reads the cluster's upmaps once and applies all pairs of a PG
+together, merging into any existing pg_upmap_items (which is why pgremapper is
+used rather than 'ceph osd pg-upmap-items', that replaces the whole entry).
+
+--pgremapper prints bare '<pgid> <up osd> <acting osd>' lines instead, for
+'pgremapper remap', but a PG that needs several lines (a companion pin always
+does) is not safe to apply that way: run as separate commands, a later run can
+overwrite the pair an earlier one just added, and a lone pair can be invalid (two
+shards on one host) and is then silently dropped by the mons. Both were seen
+on a live cluster, so the option warns whenever it prints such a PG.
+
+Consider 'ceph balancer off' while the cancelled PGs are pinned: the upmap
+balancer may otherwise undo them.
+"""
+
+import argparse
+import copy
+import hashlib
+import json
+import math
+import re
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import NamedTuple
+
+# Sentinel used by CRUSH/Ceph for "no OSD in this slot" (crush/crush.h).
+CRUSH_ITEM_NONE = 0x7FFFFFFF
+
+POOL_TYPE_ERASURE = 3
+
+# 'ceph osd df' reports sizes in KiB.
+KIB = 1024
+
+# Maps each snapshot to the 'ceph ... --format json' command that produces it
+# and the '<key>.json' filename it is saved/loaded as under --save-state/
+# --load-state.
+SNAPSHOT_COMMANDS: dict[str, list[str]] = {
+    "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
+    "osd_df": ["ceph", "osd", "df", "--format", "json"],
+    "osd_dump": ["ceph", "osd", "dump", "--format", "json"],
+    "pool_ls_detail": ["ceph", "osd", "pool", "ls", "detail", "--format", "json"],
+    "crush_rule_dump": ["ceph", "osd", "crush", "rule", "dump", "--format", "json"],
+    # Exactly the PGs whose up != acting, filtered by the mons: a small fraction
+    # of what 'ceph pg dump pgs' would return on a big cluster.
+    "pg_ls_remapped": ["ceph", "pg", "ls", "remapped", "--format", "json"],
+}
+
+# Set from args at the top of main(): None means "call the live ceph CLI as
+# normal"; a Path means "read '<key>.json' from this directory instead of
+# running SNAPSHOT_COMMANDS[key]" (see --load-state).
+LOAD_STATE_DIR: Path | None = None
+
+# Set from args at the top of main(): None means "don't save"; a Path means
+# "once all six snapshots are collected, write an anonymized copy of each to
+# '<dir>/<key>.json'" (see --save-state and anonymize_snapshots).
+SAVE_STATE_DIR: Path | None = None
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_osd(text: str) -> int:
+    """argparse type: an OSD id, given as '682' or 'osd.682'."""
+    match = re.fullmatch(r"(?:osd\.)?(\d+)", text)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            f"expected an OSD id like 682 or osd.682, got {text!r}"
+        )
+    return int(match[1])
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Propose upmaps that cancel every backfill into an OSD "
+        "by pinning each arriving shard to the OSD it is on now. Prints the "
+        "proposals only; nothing is changed. Delete the lines for backfills "
+        "you want to keep.",
+        epilog="See the docstring at the top of this script for what cannot "
+        "be pinned and how to apply the output.",
+    )
+    parser.add_argument("osd", type=parse_osd, help="OSD id, e.g. 682 or osd.682")
+    fmt = parser.add_mutually_exclusive_group()
+    fmt.add_argument(
+        "--import-mappings",
+        action="store_true",
+        help="Print a JSON array for 'pgremapper import-mappings' instead of "
+        "the table, one {pgid, mapping} entry per line. This is the reliable "
+        "way to apply the proposals: all pairs of a PG go in together.",
+    )
+    fmt.add_argument(
+        "--pgremapper",
+        action="store_true",
+        help="Print '<pgid> <up osd> <acting osd>' lines with no header "
+        "instead of the table, for 'pgremapper remap', one run per line. "
+        "Warns if a PG needs several lines, since separate runs can "
+        "overwrite each other; prefer --import-mappings.",
+    )
+    state_group = parser.add_mutually_exclusive_group()
+    state_group.add_argument(
+        "--load-state",
+        metavar="DIR",
+        help="Analyze a saved cluster state instead of a live cluster. DIR "
+        "must contain the six '<key>.json' files listed in SNAPSHOT_COMMANDS "
+        "(what --save-state produces, and the layout of the fixtures under "
+        "tests/test-data/). No 'ceph' commands are run.",
+    )
+    state_group.add_argument(
+        "--save-state",
+        metavar="DIR",
+        help="Also save the live cluster state this run collects into DIR, as "
+        "the six '<key>.json' files --load-state reads back (created if "
+        "missing; must be empty or not exist). The normal analysis and output "
+        "proceed as usual. The saved copy is anonymized (hostnames, pool and "
+        "CRUSH rule names replaced; 'osd dump' reduced to what is used), so it "
+        "is safe to share.",
+    )
+    return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Data collection
+# ---------------------------------------------------------------------------
+
+
+# Populated lazily by _ceph_json, keyed by SNAPSHOT_COMMANDS key. main() fetches
+# every key before saving, so the cache then holds the complete set, which is
+# what write_anonymized_state relies on.
+_SNAPSHOT_CACHE: dict[str, object] = {}
+
+
+def _ceph_json(key: str) -> object:
+    """Return parsed JSON for one of SNAPSHOT_COMMANDS's keys.
+
+    Read from '<LOAD_STATE_DIR>/<key>.json' if --load-state was given,
+    otherwise run the live ceph command. Cached after the first call.
+    """
+    if key in _SNAPSHOT_CACHE:
+        return _SNAPSHOT_CACHE[key]
+
+    if LOAD_STATE_DIR is not None:
+        path = LOAD_STATE_DIR / f"{key}.json"
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            cmd = " ".join(SNAPSHOT_COMMANDS[key])
+            sys.exit(
+                f"ERROR: --load-state directory is missing {path} (the "
+                f"output of '{cmd}')."
+            )
+    else:
+        try:
+            proc = subprocess.run(
+                SNAPSHOT_COMMANDS[key], capture_output=True, text=True, check=True
+            )
+        except subprocess.CalledProcessError as exc:
+            sys.exit(f"ERROR: ceph command failed:\n{exc.stderr.strip()}")
+        except FileNotFoundError:
+            sys.exit("ERROR: 'ceph' binary not found in PATH.")
+        text = proc.stdout
+
+    _SNAPSHOT_CACHE[key] = json.loads(text)
+    return _SNAPSHOT_CACHE[key]
+
+
+def fetch_osd_df() -> dict[int, dict]:
+    """Return {osd_id: node} from 'ceph osd df'."""
+    data = _ceph_json("osd_df")
+    return {n["id"]: n for n in data.get("nodes", []) + data.get("stray", [])}
+
+
+def fetch_osd_hosts() -> dict[int, str]:
+    """Return {osd_id: short_hostname} from 'ceph osd tree'."""
+    data = _ceph_json("osd_tree")
+    nodes = data.get("nodes", []) + data.get("stray", [])
+    by_id = {n["id"]: n for n in nodes}
+    result = {}
+    for n in nodes:
+        if n.get("type") == "host":
+            short = n["name"].split(".")[0]
+            for child_id in n.get("children", []):
+                if by_id.get(child_id, {}).get("type") == "osd":
+                    result[child_id] = short
+    return result
+
+
+def fetch_pools() -> dict[int, dict]:
+    """Return {pool_id: pool} from 'ceph osd pool ls detail'."""
+    data = _ceph_json("pool_ls_detail")
+    return {p["pool_id"]: p for p in data}
+
+
+def fetch_ec_profiles() -> dict[str, dict]:
+    """Return {profile_name: profile} from 'ceph osd dump'."""
+    data = _ceph_json("osd_dump")
+    return data.get("erasure_code_profiles", {})
+
+
+def fetch_pg_stats() -> list[dict]:
+    """Return pg_stat dicts for the remapped PGs, from 'ceph pg ls remapped'."""
+    raw = _ceph_json("pg_ls_remapped")
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        if "pg_stats" in raw:
+            return raw["pg_stats"]
+        if "pg_stats" in raw.get("pg_map", {}):
+            return raw["pg_map"]["pg_stats"]
+        # With no matching PGs 'ceph pg ls' omits 'pg_stats' and returns
+        # just {"pg_ready": true}.
+        if "pg_ready" in raw:
+            return []
+    raise SystemExit(
+        f"ERROR: unrecognised JSON structure from 'ceph pg ls remapped'.\n"
+        f"Top-level type: {type(raw).__name__}"
+        + (f", keys: {list(raw.keys())}" if isinstance(raw, dict) else "")
+    )
+
+
+def fetch_crush_rules() -> dict[int, dict]:
+    """Return {rule_id: rule} from 'ceph osd crush rule dump'."""
+    data = _ceph_json("crush_rule_dump")
+    return {r["rule_id"]: r for r in data}
+
+
+# ---------------------------------------------------------------------------
+# Anonymization for --save-state
+# ---------------------------------------------------------------------------
+
+_TRAILING_NUM_RE = re.compile(r"(\d+)$")
+_FAKE_HASH_NAME_RE = re.compile(r"host-[0-9a-f]{8}")
+
+
+def _fake_hostname(real_name: str) -> str:
+    """Map a real hostname to a deterministic stand-in.
+
+    Keyed off the hostname's trailing number (e.g. 'ceph2-11' -> 'host11'), or,
+    with none, a hash of the whole name, so the same real host always maps to
+    the same fake one with no shared state. Same scheme as
+    backfill-toofull-unwedge-upmaps.py, so captures from both agree.
+    """
+    if _FAKE_HASH_NAME_RE.fullmatch(real_name):
+        return real_name  # already a stand-in: keep anonymization idempotent
+    m = _TRAILING_NUM_RE.search(real_name)
+    if m:
+        return f"host{int(m.group(1)):02d}"
+    return "host-" + hashlib.sha256(real_name.encode()).hexdigest()[:8]
+
+
+def anonymize_snapshots(snapshots: dict[str, object]) -> None:
+    """Anonymize a complete set of parsed snapshots in place.
+
+    Hostnames, pool names and CRUSH rule names are replaced with deterministic
+    fake values; PG ids, OSD ids, utilizations and the topology, which the
+    analysis depends on, are untouched. 'ceph osd dump' is cut down to the
+    erasure code profiles, the only part this script reads, which also keeps
+    the cluster fsid, OSD addresses and uuids out of the capture.
+
+    Idempotent, since every substitution is a function of an id or the real
+    value already present, so a second pass changes nothing.
+    """
+    osd_tree = snapshots["osd_tree"]
+    for node in osd_tree.get("nodes", []) + osd_tree.get("stray", []):
+        if node.get("type") == "host":
+            node["name"] = _fake_hostname(node["name"])
+
+    snapshots["osd_dump"] = {
+        "erasure_code_profiles": snapshots["osd_dump"].get("erasure_code_profiles", {})
+    }
+    for pool in snapshots["pool_ls_detail"]:
+        pool["pool_name"] = f"pool{pool['pool_id']}"
+    for rule in snapshots["crush_rule_dump"]:
+        rule["rule_name"] = f"rule{rule['rule_id']}"
+
+
+def write_anonymized_state(dir_: Path, snapshots: dict[str, object]) -> None:
+    """Write an anonymized copy of every collected snapshot under dir_.
+
+    Works on a deep copy: the cache that feeds the run's own analysis is left
+    untouched, so --save-state never changes what the run itself reports.
+    """
+    anonymized = copy.deepcopy(snapshots)
+    anonymize_snapshots(anonymized)
+    for key, obj in anonymized.items():
+        (dir_ / f"{key}.json").write_text(json.dumps(obj, separators=(",", ":")))
+
+
+# ---------------------------------------------------------------------------
+# PG analysis
+# ---------------------------------------------------------------------------
+
+
+def rule_failure_domain(rule: dict | None) -> str | None:
+    """Return the bucket type CRUSH spreads shards over for redundancy.
+
+    The 'type' of the rule's first choose*/chooseleaf* step: for the common EC
+    shape ('choose indep 0 type host' then 'chooseleaf indep 1 type osd') that
+    is the outer step, the inner osd pick being only the leaf within it.
+    """
+    for step in (rule or {}).get("steps", []):
+        if step.get("op", "").startswith("choose"):
+            return step.get("type")
+    return None
+
+
+def _is_real_osd(osd_id) -> bool:
+    return osd_id not in (CRUSH_ITEM_NONE, -1, None)
+
+
+def _slot(osd_list: list, index: int) -> int | None:
+    """Return the real OSD id at a position, or None for a missing/empty slot."""
+    if index >= len(osd_list):
+        return None
+    osd_id = osd_list[index]
+    return osd_id if _is_real_osd(osd_id) else None
+
+
+def find_arrivals(
+    up: list, acting: list, osd: int, is_ec: bool
+) -> tuple[list[tuple["int | str", int]], list[tuple["int | str", str]]]:
+    """Split the shards arriving on osd into those with an OSD to pin to and not.
+
+    Returns (pins, skipped): pins holds (shard, acting_osd) for each shard
+    that could be pinned back to the OSD it is on now, skipped holds (shard,
+    reason) for those that have none. The shard is the EC shard index, or '-'
+    for replicated pools. Whether a pin is actually valid (see
+    pin_with_companions) is a separate question.
+    """
+    pins, skipped = [], []
+    if is_ec:
+        for i in range(len(up)):
+            if _slot(up, i) != osd:
+                continue
+            acting_osd = _slot(acting, i)
+            if acting_osd == osd:
+                continue
+            if acting_osd is None:
+                skipped.append((i, "no acting OSD for this shard (degraded)"))
+            else:
+                pins.append((i, acting_osd))
+        return pins, skipped
+
+    up_set = {o for o in up if _is_real_osd(o)}
+    acting_set = {o for o in acting if _is_real_osd(o)}
+    if osd not in up_set or osd in acting_set:
+        return pins, skipped
+    arriving = up_set - acting_set
+    departing = acting_set - up_set
+    if len(arriving) == 1 and len(departing) == 1:
+        pins.append(("-", next(iter(departing))))
+    elif not departing:
+        skipped.append(("-", "no acting OSD to pin to (missing replica)"))
+    else:
+        skipped.append(("-", "several replicas moving, pairing is ambiguous"))
+    return pins, skipped
+
+
+def copies_moving(up: list, acting: list, is_ec: bool, pool_size: int) -> int:
+    """Count the shard/replica copies a PG has to place (see pg-movements.py).
+
+    Ceph's misplaced/degraded object counters are in copy units, so this is
+    the multiplier of num_objects in the progress denominator: slots whose up
+    OSD differs from acting, plus slots with no OSD anywhere yet.
+    """
+    if is_ec:
+        count = 0
+        for i in range(max(len(up), len(acting))):
+            up_osd, acting_osd = _slot(up, i), _slot(acting, i)
+            if up_osd is None:
+                count += acting_osd is None
+            else:
+                count += up_osd != acting_osd
+        return count
+    up_set = {o for o in up if _is_real_osd(o)}
+    acting_set = {o for o in acting if _is_real_osd(o)}
+    arriving = len(up_set - acting_set)
+    return arriving + max(0, pool_size - len(acting_set) - arriving)
+
+
+def pg_progress_pct(pg: dict, n_copies: int) -> float | None:
+    """Estimate % of a PG's data already at its target location.
+
+    From the misplaced/degraded object counters, which count down to 0 as
+    movement completes; None if the PG has no objects. An approximation that
+    assumes objects are of similar size.
+    """
+    stat_sum = pg.get("stat_sum", {})
+    total = stat_sum.get("num_objects", 0) * n_copies
+    if total <= 0:
+        return None
+    remaining = stat_sum.get("num_objects_misplaced", 0) + stat_sum.get(
+        "num_objects_degraded", 0
+    )
+    return max(0.0, min(100.0, 100.0 * (1 - remaining / total)))
+
+
+def shard_size_bytes(pg: dict, pool: dict, ec_profiles: dict[str, dict]) -> int | None:
+    """Estimate the bytes one shard of a PG occupies, or None if unknown.
+
+    A replica holds all of the PG's logical size ('num_bytes'), an EC shard
+    1/k of it (rounded up). Omap, metadata and stripe padding are not counted.
+    """
+    num_bytes = pg["stat_sum"]["num_bytes"]
+    if pool.get("type") != POOL_TYPE_ERASURE:
+        return num_bytes
+    try:
+        k = int(ec_profiles[pool["erasure_code_profile"]]["k"])
+    except (KeyError, ValueError):
+        return None
+    return -(-num_bytes // k)
+
+
+def _same_place(a: int, b: int, osd_host: dict[int, str]) -> bool:
+    """True if two OSDs are one and the same or on one host (host known)."""
+    host = osd_host.get(a)
+    return a == b or (host is not None and host == osd_host.get(b))
+
+
+def pin_with_companions(
+    up: list, acting: list, slot: int, osd_host: dict[int, str]
+) -> tuple[dict[int, int], str | None]:
+    """Pin EC shard 'slot' to its acting OSD, plus whatever that requires.
+
+    Pinning a shard back puts its acting OSD into the up set, and Ceph drops an
+    upmap whose result puts two shards on one host (the pool's failure domain)
+    or the same OSD twice. That happens whenever another shard of the PG is
+    moving too and its destination shares a host with the pinned shard's acting
+    OSD: CRUSH re-placed the two together. The way out is to pin that other
+    shard back as well ("companion"), which can in turn clash with a third, and
+    so on until the mapping is valid.
+
+    Returns ({shard: acting_osd}, None) with the requested shard first, or
+    ({}, reason) when a clashing shard cannot be pinned back (it is not moving,
+    or has no acting OSD), so that nothing partial is proposed.
+    """
+    pins = {slot: acting[slot]}
+    while True:
+        new_up = [pins.get(i, osd) for i, osd in enumerate(up)]
+        added = {}
+        for i in pins:
+            for j, other in enumerate(new_up):
+                if j == i or j in pins or not _is_real_osd(other):
+                    continue
+                if not _same_place(new_up[i], other, osd_host):
+                    continue
+                companion = _slot(acting, j)
+                if companion is None or companion == up[j]:
+                    why = "has no acting OSD" if companion is None else "is not moving"
+                    return {}, (
+                        f"acting osd.{new_up[i]} shares a host with shard {j} "
+                        f"(osd.{other}), which {why} so cannot be pinned too"
+                    )
+                added[j] = companion
+        if not added:
+            return pins, None
+        pins.update(added)
+
+
+def pin_replica(
+    up: list, osd: int, acting_osd: int, osd_host: dict[int, str]
+) -> str | None:
+    """Return why a replicated PG's replica cannot be pinned, or None if it can.
+
+    The replica swaps osd for acting_osd; the same-host clash with the other
+    replicas is checked as for EC. Replicas have no identity, so a clashing
+    replica cannot be pinned too: any PG with a second replica moving is already
+    ambiguous (see find_arrivals) and never gets here.
+    """
+    for other in up:
+        if (
+            other != osd
+            and _is_real_osd(other)
+            and _same_place(acting_osd, other, osd_host)
+        ):
+            return (
+                f"acting osd.{acting_osd} shares a host with replica "
+                f"osd.{other}, which is not moving"
+            )
+    return None
+
+
+class Cancellation(NamedTuple):
+    """One shard pinned back from the OSD it was moving to onto its acting OSD."""
+
+    pgid: str
+    shard: "int | str"  # EC shard index, or '-' for replicated pools
+    up_osd: int  # where CRUSH is sending it: the 'from' of the upmap pair
+    acting_osd: int  # where it is now: the 'to'
+    size_bytes: int | None  # estimated, None if unknown
+    state: str
+    progress_pct: float | None  # of the whole PG's movement, not this shard's
+    companion_of: "int | str | None" = None  # the requested shard this one is
+    # pinned along with (see pin_with_companions), None if it is a requested one
+
+
+class Skipped(NamedTuple):
+    """A shard arriving on the OSD that cannot be pinned, and why."""
+
+    pgid: str
+    shard: "int | str"
+    reason: str
+
+
+def pgid_sort_key(pgid: str) -> tuple[int, int]:
+    """Sort PG IDs numerically: pool id (decimal), then pg id (hex)."""
+    pool_str, pg_hex = pgid.split(".")
+    return (int(pool_str), int(pg_hex, 16))
+
+
+def plan_cancellations(
+    pg_stats: list[dict],
+    pools: dict[int, dict],
+    ec_profiles: dict[str, dict],
+    osd: int,
+    osd_host: dict[int, str],
+    crush_rules: dict[int, dict],
+) -> tuple[list[Cancellation], list[Skipped]]:
+    """Return (cancellations, skipped) for all backfills into osd, in PG order.
+
+    Every shard arriving on osd yields a cancellation, plus companion
+    cancellations for the other shards of its PG that must be pinned back with
+    it to keep the mapping valid (pin_with_companions). Exits with an error if
+    such a PG's pool does not fail over at host, since the clash check assumes
+    it.
+    """
+    cancellations, skipped = [], []
+    for pg in pg_stats:
+        up, acting = pg["up"], pg["acting"]
+        if osd not in up:
+            continue
+        pgid = pg["pgid"]
+        pool = pools.get(int(pgid.split(".")[0]))
+        if pool is None:
+            # Without the pool type EC shards would be diffed as replicas.
+            sys.exit(
+                f"ERROR: PG {pgid} belongs to a pool that 'ceph osd pool ls "
+                "detail' does not list, so its shards cannot be analyzed."
+            )
+        domain = rule_failure_domain(crush_rules.get(pool.get("crush_rule")))
+        if domain != "host":
+            sys.exit(
+                f"ERROR: pool {pool['pool_id']} (PG {pgid}) has CRUSH failure "
+                f"domain {domain or 'unknown'}; this script only checks for "
+                "same-host clashes, so it cannot tell which pins are valid."
+            )
+        is_ec = pool.get("type") == POOL_TYPE_ERASURE
+        pins, unpinnable = find_arrivals(up, acting, osd, is_ec)
+        skipped.extend(Skipped(pgid, shard, why) for shard, why in unpinnable)
+        if not pins:
+            continue
+        size = shard_size_bytes(pg, pool, ec_profiles)
+        progress = pg_progress_pct(
+            pg, copies_moving(up, acting, is_ec, pool.get("size", 0))
+        )
+        for shard, acting_osd in pins:
+            if is_ec:
+                resolved, why = pin_with_companions(up, acting, shard, osd_host)
+                moves = [(s, up[s], a) for s, a in resolved.items()]
+            else:
+                why = pin_replica(up, osd, acting_osd, osd_host)
+                moves = [("-", osd, acting_osd)]
+            if why is not None:
+                skipped.append(Skipped(pgid, shard, why))
+                continue
+            cancellations.extend(
+                Cancellation(
+                    pgid,
+                    s,
+                    from_osd,
+                    to_osd,
+                    size,
+                    pg["state"],
+                    progress,
+                    None if s == shard else shard,
+                )
+                for s, from_osd, to_osd in moves
+            )
+
+    def order(item: Cancellation | Skipped) -> tuple:
+        return (*pgid_sort_key(item.pgid), item.shard if item.shard != "-" else -1)
+
+    return sorted(cancellations, key=order), sorted(skipped, key=order)
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+COLUMNS = [
+    "PGID",
+    "SHARD",
+    "UP OSD",
+    "UP UTIL",
+    "UP HOST",
+    "ACTING OSD",
+    "ACTING UTIL",
+    "ACTING HOST",
+    "SIZE",
+    "PROGRESS",
+    "STATE",
+    "NOTE",
+]
+
+
+def format_bytes(num: int | None) -> str:
+    """Format a byte count in binary units, or '?' if unknown."""
+    if num is None:
+        return "?"
+    value = float(num)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+
+def format_utilization(osd_df: dict[int, dict], osd_id: int) -> str:
+    """Format an OSD's utilization as 'NN.N%', or '?' if 'ceph osd df' lacks it."""
+    util = osd_df.get(osd_id, {}).get("utilization")
+    return f"{util:.1f}%" if util is not None else "?"
+
+
+def format_row(
+    c: Cancellation, osd_df: dict[int, dict], osd_host: dict[int, str]
+) -> list[str]:
+    return [
+        c.pgid,
+        str(c.shard),
+        f"osd.{c.up_osd}",
+        format_utilization(osd_df, c.up_osd),
+        osd_host.get(c.up_osd, "?"),
+        f"osd.{c.acting_osd}",
+        format_utilization(osd_df, c.acting_osd),
+        osd_host.get(c.acting_osd, "?"),
+        format_bytes(c.size_bytes),
+        # floor, so a PG that is still moving never reads "100%"
+        "-" if c.progress_pct is None else f"{math.floor(c.progress_pct)}%",
+        c.state,
+        "" if c.companion_of is None else f"companion of shard {c.companion_of}",
+    ]
+
+
+def print_table(rows: list[list[str]]) -> None:
+    """Print rows under a header, columns padded to fit (last one unpadded)."""
+    # A list, not max(a, *b): with no rows the star-args form degrades to
+    # max(int) and raises.
+    widths = [
+        max([len(label), *(len(r[i]) for r in rows)]) for i, label in enumerate(COLUMNS)
+    ]
+    for cells in (COLUMNS, *rows):
+        print(
+            "  ".join(
+                cell.ljust(width) if i < len(cells) - 1 else cell
+                for i, (cell, width) in enumerate(zip(cells, widths))
+            )
+        )
+
+
+def print_pgremapper(cancellations: list[Cancellation]) -> None:
+    """Print '<pgid> <up osd> <acting osd>' per cancellation.
+
+    These are 'pgremapper remap's positional arguments; OSD ids must be bare
+    integers, it rejects the 'osd.N' form.
+    """
+    for c in cancellations:
+        print(f"{c.pgid} {c.up_osd} {c.acting_osd}")
+
+
+def print_import_mappings(cancellations: list[Cancellation]) -> None:
+    """Print the cancellations as JSON for 'pgremapper import-mappings'.
+
+    One {pgid, mapping: {from, to}} entry per pair, in a JSON array with one
+    entry per line, so it is easy to read and to prune with jq. import-mappings
+    reads the cluster's upmaps once and applies all pairs of a PG together, so
+    unlike separate 'pgremapper remap' runs the pairs of a PG cannot overwrite
+    each other.
+    """
+    print("[")
+    for i, c in enumerate(cancellations):
+        entry = {"pgid": c.pgid, "mapping": {"from": c.up_osd, "to": c.acting_osd}}
+        print(f"  {json.dumps(entry)}{',' if i < len(cancellations) - 1 else ''}")
+    print("]")
+
+
+def pgs_needing_several_pins(cancellations: list[Cancellation]) -> list[str]:
+    """Return the PGs (in PG order) that have more than one cancellation."""
+    counts = Counter(c.pgid for c in cancellations)
+    return sorted((pgid for pgid, n in counts.items() if n > 1), key=pgid_sort_key)
+
+
+def warn_separate_remaps(pgids: list[str]) -> None:
+    """Warn on stderr that these PGs are not safe to apply with 'remap' lines.
+
+    Each 'pgremapper remap' run adds one pair to a PG's upmap entry, and
+    'ceph osd pg-upmap-items' replaces the whole entry. On a live cluster the
+    run after the first was seen to send only its own pair, undoing the one
+    before; and a pair left alone can be invalid (two shards on one host) and
+    is then silently dropped by the mons, so the PG never changes.
+    """
+    shown = ", ".join(pgids[:8]) + (
+        f", ... ({len(pgids)} in all)" if len(pgids) > 8 else ""
+    )
+    print(
+        f"WARNING: {len(pgids)} PG(s) need more than one remap ({shown}). Running "
+        "these lines as separate 'pgremapper remap' commands (e.g. xargs -L1) "
+        "can silently lose pairs: a later run may overwrite the pair an earlier "
+        "one just added, and a lone pair can be invalid and dropped by the "
+        "mons. Use --import-mappings instead, which applies all pairs of a PG "
+        "together.",
+        file=sys.stderr,
+    )
+
+
+def print_summary(
+    osd: int,
+    osd_df: dict[int, dict],
+    osd_host: dict[int, str],
+    cancellations: list[Cancellation],
+    skipped: list[Skipped],
+) -> None:
+    """Report on stderr the OSD's fill level and what the proposal covers."""
+    node = osd_df[osd]
+    arriving = [c for c in cancellations if c.companion_of is None]
+    companions = len(cancellations) - len(arriving)
+    known = [c.size_bytes for c in arriving if c.size_bytes is not None]
+    total = sum(known)
+    capacity = node.get("kb", 0) * KIB
+    share = f" ({total / capacity * 100:.1f}% of its capacity)" if capacity else ""
+    unknown = len(arriving) - len(known)
+    print(
+        f"osd.{osd} ({osd_host.get(osd, '?')}) is at {node['utilization']:.1f}%. "
+        f"{len(arriving)} arriving shard(s) can be pinned back, "
+        f"~{format_bytes(total)}{share} of data"
+        + (f" (+{unknown} of unknown size)" if unknown else "")
+        + f"; {len(skipped)} cannot be pinned."
+        + (
+            f" {companions} companion shard(s) (moving elsewhere) must be "
+            "pinned back with them."
+            if companions
+            else ""
+        ),
+        file=sys.stderr,
+    )
+    for s in skipped:
+        print(f"  cannot pin {s.pgid} shard {s.shard}: {s.reason}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    args = parse_args()
+    osd = args.osd
+
+    global LOAD_STATE_DIR, SAVE_STATE_DIR
+    if args.load_state:
+        LOAD_STATE_DIR = Path(args.load_state)
+        if not LOAD_STATE_DIR.is_dir():
+            sys.exit(f"ERROR: --load-state directory not found: {LOAD_STATE_DIR}")
+    if args.save_state:
+        SAVE_STATE_DIR = Path(args.save_state)
+        SAVE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if any(SAVE_STATE_DIR.iterdir()):
+            sys.exit(f"ERROR: --save-state directory is not empty: {SAVE_STATE_DIR}")
+
+    osd_df = fetch_osd_df()
+    osd_host = fetch_osd_hosts()
+    pg_stats = fetch_pg_stats()
+    pools = fetch_pools()
+    ec_profiles = fetch_ec_profiles()
+    crush_rules = fetch_crush_rules()
+
+    # Every SNAPSHOT_COMMANDS key is now cached, so the capture is complete.
+    # Saved before the checks below, which can exit: a cluster that trips them
+    # is just the kind of state worth having captured.
+    if SAVE_STATE_DIR is not None:
+        write_anonymized_state(SAVE_STATE_DIR, _SNAPSHOT_CACHE)
+
+    if osd not in osd_df:
+        sys.exit(f"ERROR: osd.{osd} not found in 'ceph osd df'.")
+    cancellations, skipped = plan_cancellations(
+        pg_stats, pools, ec_profiles, osd, osd_host, crush_rules
+    )
+    if not cancellations and not skipped:
+        print(f"No backfills into osd.{osd}.", file=sys.stderr)
+        return
+
+    print_summary(osd, osd_df, osd_host, cancellations, skipped)
+    if cancellations:
+        if args.import_mappings:
+            print_import_mappings(cancellations)
+        elif args.pgremapper:
+            print_pgremapper(cancellations)
+            if multi := pgs_needing_several_pins(cancellations):
+                warn_separate_remaps(multi)
+        else:
+            print_table([format_row(c, osd_df, osd_host) for c in cancellations])
+    print(
+        "NOTE: cancelling a running backfill discards its progress. Consider "
+        "'ceph balancer off' while these are pinned.",
+        file=sys.stderr,
+    )
+
+
+if __name__ == "__main__":
+    main()

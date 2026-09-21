@@ -1,7 +1,7 @@
 # ceph-tools
 
 Command-line tools for Ceph and CephFS cluster administration, debugging,
-and troubleshooting: PG movement/remapping, upmap manipulation, scrub
+and troubleshooting: PG movement/remapping, upmap manipulation, cancelling backfills, scrub
 scheduling, OSD/PG lookups, MDS ops inspection, CephFS client load and
 inode-to-path resolution, and finding large, wide, or fast-growing
 directories on a mounted CephFS. Most tools wrap `ceph` CLI / `rados`
@@ -113,6 +113,38 @@ other environments.
   `backfill-toofull-unwedge-upmaps.py [--pgremapper] [--min-up-util
   PERCENT] [--max-target-util PERCENT] [--max-target-uses N] [--save-state DIR
   | --load-state DIR]`
+
+- **`cancel-backfills-into-osd.py`** — Propose upmaps that cancel every
+  backfill into a given OSD by pinning each arriving shard to the OSD that
+  holds it now. Ceph refuses a backfill when the target's *projected* usage
+  would pass `backfillfull_ratio`, and every other backfill headed for that OSD
+  counts towards it, so stopping those frees room for the ones you want (e.g.
+  draining the fullest OSD). Prints proposals only; changes nothing. It does not
+  pick which backfills to keep: the table shows each shard's up and acting OSD
+  (with utilization and host), size, PG progress and state (cancelling a
+  running backfill discards its progress), and you drop the entries for the
+  ones to let proceed.
+  Ceph drops an upmap that would put two shards of a PG on one host, which
+  happens when another shard of the PG is moving too and lands on the acting
+  OSD's host; the tool then pins that shard back too and marks it as a
+  "companion" (a backfill into a *different* OSD, so check the NOTE column, and
+  drop companions together with the entry they belong to).
+  `--import-mappings` prints a JSON array for `pgremapper import-mappings`
+  (prune it with `jq`, then `pgremapper import-mappings file.json`), which
+  applies all pairs of a PG together; this is the way to apply the output.
+  `--pgremapper` prints bare `<pgid> <up osd> <acting osd>` lines for
+  `pgremapper remap` instead, but separate `remap` runs on one PG can overwrite
+  each other's pairs (seen on a live cluster), so it warns on stderr whenever a
+  PG needs more than one line. Shards that cannot be pinned (no acting OSD,
+  ambiguous replicated pairing, a clash that no companion can resolve) are
+  listed on stderr. Assumes the pools' CRUSH failure domain is `host`.
+  Note that `backfill_toofull` is reported per PG: a stuck shard is often
+  blocked by a *different* shard of the same PG heading to a full OSD, so run it
+  on that OSD too. pgremapper's `cancel-backfill --include-osds N --target` does
+  the same at OSD/pool granularity. `--save-state DIR` writes the run's cluster
+  state as JSON, anonymized so it can be shared, and `--load-state DIR` replays
+  such a capture offline with no cluster access.
+  `cancel-backfills-into-osd.py [--import-mappings | --pgremapper] [--save-state DIR | --load-state DIR] <osd>`
 
 - **`scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /
@@ -235,6 +267,13 @@ cluster-sized one (808 stuck PGs, 1513 arriving shards) the counts plus the
 invariants that matter — no target projected above `--max-target-util`
 (`backfillfull_ratio` minus 1 by default), no target used more than
 `--max-target-uses` times, no shard diverted off an OSD below `nearfull_ratio`.
+
+The `cancel-backfills-into-osd.py` tests do the same with the real-cluster
+snapshot in `tests/test-data/cancel-backfills-into-osd-*/` (688 remapped PGs,
+same-host clashes that need companion pins). Besides the exact `--pgremapper`
+output documented in its `README.txt`, they check independently that applying
+the proposed pins leaves every PG with no repeated host or OSD, and that
+`--save-state` output replays to the same result with no `ceph` available.
 
 ## License
 
