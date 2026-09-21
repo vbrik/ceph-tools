@@ -1,4 +1,4 @@
-"""Unit tests for backfill-toofull-unwedge-upmaps.py.
+"""Unit tests for divert-toofull-backfills.py.
 
 Two kinds of bug drive what is tested here, both of which read as
 plausible output rather than as an obvious failure.
@@ -41,12 +41,13 @@ from typing import ClassVar
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(
-    os.path.dirname(TESTS_DIR),
-    "backfill-toofull-unwedge-upmaps.py",
+    os.path.dirname(os.path.dirname(TESTS_DIR)),
+    "pg-osd",
+    "divert-toofull-backfills.py",
 )
 TEST_DATA = os.path.join(TESTS_DIR, "test-data")
 
-spec = importlib.util.spec_from_file_location("unwedge_upmaps", SCRIPT)
+spec = importlib.util.spec_from_file_location("divert_toofull_backfills", SCRIPT)
 ut = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ut)
 
@@ -406,7 +407,7 @@ def table_from_readme(fixture):
     return "\n".join(block)
 
 
-CEPH2_FIXTURE = "backfill-toofull-unwedge-ceph2-util-emergency-2-new-hosts"
+CEPH2_FIXTURE = "divert-toofull-backfills-ceph2-util-emergency-2-new-hosts"
 
 # What the fixture's README.txt documents, and what the thresholds buy:
 # 1513 arriving shards, 976 of them plausibly blocked. With the defaults each
@@ -487,17 +488,17 @@ class FixtureReplayTest(unittest.TestCase):
         return self.run_proc(fixture, *extra).stdout.rstrip("\n")
 
     def test_osd457_down_table_matches_readme(self):
-        fixture = "backfill-toofull-unwedge-osd457-down"
+        fixture = "divert-toofull-backfills-osd457-down"
         self.assertEqual(self.run_script(fixture), table_from_readme(fixture))
 
     def test_existing_upmap_chain_table_matches_readme(self):
-        fixture = "backfill-toofull-unwedge-osd263-existing-upmap-chain"
+        fixture = "divert-toofull-backfills-osd263-existing-upmap-chain"
         self.assertEqual(self.run_script(fixture), table_from_readme(fixture))
 
     def test_existing_upmap_row_is_unmarked_and_has_no_upmap_column(self):
         # The UP OSD is a plain 'osd.N' even when it is the 'to' of an
         # existing pair; pgremapper handles that case itself.
-        out = self.run_script("backfill-toofull-unwedge-osd263-existing-upmap-chain")
+        out = self.run_script("divert-toofull-backfills-osd263-existing-upmap-chain")
         self.assertNotIn("*", out)
         self.assertNotIn("EXISTING_UPMAPS", out)
 
@@ -506,7 +507,7 @@ class FixtureReplayTest(unittest.TestCase):
         # still be '<pgid> 263 <target>' for 'pgremapper remap' to rewrite
         # that pair's 'to'.
         proc = self.run_proc(
-            "backfill-toofull-unwedge-osd263-existing-upmap-chain", "--pgremapper"
+            "divert-toofull-backfills-osd263-existing-upmap-chain", "--pgremapper"
         )
         lines = proc.stdout.splitlines()
         self.assertEqual(len(lines), 6)
@@ -517,12 +518,12 @@ class FixtureReplayTest(unittest.TestCase):
         # 'pgremapper remap' takes the upmap's 'from', which is the UP OSD.
         # Emitting the ACTING OSD here would remap the wrong OSD, and the table
         # would still look right.
-        out = self.run_script("backfill-toofull-unwedge-osd457-down", "--pgremapper")
+        out = self.run_script("divert-toofull-backfills-osd457-down", "--pgremapper")
         self.assertEqual(out, "19.21f 625 849")
 
     def test_no_backfill_toofull_pgs_prints_nothing_on_stdout(self):
         self.assertEqual(
-            self.run_script("backfill-toofull-unwedge-nominal-synthetic"), ""
+            self.run_script("divert-toofull-backfills-nominal-synthetic"), ""
         )
 
     def test_default_thresholds_come_from_the_clusters_own_ratios(self):
@@ -530,7 +531,7 @@ class FixtureReplayTest(unittest.TestCase):
         # 0.91: the reported caps must track the capture, not a constant.
         # The target cap is backfillfull_ratio minus one point.
         for fixture, nearfull, max_target in [
-            ("backfill-toofull-unwedge-osd457-down", "85", "89"),
+            ("divert-toofull-backfills-osd457-down", "85", "89"),
             (CEPH2_FIXTURE, "85", "90"),
         ]:
             with self.subTest(fixture=fixture):
@@ -1403,7 +1404,7 @@ class UnknownPoolTest(unittest.TestCase):
         # diff the pool's EC shards as interchangeable replicas — both
         # failures produce plausible-looking rows.
         with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(TEST_DATA, "backfill-toofull-unwedge-osd457-down")
+            src = os.path.join(TEST_DATA, "divert-toofull-backfills-osd457-down")
             dst = os.path.join(tmp, "fixture")
             shutil.copytree(src, dst)
             path = os.path.join(dst, "pool_ls_detail.json")

@@ -1,7 +1,7 @@
 # ceph-tools
 
 Command-line tools for Ceph and CephFS cluster administration, debugging,
-and troubleshooting: PG movement/remapping, upmap manipulation, cancelling backfills, scrub
+and troubleshooting: PG movement/remapping, upmap manipulation, stopping and diverting backfills, scrub
 scheduling, OSD/PG lookups, MDS ops inspection, CephFS client load and
 inode-to-path resolution, and finding large, wide, or fast-growing
 directories on a mounted CephFS. Most tools wrap `ceph` CLI / `rados`
@@ -13,7 +13,7 @@ aren't answered directly by a single `ceph` subcommand.
 
 Every script is standalone and can be copied out and run on its own; there
 is no shared library or install step beyond the requirements below. CephFS
-tools live in the `cephfs/` directory; everything else is at the top level.
+tools live in the `cephfs/` directory and PG/OSD tools in `pg-osd/`; everything else is at the top level.
 
 ## Requirements
 
@@ -21,7 +21,7 @@ tools live in the `cephfs/` directory; everything else is at the top level.
   pointed at the target cluster.
 - Python 3 for the `.py` scripts. Most run under the `python3` shebang;
   `cephfs/client-inodes.py`, `cephfs/find-recent-rctime.py` and
-  `scrub-all-pgs-that-need-it.py` use `python`. Stdlib only, except:
+  `pg-osd/scrub-all-pgs-that-need-it.py` use `python`. Stdlib only, except:
   - `cephfs/find-recent-rctime.py` requires `python-dateutil` for its
     flexible `--min-ctime` date parsing.
   - `cephfs/mds-ops-pretty.py` can optionally resolve UID/GID to names via
@@ -44,28 +44,28 @@ other environments.
 
 ### RADOS / OSD
 
-- **`osds-of-pg.py`** — Show a PG's `acting` and `up` OSDs, one row per
+- **`pg-osd/osds-of-pg.py`** — Show a PG's `acting` and `up` OSDs, one row per
   shard, with each OSD's utilization and host, the PG's primaries
   marked `*`, remap PROGRESS for shards that are moving (same estimate as
-  `pg-movements.py`, per PG), and the PG's `pg_upmap_items` pairs that touch
+  `pg-osd/pg-movements.py`, per PG), and the PG's `pg_upmap_items` pairs that touch
   each row (UPMAPS). Same grouped ACTING/UP table style as
-  `backfill-toofull-unwedge-upmaps.py`.
-  `osds-of-pg.py <pgid>`
+  `pg-osd/divert-toofull-backfills.py`.
+  `pg-osd/osds-of-pg.py <pgid>`
 
-- **`pg-movements.py`** — For every PG where `up` != `acting`,
+- **`pg-osd/pg-movements.py`** — For every PG where `up` != `acting`,
   print source/destination OSDs, movement type, per-PG progress, and PG
   state. Progress is derived from the misplaced/degraded object counters,
   which count copies, so it is scaled by the number of shards/replicas
   moving. Handles EC (per-shard) and replicated (set-diff) pools
   differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
-  `pg-movements.py [--sort-by {pgid,from-osd,to-osd}]`
+  `pg-osd/pg-movements.py [--sort-by {pgid,from-osd,to-osd}]`
 
-- **`upmaps-of-osd.sh`** — Show `pg_upmap_items` entries where a
+- **`pg-osd/upmaps-of-osd.sh`** — Show `pg_upmap_items` entries where a
   given OSD is a source or destination.
-  `upmaps-of-osd.sh <osd>`
+  `pg-osd/upmaps-of-osd.sh <osd>`
 
-- **`backfill-toofull-unwedge-upmaps.py`** —
+- **`pg-osd/divert-toofull-backfills.py`** —
   Propose upmap re-targets that unwedge PGs stuck in `backfill_toofull` on
   full hosts. When an OSD goes out, a `chooseleaf ... type host` CRUSH rule
   retries *inside the same host bucket*, so the dead OSD's PGs pile onto its
@@ -114,11 +114,11 @@ other environments.
   cluster access. Handles EC pools per-shard and replicated pools by set
   difference. See the script's module docstring for the full explanation and
   caveats (`--help` summarizes and points there).
-  `backfill-toofull-unwedge-upmaps.py [--pgremapper] [--min-up-util
+  `pg-osd/divert-toofull-backfills.py [--pgremapper] [--min-up-util
   PERCENT] [--max-target-util PERCENT] [--max-target-uses N] [--save-state DIR
   | --load-state DIR]`
 
-- **`cancel-backfills-into-osd.py`** — List the upmaps needed to stop *all*
+- **`pg-osd/stop-backfills-into-osd.py`** — List the upmaps needed to stop *all*
   backfills into a given OSD, by pinning each arriving shard to the OSD that
   holds it now. Ceph refuses a backfill when the target's *projected* usage
   would pass `backfillfull_ratio`, and every other backfill headed for that OSD
@@ -156,15 +156,15 @@ other environments.
   OSD/pool granularity. `--save-state DIR` writes the run's cluster state as
   JSON, anonymized so it can be shared, and `--load-state DIR` replays such a
   capture offline with no cluster access.
-  `cancel-backfills-into-osd.py [--import-mappings | --pgremapper] [--save-state DIR | --load-state DIR] <osd>`
+  `pg-osd/stop-backfills-into-osd.py [--import-mappings | --pgremapper] [--save-state DIR | --load-state DIR] <osd>`
 
-- **`scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
+- **`pg-osd/scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /
   `PG_NOT_DEEP_SCRUBBED`. For each such PG it looks up the acting primary
   via `ceph pg <pgid> query` and issues `ceph tell osd.<primary> scrub` /
   `deep_scrub`, which is a work-around for a broken `ceph pg (deep-)scrub`.
   Acts on the cluster immediately — it has no dry-run mode.
-  `scrub-all-pgs-that-need-it.py`
+  `pg-osd/scrub-all-pgs-that-need-it.py`
 
 - **`find-large-omap-objects.sh`** — List PGs with objects flagged
   for having large omap entries.
@@ -264,15 +264,18 @@ being examined.
 
 ## Tests
 
-Stdlib `unittest`, no dependencies. All tests, including those for the
-`cephfs/` scripts, live in `tests/`:
+Stdlib `unittest`, no dependencies. All tests live in `tests/`, in one
+subdirectory per script group (`tests/pg-osd/`, `tests/cephfs/`); `pytest tests`
+works too. `unittest discover` does not descend into the hyphenated
+directories, so run it once per group:
 
 ```
-python3 -m unittest discover -s tests
+python3 -m unittest discover -s tests/pg-osd
+python3 -m unittest discover -s tests/cephfs
 ```
 
-The `backfill-toofull-unwedge-upmaps.py` tests replay the
-cluster-state snapshots under `tests/test-data/` via `--load-state` and check the
+The `pg-osd/divert-toofull-backfills.py` tests replay the
+cluster-state snapshots under `tests/pg-osd/test-data/` via `--load-state` and check the
 output against what each fixture's `README.txt` documents, so fixture and
 code cannot drift apart: the exact table for the small fixtures, and for the
 cluster-sized one (808 stuck PGs, 1513 arriving shards) the counts plus the
@@ -280,8 +283,8 @@ invariants that matter — no target projected above `--max-target-util`
 (`backfillfull_ratio` minus 1 by default), no target used more than
 `--max-target-uses` times, no shard diverted off an OSD below `nearfull_ratio`.
 
-The `cancel-backfills-into-osd.py` tests do the same with two real-cluster
-snapshots in `tests/test-data/cancel-backfills-into-osd-*/` (688 remapped PGs;
+The `pg-osd/stop-backfills-into-osd.py` tests do the same with two real-cluster
+snapshots in `tests/pg-osd/test-data/stop-backfills-into-osd-*/` (688 remapped PGs;
 one where stopping the backfills into an OSD needs companion and blocker pins
 for six PGs, and one where a single wanted backfill is held up by a blocker in
 its own PG). Besides the exact `--pgremapper` output documented in each

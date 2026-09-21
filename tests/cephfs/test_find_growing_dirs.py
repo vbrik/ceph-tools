@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCRIPT = os.path.join(REPO_ROOT, "cephfs", "find-growing-dirs.py")
 
 spec = importlib.util.spec_from_file_location("find_growing_dirs", SCRIPT)

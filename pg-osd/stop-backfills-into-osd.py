@@ -85,7 +85,7 @@ side effect of an otherwise normal run. The copy is anonymized (see
 anonymize_snapshots), so it can be shared or committed. --load-state DIR reads
 such a directory back instead of calling 'ceph', so a captured state can be
 replayed offline with no cluster access. The two options are mutually
-exclusive. tests/test-data/cancel-backfills-into-osd-*/ hold captures for use
+exclusive. tests/pg-osd/test-data/stop-backfills-into-osd-*/ hold captures for use
 as --load-state arguments, each with a README.txt describing the scenario.
 
 Applying the output
@@ -93,7 +93,7 @@ Applying the output
 --import-mappings prints a JSON array for 'pgremapper import-mappings', one
 {pgid, mapping: {from, to}} entry per line (all other output goes to stderr):
 
-    cancel-backfills-into-osd.py --import-mappings 682 > mappings.json
+    stop-backfills-into-osd.py --import-mappings 682 > mappings.json
     # drop the entry into the OSD for each backfill you want to keep, but not
     # its blockers (other entries of the same PG), e.g. keep 19.92e's 896->231:
     jq 'map(select(.pgid != "19.92e" or .mapping.from != 896))' mappings.json \\
@@ -238,7 +238,7 @@ def parse_args() -> argparse.Namespace:
         help="Analyze a saved cluster state instead of a live cluster. DIR "
         "must contain the six '<key>.json' files listed in SNAPSHOT_COMMANDS "
         "(what --save-state produces, and the layout of the fixtures under "
-        "tests/test-data/). No 'ceph' commands are run.",
+        "tests/pg-osd/test-data/). No 'ceph' commands are run.",
     )
     state_group.add_argument(
         "--save-state",
@@ -389,7 +389,7 @@ def _fake_hostname(real_name: str) -> str:
     Keyed off the hostname's trailing number (e.g. 'ceph2-11' -> 'host11'), or,
     with none, a hash of the whole name, so the same real host always maps to
     the same fake one with no shared state. Same scheme as
-    backfill-toofull-unwedge-upmaps.py, so captures from both agree.
+    divert-toofull-backfills.py, so captures from both agree.
     """
     if _FAKE_HASH_NAME_RE.fullmatch(real_name):
         return real_name  # already a stand-in: keep anonymization idempotent

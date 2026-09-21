@@ -237,8 +237,8 @@ are left untouched, since those are what the analysis (and a replay via
 
 --load-state DIR reads those six files back instead of calling 'ceph', so a
 captured state — anonymized or not — can be replayed offline with no
-cluster access. The two flags are mutually exclusive. tests/test-data/
-backfill-toofull-unwedge-*/ hold sample captures usable directly as --load-state
+cluster access. The two flags are mutually exclusive. tests/pg-osd/test-data/
+divert-toofull-backfills-*/ hold sample captures usable directly as --load-state
 arguments, each with a README.txt describing the scenario and what the
 script should reproduce from it — the exact table for the small fixtures,
 and for the cluster-sized one the counts and invariants its test asserts
@@ -286,7 +286,7 @@ to the target (mappingstate.go, tryRemap), so it handles both.
 
 Review the proposals before applying them. To hand them to pgremapper:
 
-    backfill-toofull-unwedge-upmaps.py --pgremapper > remaps.txt
+    divert-toofull-backfills.py --pgremapper > remaps.txt
     xargs -a remaps.txt -L1 pgremapper-v1.0.0-linux-amd64 remap
 
 Use 'xargs -a', not '< remaps.txt': with a redirect, xargs points each child's
@@ -331,7 +331,7 @@ KIB = 1024
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces
 # it and the '<key>.json' filename it is saved/loaded as under --save-state/
-# --load-state. Keys match the fixtures under tests/test-data/backfill-toofull-unwedge-*/
+# --load-state. Keys match the fixtures under tests/pg-osd/test-data/divert-toofull-backfills-*/
 # verbatim, so those directories can be passed straight to --load-state.
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
@@ -447,7 +447,7 @@ def parse_args() -> argparse.Namespace:
         "SNAPSHOT_COMMANDS (osd_tree.json, osd_df.json, osd_dump.json, "
         "pool_ls_detail.json, crush_rule_dump.json and "
         "pg_ls_backfill_toofull.json) — the same layout as the fixtures "
-        "under tests/test-data/backfill-toofull-unwedge-*/, and what --save-state produces. "
+        "under tests/pg-osd/test-data/divert-toofull-backfills-*/, and what --save-state produces. "
         "No 'ceph' commands are run.",
     )
     state_group.add_argument(

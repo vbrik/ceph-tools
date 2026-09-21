@@ -11,8 +11,8 @@ import io
 import os
 import unittest
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPT = os.path.join(REPO_ROOT, "osds-of-pg.py")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SCRIPT = os.path.join(REPO_ROOT, "pg-osd", "osds-of-pg.py")
 spec = importlib.util.spec_from_file_location("osds_of_pg", SCRIPT)
 op = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(op)

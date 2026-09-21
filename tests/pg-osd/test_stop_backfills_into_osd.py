@@ -1,4 +1,4 @@
-"""Unit tests for cancel-backfills-into-osd.py.
+"""Unit tests for stop-backfills-into-osd.py.
 
 The risky parts are deciding which acting OSD a shard can be pinned back to
 (EC by position, replicated by set difference), and refusing to propose a pin
@@ -22,9 +22,9 @@ import unittest
 from typing import ClassVar
 from unittest import mock
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPT = os.path.join(REPO_ROOT, "cancel-backfills-into-osd.py")
-spec = importlib.util.spec_from_file_location("cancel_backfills_into_osd", SCRIPT)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SCRIPT = os.path.join(REPO_ROOT, "pg-osd", "stop-backfills-into-osd.py")
+spec = importlib.util.spec_from_file_location("stop_backfills_into_osd", SCRIPT)
 cb = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cb)
 
@@ -867,7 +867,7 @@ class MainTest(unittest.TestCase):
         fake = canned_ceph(self.PGS if pgs is None else pgs, extra_osds, drop)
         with (
             mock.patch.object(cb, "_ceph_json", fake),
-            mock.patch("sys.argv", ["cancel-backfills-into-osd.py", *argv]),
+            mock.patch("sys.argv", ["stop-backfills-into-osd.py", *argv]),
             contextlib.redirect_stdout(out),
             contextlib.redirect_stderr(err),
         ):
@@ -1266,12 +1266,13 @@ class StateOptionsCliTest(unittest.TestCase):
 FIXTURE = (
     pathlib.Path(REPO_ROOT)
     / "tests"
+    / "pg-osd"
     / "test-data"
-    / ("cancel-backfills-into-osd-ceph2-osd896-host-clash-companions")
+    / ("stop-backfills-into-osd-ceph2-osd896-host-clash-companions")
 )
 
 FIXTURE_BLOCKER = (
-    FIXTURE.parent / "cancel-backfills-into-osd-ceph2-osd896-blocker-in-same-pg"
+    FIXTURE.parent / "stop-backfills-into-osd-ceph2-osd896-blocker-in-same-pg"
 )
 
 # Documented in the fixture's README.txt. The pins that are neither into 896 nor
@@ -1294,7 +1295,7 @@ EXPECTED_896 = """\
 
 
 class FixtureReplayTest(unittest.TestCase):
-    """Replay the real-cluster snapshot in tests/test-data (see its README.txt)."""
+    """Replay the real-cluster snapshot in tests/pg-osd/test-data (see its README.txt)."""
 
     def replay(self, osd, *flags):
         result = run_cli("--load-state", str(FIXTURE), *flags, str(osd))

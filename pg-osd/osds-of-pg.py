@@ -9,7 +9,7 @@ the row.
 Usage: osds-of-pg.py <pgid>
   e.g. osds-of-pg.py 3.1a2
 
-Columns (same two-line grouped header as backfill-toofull-unwedge-upmaps.py):
+Columns (same two-line grouped header as divert-toofull-backfills.py):
 
   SHARD      EC shard index, '-' for replicated pools (see below)
   ACTING     OSD holding the shard's data now, with its UTIL and HOST
