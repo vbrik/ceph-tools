@@ -237,7 +237,7 @@ are left untouched, since those are what the analysis (and a replay via
 
 --load-state DIR reads those six files back instead of calling 'ceph', so a
 captured state — anonymized or not — can be replayed offline with no
-cluster access. The two flags are mutually exclusive. test-data/
+cluster access. The two flags are mutually exclusive. tests/test-data/
 backfill-toofull-unwedge-*/ hold sample captures usable directly as --load-state
 arguments, each with a README.txt describing the scenario and what the
 script should reproduce from it — the exact table for the small fixtures,
@@ -331,7 +331,7 @@ KIB = 1024
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces
 # it and the '<key>.json' filename it is saved/loaded as under --save-state/
-# --load-state. Keys match the fixtures under test-data/backfill-toofull-unwedge-*/
+# --load-state. Keys match the fixtures under tests/test-data/backfill-toofull-unwedge-*/
 # verbatim, so those directories can be passed straight to --load-state.
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
@@ -447,7 +447,7 @@ def parse_args() -> argparse.Namespace:
         "SNAPSHOT_COMMANDS (osd_tree.json, osd_df.json, osd_dump.json, "
         "pool_ls_detail.json, crush_rule_dump.json and "
         "pg_ls_backfill_toofull.json) — the same layout as the fixtures "
-        "under test-data/backfill-toofull-unwedge-*/, and what --save-state produces. "
+        "under tests/test-data/backfill-toofull-unwedge-*/, and what --save-state produces. "
         "No 'ceph' commands are run.",
     )
     state_group.add_argument(

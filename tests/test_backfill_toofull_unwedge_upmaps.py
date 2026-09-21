@@ -39,11 +39,12 @@ import unittest
 from collections import Counter
 from typing import ClassVar
 
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    os.path.dirname(TESTS_DIR),
     "backfill-toofull-unwedge-upmaps.py",
 )
-TEST_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-data")
+TEST_DATA = os.path.join(TESTS_DIR, "test-data")
 
 spec = importlib.util.spec_from_file_location("unwedge_upmaps", SCRIPT)
 ut = importlib.util.module_from_spec(spec)

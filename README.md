@@ -220,16 +220,15 @@ being examined.
 
 ## Tests
 
-Stdlib `unittest`, no dependencies. `cephfs/` is not a package, so it needs
-its own run:
+Stdlib `unittest`, no dependencies. All tests, including those for the
+`cephfs/` scripts, live in `tests/`:
 
 ```
-python3 -m unittest discover -p 'test_*.py'
-python3 -m unittest discover -s cephfs -p 'test_*.py'
+python3 -m unittest discover -s tests
 ```
 
 The `backfill-toofull-unwedge-upmaps.py` tests replay the
-cluster-state snapshots under `test-data/` via `--load-state` and check the
+cluster-state snapshots under `tests/test-data/` via `--load-state` and check the
 output against what each fixture's `README.txt` documents, so fixture and
 code cannot drift apart: the exact table for the small fixtures, and for the
 cluster-sized one (808 stuck PGs, 1513 arriving shards) the counts plus the

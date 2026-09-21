@@ -13,7 +13,8 @@ import importlib.util
 import os
 import unittest
 
-SCRIPT = os.path.join(os.path.dirname(__file__), "pg-movements.py")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT = os.path.join(REPO_ROOT, "pg-movements.py")
 spec = importlib.util.spec_from_file_location("pg_movements", SCRIPT)
 pm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pm)
