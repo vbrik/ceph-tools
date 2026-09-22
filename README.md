@@ -77,7 +77,7 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   host, the PG's primaries marked `*`, remap PROGRESS for shards that are moving (same estimate as
   `backfillctl show-backfill`, per PG), and the PG's `pg_upmap_items` pairs that touch
   each row (UPMAPS). Same grouped ACTING/UP table style as
-  `backfillctl divert-toofull-backfills`. `--load-state DIR` replays a
+  `backfillctl divert-toofull`. `--load-state DIR` replays a
   `backfillctl save-state` capture instead of querying the live cluster.
   `backfillctl [--load-state DIR] show-pg-osds <pgid> [<pgid> ...]`
 
@@ -98,7 +98,7 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   querying the live cluster.
   `backfillctl [--load-state DIR] show-backfill [--sort-by {pgid,from-osd,to-osd}] [--osds OSD ...] [--pgs PGID ...]`
 
-- **`backfillctl divert-toofull-backfills`** —
+- **`backfillctl divert-toofull`** —
   Propose upmap re-targets that unwedge PGs stuck in `backfill_toofull` on
   full hosts. When an OSD goes out, a `chooseleaf ... type host` CRUSH rule
   retries *inside the same host bucket*, so the dead OSD's PGs pile onto its
@@ -157,7 +157,7 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   instead of querying the live cluster. Handles EC pools per-shard and
   replicated pools by set difference. See the subcommand's module docstring
   for the full explanation and caveats (`--help` summarizes and points there).
-  `backfillctl [--load-state DIR] divert-toofull-backfills
+  `backfillctl [--load-state DIR] divert-toofull
   [--import-mappings | --pgremapper] [--min-up-util PERCENT]
   [--max-target-util PERCENT] [--max-target-uses N] [--pgs PGID [PGID ...]]`
 
@@ -355,7 +355,7 @@ a few subprocess runs that check the two are wired together. A change of
 output format, like reordering columns, should therefore break only
 rendering tests.
 
-The `backfillctl divert-toofull-backfills` tests replay the
+The `backfillctl divert-toofull` tests replay the
 cluster-state snapshots under `tests/pg-osd/test-data/` via `--load-state` and check the
 plan against what each fixture's `README.txt` documents, so fixture and
 code cannot drift apart: the exact proposals (the README's machine-checked

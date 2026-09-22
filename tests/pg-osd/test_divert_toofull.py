@@ -1,4 +1,4 @@
-"""Unit tests for backfillctl's divert-toofull-backfills subcommand.
+"""Unit tests for backfillctl's divert-toofull subcommand.
 
 Two kinds of bug drive what is tested here, both of which read as
 plausible output rather than as an obvious failure.
@@ -40,7 +40,7 @@ from typing import ClassVar
 
 from _support import REPO_ROOT, FakeStore, plan_from_state, shared
 
-from backfillctl import divert_toofull_backfills as ut
+from backfillctl import divert_toofull as ut
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,7 +54,7 @@ def cli(state_dir: str) -> list[str]:
         str(REPO_ROOT / "backfillctl"),
         "--load-state",
         state_dir,
-        "divert-toofull-backfills",
+        "divert-toofull",
     ]
 
 
@@ -85,7 +85,7 @@ PCT = KB * ut.KIB // 100
 
 
 def make_proposal(acting_osd=406):
-    shard = ut.DivertedShard(
+    shard = ut.ArrivingShard(
         pgid="19.2",
         shard=0,
         up_osd=882,
@@ -212,52 +212,52 @@ class PrintTableTest(unittest.TestCase):
         )
 
 
-class FindDivertedShardsTest(unittest.TestCase):
+class FindArrivingShardsTest(unittest.TestCase):
     def test_ec_pairs_up_and_acting_by_position(self):
         pg = {"pgid": "19.2", "up": [882, 111], "acting": [406, 111]}
-        (shard,) = ut.find_diverted_shards(pg, is_ec=True)
+        (shard,) = ut.find_arriving_shards(pg, is_ec=True)
         self.assertEqual((shard.shard, shard.up_osd, shard.acting_osd), (0, 882, 406))
 
     def test_ec_empty_acting_slot_yields_unknown_acting_osd(self):
         pg = {"pgid": "19.2", "up": [882, 111], "acting": [shared.CRUSH_ITEM_NONE, 111]}
-        (shard,) = ut.find_diverted_shards(pg, is_ec=True)
+        (shard,) = ut.find_arriving_shards(pg, is_ec=True)
         self.assertEqual(shard.up_osd, 882)
         self.assertIsNone(shard.acting_osd)
 
     def test_replicated_names_acting_osd_when_pairing_is_unambiguous(self):
         pg = {"pgid": "5.1", "up": [882, 111], "acting": [406, 111]}
-        (shard,) = ut.find_diverted_shards(pg, is_ec=False)
+        (shard,) = ut.find_arriving_shards(pg, is_ec=False)
         self.assertEqual((shard.shard, shard.up_osd, shard.acting_osd), ("-", 882, 406))
 
     def test_replicated_leaves_acting_osd_unknown_when_ambiguous(self):
         # Two replicas arriving and two leaving: no way to say which came
         # from which, so neither row claims an acting OSD.
         pg = {"pgid": "5.1", "up": [882, 883, 111], "acting": [406, 407, 111]}
-        shards = ut.find_diverted_shards(pg, is_ec=False)
+        shards = ut.find_arriving_shards(pg, is_ec=False)
         self.assertEqual([s.up_osd for s in shards], [882, 883])
         self.assertEqual([s.acting_osd for s in shards], [None, None])
 
     def test_every_shard_of_the_pg_carries_its_size(self):
         pg = {"pgid": "19.2", "up": [882, 883, 111], "acting": [406, 407, 111]}
-        shards = ut.find_diverted_shards(pg, is_ec=True, size_bytes=1234)
+        shards = ut.find_arriving_shards(pg, is_ec=True, size_bytes=1234)
         self.assertEqual([s.size_bytes for s in shards], [1234, 1234])
 
     def test_replicated_acting_osd_is_not_named_on_every_arriving_replica(self):
         # One replica leaving and two arriving: naming the departing OSD on
         # both would claim it holds two replicas.
         pg = {"pgid": "5.1", "up": [882, 883, 111], "acting": [406, 111]}
-        shards = ut.find_diverted_shards(pg, is_ec=False)
+        shards = ut.find_arriving_shards(pg, is_ec=False)
         self.assertEqual([s.up_osd for s in shards], [882, 883])
         self.assertEqual([s.acting_osd for s in shards], [None, None])
 
     def test_replicated_acting_osd_is_named_for_a_one_for_one_swap(self):
         pg = {"pgid": "5.1", "up": [882, 111], "acting": [406, 111]}
-        (shard,) = ut.find_diverted_shards(pg, is_ec=False)
+        (shard,) = ut.find_arriving_shards(pg, is_ec=False)
         self.assertEqual(shard.acting_osd, 406)
 
     def test_reordered_replicated_set_is_not_movement(self):
         pg = {"pgid": "5.1", "up": [111, 882], "acting": [882, 111]}
-        self.assertEqual(ut.find_diverted_shards(pg, is_ec=False), [])
+        self.assertEqual(ut.find_arriving_shards(pg, is_ec=False), [])
 
 
 class FilterToofullPgsTest(unittest.TestCase):
@@ -325,7 +325,7 @@ class SelectStuckShardsTest(unittest.TestCase):
     """backfill_toofull is a PG property, so arriving shards get filtered."""
 
     def shard(self, up_osd):
-        return ut.DivertedShard("19.1", "-", up_osd, None, [up_osd])
+        return ut.ArrivingShard("19.1", "-", up_osd, None, [up_osd])
 
     def test_shard_on_a_full_osd_is_kept(self):
         stuck, skipped = ut.select_stuck_shards([self.shard(1)], SOURCE_DF, 85.0)
@@ -464,7 +464,7 @@ def remap_triples(proposals):
     return [f"{p.shard.pgid} {p.shard.up_osd} {p.target_osd}" for p in proposals]
 
 
-CEPH2_FIXTURE = "divert-toofull-backfills-ceph2-util-emergency-2-new-hosts"
+CEPH2_FIXTURE = "divert-toofull-ceph2-util-emergency-2-new-hosts"
 
 # What the fixture's README.txt documents, and what the thresholds buy:
 # 1513 arriving shards, 976 of them plausibly blocked. With the defaults each
@@ -516,7 +516,7 @@ class PrintUnplaceableTest(unittest.TestCase):
 
 def proposal(pgid, up_osd, target_osd, shard=0):
     """A Proposal with just enough fields set for the import-mappings tests."""
-    ds = ut.DivertedShard(pgid, shard, up_osd, None, [up_osd])
+    ds = ut.ArrivingShard(pgid, shard, up_osd, None, [up_osd])
     return ut.Proposal(ds, target_osd, "h", 50.0, 55.0)
 
 
@@ -601,7 +601,7 @@ class FixturePlanTest(unittest.TestCase):
     """plan() on the small fixtures, checked against their READMEs."""
 
     def test_osd457_down_proposals_match_readme(self):
-        fixture = "divert-toofull-backfills-osd457-down"
+        fixture = "divert-toofull-osd457-down"
         result = fixture_plan(fixture)
         self.assertEqual(
             [proposal_tuple(p) for p in result.proposals],
@@ -610,7 +610,7 @@ class FixturePlanTest(unittest.TestCase):
         self.assertEqual((result.toofull_pg_count, result.arriving_count), (1, 1))
 
     def test_existing_upmap_chain_proposals_match_readme(self):
-        fixture = "divert-toofull-backfills-osd263-existing-upmap-chain"
+        fixture = "divert-toofull-osd263-existing-upmap-chain"
         result = fixture_plan(fixture)
         self.assertEqual(
             [proposal_tuple(p) for p in result.proposals],
@@ -619,7 +619,7 @@ class FixturePlanTest(unittest.TestCase):
         self.assertEqual(result.unplaceable, [])
 
     def test_no_backfill_toofull_pgs_proposes_nothing(self):
-        result = fixture_plan("divert-toofull-backfills-nominal-synthetic")
+        result = fixture_plan("divert-toofull-nominal-synthetic")
         self.assertEqual((result.proposals, result.unplaceable), ([], []))
 
     def test_default_thresholds_come_from_the_clusters_own_ratios(self):
@@ -627,7 +627,7 @@ class FixturePlanTest(unittest.TestCase):
         # 0.91: the caps must track the capture, not a constant. The target
         # cap is backfillfull_ratio minus one point.
         for fixture, nearfull, max_target in [
-            ("divert-toofull-backfills-osd457-down", 85, 89),
+            ("divert-toofull-osd457-down", 85, 89),
             (CEPH2_FIXTURE, 85, 90),
         ]:
             with self.subTest(fixture=fixture):
@@ -655,7 +655,7 @@ class FixtureReplayTest(unittest.TestCase):
     def test_existing_upmap_row_is_unmarked_and_has_no_upmap_column(self):
         # The UP OSD is a plain 'osd.N' even when it is the 'to' of an
         # existing pair; pgremapper handles that case itself.
-        out = self.run_script("divert-toofull-backfills-osd263-existing-upmap-chain")
+        out = self.run_script("divert-toofull-osd263-existing-upmap-chain")
         self.assertNotIn("*", out)
         self.assertNotIn("EXISTING_UPMAPS", out)
 
@@ -664,7 +664,7 @@ class FixtureReplayTest(unittest.TestCase):
         # still be '<pgid> 263 <target>' for 'pgremapper remap' to rewrite
         # that pair's 'to'.
         proc = self.run_proc(
-            "divert-toofull-backfills-osd263-existing-upmap-chain", "--pgremapper"
+            "divert-toofull-osd263-existing-upmap-chain", "--pgremapper"
         )
         lines = proc.stdout.splitlines()
         self.assertEqual(len(lines), 6)
@@ -675,7 +675,7 @@ class FixtureReplayTest(unittest.TestCase):
         # 'pgremapper remap' takes the upmap's 'from', which is the UP OSD.
         # Emitting the ACTING OSD here would remap the wrong OSD, and the table
         # would still look right.
-        fixture = "divert-toofull-backfills-osd457-down"
+        fixture = "divert-toofull-osd457-down"
         out = self.run_script(fixture, "--pgremapper")
         self.assertEqual(
             out.splitlines(), remap_triples(fixture_plan(fixture).proposals)
@@ -683,12 +683,10 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertEqual(out, "19.21f 625 849")
 
     def test_no_backfill_toofull_pgs_prints_nothing_on_stdout(self):
-        self.assertEqual(
-            self.run_script("divert-toofull-backfills-nominal-synthetic"), ""
-        )
+        self.assertEqual(self.run_script("divert-toofull-nominal-synthetic"), "")
 
     def test_import_mappings_carries_the_same_pairs_as_pgremapper(self):
-        fixture = "divert-toofull-backfills-osd263-existing-upmap-chain"
+        fixture = "divert-toofull-osd263-existing-upmap-chain"
         pgremapper = self.run_script(fixture, "--pgremapper")
         import_mappings = self.run_script(fixture, "--import-mappings")
         from_lines = [tuple(line.split()) for line in pgremapper.splitlines()]
@@ -700,9 +698,7 @@ class FixtureReplayTest(unittest.TestCase):
 
     def test_no_backfill_toofull_pgs_prints_an_empty_json_array(self):
         self.assertEqual(
-            self.run_script(
-                "divert-toofull-backfills-nominal-synthetic", "--import-mappings"
-            ),
+            self.run_script("divert-toofull-nominal-synthetic", "--import-mappings"),
             "[]",
         )
 
@@ -712,7 +708,7 @@ class FixtureReplayTest(unittest.TestCase):
                 *cli(
                     os.path.join(
                         TEST_DATA,
-                        "divert-toofull-backfills-osd263-existing-upmap-chain",
+                        "divert-toofull-osd263-existing-upmap-chain",
                     )
                 ),
                 "--pgremapper",
@@ -726,7 +722,7 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertIn("not allowed with argument", proc.stderr)
 
     def test_default_thresholds_are_reported_on_stderr(self):
-        err = self.run_proc("divert-toofull-backfills-osd457-down").stderr
+        err = self.run_proc("divert-toofull-osd457-down").stderr
         self.assertIn("--min-up-util 85%", err)
         self.assertIn("--max-target-util 89%", err)
 
@@ -734,7 +730,7 @@ class FixtureReplayTest(unittest.TestCase):
 class PgsFlagTest(unittest.TestCase):
     """--pgs restricts the run to shards of the named PG(s) only."""
 
-    FIXTURE = "divert-toofull-backfills-osd263-existing-upmap-chain"
+    FIXTURE = "divert-toofull-osd263-existing-upmap-chain"
 
     def plan(self, *argv):
         return fixture_plan(self.FIXTURE, *argv)
@@ -797,7 +793,7 @@ class PrintPgsFilterTest(unittest.TestCase):
         # A typo in --pgs can be what trips a later error, so the note naming
         # it must not wait for render(), which an exit never reaches.
         with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(TEST_DATA, "divert-toofull-backfills-osd457-down")
+            src = os.path.join(TEST_DATA, "divert-toofull-osd457-down")
             dst = os.path.join(tmp, "fixture")
             shutil.copytree(src, dst)
             path = os.path.join(dst, "pool_ls_detail.json")
@@ -813,9 +809,7 @@ class PrintPgsFilterTest(unittest.TestCase):
 
     def test_printed_only_with_pgs(self):
         # The note goes to stderr, ahead of the summary, only under --pgs.
-        fixture = os.path.join(
-            TEST_DATA, "divert-toofull-backfills-osd263-existing-upmap-chain"
-        )
+        fixture = os.path.join(TEST_DATA, "divert-toofull-osd263-existing-upmap-chain")
         for extra, shown in [((), False), (("--pgs", "19.zzz"), True)]:
             with self.subTest(extra=extra):
                 proc = subprocess.run(
@@ -843,7 +837,7 @@ def osd_df_of(utils):
 
 def stuck(pgid, up_osd=1, up_set=None, size_pct=0, shard=0, acting=None):
     """A diverted shard arriving on up_osd whose size is size_pct percent of an OSD."""
-    return ut.DivertedShard(
+    return ut.ArrivingShard(
         pgid, shard, up_osd, acting, up_set or [up_osd], size_pct * PCT
     )
 
@@ -1659,7 +1653,7 @@ class UnknownPoolTest(unittest.TestCase):
         # diff the pool's EC shards as interchangeable replicas — both
         # failures produce plausible-looking rows.
         with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(TEST_DATA, "divert-toofull-backfills-osd457-down")
+            src = os.path.join(TEST_DATA, "divert-toofull-osd457-down")
             dst = os.path.join(tmp, "fixture")
             shutil.copytree(src, dst)
             path = os.path.join(dst, "pool_ls_detail.json")

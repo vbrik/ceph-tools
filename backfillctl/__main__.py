@@ -11,7 +11,7 @@ global option, given before the subcommand name
 
 import argparse
 
-import divert_toofull_backfills
+import divert_toofull
 import save_state
 import show_backfill
 import show_pg_osds
@@ -21,7 +21,7 @@ from shared import add_load_state_arg
 _COMMAND_MODULES = (
     show_pg_osds,
     show_backfill,
-    divert_toofull_backfills,
+    divert_toofull,
     stop_backfills_into_osd,
     save_state,
 )

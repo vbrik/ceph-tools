@@ -24,7 +24,7 @@ from unittest import mock
 
 from _support import REPO_ROOT, FakeStore, parse_args, shared
 
-from backfillctl import divert_toofull_backfills as dt
+from backfillctl import divert_toofull as dt
 from backfillctl import save_state as ss
 from backfillctl import stop_backfills_into_osd as cb
 
@@ -192,14 +192,14 @@ class CrossSubcommandFixtureTest(unittest.TestCase):
         pgs = cb.fetch_remapped_pg_stats(store)
         self.assertEqual(len(pgs), 688)
 
-    def test_divert_toofull_backfills_filters_for_backfill_toofull(self):
+    def test_divert_toofull_filters_for_backfill_toofull(self):
         store = FakeStore(self.load())
         pgs = dt.fetch_backfill_toofull_pg_stats(store)
         self.assertEqual(len(pgs), 585)
 
     def test_one_directory_serves_a_second_subcommand_it_was_not_captured_for(self):
         # This fixture's README documents its capture as a
-        # stop-backfills-into-osd run; divert-toofull-backfills was never
+        # stop-backfills-into-osd run; divert-toofull was never
         # involved, yet the same directory (now pg_dump_pgs.json-based) is
         # enough for it too -- the point of the unified save-state format.
         out = io.StringIO()
