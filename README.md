@@ -134,8 +134,13 @@ other environments.
   draining the fullest OSD). Prints proposals only; changes nothing. The list
   is everything required, which can include pins that stop backfills into
   **other** OSDs, marked in the `NOTE` column:
-  - a *companion*: another shard of the same PG that would otherwise share a
-    host with a pinned shard (Ceph silently drops such an upmap);
+  - a *companion*: another shard of the same PG that is moving onto the host
+    of a shard you pin back. Ceph checks the failure domain on the `up` set, so
+    pinning only one of the two would leave two shards of the PG on one host
+    there and Ceph silently drops the upmap; you cannot keep one move and
+    cancel the other. (A shard moving onto a host that holds another shard of
+    its PG is harmless by itself: a PG's backfills run together and `acting`
+    switches to `up` only once all of them have finished.)
   - a *blocker*: another shard of the PG whose target OSD would reach
     `backfillfull_ratio`. `backfill_toofull` is a per-PG state, so it holds the
     whole PG back, including the shard you want to keep (e.g. `99 -> 337`

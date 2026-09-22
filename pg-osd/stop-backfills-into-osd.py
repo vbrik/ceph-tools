@@ -40,13 +40,25 @@ exactly one replica is arriving and one is leaving.
 
 Companion pins
 --------------
-A pin is only accepted if the resulting mapping is valid, and Ceph drops an
-upmap that puts two shards of a PG on one host (the pool's failure domain,
-which must be 'host') or one OSD twice. That happens when another shard of the
-PG is moving too and its destination shares a host with the acting OSD being
-pinned back to: CRUSH re-placed the two together, so pinning only one leaves
-the clash. The other shard is then pinned back as well, listed as a "companion
-of shard N" (which can chain, if its acting OSD clashes with a third shard).
+Ceph checks the failure domain on the 'up' set (CRUSH output plus upmaps), not
+on 'acting', which is just where the data is now. A PG's backfills run together
+and 'acting' switches to 'up' only once ALL of them have finished, so a shard
+that is still moving never adds a same-host shard to 'acting': in the shard 1
+(acting on host H) and shard 4 (moving to host H) example, H holds a partial
+copy of shard 4 that does not count as redundancy until the switch, and by then
+shard 1 has left H. That co-location during the move is harmless, so it is NOT
+what companions are about.
+
+What matters is that a pin is only accepted if the resulting 'up' set is valid:
+Ceph drops an upmap that puts two shards of a PG on one host (the pool's failure
+domain, which must be 'host') or one OSD twice. Pinning shard 1 back to its
+acting OSD on H while shard 4 is still headed for H makes exactly that 'up' set,
+and permanently, not just during the move. CRUSH re-placed the two together, so
+pinning only one leaves the clash and the upmap is silently dropped. The other
+shard is then pinned back as well, listed as a "companion of shard N" (which
+can chain, if its acting OSD clashes with a third shard). In other words: you
+cannot cancel shard 1's move and keep shard 4's, because no valid 'up' set has
+both.
 Companions are backfills into *other* OSDs that you did not ask about: check
 the NOTE column, and note that dropping a companion entry invalidates the pin
 it goes with. (A companion whose target is also over backfillfull_ratio is
@@ -207,7 +219,11 @@ def parse_args() -> argparse.Namespace:
         "That can also mean pinning back shards heading for OTHER OSDs, so "
         "the output lists every pin required, not only those into the given "
         "OSD: a companion is a shard of the same PG that would otherwise share "
-        "a host with a pinned shard (Ceph drops such upmaps), and a blocker is "
+        "a host with a pinned shard once that is pinned back, so the resulting "
+        "'up' set would break the host failure domain and Ceph would silently "
+        "drop the upmap (a shard still moving onto a host that holds another "
+        "shard of its PG is harmless in itself: a PG's 'acting' set switches "
+        "to 'up' only when all its backfills have finished), and a blocker is "
         "a shard whose target OSD would reach backfillfull_ratio and so holds "
         "the whole PG in backfill_toofull. The NOTE column says which is "
         "which. Prints the proposals only; nothing is changed. Deciding what "
