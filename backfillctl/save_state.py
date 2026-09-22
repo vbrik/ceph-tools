@@ -30,7 +30,7 @@ Cost
 per-subcommand listings (pg ls remapped, pg ls backfill_toofull, pg <pgid>
 query) exist to avoid paying for on a live run. That cost is paid once here,
 at capture time, not on every analysis run: a live 'backfillctl
-pg-movements'/'stop-backfills-into-osd'/'divert-toofull-backfills' still
+show-backfill'/'stop-backfills-into-osd'/'divert-toofull-backfills' still
 issues its own narrower command, and only pays the full 'pg dump pgs' cost
 when replaying a --load-state snapshot this command produced.
 """
@@ -60,7 +60,7 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 }
 
 # The parts of each pg_stat entry that some subcommand reads: identity and
-# movement (pg-movements, show-pg-osds), the flags stop-backfills-into-osd and
+# movement (show-backfill, show-pg-osds), the flags stop-backfills-into-osd and
 # divert-toofull-backfills filter on (part of 'state'), and the progress/size
 # counters (shared.pg_progress_pct, shared.shard_size_bytes).
 KEPT_PG_STAT_KEYS = ("pgid", "state", "up", "acting", "acting_primary", "up_primary")

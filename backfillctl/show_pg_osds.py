@@ -27,7 +27,7 @@ Columns (same two-line grouped header as the divert-toofull-backfills subcommand
 An OSD that is the PG's primary in that set is marked with '*'. An empty slot
 is shown as 'none'.
 
-Rows are built as in the pg-movements subcommand:
+Rows are built as in the show-backfill subcommand:
 
   - EC pools: index i is shard i, a fixed identity, so acting[i] is paired
     with up[i].
@@ -36,7 +36,7 @@ Rows are built as in the pg-movements subcommand:
     (in OSD id order) with OSDs only in up.
 
 PROGRESS is estimated from the PG's object counters exactly as in the
-pg-movements subcommand (both use shared.pg_progress_pct). It is a per-PG figure, so
+show-backfill subcommand (both use shared.pg_progress_pct). It is a per-PG figure, so
 every remapped row shows the same value.
 
 'backfillctl save-state DIR' captures a cluster's state (anonymized, and

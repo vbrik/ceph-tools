@@ -54,7 +54,7 @@ candidates dropped by --min-up-util are counted separately; both are
 reported on stderr so the silence is not ambiguous.
 
 'up'/'acting' are diffed differently per pool type, for the same reason as in
-the pg-movements subcommand: EC shards are identified by position, so index i is diffed
+the show-backfill subcommand: EC shards are identified by position, so index i is diffed
 against index i and the shard index is reported. Replicated replicas are
 interchangeable, so position carries no identity (a same-OSD-set reorder from
 primary-affinity or pg-upmap-items is not movement) and the sets are diffed

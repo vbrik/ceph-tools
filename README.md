@@ -75,14 +75,14 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
 - **`backfillctl show-pg-osds`** — Show one or more PGs' `acting` and `up` OSDs,
   a table per PG with one row per shard, with each OSD's utilization and
   host, the PG's primaries marked `*`, remap PROGRESS for shards that are moving (same estimate as
-  `backfillctl pg-movements`, per PG), and the PG's `pg_upmap_items` pairs that touch
+  `backfillctl show-backfill`, per PG), and the PG's `pg_upmap_items` pairs that touch
   each row (UPMAPS). Same grouped ACTING/UP table style as
   `backfillctl divert-toofull-backfills`. `--load-state DIR` replays a
   `backfillctl save-state` capture instead of querying the live cluster.
   `backfillctl [--load-state DIR] show-pg-osds <pgid> [<pgid> ...]`
 
-- **`backfillctl pg-movements`** — For every PG where `up` != `acting`,
-  print source/destination OSDs, movement type, per-PG progress, and PG
+- **`backfillctl show-backfill`** — Show backfills: for every PG where
+  `up` != `acting`, print source/destination OSDs, movement type, per-PG progress, and PG
   state. Progress is derived from the misplaced/degraded object counters,
   which count copies, so it is scaled by the number of shards/replicas
   moving. Those counters can hit zero before the PG actually finishes
@@ -91,13 +91,12 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   `stop-backfills-into-osd` do the same. Handles EC (per-shard) and
   replicated (set-diff) pools differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
+  `--osds` narrows the output to rows involving any of the given OSDs (as
+  source, destination or `*`-marked recovering primary), `--pgs` to the
+  given PGs; together, a row must match both.
   `--load-state DIR` replays a `backfillctl save-state` capture instead of
   querying the live cluster.
-  `backfillctl [--load-state DIR] pg-movements [--sort-by {pgid,from-osd,to-osd}]`
-
-- **`pg-osd/upmaps-of-osd.sh`** — Show `pg_upmap_items` entries where a
-  given OSD is a source or destination.
-  `pg-osd/upmaps-of-osd.sh <osd>`
+  `backfillctl [--load-state DIR] show-backfill [--sort-by {pgid,from-osd,to-osd}] [--osds OSD ...] [--pgs PGID ...]`
 
 - **`backfillctl divert-toofull-backfills`** —
   Propose upmap re-targets that unwedge PGs stuck in `backfill_toofull` on

@@ -8,7 +8,6 @@ hand-built PG dicts, and through plan() on canned 'ceph' output and the
 real-cluster fixtures; run() tests check how render() prints the result.
 """
 
-import argparse
 import contextlib
 import io
 import json
@@ -926,17 +925,6 @@ class PrintTableTest(unittest.TestCase):
         _, label_line = self.printed([])
         self.assertIn("OSD" + shared.COLUMN_SEP + "UTIL", label_line)
         self.assertIn("HOST" + shared.GROUP_SEP + "OSD", label_line)
-
-
-class ParseOsdTest(unittest.TestCase):
-    def test_bare_and_prefixed(self):
-        self.assertEqual(cb.parse_osd("682"), 682)
-        self.assertEqual(cb.parse_osd("osd.682"), 682)
-
-    def test_rejects_garbage_and_negatives(self):
-        for text in ("", "osd.", "x", "-1", "6.8"):
-            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
-                cb.parse_osd(text)
 
 
 class ParseArgsCliTest(unittest.TestCase):

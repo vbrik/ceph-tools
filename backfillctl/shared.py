@@ -225,7 +225,7 @@ def progress_reads_100(pct: float | None) -> bool:
 
 # Printed once by a subcommand when any row's PROGRESS reads 100% (see
 # progress_reads_100). Kept in one place so the wording can't drift between
-# pg-movements, show-pg-osds and stop-backfills-into-osd. No leading
+# show-backfill, show-pg-osds and stop-backfills-into-osd. No leading
 # newline/hard-wrapping: each caller adds its own paragraph spacing and either
 # prints this as-is (fixed-width footnote style) or hands it to a wrapper that
 # reflows it (textwrap.fill treats the embedded newlines as plain whitespace).
@@ -339,6 +339,16 @@ def resolve_save_dir(path: str) -> Path:
     if any(save_dir.iterdir()):
         sys.exit(f"ERROR: directory is not empty: {save_dir}")
     return save_dir
+
+
+def parse_osd(text: str) -> int:
+    """argparse type: an OSD id, given as '682' or 'osd.682'."""
+    match = re.fullmatch(r"(?:osd\.)?(\d+)", text)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            f"expected an OSD id like 682 or osd.682, got {text!r}"
+        )
+    return int(match[1])
 
 
 def add_load_state_arg(parser: argparse.ArgumentParser):

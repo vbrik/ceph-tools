@@ -41,7 +41,7 @@ it only reports the OSD's utilization and how much data is arriving.
 (pgremapper's own 'cancel-backfill --include-osds N --target' does the same
 job at OSD/pool granularity; this script exists to review and pick per shard.)
 
-'up'/'acting' are diffed differently per pool type, as in the pg-movements
+'up'/'acting' are diffed differently per pool type, as in the show-backfill
 subcommand: EC shards are identified by position, so index i is diffed against index i.
 Replicated replicas are interchangeable, so the sets are diffed and SHARD is
 '-'; a replica can only be paired with the acting OSD it replaces when
@@ -178,7 +178,6 @@ balancer may otherwise undo them.
 
 import argparse
 import json
-import re
 import shutil
 import sys
 import textwrap
@@ -202,6 +201,7 @@ from shared import (
     format_progress,
     is_real_osd,
     osd_cells,
+    parse_osd,
     pg_progress_pct,
     pgid_sort_key,
     print_table,
@@ -247,16 +247,6 @@ def fetch_remapped_pg_stats(store: SnapshotStore) -> list[dict]:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
-
-def parse_osd(text: str) -> int:
-    """argparse type: an OSD id, given as '682' or 'osd.682'."""
-    match = re.fullmatch(r"(?:osd\.)?(\d+)", text)
-    if match is None:
-        raise argparse.ArgumentTypeError(
-            f"expected an OSD id like 682 or osd.682, got {text!r}"
-        )
-    return int(match[1])
 
 
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
