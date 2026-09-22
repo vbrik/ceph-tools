@@ -203,7 +203,7 @@ class CrossSubcommandFixtureTest(unittest.TestCase):
         # involved, yet the same directory (now pg_dump_pgs.json-based) is
         # enough for it too -- the point of the unified save-state format.
         out = io.StringIO()
-        args = parse_args(dt, ["--load-state", str(FIXTURE)])
+        args = parse_args(dt, [], load_state=str(FIXTURE))
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             dt.run(args)
         self.assertIn("585 backfill_toofull PG(s) cluster-wide", out.getvalue())

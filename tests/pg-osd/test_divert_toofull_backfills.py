@@ -43,9 +43,21 @@ from _support import REPO_ROOT, FakeStore, shared
 from backfillctl import divert_toofull_backfills as ut
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-# Argv prefix that runs this subcommand as a subprocess (directory-execution
-# form, works from any cwd): [sys.executable, *CLI, ...subcommand args].
-CLI = [str(REPO_ROOT / "backfillctl"), "divert-toofull-backfills"]
+
+
+def cli(state_dir: str) -> list[str]:
+    """Argv prefix that runs this subcommand as a subprocess on a saved state
+    (directory-execution form, works from any cwd); subcommand args follow.
+    """
+    return [
+        sys.executable,
+        str(REPO_ROOT / "backfillctl"),
+        "--load-state",
+        state_dir,
+        "divert-toofull-backfills",
+    ]
+
+
 TEST_DATA = os.path.join(TESTS_DIR, "test-data")
 
 
@@ -581,8 +593,7 @@ class FixtureReplayTest(unittest.TestCase):
 
     def run_proc(self, fixture, *extra):
         return subprocess.run(
-            [sys.executable, *CLI, "--load-state", os.path.join(TEST_DATA, fixture)]
-            + list(extra),
+            [*cli(os.path.join(TEST_DATA, fixture))] + list(extra),
             capture_output=True,
             text=True,
             check=True,
@@ -652,11 +663,11 @@ class FixtureReplayTest(unittest.TestCase):
     def test_import_mappings_and_pgremapper_are_mutually_exclusive(self):
         proc = subprocess.run(
             [
-                sys.executable,
-                *CLI,
-                "--load-state",
-                os.path.join(
-                    TEST_DATA, "divert-toofull-backfills-osd263-existing-upmap-chain"
+                *cli(
+                    os.path.join(
+                        TEST_DATA,
+                        "divert-toofull-backfills-osd263-existing-upmap-chain",
+                    )
                 ),
                 "--pgremapper",
                 "--import-mappings",
@@ -690,10 +701,7 @@ class PgsFlagTest(unittest.TestCase):
     def run_proc(self, *extra):
         return subprocess.run(
             [
-                sys.executable,
-                *CLI,
-                "--load-state",
-                os.path.join(TEST_DATA, self.FIXTURE),
+                *cli(os.path.join(TEST_DATA, self.FIXTURE)),
             ]
             + list(extra),
             capture_output=True,
@@ -1284,10 +1292,7 @@ def run_ceph2(*extra):
     """Run the script on the cluster-sized fixture; return the CompletedProcess."""
     return subprocess.run(
         [
-            sys.executable,
-            *CLI,
-            "--load-state",
-            os.path.join(TEST_DATA, CEPH2_FIXTURE),
+            *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
             *extra,
         ],
         capture_output=True,
@@ -1310,10 +1315,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
     def setUpClass(cls):
         cls.proc = subprocess.run(
             [
-                sys.executable,
-                *CLI,
-                "--load-state",
-                os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
             ],
             capture_output=True,
             text=True,
@@ -1456,10 +1458,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
             with self.subTest(value=value):
                 proc = subprocess.run(
                     [
-                        sys.executable,
-                        *CLI,
-                        "--load-state",
-                        os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                        *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
                         "--max-target-uses",
                         value,
                     ],
@@ -1501,10 +1500,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
             with self.subTest(value=value):
                 proc = subprocess.run(
                     [
-                        sys.executable,
-                        *CLI,
-                        "--load-state",
-                        os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                        *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
                         "--max-target-util",
                         value,
                     ],
@@ -1525,10 +1521,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
             with self.subTest(value=value):
                 proc = subprocess.run(
                     [
-                        sys.executable,
-                        *CLI,
-                        "--load-state",
-                        os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                        *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
                         f"--max-target-util={value}",
                     ],
                     capture_output=True,
@@ -1541,10 +1534,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
     def test_pgremapper_mode_agrees_with_the_table(self):
         proc = subprocess.run(
             [
-                sys.executable,
-                *CLI,
-                "--load-state",
-                os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
                 "--pgremapper",
             ],
             capture_output=True,
@@ -1575,10 +1565,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
     def test_pgremapper_mode_reports_the_unplaceable_count_on_stderr(self):
         proc = subprocess.run(
             [
-                sys.executable,
-                *CLI,
-                "--load-state",
-                os.path.join(TEST_DATA, CEPH2_FIXTURE),
+                *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
                 "--pgremapper",
             ],
             capture_output=True,
@@ -1628,7 +1615,7 @@ class UnknownPoolTest(unittest.TestCase):
             with open(path, "w") as f:
                 json.dump([p for p in pools if p["pool_id"] != 19], f)
             proc = subprocess.run(
-                [sys.executable, *CLI, "--load-state", dst],
+                [*cli(dst)],
                 capture_output=True,
                 text=True,
                 check=False,

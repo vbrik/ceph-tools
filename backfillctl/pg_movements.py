@@ -57,7 +57,6 @@ from shared import (
     PROGRESS_100_NOTE,
     SnapshotStore,
     abbreviate_state,
-    add_load_state_arg,
     copies_moving,
     ec_shard_moves,
     fetch_osd_df,
@@ -101,7 +100,6 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         default="pgid",
         help="column to sort output rows by (default: pgid)",
     )
-    add_load_state_arg(parser)
     return parser
 
 

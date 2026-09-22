@@ -6,7 +6,7 @@ has to sit next to them. Four groups of things live here:
 
 * OSD-slot helpers and PG arithmetic (progress, copies in flight, shard size);
 * reading cluster state, live or from a saved snapshot (`SnapshotStore`), the
-  `--load-state` flag built on it, and the anonymizer (used by the
+  global `--load-state` flag built on it, and the anonymizer (used by the
   `save-state` subcommand) that makes a saved snapshot safe to share;
 * `fetch_*` helpers that turn snapshot keys into lookup tables;
 * the two-line grouped table (`print_table`) and its cell formatters.
@@ -333,14 +333,19 @@ def resolve_save_dir(path: str) -> Path:
 
 
 def add_load_state_arg(parser: argparse.ArgumentParser):
-    """Add --load-state, to analyze a captured cluster state instead of a live one."""
+    """Add --load-state, to analyze a captured cluster state instead of a live one.
+
+    backfillctl adds it once, to its top-level parser, so it is global: it
+    goes before the subcommand name and reaches every subcommand's args.
+    """
     parser.add_argument(
         "--load-state",
         metavar="DIR",
         help="Analyze a saved cluster state instead of a live cluster. DIR "
         "must be a directory as produced by 'backfillctl save-state' (or "
         "matching the layout of the fixtures under "
-        "tests/pg-osd/test-data/). No 'ceph' commands are run.",
+        "tests/pg-osd/test-data/). No 'ceph' commands are run. Not "
+        "accepted by save-state.",
     )
 
 

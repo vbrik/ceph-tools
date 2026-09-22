@@ -230,9 +230,9 @@ class MainTest(unittest.TestCase):
         "pool_ls_detail": [{"pool_id": 5, "pool_name": "rep", "type": 1, "size": 2}],
     }
 
-    def run_main(self, *argv):
+    def run_main(self, *argv, load_state=None):
         out = io.StringIO()
-        args = parse_args(op, argv)
+        args = parse_args(op, argv, load_state=load_state)
         with contextlib.redirect_stdout(out):
             op.run(args)
         return out.getvalue()
@@ -241,7 +241,7 @@ class MainTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             for key, data in self.SNAPSHOTS.items():
                 (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
-            out = self.run_main("--load-state", tmp, "5.3")
+            out = self.run_main("5.3", load_state=tmp)
         lines = out.splitlines()
         self.assertEqual("PG 5.3  state: active+remapped+backfilling", lines[0])
         rows = [ln.split() for ln in lines[4:6]]
@@ -277,7 +277,7 @@ class MainTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             for key, data in self.SNAPSHOTS.items():
                 (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
-            out = self.run_main("--load-state", tmp, "5.3")
+            out = self.run_main("5.3", load_state=tmp)
         self.assertNotIn("PROGRESS reads 100%", out)
 
     def test_progress_100_note_appears_when_the_pg_reads_100(self):
@@ -286,7 +286,7 @@ class MainTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             for key, data in snaps.items():
                 (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
-            out = self.run_main("--load-state", tmp, "5.3")
+            out = self.run_main("5.3", load_state=tmp)
         self.assertIn(" 100%", out)
         self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", out)
 
@@ -295,7 +295,7 @@ class MainTest(unittest.TestCase):
             for key, data in self.SNAPSHOTS.items():
                 (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
             with self.assertRaises(SystemExit) as ctx:
-                self.run_main("--load-state", tmp, "99.99")
+                self.run_main("99.99", load_state=tmp)
         self.assertIn("99.99", str(ctx.exception))
         self.assertIn("pg_dump_pgs.json", str(ctx.exception))
 

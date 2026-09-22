@@ -119,12 +119,13 @@ fetch_remapped_pg_stats) rather than a full 'pg dump pgs'.
 
 'backfillctl save-state DIR' captures a cluster's state (anonymized, and
 covering every subcommand, not just this one) into DIR, as one '<key>.json'
-file per command including a full 'ceph pg dump pgs'. --load-state DIR then
-reads those files back instead of calling 'ceph', filtering pg_dump_pgs
-client-side for the PGs with up != acting, so a captured state can be
-replayed offline with no cluster access. tests/pg-osd/test-data/
-stop-backfills-into-osd-*/ hold captures for use as --load-state arguments,
-each with a README.txt describing the scenario.
+file per command including a full 'ceph pg dump pgs'. 'backfillctl
+--load-state DIR stop-backfills-into-osd ...' then reads those files back
+instead of calling 'ceph', filtering pg_dump_pgs client-side for the PGs
+with up != acting, so a captured state can be replayed offline with no
+cluster access. tests/pg-osd/test-data/stop-backfills-into-osd-*/ hold
+captures for use as --load-state arguments, each with a README.txt
+describing the scenario.
 
 Applying the output
 -------------------
@@ -190,7 +191,6 @@ from shared import (
     PROGRESS_100_NOTE,
     SnapshotStore,
     abbreviate_state,
-    add_load_state_arg,
     copies_moving,
     fetch_crush_rules,
     fetch_ec_profiles,
@@ -321,7 +321,6 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "Warns if a PG needs several lines, since separate runs can "
         "overwrite each other; prefer --import-mappings.",
     )
-    add_load_state_arg(parser)
     return parser
 
 

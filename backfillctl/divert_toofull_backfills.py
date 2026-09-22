@@ -231,15 +231,15 @@ fetch_backfill_toofull_pg_stats) rather than a full 'pg dump pgs'.
 
 'backfillctl save-state DIR' captures a cluster's state — anonymized, and
 covering every subcommand, not just this one — into DIR, as one '<key>.json'
-file per command including a full 'ceph pg dump pgs'. --load-state DIR then
-reads those files back instead of calling 'ceph', filtering pg_dump_pgs
-client-side for the PGs in backfill_toofull, so a captured state can be
-replayed offline with no cluster access. tests/pg-osd/test-data/
-divert-toofull-backfills-*/ hold sample captures usable directly as
---load-state arguments, each with a README.txt describing the scenario and
-what the script should reproduce from it — the exact table for the small
-fixtures, and for the cluster-sized one the counts and invariants its test
-asserts instead.
+file per command including a full 'ceph pg dump pgs'. 'backfillctl
+--load-state DIR divert-toofull-backfills ...' then reads those files back
+instead of calling 'ceph', filtering pg_dump_pgs client-side for the PGs in
+backfill_toofull, so a captured state can be replayed offline with no
+cluster access. tests/pg-osd/test-data/divert-toofull-backfills-*/ hold
+sample captures usable directly as --load-state arguments, each with a
+README.txt describing the scenario and what the script should reproduce
+from it — the exact table for the small fixtures, and for the cluster-sized
+one the counts and invariants its test asserts instead.
 
 Applying the output
 -------------------
@@ -323,7 +323,6 @@ from shared import (
     KIB,
     POOL_TYPE_ERASURE,
     SnapshotStore,
-    add_load_state_arg,
     fetch_crush_rules,
     fetch_ec_profiles,
     fetch_osd_df,
@@ -493,7 +492,6 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "currently backfill_toofull is reported on stderr, since that "
         "usually means a typo.",
     )
-    add_load_state_arg(parser)
     return parser
 
 
