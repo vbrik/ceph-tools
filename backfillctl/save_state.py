@@ -30,7 +30,7 @@ Cost
 per-subcommand listings (pg ls remapped, pg ls backfill_toofull, pg <pgid>
 query) exist to avoid paying for on a live run. That cost is paid once here,
 at capture time, not on every analysis run: a live 'backfillctl
-show-backfill'/'stop-backfills-into-osd'/'divert-toofull' still
+show-backfill'/'cancel-backfill'/'divert-toofull' still
 issues its own narrower command, and only pays the full 'pg dump pgs' cost
 when replaying a --load-state snapshot this command produced.
 """
@@ -60,7 +60,7 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 }
 
 # The parts of each pg_stat entry that some subcommand reads: identity and
-# movement (show-backfill, show-pg-osds), the flags stop-backfills-into-osd and
+# movement (show-backfill, show-pg-osds), the flags cancel-backfill and
 # divert-toofull filter on (part of 'state'), and the progress/size
 # counters (shared.pg_progress_pct, shared.shard_size_bytes).
 KEPT_PG_STAT_KEYS = ("pgid", "state", "up", "acting", "acting_primary", "up_primary")
@@ -68,7 +68,7 @@ KEPT_STAT_SUM_KEYS = (*PROGRESS_COUNTERS, "num_bytes")
 
 # The parts of 'ceph osd dump' some subcommand reads: erasure code profiles
 # (shard sizing), the full/backfillfull/nearfull ratios (divert-toofull,
-# stop-backfills-into-osd), and pg_upmap_items (show-pg-osds, divert-toofull).
+# cancel-backfill), and pg_upmap_items (show-pg-osds, divert-toofull).
 KEPT_OSD_DUMP_KEYS = (
     "erasure_code_profiles",
     "full_ratio",

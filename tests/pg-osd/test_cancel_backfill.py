@@ -1,4 +1,4 @@
-"""Unit tests for backfillctl's stop-backfills-into-osd subcommand.
+"""Unit tests for backfillctl's cancel-backfill subcommand.
 
 The risky parts are deciding which acting OSD a shard can be pinned back to
 (EC by position, replicated by set difference), and refusing to propose a pin
@@ -22,7 +22,7 @@ from unittest import mock
 
 from _support import REPO_ROOT, FakeStore, parse_args, plan_from_state, shared
 
-from backfillctl import stop_backfills_into_osd as cb
+from backfillctl import cancel_backfill as cb
 
 
 def flat(text: str) -> str:
@@ -931,11 +931,14 @@ class ParseArgsCliTest(unittest.TestCase):
     def parse(self, *argv):
         return parse_args(cb, argv)
 
-    def test_osd_is_a_required_flag_not_positional(self):
+    def test_osd_is_a_flag_not_positional(self):
         with self.assertRaises(SystemExit):
-            self.parse("682")  # no --osd: bare id is now unrecognized
+            self.parse("682")  # no --osd: bare id is unrecognized
         self.assertEqual(self.parse("--osd", "682").osd, 682)
         self.assertEqual(self.parse("--osd", "osd.682").osd, 682)
+
+    def test_osd_is_optional(self):
+        self.assertIsNone(self.parse().osd)
 
     def test_exclude_pgs_defaults_to_empty(self):
         self.assertEqual(self.parse("--osd", "682").exclude_pgs, [])
@@ -1380,7 +1383,7 @@ def run_cli(*argv, load_state=None, path=None):
             sys.executable,
             str(REPO_ROOT / "backfillctl"),
             *global_argv,
-            "stop-backfills-into-osd",
+            "cancel-backfill",
             *argv,
         ],
         capture_output=True,
@@ -1461,12 +1464,10 @@ FIXTURE = (
     / "tests"
     / "pg-osd"
     / "test-data"
-    / "stop-backfills-into-osd-ceph2-osd896-host-clash-companions"
+    / "cancel-backfill-ceph2-osd896-host-clash-companions"
 )
 
-FIXTURE_BLOCKER = (
-    FIXTURE.parent / "stop-backfills-into-osd-ceph2-osd896-blocker-in-same-pg"
-)
+FIXTURE_BLOCKER = FIXTURE.parent / "cancel-backfill-ceph2-osd896-blocker-in-same-pg"
 
 # Documented in the fixture's README.txt. The pins that are neither into 896 nor
 # needed for host validity alone are the blockers (targets over backfillfull),
@@ -1805,6 +1806,202 @@ class BlockerFixtureReplayTest(unittest.TestCase):
         entries = json.loads(self.replay("--pin-blockers", "--import-mappings").stdout)
         kept = [e for e in entries if e["mapping"]["from"] != 896]
         self.assertEqual(kept, [{"pgid": "19.92e", "mapping": {"from": 337, "to": 99}}])
+
+
+class CancelWholePgTest(unittest.TestCase):
+    """cancel_whole_pg: every moving shard of one PG, as used without --osd."""
+
+    def cancel(self, up, acting, is_ec=True, osd_host=None):
+        return cb.cancel_whole_pg(up, acting, is_ec, osd_host or {})
+
+    def test_every_moving_ec_shard_is_pinned_in_shard_order(self):
+        moves, skipped = self.cancel([10, 2, 30, 4], [1, 2, 3, 4])
+        self.assertEqual(moves, [(0, 10, 1), (2, 30, 3)])
+        self.assertEqual(skipped, [])
+
+    def test_nothing_moving_yields_nothing(self):
+        self.assertEqual(self.cancel([1, 2, 3], [1, 2, 3]), ([], []))
+
+    def test_an_empty_up_slot_is_not_a_backfill(self):
+        # CRUSH found no OSD for shard 1: nothing arrives, so nothing to cancel
+        self.assertEqual(self.cancel([10, NONE, 3], [1, 2, 3]), ([(0, 10, 1)], []))
+
+    def test_a_degraded_shard_is_skipped_and_the_others_still_pinned(self):
+        moves, skipped = self.cancel([10, 20, 3], [1, NONE, 3])
+        self.assertEqual(moves, [(0, 10, 1)])
+        self.assertEqual([s for s, _ in skipped], [1])
+        self.assertIn("degraded", skipped[0][1])
+
+    def test_a_clash_with_a_degraded_shard_skips_the_whole_pg(self):
+        # shard 0 goes back to osd.1 on host H, but degraded shard 1 is still
+        # headed for osd.20, also on H, and has nothing to be pinned back to
+        moves, skipped = self.cancel(
+            [10, 20, 3], [1, NONE, 3], osd_host={1: "H", 20: "H"}
+        )
+        self.assertEqual(moves, [])
+        self.assertEqual([s for s, _ in skipped], [1, 0])
+        self.assertIn("shares a host with shard 1", skipped[1][1])
+
+    def test_a_chain_comes_out_in_apply_order(self):
+        # shard 0 goes back to osd.20, which 'up' still has for shard 1, so
+        # the pair moving osd.20 away (20->5) has to come first
+        moves, _ = self.cancel([30, 20, 3], [20, 5, 3])
+        self.assertEqual(moves, [(1, 20, 5), (0, 30, 20)])
+
+    def test_a_ring_skips_every_pin_of_the_pg(self):
+        moves, skipped = self.cancel([2, 1, 3], [1, 2, 3])
+        self.assertEqual(moves, [])
+        self.assertEqual([s for s, _ in skipped], [0, 1])
+        self.assertIn("cycle", skipped[0][1])
+
+    def test_several_replicas_are_paired_in_sorted_order(self):
+        # find_arrivals calls this ambiguous; cancelling all of them is not
+        moves, skipped = self.cancel([1, 40, 30], [1, 3, 4], is_ec=False)
+        self.assertEqual(moves, [("-", 30, 3), ("-", 40, 4)])
+        self.assertEqual(skipped, [])
+
+    def test_a_missing_replica_is_skipped_and_the_rest_pinned(self):
+        moves, skipped = self.cancel([1, 30, 40], [1, 3, NONE], is_ec=False)
+        self.assertEqual(moves, [("-", 30, 3)])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("osd.40", skipped[0][1])
+        self.assertIn("missing replica", skipped[0][1])
+
+    def test_a_replicated_clash_skips_the_whole_pg(self):
+        # osd.40 has no departing partner and stays in 'up', on osd.3's host
+        moves, skipped = self.cancel(
+            [1, 30, 40], [1, 3, NONE], is_ec=False, osd_host={3: "H", 40: "H"}
+        )
+        self.assertEqual(moves, [])
+        self.assertEqual(len(skipped), 2)
+        self.assertIn("acting osd.3 shares a host with replica osd.40", skipped[1][1])
+
+
+def run_plan_all(pgs, **kwargs):
+    """plan_cancellations without --osd, on the same tiny cluster as run_plan."""
+    return cb.plan_cancellations(
+        pgs, {19: EC_POOL, 7: REP_POOL}, EC_PROFILES, None, {}, RULES, **kwargs
+    )
+
+
+class PlanAllTest(unittest.TestCase):
+    def test_every_remapped_pg_is_cancelled_whatever_its_osds(self):
+        pgs = [
+            pg("19.9", [10, 2, 30, 4], [1, 2, 3, 4]),
+            pg("7.ff", [1, 2, 50], [1, 2, 5]),
+            pg("19.b", [1, 2, 3, 4], [1, 2, 3, 4], "active+clean"),
+        ]
+        cancellations, skipped = run_plan_all(pgs)
+        self.assertEqual(pins(cancellations), ["7.ff 50 5", "19.9 10 1", "19.9 30 3"])
+        self.assertEqual(skipped, [])
+
+    def test_no_pin_is_a_companion(self):
+        # with --osd 682, 9->4 would be a companion of shard 0 (see MainTest)
+        cancellations, _ = run_plan_all([pg("19.d", [OSD, 2, 3, 9], [8, 2, 3, 4])])
+        self.assertEqual(pins(cancellations), ["19.d 682 8", "19.d 9 4"])
+        self.assertEqual({c.companion_of for c in cancellations}, {None})
+
+    def test_carries_state_size_and_progress(self):
+        state = "active+remapped+backfilling"
+        p = pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4], state, misplaced=25)
+        (c,), _ = run_plan_all([p])
+        self.assertEqual((c.state, c.size_bytes, c.progress_pct), (state, 1_000, 75.0))
+
+    def test_excluded_pgs_are_left_alone(self):
+        pgs = [pg("19.9", [10, 2, 3, 4], [1, 2, 3, 4]), pg("19.a", [10], [1])]
+        cancellations, _ = run_plan_all(pgs, exclude_pgs={"19.9"})
+        self.assertEqual(pins(cancellations), ["19.a 10 1"])
+
+    def test_failure_domain_is_checked_for_every_remapped_pg(self):
+        with self.assertRaises(SystemExit):
+            cb.plan_cancellations(
+                [pg("19.9", [10, 2, 3, 4], [1, 2, 3, 4])],
+                {19: EC_POOL},
+                EC_PROFILES,
+                None,
+                {},
+                {},
+            )
+
+
+class MainAllTest(unittest.TestCase):
+    """plan() and run() without --osd, on MainTest's canned cluster."""
+
+    run_main = MainTest.run_main
+    plan = MainTest.plan
+    PGS = MainTest.PGS
+
+    def test_plan_pins_every_moving_shard(self):
+        result = self.plan()
+        self.assertIsNone(result.osd)
+        self.assertEqual(
+            pins(result.cancellations), ["19.9 682 8", "19.d 682 8", "19.d 9 4"]
+        )
+        self.assertEqual([(s.pgid, s.shard) for s in result.skipped], [("19.a", 0)])
+
+    def test_pin_blockers_requires_osd(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            self.plan("--pin-blockers")
+        self.assertIn("--pin-blockers requires --osd", str(cm.exception))
+
+    def test_summary_counts_shards_and_pgs_and_no_blocker_note(self):
+        _, err = self.run_main("--pgremapper")
+        err = flat(err)
+        self.assertIn("3 moving shard(s) in 2 PG(s) can be pinned back", err)
+        self.assertIn("1 cannot be pinned", err)
+        self.assertNotIn("--pin-blockers", err)
+        self.assertNotIn("osd.682 (", err)  # no single OSD to report on
+
+    def test_exclude_pgs_note_does_not_name_an_osd(self):
+        _, err = self.run_main("--exclude-pgs", "19.9", "19.zzz")
+        err = flat(err)
+        self.assertIn("1 of 2 given PG id(s) matched a remapped PG and", err)
+        self.assertIn("matched nothing (check for typos): 19.zzz", err)
+
+    def test_nothing_to_pin_says_so(self):
+        out, err = self.run_main("--import-mappings", pgs=[])
+        self.assertEqual(json.loads(out), [])
+        self.assertIn("No backfills.", err)
+
+
+class FixtureAllTest(unittest.TestCase):
+    """cancel-backfill without --osd on the real-cluster snapshot."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.result = plan_from_state(cb, FIXTURE)
+
+    def test_every_remapped_pg_is_covered_and_nothing_is_unpinnable(self):
+        # 688 remapped PGs, see the fixture's README.txt
+        self.assertEqual(len({c.pgid for c in self.result.cancellations}), 688)
+        self.assertEqual(self.result.skipped, [])
+
+    def test_contains_every_pin_the_osd_896_run_proposes(self):
+        # --osd 896's pins, companions included, all cancel moving shards
+        everything = set(pins(self.result.cancellations))
+        self.assertLessEqual(set(EXPECTED_896_DEFAULT.splitlines()), everything)
+
+    def test_every_pin_turns_up_into_acting(self):
+        # after the pins, each PG's 'up' is its 'acting' (no degraded shards here)
+        pgs = {
+            p["pgid"]: p
+            for p in shared.extract_pg_stats(
+                json.loads((FIXTURE / "pg_dump_pgs.json").read_text()), "pg_dump_pgs"
+            )
+        }
+        by_pg: dict[str, list] = {}
+        for c in self.result.cancellations:
+            by_pg.setdefault(c.pgid, []).append(c)
+        for pgid, cs in by_pg.items():
+            up = list(pgs[pgid]["up"])
+            for c in cs:  # in apply order, as Ceph applies pg_upmap_items pairs
+                up[up.index(c.up_osd)] = c.acting_osd
+            with self.subTest(pgid=pgid):
+                if cs[0].shard == "-":
+                    self.assertEqual(sorted(up), sorted(pgs[pgid]["acting"]))
+                else:
+                    self.assertEqual(up, pgs[pgid]["acting"])
 
 
 if __name__ == "__main__":

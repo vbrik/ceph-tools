@@ -6,7 +6,7 @@ own general scrub (hostnames, fsid, ...) is tested in test_shared.py.
 
 CrossSubcommandFixtureTest is the one that matters most: it replays a real,
 already-committed fixture (tests/pg-osd/test-data/
-stop-backfills-into-osd-ceph2-osd896-host-clash-companions/) that happens to
+cancel-backfill-ceph2-osd896-host-clash-companions/) that happens to
 contain a genuine mix of PG states (688 remapped, of which 585 are also
 backfill_toofull -- see its README.txt), so filtering pg_dump_pgs.json for
 one flag or the other actually has something to exclude. That is the risk in
@@ -24,16 +24,16 @@ from unittest import mock
 
 from _support import REPO_ROOT, FakeStore, parse_args, shared
 
+from backfillctl import cancel_backfill as cb
 from backfillctl import divert_toofull as dt
 from backfillctl import save_state as ss
-from backfillctl import stop_backfills_into_osd as cb
 
 FIXTURE = (
     REPO_ROOT
     / "tests"
     / "pg-osd"
     / "test-data"
-    / "stop-backfills-into-osd-ceph2-osd896-host-clash-companions"
+    / "cancel-backfill-ceph2-osd896-host-clash-companions"
 )
 
 
@@ -187,7 +187,7 @@ class CrossSubcommandFixtureTest(unittest.TestCase):
         self.assertEqual(len(toofull), 585)
         self.assertLess(len(toofull), len(remapped))
 
-    def test_stop_backfills_into_osd_filters_for_remapped(self):
+    def test_cancel_backfill_filters_for_remapped(self):
         store = FakeStore(self.load())
         pgs = cb.fetch_remapped_pg_stats(store)
         self.assertEqual(len(pgs), 688)
@@ -199,7 +199,7 @@ class CrossSubcommandFixtureTest(unittest.TestCase):
 
     def test_one_directory_serves_a_second_subcommand_it_was_not_captured_for(self):
         # This fixture's README documents its capture as a
-        # stop-backfills-into-osd run; divert-toofull was never
+        # cancel-backfill run; divert-toofull was never
         # involved, yet the same directory (now pg_dump_pgs.json-based) is
         # enough for it too -- the point of the unified save-state format.
         out = io.StringIO()

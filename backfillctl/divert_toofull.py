@@ -282,12 +282,12 @@ second one when its source osd is that pair's 'to' — so a single call handles
 both cases above. Running it several times in a row for the same PG is a
 different matter: a PG can have more than one diverted shard (rare — one PG
 out of 51 proposed on the cluster-sized test fixture — but real), and
-the stop-backfills-into-osd subcommand's own docstring records a later
+the cancel-backfill subcommand's own docstring records a later
 'remap' run overwriting the pair an earlier one had just added, on a live
 cluster. --import-mappings sidesteps that: import-mappings reads the
 cluster's upmaps once and applies every pair of a PG together, so it is the
 reliable way to apply the proposals. --pgremapper warns on stderr whenever a
-PG needs more than one line, for the same reason stop-backfills-into-osd does.
+PG needs more than one line, for the same reason cancel-backfill does.
 
   - If the upmap balancer is active ('ceph balancer status'), it may undo
     manually placed upmap entries. Consider 'ceph balancer off' while the
@@ -1095,7 +1095,7 @@ def warn_separate_remaps(pgids: list[str]) -> None:
     'pgremapper remap' merges a single invocation's pair into a PG's existing
     upmap entry (see module docstring), but running it once per line for a PG
     with several proposed remaps means several invocations against the same
-    PG, and the stop-backfills-into-osd subcommand's own docstring records a
+    PG, and the cancel-backfill subcommand's own docstring records a
     later run overwriting the pair an earlier one had just added, on a live
     cluster.
     """

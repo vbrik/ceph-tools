@@ -11,18 +11,18 @@ global option, given before the subcommand name
 
 import argparse
 
+import cancel_backfill
 import divert_toofull
 import save_state
 import show_backfill
 import show_pg_osds
-import stop_backfills_into_osd
 from shared import add_load_state_arg
 
 _COMMAND_MODULES = (
     show_pg_osds,
     show_backfill,
     divert_toofull,
-    stop_backfills_into_osd,
+    cancel_backfill,
     save_state,
 )
 
@@ -31,7 +31,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="backfillctl",
         description="Ceph PG/OSD backfill and upmap tools: show what's "
-        "moving, and propose upmaps to divert or stop backfills.",
+        "moving, and propose upmaps to divert or cancel backfills.",
     )
     add_load_state_arg(parser)
     subparsers = parser.add_subparsers(dest="command", required=True)
