@@ -1,7 +1,9 @@
 Fixture: genuine no-problems path for divert-toofull-backfills
 -- i.e. the case where 'ceph pg ls backfill_toofull' matches nothing.
 
-SYNTHETIC: pg_ls_backfill_toofull.json is hand-written, not captured. At
+SYNTHETIC: pg_dump_pgs.json (originally saved as pg_ls_backfill_toofull.json;
+renamed, content unchanged, to match 'backfillctl save-state''s later
+unified snapshot format) is hand-written, not captured. At
 capture time (2026-08-11 ~09:05) the live cluster had an active instance of
 the target scenario (osd.457 down on host27 -- see the sibling
 ../divert-toofull-backfills-osd457-down/ fixture), so there was no genuinely

@@ -12,6 +12,12 @@ Captured: 2026-08-17 ~06:17 from a live cluster, via:
   ceph osd crush rule dump --format json > crush_rule_dump.json
   ceph pg ls backfill_toofull --format json > pg_ls_backfill_toofull.json
 
+RENAMED: pg_ls_backfill_toofull.json has since been renamed to
+pg_dump_pgs.json, content unchanged, to match 'backfillctl save-state''s
+later unified snapshot format, which every subcommand's --load-state now
+reads that PG data from (filtering it client-side for the flag it cares
+about).
+
 What's actually going on: osd.263 (on host12) is overfull and has 6 EC
 shards (pool 19) newly arriving on it, all in backfill_toofull. For 4 of
 those 6 PGs, osd.263 is not CRUSH's own pick for that shard -- it only ended

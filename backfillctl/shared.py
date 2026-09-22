@@ -5,9 +5,9 @@ Not a script itself: the others import it (`from shared import ...`), so it
 has to sit next to them. Four groups of things live here:
 
 * OSD-slot helpers and PG arithmetic (progress, copies in flight, shard size);
-* reading cluster state, live or from a saved snapshot (`SnapshotStore`), and
-  the `--load-state` / `--save-state` flags built on it, with the anonymizer
-  that makes a saved snapshot safe to share;
+* reading cluster state, live or from a saved snapshot (`SnapshotStore`), the
+  `--load-state` flag built on it, and the anonymizer (used by the
+  `save-state` subcommand) that makes a saved snapshot safe to share;
 * `fetch_*` helpers that turn snapshot keys into lookup tables;
 * the two-line grouped table (`print_table`) and its cell formatters.
 """
@@ -280,22 +280,13 @@ class SnapshotStore:
     def from_args(
         cls, args: argparse.Namespace, commands: dict[str, list[str]], **kwargs
     ) -> "SnapshotStore":
-        """Build a store from --load-state/--save-state, validating the directories.
-
-        --save-state's directory is created if missing and must be empty, so a
-        snapshot is never partially overwritten.
-        """
-        load_dir = save_dir = None
+        """Build a store from --load-state, validating the directory."""
+        load_dir = None
         if args.load_state:
             load_dir = Path(args.load_state)
             if not load_dir.is_dir():
                 sys.exit(f"ERROR: --load-state directory not found: {load_dir}")
-        if args.save_state:
-            save_dir = Path(args.save_state)
-            save_dir.mkdir(parents=True, exist_ok=True)
-            if any(save_dir.iterdir()):
-                sys.exit(f"ERROR: --save-state directory is not empty: {save_dir}")
-        return cls(commands, load_dir=load_dir, save_dir=save_dir, **kwargs)
+        return cls(commands, load_dir=load_dir, **kwargs)
 
     def json(self, key: str) -> object:
         """Return the parsed JSON for one of the store's keys."""
@@ -328,28 +319,28 @@ class SnapshotStore:
             )
 
 
-def add_state_args(parser: argparse.ArgumentParser, commands: dict[str, list[str]]):
-    """Add the mutually exclusive --load-state / --save-state options."""
-    keys = ", ".join(f"{key}.json" for key in commands)
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
+def resolve_save_dir(path: str) -> Path:
+    """Validate and prepare a directory for 'backfillctl save-state' to write into.
+
+    Created if missing; must be empty (or not yet exist) so a capture is
+    never partially overwritten by an unrelated one.
+    """
+    save_dir = Path(path)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    if any(save_dir.iterdir()):
+        sys.exit(f"ERROR: directory is not empty: {save_dir}")
+    return save_dir
+
+
+def add_load_state_arg(parser: argparse.ArgumentParser):
+    """Add --load-state, to analyze a captured cluster state instead of a live one."""
+    parser.add_argument(
         "--load-state",
         metavar="DIR",
         help="Analyze a saved cluster state instead of a live cluster. DIR "
-        f"must contain the files this script reads ({keys}): what --save-state "
-        "produces, and the layout of the fixtures under tests/pg-osd/test-data/. "
-        "No 'ceph' commands are run.",
-    )
-    group.add_argument(
-        "--save-state",
-        metavar="DIR",
-        help="Also save the live cluster state this run collects into DIR, as "
-        "the files --load-state reads back (created if missing; must be empty "
-        "or not exist). The normal analysis and output proceed as usual. The "
-        "saved copy is anonymized (cluster fsid, OSD addresses and uuids, "
-        "hostnames, pool and CRUSH rule names replaced by deterministic fake "
-        "values) and, where the script reads only part of a command's output, "
-        "cut down to that part, so it is safe to share.",
+        "must be a directory as produced by 'backfillctl save-state' (or "
+        "matching the layout of the fixtures under "
+        "tests/pg-osd/test-data/). No 'ceph' commands are run.",
     )
 
 

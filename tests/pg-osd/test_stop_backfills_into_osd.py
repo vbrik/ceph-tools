@@ -1221,87 +1221,6 @@ class MainTest(unittest.TestCase):
         self.assertNotIn("had a backfill", err)
 
 
-class AnonymizeTest(unittest.TestCase):
-    def snapshots(self):
-        return canned_snapshots([pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])])
-
-    def test_hosts_pools_and_rules_are_renamed(self):
-        snaps = self.snapshots()
-        cb.anonymize_snapshots(snaps)
-        hosts = [n["name"] for n in snaps["osd_tree"]["nodes"] if n["type"] == "host"]
-        self.assertTrue(all("example" not in h for h in hosts), hosts)
-        self.assertEqual(len(set(hosts)), 2)
-        self.assertEqual(snaps["pool_ls_detail"][0]["pool_name"], "pool19")
-        self.assertEqual(snaps["crush_rule_dump"][0]["rule_name"], "rule0")
-
-    def test_hostname_with_trailing_number_maps_to_that_number(self):
-        self.assertEqual(shared._fake_hostname("ceph2-7"), "host07")
-        self.assertEqual(shared._fake_hostname("ceph2-51"), "host51")
-
-    def test_hostname_without_trailing_number_is_hashed_deterministically(self):
-        fake = shared._fake_hostname("nodigits.example")
-        self.assertRegex(fake, r"host-[0-9a-f]{8}")
-        self.assertEqual(fake, shared._fake_hostname("nodigits.example"))
-        self.assertNotEqual(fake, shared._fake_hostname("other.example"))
-
-    def test_fake_names_map_to_themselves(self):
-        for name in ("host51", shared._fake_hostname("nodigits.example")):
-            self.assertEqual(shared._fake_hostname(name), name)
-
-    def test_osd_dump_is_reduced_to_what_the_analysis_reads(self):
-        snaps = self.snapshots()
-        cb.anonymize_snapshots(snaps)
-        self.assertEqual(
-            snaps["osd_dump"],
-            {
-                "erasure_code_profiles": EC_PROFILES,
-                "full_ratio": 0.95,
-                "backfillfull_ratio": 0.91,
-                "nearfull_ratio": 0.85,
-            },
-        )
-
-    def test_osd_dump_without_ratios_stays_valid(self):
-        snaps = self.snapshots()
-        del snaps["osd_dump"]["backfillfull_ratio"]
-        cb.anonymize_snapshots(snaps)
-        self.assertNotIn("backfillfull_ratio", snaps["osd_dump"])
-
-    def test_analysis_inputs_are_left_alone(self):
-        before = self.snapshots()
-        after = self.snapshots()
-        cb.anonymize_snapshots(after)
-        for key in ("pg_ls_remapped", "osd_df"):
-            self.assertEqual(after[key], before[key])
-
-    def test_idempotent(self):
-        once = self.snapshots()
-        cb.anonymize_snapshots(once)
-        twice = json.loads(json.dumps(once))
-        cb.anonymize_snapshots(twice)
-        self.assertEqual(once, twice)
-
-    def test_write_saves_all_keys_and_leaves_the_input_untouched(self):
-        snaps = self.snapshots()
-        with tempfile.TemporaryDirectory() as tmp:
-            store = shared.SnapshotStore(
-                cb.SNAPSHOT_COMMANDS,
-                save_dir=pathlib.Path(tmp),
-                anonymize=cb.anonymize_snapshots,
-            )
-            with mock.patch.object(
-                shared.SnapshotStore, "json", lambda self, key: snaps[key]
-            ):
-                store.save()
-            self.assertEqual(
-                {f.stem for f in pathlib.Path(tmp).glob("*.json")},
-                set(cb.SNAPSHOT_COMMANDS),
-            )
-            saved = (pathlib.Path(tmp) / "osd_tree.json").read_text()
-        self.assertNotIn("example", saved)
-        self.assertEqual(snaps, self.snapshots())  # run's own data not anonymized
-
-
 class HostnameCollisionTest(unittest.TestCase):
     """Two hosts must never anonymize to one: the analysis depends on sharing."""
 
@@ -1331,7 +1250,7 @@ class HostnameCollisionTest(unittest.TestCase):
             "pool_ls_detail": [],
             "crush_rule_dump": [],
         }
-        cb.anonymize_snapshots(snaps)
+        shared.anonymize_snapshots(snaps)
         names = [n["name"] for n in snaps["osd_tree"]["nodes"] if n["type"] == "host"]
         self.assertEqual(len(set(names)), 2)
 
@@ -1350,9 +1269,9 @@ class HostnameCollisionTest(unittest.TestCase):
             }
 
         once = tree()
-        cb.anonymize_snapshots(once)
+        shared.anonymize_snapshots(once)
         twice = json.loads(json.dumps(once))
-        cb.anonymize_snapshots(twice)
+        shared.anonymize_snapshots(twice)
         self.assertEqual(once, twice)
 
 
@@ -1394,8 +1313,12 @@ def run_cli(*argv, path=None):
     )
 
 
-class StateOptionsCliTest(unittest.TestCase):
-    """--save-state / --load-state, end to end through a fake 'ceph' on PATH."""
+class LoadStateCliTest(unittest.TestCase):
+    """--load-state, end to end: a directory (what 'backfillctl save-state'
+    produces) replaces the live cluster. A fake 'ceph' on PATH gives a live
+    run to compare against; the on-disk state is built by hand from the same
+    canned data, keyed as save-state would write it (pg_dump_pgs.json, not
+    pg_ls_remapped.json -- see cb.fetch_remapped_pg_stats)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1405,7 +1328,9 @@ class StateOptionsCliTest(unittest.TestCase):
         self.bin.mkdir()
         snaps = canned_snapshots(MainTest.PGS)
         table = {
-            " ".join(cmd[1:]): snaps[key] for key, cmd in cb.SNAPSHOT_COMMANDS.items()
+            " ".join(cmd[1:]): snaps[key]
+            for key, cmd in cb.SNAPSHOT_COMMANDS.items()
+            if key != "pg_dump_pgs"  # never requested live, see fetch_remapped_pg_stats
         }
         fake = self.bin / "ceph"
         fake.write_text(
@@ -1414,92 +1339,44 @@ class StateOptionsCliTest(unittest.TestCase):
         )
         fake.chmod(0o755)
         self.with_ceph = f"{self.bin}{os.pathsep}{os.environ['PATH']}"
-        self.without_ceph = str(self.root / "empty")  # nothing runnable
 
-    def test_save_then_load_reproduces_the_output_without_ceph(self):
-        state = self.root / "state"
-        live = run_cli(
-            "--save-state",
-            str(state),
-            "--pgremapper",
-            "--osd",
-            "682",
-            path=self.with_ceph,
+        self.state = self.root / "state"
+        self.state.mkdir()
+        for key in (
+            "osd_tree",
+            "osd_df",
+            "osd_dump",
+            "pool_ls_detail",
+            "crush_rule_dump",
+        ):
+            (self.state / f"{key}.json").write_text(json.dumps(snaps[key]))
+        (self.state / "pg_dump_pgs.json").write_text(
+            json.dumps(snaps["pg_ls_remapped"])
         )
+
+    def test_load_state_reproduces_the_live_output(self):
+        live = run_cli("--pgremapper", "--osd", "682", path=self.with_ceph)
         self.assertEqual(live.returncode, 0, live.stderr)
         self.assertEqual(live.stdout, "19.9 682 8\n19.d 682 8\n19.d 9 4\n")
-        self.assertEqual(
-            {f.stem for f in state.glob("*.json")}, set(cb.SNAPSHOT_COMMANDS)
-        )
 
         replay = run_cli(
-            "--load-state",
-            str(state),
-            "--pgremapper",
-            "--osd",
-            "682",
-            path=self.without_ceph,
+            "--load-state", str(self.state), "--pgremapper", "--osd", "682"
         )
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertEqual(replay.stdout, live.stdout)
-
-    def test_saved_state_is_anonymized_but_the_run_reports_real_names(self):
-        state = self.root / "state"
-        live = run_cli("--save-state", str(state), "--osd", "682", path=self.with_ceph)
-        self.assertIn("h2", live.stdout)  # the live table shows the real host
-        saved = "".join(f.read_text() for f in state.glob("*.json"))
-        for secret in ("h1.example", "secret-rule", "10.1.2.3", "11111111-2222"):
-            self.assertNotIn(secret, saved)
-
-    def test_save_still_happens_when_the_analysis_exits_with_an_error(self):
-        state = self.root / "state"
-        result = run_cli(
-            "--save-state", str(state), "--osd", "5000", path=self.with_ceph
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("5000", result.stderr)
-        self.assertEqual(
-            {f.stem for f in state.glob("*.json")}, set(cb.SNAPSHOT_COMMANDS)
-        )
-
-    def test_save_refuses_a_non_empty_directory(self):
-        state = self.root / "state"
-        state.mkdir()
-        (state / "x").write_text("")
-        result = run_cli(
-            "--save-state", str(state), "--osd", "682", path=self.with_ceph
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("not empty", result.stderr)
-
-    def test_save_accepts_an_existing_empty_directory(self):
-        state = self.root / "state"
-        state.mkdir()
-        self.assertEqual(
-            run_cli(
-                "--save-state", str(state), "--osd", "682", path=self.with_ceph
-            ).returncode,
-            0,
-        )
 
     def test_load_reports_a_missing_directory_and_a_missing_file(self):
         result = run_cli("--load-state", str(self.root / "nope"), "--osd", "682")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not found", result.stderr)
 
-        partial = self.root / "partial"
-        partial.mkdir()
-        result = run_cli("--load-state", str(partial), "--osd", "682")
+        (self.state / "pg_dump_pgs.json").unlink()
+        result = run_cli("--load-state", str(self.state), "--osd", "682")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing", result.stderr)
 
     def test_pgremapper_and_import_mappings_are_mutually_exclusive(self):
         result = run_cli("--pgremapper", "--import-mappings", "--osd", "682")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("not allowed with", result.stderr)
-
-    def test_the_two_options_are_mutually_exclusive(self):
-        result = run_cli("--load-state", "a", "--save-state", "b", "--osd", "682")
         self.assertEqual(result.returncode, 2)
         self.assertIn("not allowed with", result.stderr)
 
@@ -1667,7 +1544,7 @@ class FixtureReplayTest(unittest.TestCase):
             if n["type"] == "host"
             for c in n["children"]
         }
-        pgs = {p["pgid"]: p for p in snap["pg_ls_remapped"]["pg_stats"]}
+        pgs = {p["pgid"]: p for p in snap["pg_dump_pgs"]["pg_stats"]}
         for osd in (896, 74, 682):
             for pin_blockers in (False, True):
                 flags = ("--pin-blockers",) if pin_blockers else ()
@@ -1737,7 +1614,7 @@ class ChainFixtureReplayTest(unittest.TestCase):
         snap = {p.stem: json.loads(p.read_text()) for p in FIXTURE.glob("*.json")}
         store = FakeStore(snap)
         osd_df, osd_host = cb.fetch_osd_df(store), cb.fetch_osd_hosts(store)
-        pgs, pools = cb.fetch_pg_stats(store, "pg_ls_remapped"), cb.fetch_pools(store)
+        pgs, pools = cb.fetch_pg_stats(store, "pg_dump_pgs"), cb.fetch_pools(store)
         ecp, rules = cb.fetch_ec_profiles(store), cb.fetch_crush_rules(store)
         pct = cb.fetch_backfillfull_pct(store)
         targets = {

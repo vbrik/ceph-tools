@@ -57,17 +57,27 @@ other environments.
 not a set of standalone scripts, because its subcommands share code and more
 are coming that will be variations on the existing ones. Run
 `python3 backfillctl <subcommand> --help` (or
-`python3 -m backfillctl <subcommand> --help`) for any of the four below.
+`python3 -m backfillctl <subcommand> --help`) for any of the five below.
+Four analyze a cluster; the fifth, `save-state`, captures one so the other
+four can replay it offline.
+
+- **`backfillctl save-state`** — Capture the live cluster state every other
+  subcommand needs into `DIR` (created if missing, must be empty), as one
+  anonymized `<key>.json` file per `ceph ... --format json` command — including
+  a full `ceph pg dump pgs`, covering every PG, not just the remapped or
+  `backfill_toofull` ones the other subcommands ask for live. Each of them
+  then reads `DIR` with `--load-state DIR`, filtering `pg_dump_pgs.json`
+  itself for the PGs it cares about, so one capture serves all four.
+  `backfillctl save-state DIR`
 
 - **`backfillctl osds-of-pg`** — Show a PG's `acting` and `up` OSDs, one row per
   shard, with each OSD's utilization and host, the PG's primaries
   marked `*`, remap PROGRESS for shards that are moving (same estimate as
   `backfillctl pg-movements`, per PG), and the PG's `pg_upmap_items` pairs that touch
   each row (UPMAPS). Same grouped ACTING/UP table style as
-  `backfillctl divert-toofull-backfills`. `--save-state DIR` / `--load-state DIR`
-  save the cluster state it read (anonymized, and cut down to the fields the
-  subcommand uses), and replay it offline.
-  `backfillctl osds-of-pg [--save-state DIR | --load-state DIR] <pgid>`
+  `backfillctl divert-toofull-backfills`. `--load-state DIR` replays a
+  `backfillctl save-state` capture instead of querying the live cluster.
+  `backfillctl osds-of-pg [--load-state DIR] <pgid>`
 
 - **`backfillctl pg-movements`** — For every PG where `up` != `acting`,
   print source/destination OSDs, movement type, per-PG progress, and PG
@@ -79,9 +89,9 @@ are coming that will be variations on the existing ones. Run
   `stop-backfills-into-osd` do the same. Handles EC (per-shard) and
   replicated (set-diff) pools differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
-  `--save-state DIR` / `--load-state DIR` save the cluster state it read
-  (anonymized, and cut down to the fields the subcommand uses), and replay it offline.
-  `backfillctl pg-movements [--sort-by {pgid,from-osd,to-osd}] [--save-state DIR | --load-state DIR]`
+  `--load-state DIR` replays a `backfillctl save-state` capture instead of
+  querying the live cluster.
+  `backfillctl pg-movements [--sort-by {pgid,from-osd,to-osd}] [--load-state DIR]`
 
 - **`pg-osd/upmaps-of-osd.sh`** — Show `pg_upmap_items` entries where a
   given OSD is a source or destination.
@@ -142,14 +152,13 @@ are coming that will be variations on the existing ones. Run
   the run to just the given PG(s), as if every other `backfill_toofull` PG
   were not stuck; a given id that isn't currently `backfill_toofull` is
   reported on stderr, since that usually means a typo.
-  `--save-state DIR` writes the run's cluster state as JSON, anonymized so it
-  can be shared, and `--load-state DIR` replays such a capture offline with no
-  cluster access. Handles EC pools per-shard and replicated pools by set
-  difference. See the subcommand's module docstring for the full explanation and
-  caveats (`--help` summarizes and points there).
+  `--load-state DIR` replays a `backfillctl save-state` capture offline
+  instead of querying the live cluster. Handles EC pools per-shard and
+  replicated pools by set difference. See the subcommand's module docstring
+  for the full explanation and caveats (`--help` summarizes and points there).
   `backfillctl divert-toofull-backfills [--import-mappings | --pgremapper]
   [--min-up-util PERCENT] [--max-target-util PERCENT] [--max-target-uses N]
-  [--pgs PGID [PGID ...]] [--save-state DIR | --load-state DIR]`
+  [--pgs PGID [PGID ...]] [--load-state DIR]`
 
 - **`backfillctl stop-backfills-into-osd`** — List the upmaps needed to stop *all*
   backfills into a given OSD, by pinning each arriving shard to the OSD that
@@ -199,10 +208,9 @@ are coming that will be variations on the existing ones. Run
   ambiguous replicated pairing, a clash that no companion can resolve) are
   listed on stderr. Assumes the pools' CRUSH failure domain is `host`.
   pgremapper's `cancel-backfill --include-osds N --target` does the same at
-  OSD/pool granularity. `--save-state DIR` writes the run's cluster state as
-  JSON, anonymized so it can be shared, and `--load-state DIR` replays such a
-  capture offline with no cluster access.
-  `backfillctl stop-backfills-into-osd --osd OSD [--exclude-pgs PGID [PGID ...]] [--pin-blockers] [--import-mappings | --pgremapper] [--save-state DIR | --load-state DIR]`
+  OSD/pool granularity. `--load-state DIR` replays a `backfillctl save-state`
+  capture offline instead of querying the live cluster.
+  `backfillctl stop-backfills-into-osd --osd OSD [--exclude-pgs PGID [PGID ...]] [--pin-blockers] [--import-mappings | --pgremapper] [--load-state DIR]`
 
 - **`pg-osd/scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /
@@ -324,9 +332,14 @@ The tests import `backfillctl`'s modules through `tests/pg-osd/_support.py`,
 which puts this repo's root on `sys.path` so `from backfillctl import ...`
 resolves. `tests/pg-osd/test_shared.py` covers `backfillctl/shared.py`: the progress
 arithmetic (EC and replicated copy counting), PG/pool helpers, the shared table
-printer and cell formatters, the `--load-state`/`--save-state` snapshot layer,
-and its anonymizer (idempotent, keeps two hosts distinct, scrubs fsid, addresses,
-uuids and names).
+printer and cell formatters, and the `--load-state` snapshot layer (its
+counterpart, `backfillctl save-state`, is covered in `test_save_state.py`,
+including the general anonymizer: idempotent, keeps two hosts distinct,
+scrubs fsid, addresses, uuids and names). `test_save_state.py` also replays
+one real, already-committed fixture through two different subcommands'
+client-side PG filters to check they actually discriminate (not just pass
+everything through) against a directory that mixes matching and
+non-matching PGs.
 
 The `backfillctl divert-toofull-backfills` tests replay the
 cluster-state snapshots under `tests/pg-osd/test-data/` via `--load-state` and check the
@@ -346,8 +359,8 @@ its PG; and one where `--pin-blockers` is the only thing standing between a
 single wanted backfill and the blocker in its own PG that is holding it up).
 Besides the exact `--pgremapper` output documented in each `README.txt`, they
 check independently that applying the proposed pins leaves
-every PG with no repeated host or OSD, and that `--save-state` output replays to
-the same result with no `ceph` available.
+every PG with no repeated host or OSD, and that a `--load-state` directory
+replays to the same result with no `ceph` available.
 
 ## License
 

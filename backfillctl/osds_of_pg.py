@@ -34,9 +34,10 @@ PROGRESS is estimated from the PG's object counters exactly as in the
 pg-movements subcommand (both use shared.pg_progress_pct). It is a per-PG figure, so
 every remapped row shows the same value.
 
---save-state DIR also writes the cluster state this run read (one '<key>.json'
-per command, see snapshot_commands), anonymized so it can be shared;
---load-state DIR replays such a directory without calling 'ceph'.
+'backfillctl save-state DIR' captures a cluster's state (anonymized, and
+covering every subcommand, not just this one) into DIR; --load-state DIR
+then replays it here instead of calling 'ceph', reading the given PG's row
+out of the capture's pg_dump_pgs.json.
 """
 
 import argparse
@@ -47,12 +48,12 @@ from typing import NamedTuple
 from shared import (
     NOT_APPLICABLE,
     PROGRESS_100_NOTE,
-    PROGRESS_COUNTERS,
     SnapshotStore,
-    add_state_args,
+    add_load_state_arg,
     copies_moving,
     fetch_osd_df,
     fetch_osd_hosts,
+    fetch_pg_stats,
     fetch_pools,
     fetch_upmap_items,
     format_progress,
@@ -65,21 +66,19 @@ from shared import (
     real_osd_set,
     slot,
 )
-from shared import anonymize_snapshots as anonymize_common
 
-
-def snapshot_commands(pgid: str) -> dict[str, list[str]]:
-    """Map each snapshot key to the 'ceph ... --format json' command behind it.
-
-    The key is also its '<key>.json' filename under --save-state/--load-state.
-    """
-    return {
-        "pg_query": ["ceph", "pg", pgid, "query", "--format", "json"],
-        "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
-        "osd_df": ["ceph", "osd", "df", "--format", "json"],
-        "osd_dump": ["ceph", "osd", "dump", "--format", "json"],
-        "pool_ls_detail": ["ceph", "osd", "pool", "ls", "detail", "--format", "json"],
-    }
+# Maps each snapshot to the 'ceph ... --format json' command that produces
+# it. pg_query is filled in by run() with this invocation's pgid: live, it is
+# the one command actually issued (one PG, not the whole cluster); --load-state
+# never looks it up, reading pg_dump_pgs.json instead (what 'backfillctl
+# save-state' captures, covering every PG -- see fetch_pg_info).
+SNAPSHOT_COMMANDS: dict[str, list[str]] = {
+    "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
+    "osd_df": ["ceph", "osd", "df", "--format", "json"],
+    "osd_dump": ["ceph", "osd", "dump", "--format", "json"],
+    "pool_ls_detail": ["ceph", "osd", "pool", "ls", "detail", "--format", "json"],
+    "pg_dump_pgs": ["ceph", "pg", "dump", "pgs", "--format", "json"],
+}
 
 
 # Two-line header: (group, label). An empty group has no group line.
@@ -101,52 +100,42 @@ COLUMNS = [
 # ---------------------------------------------------------------------------
 
 
-def anonymize_snapshots(snapshots: dict[str, object]) -> None:
-    """Anonymize the snapshots for --save-state, in place.
+def fetch_pg_info(store: SnapshotStore, pgid: str) -> dict:
+    """Return the PG's up/acting sets, primaries, state and counters.
 
-    'ceph pg query' is a large, release-dependent document (peering state,
-    peer info, ...) of which fetch_pg_info reads six values, and 'ceph osd dump'
-    holds much more than the pg_upmap_items this script reads (client blocklist,
-    ...). Only what is read is kept, so nothing else can identify the cluster.
+    Live, this reads 'pg_query' (see SNAPSHOT_COMMANDS: 'ceph pg <pgid>
+    query', filled in by run() -- one PG, not the whole cluster). From a
+    --load-state snapshot (pg_dump_pgs.json, covering every PG -- see the
+    save-state subcommand), the same values are read off that PG's own
+    pg_stat entry instead.
     """
-    anonymize_common(snapshots)
-    snapshots["osd_dump"] = {
-        "pg_upmap_items": snapshots["osd_dump"].get("pg_upmap_items", [])
-    }
-    query = snapshots["pg_query"]
-    stats = query.get("info", {}).get("stats", {})
-    snapshots["pg_query"] = {
-        **{k: query[k] for k in ("up", "acting", "state") if k in query},
-        "info": {
-            "stats": {
-                **{k: stats[k] for k in ("up_primary", "acting_primary") if k in stats},
-                "stat_sum": {
-                    k: v
-                    for k, v in stats.get("stat_sum", {}).items()
-                    if k in PROGRESS_COUNTERS
-                },
+    if store.load_dir is None:
+        data = store.json("pg_query")
+        try:
+            stats = data.get("info", {}).get("stats", {})
+            return {
+                "up": data["up"],
+                "up_primary": stats["up_primary"],
+                "acting": data["acting"],
+                "acting_primary": stats["acting_primary"],
+                "state": data["state"],
+                "stat_sum": stats.get("stat_sum", {}),
             }
-        },
-    }
-
-
-def fetch_pg_info(store: SnapshotStore) -> dict:
-    """Return the PG's up/acting sets, primaries, state and counters from 'ceph pg query'."""
-    data = store.json("pg_query")
-    try:
-        stats = data.get("info", {}).get("stats", {})
-        return {
-            "up": data["up"],
-            "up_primary": stats["up_primary"],
-            "acting": data["acting"],
-            "acting_primary": stats["acting_primary"],
-            "state": data["state"],
-            "stat_sum": stats.get("stat_sum", {}),
-        }
-    except KeyError as exc:
-        sys.exit(
-            f"ERROR: unexpected JSON shape from 'ceph pg query': missing key {exc}"
-        )
+        except KeyError as exc:
+            sys.exit(
+                f"ERROR: unexpected JSON shape from 'ceph pg query': missing key {exc}"
+            )
+    for pg in fetch_pg_stats(store, "pg_dump_pgs"):
+        if pg["pgid"] == pgid:
+            return {
+                "up": pg["up"],
+                "up_primary": pg["up_primary"],
+                "acting": pg["acting"],
+                "acting_primary": pg["acting_primary"],
+                "state": pg["state"],
+                "stat_sum": pg.get("stat_sum", {}),
+            }
+    sys.exit(f"ERROR: PG {pgid} not found in --load-state snapshot's pg_dump_pgs.json.")
 
 
 # ---------------------------------------------------------------------------
@@ -220,20 +209,21 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "utilization, host, remap progress and upmaps.",
     )
     parser.add_argument("pgid", help="PG id, e.g. 3.1a2")
-    add_state_args(parser, snapshot_commands("<pgid>"))
+    add_load_state_arg(parser)
     return parser
 
 
 def run(args: argparse.Namespace) -> None:
-    store = SnapshotStore.from_args(
-        args, snapshot_commands(args.pgid), anonymize=anonymize_snapshots
-    )
-    pg = fetch_pg_info(store)
+    commands = {
+        **SNAPSHOT_COMMANDS,
+        "pg_query": ["ceph", "pg", args.pgid, "query", "--format", "json"],
+    }
+    store = SnapshotStore.from_args(args, commands)
+    pg = fetch_pg_info(store, args.pgid)
     pool = fetch_pools(store).get(pgid_pool_id(args.pgid))
     osd_host = fetch_osd_hosts(store)
     osd_df = fetch_osd_df(store)
     pairs = fetch_upmap_items(store).get(args.pgid, [])
-    store.save()
 
     erasure = is_erasure(pool)
     rows = build_rows(pg["up"], pg["acting"], erasure)

@@ -19,6 +19,11 @@ which stores the (anonymized) output of these commands:
   ceph osd crush rule dump --format json     > crush_rule_dump.json
   ceph pg ls remapped --format json          > pg_ls_remapped.json
 
+RENAMED: pg_ls_remapped.json has since been renamed to pg_dump_pgs.json,
+content unchanged, to match 'backfillctl save-state''s later unified
+snapshot format, which every subcommand's --load-state now reads that PG
+data from (filtering it client-side for the flag it cares about).
+
 osd_dump.json keeps only the erasure code profiles and the full ratios. This
 capture was made before the ratios were kept, so full_ratio 0.95,
 backfillfull_ratio 0.91 and nearfull_ratio 0.85 -- the values the cluster

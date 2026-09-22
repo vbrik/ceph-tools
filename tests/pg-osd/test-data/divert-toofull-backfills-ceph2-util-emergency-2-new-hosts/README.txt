@@ -12,6 +12,12 @@ Added to the repo: 2026-09-20, captured from a live cluster via:
   ceph osd crush rule dump --format json > crush_rule_dump.json
   ceph pg ls backfill_toofull --format json > pg_ls_backfill_toofull.json
 
+RENAMED: pg_ls_backfill_toofull.json has since been renamed to
+pg_dump_pgs.json, content unchanged, to match 'backfillctl save-state''s
+later unified snapshot format, which every subcommand's --load-state now
+reads that PG data from (filtering it client-side for the flag it cares
+about).
+
 What's actually going on: 900 OSDs across 38 hosts, none down or out.
 backfillfull_ratio is 0.91 here, where the other fixtures have Ceph's 0.90
 default; nearfull_ratio is 0.85 and full_ratio is 0.95. That difference is

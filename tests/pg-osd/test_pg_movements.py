@@ -203,59 +203,6 @@ class MainTest(unittest.TestCase):
         rows = self.rows(self.run_main("--sort-by", "to-osd"))
         self.assertEqual("5.3", rows[-1][0])  # osd.3 is the highest destination
 
-    def test_save_state_keeps_only_what_the_script_reads_and_replays_identically(self):
-        # Hostnames already in anonymized form map to themselves, so the
-        # replay is comparable to the live run.
-        snaps = {
-            **SNAPSHOTS,
-            "osd_tree": json.loads(
-                json.dumps(SNAPSHOTS["osd_tree"])
-                .replace("ceph1.example.org", "host01")
-                .replace("ceph2.example.org", "host02")
-            ),
-            "pg_dump_pgs": {
-                "pg_stats": [
-                    {
-                        **p,
-                        "stat_sum": {**p["stat_sum"], "num_bytes": 4096},
-                        "acting_recovery_backfill": ["0(0)"],
-                        "last_scrub_stamp": "2026-01-01T00:00:00",
-                    }
-                    for p in PGS
-                ]
-            },
-        }
-        by_command = {
-            tuple(cmd): snaps[key] for key, cmd in pm.SNAPSHOT_COMMANDS.items()
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            out = io.StringIO()
-            save_args = parse_args(pm, ["--save-state", tmp + "/snap"])
-            with (
-                mock.patch.object(shared, "ceph_json", lambda c: by_command[tuple(c)]),
-                contextlib.redirect_stdout(out),
-            ):
-                pm.run(save_args)
-            saved = json.loads(
-                (pathlib.Path(tmp) / "snap" / "pg_dump_pgs.json").read_text()
-            )
-            self.assertEqual(
-                {"pgid", "state", "up", "acting", "acting_primary", "stat_sum"},
-                set().union(*(pg.keys() for pg in saved["pg_stats"])),
-            )
-            self.assertEqual(
-                {"num_objects", "num_objects_misplaced", "num_objects_degraded"},
-                set().union(*(pg["stat_sum"].keys() for pg in saved["pg_stats"])),
-            )
-            replayed = io.StringIO()
-            load_args = parse_args(pm, ["--load-state", tmp + "/snap"])
-            with (
-                mock.patch.object(shared, "ceph_json", side_effect=AssertionError),
-                contextlib.redirect_stdout(replayed),
-            ):
-                pm.run(load_args)
-        self.assertEqual(out.getvalue(), replayed.getvalue())
-
     def test_load_state_reads_the_saved_snapshots(self):
         with tempfile.TemporaryDirectory() as tmp:
             for key, data in SNAPSHOTS.items():
