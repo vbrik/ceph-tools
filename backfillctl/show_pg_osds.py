@@ -182,6 +182,63 @@ def build_rows(up: list[int], acting: list[int], erasure: bool) -> list[ShardRow
     return rows
 
 
+class PgView(NamedTuple):
+    """One PG's rows, and what else its table shows."""
+
+    pgid: str
+    pg: dict  # see fetch_pg_info
+    rows: list[ShardRow]
+    progress_pct: float | None  # of the whole PG's movement, see pg_progress_pct
+    upmap_pairs: list[dict]  # the PG's pg_upmap_items pairs
+
+
+class ShowResult(NamedTuple):
+    """Everything a run looked up, independent of how it is printed.
+
+    plan() computes it and render() prints it. osd_df and osd_host are
+    carried along only because the tables show them.
+    """
+
+    pgs: list[PgView]  # in the order given, without duplicates
+    osd_df: dict[int, dict]
+    osd_host: dict[int, str]
+
+
+def plan(args: argparse.Namespace, store: SnapshotStore) -> ShowResult:
+    """Look up every PG in args.pgids and pair up its OSDs into rows.
+
+    Every PG is looked up before anything else, so an unknown one exits (see
+    fetch_pg_info) before render() prints any output.
+    """
+    pgids = list(dict.fromkeys(args.pgids))  # drop duplicates, keep order
+    pgs = {pgid: fetch_pg_info(store, pgid) for pgid in pgids}
+    pools = fetch_pools(store)
+    osd_host = fetch_osd_hosts(store)
+    osd_df = fetch_osd_df(store)
+    upmap_items = fetch_upmap_items(store)
+
+    views = []
+    for pgid, pg in pgs.items():
+        pool = pools.get(pgid_pool_id(pgid))
+        erasure = is_erasure(pool)
+        pct = pg_progress_pct(
+            pg,
+            copies_moving(
+                pg["up"], pg["acting"], erasure, pool.get("size", 0) if pool else 0
+            ),
+        )
+        views.append(
+            PgView(
+                pgid,
+                pg,
+                build_rows(pg["up"], pg["acting"], erasure),
+                pct,
+                upmap_items.get(pgid, []),
+            )
+        )
+    return ShowResult(views, osd_df, osd_host)
+
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -222,43 +279,31 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     return parser
 
 
-def run(args: argparse.Namespace) -> None:
-    pgids = list(dict.fromkeys(args.pgids))  # drop duplicates, keep order
-    commands = SNAPSHOT_COMMANDS | {
-        pg_query_key(pgid): ["ceph", "pg", pgid, "query", "--format", "json"]
-        for pgid in pgids
-    }
-    store = SnapshotStore.from_args(args, commands)
-    # Look up every PG first, so an unknown one exits before any output.
-    pgs = {pgid: fetch_pg_info(store, pgid) for pgid in pgids}
-    pools = fetch_pools(store)
-    osd_host = fetch_osd_hosts(store)
-    osd_df = fetch_osd_df(store)
-    upmap_items = fetch_upmap_items(store)
-
+def render(result: ShowResult) -> None:
+    """Print a table per PG, then the footnotes that apply to any of them."""
     any_remapped = any_reads_100 = False
-    for i, (pgid, pg) in enumerate(pgs.items()):
-        pool = pools.get(pgid_pool_id(pgid))
-        pairs = upmap_items.get(pgid, [])
-        erasure = is_erasure(pool)
-        rows = build_rows(pg["up"], pg["acting"], erasure)
-        pct = pg_progress_pct(
-            pg,
-            copies_moving(
-                pg["up"], pg["acting"], erasure, pool.get("size", 0) if pool else 0
-            ),
-        )
-
+    for i, view in enumerate(result.pgs):
         if i:
             print()
-        print(f"PG {pgid}  state: {pg['state']}\n")
+        print(f"PG {view.pgid}  state: {view.pg['state']}\n")
         print_table(
-            COLUMNS, [format_row(r, pg, pct, osd_df, osd_host, pairs) for r in rows]
+            COLUMNS,
+            [
+                format_row(
+                    r,
+                    view.pg,
+                    view.progress_pct,
+                    result.osd_df,
+                    result.osd_host,
+                    view.upmap_pairs,
+                )
+                for r in view.rows
+            ],
         )
 
-        if any(r.remapped for r in rows):
+        if any(r.remapped for r in view.rows):
             any_remapped = True
-            any_reads_100 |= progress_reads_100(pct)
+            any_reads_100 |= progress_reads_100(view.progress_pct)
 
     if any_remapped:
         print(
@@ -268,3 +313,11 @@ def run(args: argparse.Namespace) -> None:
     if any_reads_100:
         print(f"\n{PROGRESS_100_NOTE}")
     print("\n* primary")
+
+
+def run(args: argparse.Namespace) -> None:
+    commands = SNAPSHOT_COMMANDS | {
+        pg_query_key(pgid): ["ceph", "pg", pgid, "query", "--format", "json"]
+        for pgid in args.pgids
+    }
+    render(plan(args, SnapshotStore.from_args(args, commands)))

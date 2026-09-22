@@ -26,7 +26,7 @@ for path in (REPO_ROOT, BACKFILLCTL_DIR):
 
 import shared
 
-__all__ = ["REPO_ROOT", "FakeStore", "parse_args", "shared"]
+__all__ = ["REPO_ROOT", "FakeStore", "parse_args", "plan_from_state", "shared"]
 
 
 def parse_args(
@@ -46,6 +46,19 @@ def parse_args(
     (name,) = subparsers.choices
     global_argv = ["--load-state", load_state] if load_state is not None else []
     return parser.parse_args([*global_argv, name, *argv])
+
+
+def plan_from_state(module, state_dir: str | Path, *argv: str):
+    """Return module.plan()'s result for a --load-state capture, run in-process.
+
+    argv is parsed as parse_args does. This is how tests check what a command
+    decides without going through how it prints it (see each module's
+    render()).
+    """
+    args = parse_args(module, list(argv), load_state=str(state_dir))
+    return module.plan(
+        args, shared.SnapshotStore.from_args(args, module.SNAPSHOT_COMMANDS)
+    )
 
 
 class FakeStore:

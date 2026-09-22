@@ -32,11 +32,12 @@ cluster-wide, 1 arriving shard, and proposes remapping 19.21f shard 7 from
 osd.625 to osd.849 (host35, 86.8% util, projected to reach 87.5% once
 the shard has landed; checked by hand: the PG's 1384102474816 bytes over
 k=8 is a 173 GB shard, 0.72% of osd.849's 24.1 TB, on top of its 86.80%).
-Table output:
 
-                   ---- ACTING ----    --------- UP ---------    ----------- TARGET ----------
-  PGID    SHARD    OSD   UTIL  HOST    OSD      UTIL   HOST      OSD      UTIL   PROJ   HOST
-  19.21f  7        none  -     -       osd.625  89.4%  host27    osd.849  86.8%  87.5%  host35
+Expected proposals, one per line as PGID SHARD ACTING_OSD UP_OSD TARGET_OSD
+(checked by the tests against what the script plans; 'none' is an unknown
+acting OSD):
+
+  19.21f  7  none  625  849
 
 This fixture also pins down where --min-up-util draws its line.
 osd.625 is at 89.4% against this cluster's backfillfull_ratio of 0.90, so
@@ -49,8 +50,9 @@ would be filtered out and the fixture would propose nothing. The default
 
 This fixture is also the one that exercises the unknown-ACTING-OSD case:
 osd.457 is already out, so the slot it left in 'acting' reads as
-CRUSH_ITEM_NONE and the row shows 'none' with '-' for the utilization and
-host that would have been derived from it.
+CRUSH_ITEM_NONE: the proposal's acting OSD is unknown (None), which the
+table shows as 'none' with '-' for the utilization and host that would
+have been derived from it.
 
 Use this fixture to exercise the "found something to divert" path. It is
 NOT a no-problems fixture -- see divert-toofull-backfills-nominal-synthetic/ for that
@@ -60,7 +62,7 @@ available at capture time).
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 
-  backfillctl divert-toofull-backfills --load-state .
+  backfillctl --load-state . divert-toofull-backfills
 
 ANONYMIZED: cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule
 names have been replaced with deterministic fake values (see

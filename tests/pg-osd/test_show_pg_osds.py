@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import parse_args, shared
+from _support import parse_args, plan_from_state, shared
 
 from backfillctl import show_pg_osds as op
 
@@ -159,7 +159,7 @@ class TableTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
-    """main() end to end: a live run (mocked SnapshotStore.json) and
+    """plan() and run() end to end: a live run (mocked SnapshotStore.json) and
     --load-state (a pg_dump_pgs.json-based directory, what 'backfillctl
     save-state' produces -- see op.fetch_pg_info)."""
 
@@ -260,37 +260,25 @@ class MainTest(unittest.TestCase):
     def test_replicated_pg_from_a_saved_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.write_snapshots(tmp)
+            result = plan_from_state(op, tmp, "5.3")
+        (view,) = result.pgs
+        self.assertEqual("5.3", view.pgid)
+        self.assertEqual("active+remapped+backfilling", view.pg["state"])
+        # osd.1 stays; osd.2's copy is headed for osd.4
+        self.assertEqual([Row("-", 1, 1), Row("-", 2, 4)], view.rows)
+        self.assertEqual(50.0, view.progress_pct)
+        self.assertEqual([{"from": 2, "to": 4}], view.upmap_pairs)
+        self.assertEqual("ceph1-2", result.osd_host[4])
+
+    def test_saved_state_renders_one_line_per_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_snapshots(tmp)
             out = self.run_main("5.3", load_state=tmp)
         lines = out.splitlines()
         self.assertEqual("PG 5.3  state: active+remapped+backfilling", lines[0])
-        rows = [ln.split() for ln in lines[4:6]]
-        self.assertEqual(
-            [
-                [
-                    "-",
-                    "osd.1*",
-                    "50.0%",
-                    "ceph1-1",
-                    "osd.1*",
-                    "50.0%",
-                    "ceph1-1",
-                    "-",
-                    "-",
-                ],
-                [
-                    "-",
-                    "osd.2",
-                    "91.0%",
-                    "ceph1-1",
-                    "osd.4",
-                    "20.0%",
-                    "ceph1-2",
-                    "50%",
-                    "2->4",
-                ],
-            ],
-            rows,
-        )
+        # a blank line, the two header lines, then the rows
+        self.assertEqual(["-", "-"], [ln.split()[0] for ln in lines[4:6]])
+        self.assertIn("2->4", lines[5])
 
     def test_progress_100_note_absent_below_100(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -317,11 +305,11 @@ class MainTest(unittest.TestCase):
 
     def test_pool_missing_from_pool_ls_is_treated_as_replicated_of_unknown_size(self):
         snaps = {**self.SNAPSHOTS, "pool_ls_detail": []}
-        with mock.patch.object(
-            shared.SnapshotStore, "json", lambda self, key: snaps[key]
-        ):
-            out = self.run_main("5.3")
-        self.assertIn("50%", out)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_snapshots(tmp, snaps)
+            (view,) = plan_from_state(op, tmp, "5.3").pgs
+        self.assertEqual([Row("-", 1, 1), Row("-", 2, 4)], view.rows)
+        self.assertEqual(50.0, view.progress_pct)
 
     def test_several_pgs_print_a_block_each_and_footnotes_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,8 +338,8 @@ class MainTest(unittest.TestCase):
     def test_duplicate_pgids_are_shown_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.write_snapshots(tmp)
-            out = self.run_main("5.3", "5.3", load_state=tmp)
-        self.assertEqual(1, out.count("PG 5.3  state:"))
+            result = plan_from_state(op, tmp, "5.3", "5.3")
+        self.assertEqual(["5.3"], [view.pgid for view in result.pgs])
 
     def test_unknown_pgid_among_several_fails_before_any_output(self):
         out = io.StringIO()

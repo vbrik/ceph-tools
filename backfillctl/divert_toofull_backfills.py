@@ -322,6 +322,7 @@ import shared
 from shared import (
     KIB,
     POOL_TYPE_ERASURE,
+    PgidFilter,
     SnapshotStore,
     fetch_crush_rules,
     fetch_ec_profiles,
@@ -1116,9 +1117,39 @@ def warn_separate_remaps(pgids: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run(args: argparse.Namespace) -> None:
-    store = SnapshotStore.from_args(args, SNAPSHOT_COMMANDS)
+class DivertResult(NamedTuple):
+    """Everything a run decides, independent of how it is printed.
 
+    plan() computes it and render() prints it, so tests of the planning can
+    assert on these fields and survive changes to the output format. osd_df
+    and osd_host are carried along only because the table shows them.
+    """
+
+    proposals: list[Proposal]  # in PG, then shard, order
+    unplaceable: list[DivertedShard]
+    toofull_pg_count: int  # backfill_toofull PGs considered (after --pgs)
+    pgs_with_shards: int  # of those, the ones with a newly-arriving shard
+    arriving_count: int  # arriving shards in all
+    stuck_count: int  # arriving on an OSD at or above min_up_util
+    left_alone_count: int  # arriving on an OSD below it: not the blocker
+    candidates: dict[str, list[int]]  # see build_candidate_osds
+    min_up_util: float
+    max_target_util: float
+    ratios: FullRatios
+    pgs_filter: PgidFilter | None  # None without --pgs
+    osd_df: dict[int, dict]
+    osd_host: dict[int, str]
+
+
+def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
+    """Fetch the cluster state from store and work out what to divert where.
+
+    Exits with an error message when the state cannot be analyzed safely
+    (see check_host_failure_domain and the unknown-pool check). The only output
+    is the --pgs note (see print_pgs_filter), printed as soon as the filter
+    runs so that the ids that matched nothing are named even if planning then
+    exits: a typo can be what trips one of those errors.
+    """
     osd_host = fetch_osd_hosts(store)
     osd_df = fetch_osd_df(store)
     upmap_items = fetch_upmap_items(store)
@@ -1146,22 +1177,14 @@ def run(args: argparse.Namespace) -> None:
             "would let the script propose targets that re-wedge."
         )
 
+    pgs_filter = None
     if args.pgs:
         wanted_pgs = set(args.pgs)
         toofull_pgs, matched_pgs = filter_toofull_pgs(toofull_pgs, wanted_pgs)
-        unmatched_pgs = sorted(wanted_pgs - matched_pgs)
-        print(
-            f"--pgs: {len(matched_pgs)} of {len(wanted_pgs)} given PG id(s) "
-            "are currently backfill_toofull and will be the only ones "
-            "considered"
-            + (
-                f"; {len(unmatched_pgs)} matched nothing (check for typos): "
-                + ", ".join(unmatched_pgs)
-                if unmatched_pgs
-                else ""
-            ),
-            file=sys.stderr,
+        pgs_filter = PgidFilter(
+            len(wanted_pgs), len(matched_pgs), sorted(wanted_pgs - matched_pgs)
         )
+        print_pgs_filter(pgs_filter)
 
     toofull_pool_ids = {pgid_pool_id(pg["pgid"]) for pg in toofull_pgs}
     # A pool that has stuck PGs but is absent from 'ceph osd pool ls detail'
@@ -1212,27 +1235,67 @@ def run(args: argparse.Namespace) -> None:
         max_uses=args.max_target_uses,
         max_target_util=max_target_util,
     )
+    return DivertResult(
+        proposals=proposals,
+        unplaceable=unplaceable,
+        toofull_pg_count=len(toofull_pgs),
+        pgs_with_shards=pgs_with_shards,
+        arriving_count=len(arriving),
+        stuck_count=len(shards),
+        left_alone_count=len(not_full_enough),
+        candidates=candidates,
+        min_up_util=min_up_util,
+        max_target_util=max_target_util,
+        ratios=ratios,
+        pgs_filter=pgs_filter,
+        osd_df=osd_df,
+        osd_host=osd_host,
+    )
 
+
+def print_pgs_filter(pgs_filter: PgidFilter) -> None:
+    """Report on stderr what --pgs matched, naming the ids that matched nothing."""
+    print(
+        f"--pgs: {pgs_filter.matched} of {pgs_filter.given} given PG id(s) "
+        "are currently backfill_toofull and will be the only ones "
+        "considered"
+        + (
+            f"; {len(pgs_filter.unmatched)} matched nothing (check for typos): "
+            + ", ".join(pgs_filter.unmatched)
+            if pgs_filter.unmatched
+            else ""
+        ),
+        file=sys.stderr,
+    )
+
+
+def render(result: DivertResult, args: argparse.Namespace) -> None:
+    """Print result: proposals on stdout in the format args asks for, notes on stderr."""
     # Everything informational goes to stderr so stdout stays parseable.
+    osd_df = result.osd_df
+    max_target_util = result.max_target_util
     by_class = ", ".join(
         f"{cls}={sum(osd_df[o]['utilization'] <= max_target_util for o in osds)}"
         f"/{len(osds)}"
-        for cls, osds in sorted(candidates.items())
+        for cls, osds in sorted(result.candidates.items())
     )
     print(
-        f"{len(toofull_pgs)} backfill_toofull PG(s) cluster-wide, "
-        f"{pgs_with_shards} with newly-arriving shard(s); "
-        f"{len(arriving)} arriving shard(s), of which {len(shards)} on an OSD "
-        f"at or above --min-up-util {min_up_util:g}% "
-        f"({len(not_full_enough)} left alone as not the blocker); "
+        f"{result.toofull_pg_count} backfill_toofull PG(s) cluster-wide, "
+        f"{result.pgs_with_shards} with newly-arriving shard(s); "
+        f"{result.arriving_count} arriving shard(s), of which "
+        f"{result.stuck_count} on an OSD "
+        f"at or above --min-up-util {result.min_up_util:g}% "
+        f"({result.left_alone_count} left alone as not the blocker); "
         f"candidate target OSDs at or below the cap now / in all: "
         f"{by_class or 'none'}; each may take up to "
         f"--max-target-uses {args.max_target_uses} shard(s), while its "
         f"projected utilization stays at or below --max-target-util "
-        f"{max_target_util:g}% (backfillfull_ratio {ratios.backfillfull:g}%)",
+        f"{max_target_util:g}% "
+        f"(backfillfull_ratio {result.ratios.backfillfull:g}%)",
         file=sys.stderr,
     )
 
+    proposals, unplaceable = result.proposals, result.unplaceable
     if args.import_mappings:
         print_import_mappings(proposals)
     elif proposals:
@@ -1241,7 +1304,10 @@ def run(args: argparse.Namespace) -> None:
             if multi := pgs_needing_several_targets(proposals):
                 warn_separate_remaps(multi)
         else:
-            print_table(COLUMNS, [format_row(p, osd_host, osd_df) for p in proposals])
+            print_table(
+                COLUMNS,
+                [format_row(p, result.osd_host, osd_df) for p in proposals],
+            )
 
     if unplaceable:
         print_unplaceable(len(unplaceable))
@@ -1258,3 +1324,7 @@ def run(args: argparse.Namespace) -> None:
             "Apply these, let them drain, then re-run.",
             file=sys.stderr,
         )
+
+
+def run(args: argparse.Namespace) -> None:
+    render(plan(args, SnapshotStore.from_args(args, SNAPSHOT_COMMANDS)), args)

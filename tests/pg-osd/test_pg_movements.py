@@ -2,8 +2,9 @@
 
 The progress arithmetic and OSD-slot helpers it shares with the others
 are tested in test_shared.py. Here: how PG states are classified and
-abbreviated, and run() end to end over canned snapshots, which pins how
-EC (positional) and replicated (set-difference) PGs turn into rows.
+abbreviated; plan() over canned snapshots, which pins how EC (positional)
+and replicated (set-difference) PGs turn into rows; and how render() prints
+them.
 """
 
 import contextlib
@@ -14,7 +15,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import REPO_ROOT, parse_args, shared
+from _support import REPO_ROOT, FakeStore, parse_args, plan_from_state, shared
 
 from backfillctl import pg_movements as pm
 
@@ -110,17 +111,25 @@ class MainTest(unittest.TestCase):
             pm.run(args)
         return out.getvalue()
 
-    def rows(self, out):
-        lines = out.splitlines()
-        return [
-            line.split() for line in lines[2 : lines.index("") if "" in lines else None]
-        ]
+    def plan(self, *argv, snapshots=SNAPSHOTS):
+        store = FakeStore(snapshots, commands=pm.SNAPSHOT_COMMANDS)
+        return pm.plan(parse_args(pm, argv), store)
+
+    def row(self, pgid, snapshots=SNAPSHOTS):
+        return next(r for r in self.plan(snapshots=snapshots).rows if r.pgid == pgid)
 
     def test_only_moving_pgs_get_rows_in_pg_order(self):
-        rows = self.rows(self.run_main())
-        self.assertEqual(["5.3", "5.1f", "27.9", "27.10"], [r[0] for r in rows])
+        rows = self.plan().rows
+        self.assertEqual(["5.3", "5.1f", "27.9", "27.10"], [r.pgid for r in rows])
 
     def test_ec_row_names_the_shard_and_both_osds(self):
+        row = self.row("27.10")
+        self.assertEqual(
+            (1, {3}, {2}, "backfill"),
+            (row.shard, row.sources, row.destinations, row.move_type),
+        )
+
+    def test_ec_row_rendering(self):
         out = self.run_main()
         line = next(ln for ln in out.splitlines() if ln.startswith("27.10"))
         self.assertRegex(
@@ -131,19 +140,21 @@ class MainTest(unittest.TestCase):
         # 27.9: one shard moving plus one with no OSD anywhere = 2 copies to
         # place, so 100 degraded objects of 200 copy-units is 50% done; counting
         # only the moving shard would clamp to 0%.
-        out = self.run_main()
-        line = next(ln for ln in out.splitlines() if ln.startswith("27.9"))
-        self.assertIn(" 50% ", line)
+        self.assertEqual(50.0, self.row("27.9").progress_pct)
 
     def test_progress_denominator_of_a_single_moving_shard(self):
         # 27.10: 150 of 100 * 1 copy-units misplaced is clamped to 0%; wrongly
         # counting a second copy would read 25%.
-        out = self.run_main()
-        line = next(ln for ln in out.splitlines() if ln.startswith("27.10"))
-        self.assertIn(" 0% ", line)
+        self.assertEqual(0.0, self.row("27.10").progress_pct)
 
     def test_replicated_reorder_is_not_reported(self):
-        self.assertNotIn("5.4", self.run_main())
+        self.assertNotIn("5.4", [r.pgid for r in self.plan().rows])
+
+    def test_degraded_replica_has_no_source_but_the_primary(self):
+        row = self.row("5.1f")
+        self.assertEqual((set(), {2}), (row.sources, row.destinations))
+        self.assertEqual(0, row.primary)
+        self.assertTrue(row.needs_primary_marker)
 
     def test_degraded_replica_shows_the_primary_as_the_worker(self):
         out = self.run_main()
@@ -185,12 +196,17 @@ class MainTest(unittest.TestCase):
             },
             "osd_df": {"nodes": [], "stray": [{"id": 4, "utilization": 33.0}]},
         }
+        result = self.plan(snapshots=snaps)
+        self.assertEqual(("h2", "h2"), (result.osd_host[3], result.osd_host[4]))
+        self.assertEqual(33.0, result.osd_df[4]["utilization"])
+        self.assertNotIn(3, result.osd_df)
         out = self.run_main(snapshots=snaps)
         self.assertIn("4(h2,33%)", out)
         self.assertIn("3(h2,?%)", out)
 
     def test_no_movement(self):
         snaps = {**SNAPSHOTS, "pg_dump_pgs": [PGS[2]]}
+        self.assertEqual([], self.plan(snapshots=snaps).rows)
         self.assertEqual("No PG movements detected.\n", self.run_main(snapshots=snaps))
 
     def test_pg_stats_not_ready_is_an_error_naming_the_command(self):
@@ -200,21 +216,16 @@ class MainTest(unittest.TestCase):
         self.assertIn("ceph pg dump pgs", str(ctx.exception))
 
     def test_sort_by_destination(self):
-        rows = self.rows(self.run_main("--sort-by", "to-osd"))
-        self.assertEqual("5.3", rows[-1][0])  # osd.3 is the highest destination
+        rows = self.plan("--sort-by", "to-osd").rows
+        self.assertEqual("5.3", rows[-1].pgid)  # osd.3 is the highest destination
 
     def test_load_state_reads_the_saved_snapshots(self):
         with tempfile.TemporaryDirectory() as tmp:
             for key, data in SNAPSHOTS.items():
                 (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
-            out = io.StringIO()
-            args = parse_args(pm, [], load_state=tmp)
-            with (
-                mock.patch.object(shared, "ceph_json", side_effect=AssertionError),
-                contextlib.redirect_stdout(out),
-            ):
-                pm.run(args)
-        self.assertIn("4 shard movement(s) across 4 PG(s).", out.getvalue())
+            with mock.patch.object(shared, "ceph_json", side_effect=AssertionError):
+                result = plan_from_state(pm, tmp)
+        self.assertEqual(4, len(result.rows))
 
 
 FIXTURE_STUCK_AT_100 = (
@@ -225,6 +236,16 @@ FIXTURE_STUCK_AT_100 = (
 class FixtureReplayTest(unittest.TestCase):
     """Replay the real-cluster snapshot in tests/pg-osd/test-data (see its README.txt)."""
 
+    def test_the_real_stuck_pgs_read_100(self):
+        # 27.126 has two shards genuinely still backfilling despite reading
+        # 100% (see the fixture's README.txt).
+        rows = [
+            r
+            for r in plan_from_state(pm, FIXTURE_STUCK_AT_100).rows
+            if r.pgid == "27.126"
+        ]
+        self.assertEqual([100.0, 100.0], [r.progress_pct for r in rows])
+
     def test_progress_100_note_appears_for_the_real_stuck_pgs(self):
         out = io.StringIO()
         args = parse_args(pm, [], load_state=str(FIXTURE_STUCK_AT_100))
@@ -232,12 +253,6 @@ class FixtureReplayTest(unittest.TestCase):
             pm.run(args)
         value = out.getvalue()
         self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", value)
-        # 27.126 has two shards genuinely still backfilling despite reading
-        # 100% (see the fixture's README.txt).
-        pg_lines = [ln for ln in value.splitlines() if ln.startswith("27.126")]
-        self.assertEqual(2, len(pg_lines))
-        for line in pg_lines:
-            self.assertIn(" 100% ", line)
 
 
 if __name__ == "__main__":
