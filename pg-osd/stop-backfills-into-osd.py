@@ -177,7 +177,9 @@ balancer may otherwise undo them.
 import argparse
 import json
 import re
+import shutil
 import sys
+import textwrap
 from collections import Counter
 from typing import NamedTuple
 
@@ -702,6 +704,42 @@ COLUMNS = [
 ]
 
 
+def wrap_text(text: str, indent: str = "") -> str:
+    """Wrap a stderr paragraph or list item to a readable width.
+
+    Capped at 100 columns (and no narrower than 40) so a long NOTE/WARNING/
+    ERROR stays readable on a wide terminal instead of stretching edge to
+    edge; 'indent' (e.g. "  " for a list item under a paragraph) is repeated
+    on wrapped lines plus two more spaces, so the continuation hangs under
+    the item's own text rather than the margin.
+    """
+    width = min(100, max(40, shutil.get_terminal_size().columns))
+    return textwrap.fill(
+        text,
+        width=width,
+        initial_indent=indent,
+        subsequent_indent=indent + "  ",
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+
+
+def stderr_para(text: str) -> None:
+    """Print a wrapped stderr paragraph, blank-line-separated from the last one.
+
+    Without the blank line, a run's several NOTE/WARNING messages read as one
+    undifferentiated block once each has wrapped across multiple terminal
+    lines; this makes each message its own visually distinct paragraph.
+    """
+    if stderr_para.printed:
+        print(file=sys.stderr)
+    print(wrap_text(text), file=sys.stderr)
+    stderr_para.printed = True
+
+
+stderr_para.printed = False
+
+
 def format_bytes(num: int | None) -> str:
     """Format a byte count in binary units, or '?' if unknown."""
     if num is None:
@@ -802,7 +840,7 @@ def warn_chained_pgs(chained: dict[str, list[Cancellation]], left_out: bool) -> 
     PGs are left out (left_out) and the pairs are given here as commands
     instead.
     """
-    lines = [
+    stderr_para(
         f"WARNING: {len(chained)} PG(s) have chained pairs (one pair's target is "
         f"another's source, e.g. osd.A->B and osd.B->C): {', '.join(chained)}. "
         "Ceph applies an entry's pairs in order and skips one whose target is "
@@ -814,11 +852,11 @@ def warn_chained_pgs(chained: dict[str, list[Cancellation]], left_out: bool) -> 
         + " Apply each with 'ceph osd pg-upmap-items', which replaces the PG's "
         "whole upmap entry, so add the PG's existing pairs from 'ceph osd dump' "
         "first (this has not been tried on your cluster):"
-    ]
+    )
     for pgid, cs in chained.items():
         pairs = " ".join(f"{c.up_osd} {c.acting_osd}" for c in cs)
-        lines.append(f"  ceph osd pg-upmap-items {pgid} {pairs}")
-    print("\n".join(lines), file=sys.stderr)
+        # Not wrapped: these are meant to be copy-pasted as shell commands.
+        print(f"  ceph osd pg-upmap-items {pgid} {pairs}", file=sys.stderr)
 
 
 def pgs_needing_several_pins(cancellations: list[Cancellation]) -> list[str]:
@@ -839,14 +877,13 @@ def warn_separate_remaps(pgids: list[str]) -> None:
     shown = ", ".join(pgids[:8]) + (
         f", ... ({len(pgids)} in all)" if len(pgids) > 8 else ""
     )
-    print(
+    stderr_para(
         f"WARNING: {len(pgids)} PG(s) need more than one remap ({shown}). Running "
         "these lines as separate 'pgremapper remap' commands (e.g. xargs -L1) "
         "can silently lose pairs: a later run may overwrite the pair an earlier "
         "one just added, and a lone pair can be invalid and dropped by the "
         "mons. Use --import-mappings instead, which applies all pairs of a PG "
-        "together.",
-        file=sys.stderr,
+        "together."
     )
 
 
@@ -867,7 +904,7 @@ def print_summary(
     capacity = node.get("kb", 0) * KIB
     share = f" ({total / capacity * 100:.1f}% of its capacity)" if capacity else ""
     unknown = len(arriving) - len(known)
-    print(
+    stderr_para(
         f"osd.{osd} ({osd_host.get(osd, '?')}) is at {node['utilization']:.1f}%. "
         f"{len(arriving)} arriving shard(s) can be pinned back, "
         f"~{format_bytes(total)}{share} of data"
@@ -885,11 +922,13 @@ def print_summary(
             + "."
             if others
             else ""
-        ),
-        file=sys.stderr,
+        )
     )
     for s in skipped:
-        print(f"  cannot pin {s.pgid} shard {s.shard}: {s.reason}", file=sys.stderr)
+        print(
+            wrap_text(f"cannot pin {s.pgid} shard {s.shard}: {s.reason}", indent="  "),
+            file=sys.stderr,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -921,11 +960,10 @@ def main() -> None:
         sys.exit(f"ERROR: osd.{osd} not found in 'ceph osd df'.")
     backfillfull_pct = fetch_backfillfull_pct(store)
     if backfillfull_pct is None and args.pin_blockers:
-        print(
+        stderr_para(
             "NOTE: 'osd dump' has no backfillfull_ratio (an older --load-state "
             "capture?), so --pin-blockers has nothing to work from and no "
-            "blockers are looked for.",
-            file=sys.stderr,
+            "blockers are looked for."
         )
     if exclude_pgs:
         # "matched" only means osd is somewhere in the PG's 'up' (i.e. it is
@@ -938,7 +976,7 @@ def main() -> None:
             if osd in pg["up"] and pg["pgid"] in exclude_pgs
         }
         unmatched = sorted(exclude_pgs - matched)
-        print(
+        stderr_para(
             f"NOTE: --exclude-pgs: {len(matched)} of {len(exclude_pgs)} given "
             f"PG id(s) matched a remapped PG involving osd.{osd} and were "
             "left alone"
@@ -947,8 +985,7 @@ def main() -> None:
                 f"{', '.join(unmatched)}."
                 if unmatched
                 else "."
-            ),
-            file=sys.stderr,
+            )
         )
     cancellations, skipped = plan_cancellations(
         pg_stats,
@@ -989,18 +1026,16 @@ def main() -> None:
     if chained:
         warn_chained_pgs(chained, left_out=machine_format)
     if backfillfull_pct is not None and not args.pin_blockers:
-        print(
+        stderr_para(
             "NOTE: --pin-blockers was not given, so a shard of the same PG "
             "whose own target OSD is over backfillfull_ratio was not pinned "
             "back. If that leaves a PG in backfill_toofull, a backfill you "
             "decide to keep from this output will never actually run. Rerun "
-            "with --pin-blockers to find and include those pins too.",
-            file=sys.stderr,
+            "with --pin-blockers to find and include those pins too."
         )
-    print(
+    stderr_para(
         "NOTE: cancelling a running backfill discards its progress. Consider "
-        "'ceph balancer off' while these are pinned.",
-        file=sys.stderr,
+        "'ceph balancer off' while these are pinned."
     )
 
 

@@ -26,6 +26,12 @@ from _support import SCRIPT_DIR, FakeStore, load_script, script_path, shared
 SCRIPT = script_path("stop-backfills-into-osd.py")
 cb = load_script("stop-backfills-into-osd.py")
 
+
+def flat(text: str) -> str:
+    """Collapse whitespace, so a substring check survives stderr's line wrapping."""
+    return " ".join(text.split())
+
+
 NONE = shared.CRUSH_ITEM_NONE
 OSD = 682
 EC_POOL = {
@@ -1045,7 +1051,9 @@ class MainTest(unittest.TestCase):
         )
         self.assertEqual(out, "19.e 682 8\n19.e 77 66\n")
         self.assertIn("1 more shard(s)", err)
-        self.assertIn("1 because their target would be over backfillfull_ratio", err)
+        self.assertIn(
+            "1 because their target would be over backfillfull_ratio", flat(err)
+        )
         self.assertNotIn("--pin-blockers was not given", err)
 
     def test_table_says_which_shard_a_blocker_blocks(self):
@@ -1593,7 +1601,7 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertEqual(sum("blocks shard" in r for r in rows), 7)
         self.assertIn("6 arriving shard(s)", result.stderr)
         self.assertIn("7 more shard(s)", result.stderr)
-        self.assertIn("(7 because their target would be over", result.stderr)
+        self.assertIn("(7 because their target would be over", flat(result.stderr))
         self.assertIn("0 cannot be pinned", result.stderr)
         self.assertNotIn("--pin-blockers was not given", result.stderr)
 
@@ -1774,7 +1782,9 @@ class BlockerFixtureReplayTest(unittest.TestCase):
         err = self.replay("--pin-blockers").stderr
         self.assertIn("1 arriving shard(s)", err)
         self.assertIn("1 more shard(s)", err)
-        self.assertIn("1 because their target would be over backfillfull_ratio", err)
+        self.assertIn(
+            "1 because their target would be over backfillfull_ratio", flat(err)
+        )
 
     def test_keeping_the_wanted_backfill_means_dropping_only_its_own_entry(self):
         # the user's case: keep 231->896, so drop that entry and keep the blocker
