@@ -156,6 +156,10 @@ other environments.
   abbreviated state (cancelling a running backfill discards its progress). You drop the entries
   for the ones to let proceed; with `--pin-blockers`, keep the blockers of any
   shard you keep, and always drop companions with the entry they belong to.
+  `--exclude-pgs PGID [PGID ...]` does this up front instead: those PGs (and
+  their companions/blockers) never appear in the output. A given id that
+  doesn't match a remapped PG with `--osd` in its `up` set is reported on
+  stderr, since that usually means a typo.
   `--import-mappings` prints a JSON array for `pgremapper import-mappings`
   (prune it with `jq`, then `pgremapper import-mappings file.json`), which
   takes all pairs in one run and, as dry runs showed, keeps a PG's existing
@@ -173,7 +177,7 @@ other environments.
   OSD/pool granularity. `--save-state DIR` writes the run's cluster state as
   JSON, anonymized so it can be shared, and `--load-state DIR` replays such a
   capture offline with no cluster access.
-  `pg-osd/stop-backfills-into-osd.py [--pin-blockers] [--import-mappings | --pgremapper] [--save-state DIR | --load-state DIR] <osd>`
+  `pg-osd/stop-backfills-into-osd.py --osd OSD [--exclude-pgs PGID [PGID ...]] [--pin-blockers] [--import-mappings | --pgremapper] [--save-state DIR | --load-state DIR]`
 
 - **`pg-osd/scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /

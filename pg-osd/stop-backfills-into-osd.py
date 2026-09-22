@@ -22,7 +22,9 @@ OSD, and whatever else must be pinned for them to work: the output is the
 complete set of pins that stops ALL backfills into the OSD, which includes pins
 that stop backfills into OTHER OSDs (see "Companion pins"). It changes
 nothing. It does not decide which backfills to keep: review the output and
-delete the entries for the ones you want to let proceed.
+delete the entries for the ones you want to let proceed, or pass their PG ids
+to --exclude-pgs to leave them out of the output (and its companions and
+blockers) from the start.
 
 That covers the script's name: by default it does exactly and only what
 "stop backfills into an OSD" says. It has a second, less obvious job, off by
@@ -128,7 +130,7 @@ Applying the output
 --import-mappings prints a JSON array for 'pgremapper import-mappings', one
 {pgid, mapping: {from, to}} entry per line (all other output goes to stderr):
 
-    stop-backfills-into-osd.py --pin-blockers --import-mappings 682 > mappings.json
+    stop-backfills-into-osd.py --pin-blockers --import-mappings --osd 682 > mappings.json
     # drop the entry into the OSD for each backfill you want to keep, but not
     # its blockers (other entries of the same PG, present with --pin-blockers),
     # e.g. keep 19.92e's 896->231:
@@ -257,7 +259,20 @@ def parse_args() -> argparse.Namespace:
         epilog="See the docstring at the top of this script for companions, "
         "blockers, what cannot be pinned and how to apply the output.",
     )
-    parser.add_argument("osd", type=parse_osd, help="OSD id, e.g. 682 or osd.682")
+    parser.add_argument(
+        "--osd", type=parse_osd, required=True, help="OSD id, e.g. 682 or osd.682"
+    )
+    parser.add_argument(
+        "--exclude-pgs",
+        nargs="+",
+        default=[],
+        metavar="PGID",
+        help="PG id(s) to leave alone: skip entirely (no pins, no companions, "
+        "no blockers) even if they have a backfill into --osd. Space-"
+        "separated, e.g. --exclude-pgs 19.92e 20.1a3. A given id that does "
+        "not match a remapped PG with --osd in its 'up' set is reported on "
+        "stderr, since that usually means a typo.",
+    )
     parser.add_argument(
         "--pin-blockers",
         action="store_true",
@@ -551,6 +566,7 @@ def plan_cancellations(
     osd_df: dict[int, dict] | None = None,
     backfillfull_pct: float | None = None,
     pin_blockers: bool = False,
+    exclude_pgs: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[list[Cancellation], list[Skipped]]:
     """Return (cancellations, skipped) for all backfills into osd, in PG order.
 
@@ -563,6 +579,9 @@ def plan_cancellations(
     skipped and reported; the requested shard's own pin is kept. Exits with an
     error if such a PG's pool does not fail over at host, since the clash
     check assumes it.
+
+    A PG whose id is in exclude_pgs is left alone entirely: no cancellation,
+    companion, blocker or skipped entry, as if it were never seen.
     """
     blockers_enabled = (
         pin_blockers and osd_df is not None and backfillfull_pct is not None
@@ -573,6 +592,8 @@ def plan_cancellations(
         if osd not in up:
             continue
         pgid = pg["pgid"]
+        if pgid in exclude_pgs:
+            continue
         pool = pools.get(int(pgid.split(".")[0]))
         if pool is None:
             # Without the pool type EC shards would be diffed as replicas.
@@ -879,6 +900,7 @@ def print_summary(
 def main() -> None:
     args = parse_args()
     osd = args.osd
+    exclude_pgs = set(args.exclude_pgs)
 
     store = SnapshotStore.from_args(
         args, SNAPSHOT_COMMANDS, anonymize=anonymize_snapshots
@@ -905,6 +927,29 @@ def main() -> None:
             "blockers are looked for.",
             file=sys.stderr,
         )
+    if exclude_pgs:
+        # "matched" only means osd is somewhere in the PG's 'up' (i.e. it is
+        # one of the PGs plan_cancellations would otherwise have looked at);
+        # it does not mean osd itself has a backfill (see find_arrivals), so
+        # the note below must not claim more than that.
+        matched = {
+            pg["pgid"]
+            for pg in pg_stats
+            if osd in pg["up"] and pg["pgid"] in exclude_pgs
+        }
+        unmatched = sorted(exclude_pgs - matched)
+        print(
+            f"NOTE: --exclude-pgs: {len(matched)} of {len(exclude_pgs)} given "
+            f"PG id(s) matched a remapped PG involving osd.{osd} and were "
+            "left alone"
+            + (
+                f"; {len(unmatched)} matched nothing (check for typos): "
+                f"{', '.join(unmatched)}."
+                if unmatched
+                else "."
+            ),
+            file=sys.stderr,
+        )
     cancellations, skipped = plan_cancellations(
         pg_stats,
         pools,
@@ -915,6 +960,7 @@ def main() -> None:
         osd_df,
         backfillfull_pct,
         args.pin_blockers,
+        exclude_pgs,
     )
     if not cancellations and not skipped:
         print(f"No backfills into osd.{osd}.", file=sys.stderr)

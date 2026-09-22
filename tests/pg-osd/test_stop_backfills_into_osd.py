@@ -205,10 +205,16 @@ class PinReplicaTest(unittest.TestCase):
         self.assertIsNone(cb.pin_replica([1, OSD], OSD, 9, {9: "H", OSD: "H"}))
 
 
-def run_plan(pgs, pools=None, osd_host=None, rules=None):
+def run_plan(pgs, pools=None, osd_host=None, rules=None, exclude_pgs=None):
     pools = pools or {19: EC_POOL, 7: REP_POOL}
     return cb.plan_cancellations(
-        pgs, pools, EC_PROFILES, OSD, osd_host or {}, RULES if rules is None else rules
+        pgs,
+        pools,
+        EC_PROFILES,
+        OSD,
+        osd_host or {},
+        RULES if rules is None else rules,
+        exclude_pgs=exclude_pgs or frozenset(),
     )
 
 
@@ -500,7 +506,7 @@ class PlanChainTest(unittest.TestCase):
         self.assertIn("cycle", skipped[0].reason)
 
 
-def run_plan_with_df(pgs, df, ratio=RATIO, pin_blockers=True):
+def run_plan_with_df(pgs, df, ratio=RATIO, pin_blockers=True, exclude_pgs=None):
     return cb.plan_cancellations(
         pgs,
         {19: EC_POOL, 7: REP_POOL},
@@ -511,6 +517,7 @@ def run_plan_with_df(pgs, df, ratio=RATIO, pin_blockers=True):
         df,
         ratio,
         pin_blockers,
+        exclude_pgs or frozenset(),
     )
 
 
@@ -623,6 +630,43 @@ class PlanCompanionsTest(unittest.TestCase):
         self.assertEqual(
             self.plan([pg("19.9", [1, 2, 3, 4], [1, 2, 3, 4])], rules={}), ([], [])
         )
+
+
+class PlanExcludeTest(unittest.TestCase):
+    """exclude_pgs removes a PG from consideration entirely."""
+
+    plan = staticmethod(run_plan)
+
+    def test_excluded_pg_produces_no_cancellation(self):
+        p = pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        self.assertEqual(self.plan([p], exclude_pgs={"19.9"}), ([], []))
+
+    def test_excluded_pg_is_not_reported_as_skipped_either(self):
+        # normally an empty acting slot is reported on stderr as unpinnable;
+        # once the PG is excluded it must not be mentioned at all.
+        p = pg("19.9", [OSD, 2, 3, 4], [NONE, 2, 3, 4])
+        self.assertEqual(self.plan([p], exclude_pgs={"19.9"}), ([], []))
+
+    def test_excluding_one_pg_does_not_touch_others(self):
+        excluded = pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        kept = pg("19.10", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        cancellations, _ = self.plan([excluded, kept], exclude_pgs={"19.9"})
+        self.assertEqual([c.pgid for c in cancellations], ["19.10"])
+
+    def test_excluding_a_pg_also_drops_its_companions(self):
+        # shard 0 (->627, host H) would otherwise force shard 3's companion
+        # (149->497, also host H); excluding the PG must drop both.
+        p = pg("19.7e9", [OSD, 300, 626, 149], [627, 300, 626, 497])
+        hosts = {OSD: "x", 627: "H", 149: "H", 497: "z"}
+        cancellations, skipped = self.plan([p], osd_host=hosts, exclude_pgs={"19.7e9"})
+        self.assertEqual((cancellations, skipped), ([], []))
+
+    def test_excluding_a_pg_also_drops_its_blockers(self):
+        p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
+        cancellations, skipped = run_plan_with_df(
+            [p], {77: osd_df_node(77, 92.0)}, exclude_pgs={"19.5"}
+        )
+        self.assertEqual((cancellations, skipped), ([], []))
 
 
 def column_names() -> list[str]:
@@ -821,6 +865,25 @@ class ParseOsdTest(unittest.TestCase):
                 cb.parse_osd(text)
 
 
+class ParseArgsCliTest(unittest.TestCase):
+    def parse(self, *argv):
+        with mock.patch("sys.argv", ["stop-backfills-into-osd.py", *argv]):
+            return cb.parse_args()
+
+    def test_osd_is_a_required_flag_not_positional(self):
+        with self.assertRaises(SystemExit):
+            self.parse("682")  # no --osd: bare id is now unrecognized
+        self.assertEqual(self.parse("--osd", "682").osd, 682)
+        self.assertEqual(self.parse("--osd", "osd.682").osd, 682)
+
+    def test_exclude_pgs_defaults_to_empty(self):
+        self.assertEqual(self.parse("--osd", "682").exclude_pgs, [])
+
+    def test_exclude_pgs_takes_a_space_separated_list(self):
+        args = self.parse("--osd", "682", "--exclude-pgs", "19.9", "19.a")
+        self.assertEqual(args.exclude_pgs, ["19.9", "19.a"])
+
+
 def osd_df_node(osd_id, util, kb=1_000_000):
     """A 'ceph osd df' node at util percent of kb KiB."""
     return {
@@ -902,7 +965,7 @@ class MainTest(unittest.TestCase):
         return out.getvalue(), err.getvalue()
 
     def test_pgremapper_output_is_bare_lines_only(self):
-        out, err = self.run_main("--pgremapper", "osd.682")
+        out, err = self.run_main("--pgremapper", "--osd", "osd.682")
         # 19.d's companion line has its own up OSD, not 682
         self.assertEqual(out, "19.9 682 8\n19.d 682 8\n19.d 9 4\n")
         # the unpinnable shard is reported, not silently dropped
@@ -910,7 +973,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("1 more shard(s)", err)
 
     def test_table_shows_acting_osd_state_and_host(self):
-        out, _ = self.run_main("682")
+        out, _ = self.run_main("--osd", "682")
         lines = out.splitlines()
         self.assertIn("PGID", lines[1])
         self.assertEqual(len(lines), 5)  # two header lines + the 3 pins
@@ -922,7 +985,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("companion of shard 0", lines[4])
 
     def test_import_mappings_is_json_with_every_pair_and_no_warning(self):
-        out, err = self.run_main("--import-mappings", "682")
+        out, err = self.run_main("--import-mappings", "--osd", "682")
         self.assertEqual(
             json.loads(out),
             [
@@ -935,19 +998,19 @@ class MainTest(unittest.TestCase):
         self.assertIn("19.a", err)  # unpinnable shards are still reported
 
     def test_pgremapper_warns_when_a_pg_needs_several_remaps(self):
-        _, err = self.run_main("--pgremapper", "682")
+        _, err = self.run_main("--pgremapper", "--osd", "682")
         self.assertIn("WARNING", err)
         self.assertIn("19.d", err)  # the PG with the companion
         self.assertNotIn("19.9,", err)  # a single-line PG is not named
         self.assertIn("--import-mappings", err)
 
     def test_pgremapper_does_not_warn_when_every_pg_has_one_remap(self):
-        out, err = self.run_main("--pgremapper", "682", pgs=[self.PGS[0]])
+        out, err = self.run_main("--pgremapper", "--osd", "682", pgs=[self.PGS[0]])
         self.assertEqual(out, "19.9 682 8\n")
         self.assertNotIn("WARNING", err)
 
     def test_table_output_does_not_warn(self):
-        _, err = self.run_main("682")
+        _, err = self.run_main("--osd", "682")
         self.assertNotIn("WARNING", err)
 
     def test_blockers_are_not_pinned_by_default(self):
@@ -957,7 +1020,11 @@ class MainTest(unittest.TestCase):
         # note pointing at the flag.
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, err = self.run_main(
-            "--pgremapper", "682", pgs=pgs, extra_osds=[osd_df_node(77, 92.0)]
+            "--pgremapper",
+            "--osd",
+            "682",
+            pgs=pgs,
+            extra_osds=[osd_df_node(77, 92.0)],
         )
         self.assertEqual(out, "19.e 682 8\n")
         self.assertNotIn("more shard(s)", err)
@@ -971,6 +1038,7 @@ class MainTest(unittest.TestCase):
         out, err = self.run_main(
             "--pin-blockers",
             "--pgremapper",
+            "--osd",
             "682",
             pgs=pgs,
             extra_osds=[osd_df_node(77, 92.0)],
@@ -983,7 +1051,11 @@ class MainTest(unittest.TestCase):
     def test_table_says_which_shard_a_blocker_blocks(self):
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, _ = self.run_main(
-            "--pin-blockers", "682", pgs=pgs, extra_osds=[osd_df_node(77, 92.0)]
+            "--pin-blockers",
+            "--osd",
+            "682",
+            pgs=pgs,
+            extra_osds=[osd_df_node(77, 92.0)],
         )
         rows = out.splitlines()
         self.assertEqual(len(rows), 4)  # two header lines + the 2 pins
@@ -995,6 +1067,7 @@ class MainTest(unittest.TestCase):
         out, err = self.run_main(
             "--pin-blockers",
             "--pgremapper",
+            "--osd",
             "682",
             pgs=pgs,
             extra_osds=[osd_df_node(77, 80.0)],
@@ -1007,6 +1080,7 @@ class MainTest(unittest.TestCase):
         out, err = self.run_main(
             "--pin-blockers",
             "--pgremapper",
+            "--osd",
             "682",
             pgs=pgs,
             extra_osds=[osd_df_node(77, 92.0)],
@@ -1022,6 +1096,7 @@ class MainTest(unittest.TestCase):
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, err = self.run_main(
             "--pgremapper",
+            "--osd",
             "682",
             pgs=pgs,
             extra_osds=[osd_df_node(77, 92.0)],
@@ -1034,19 +1109,21 @@ class MainTest(unittest.TestCase):
     def test_chained_pgs_are_left_out_of_the_machine_formats(self):
         chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
         plain = pg("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])
-        out, err = self.run_main("--import-mappings", "682", pgs=[chain, plain])
+        out, err = self.run_main(
+            "--import-mappings", "--osd", "682", pgs=[chain, plain]
+        )
         self.assertEqual(
             json.loads(out), [{"pgid": "19.2", "mapping": {"from": 682, "to": 8}}]
         )
         self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
-        out, err = self.run_main("--pgremapper", "682", pgs=[chain, plain])
+        out, err = self.run_main("--pgremapper", "--osd", "682", pgs=[chain, plain])
         self.assertEqual(out, "19.2 682 8\n")
         self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
         self.assertNotIn("need more than one remap", err)  # 19.2 has one line
 
     def test_the_table_still_shows_a_chained_pg_in_apply_order(self):
         chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
-        out, err = self.run_main("682", pgs=[chain])
+        out, err = self.run_main("--osd", "682", pgs=[chain])
         rows = out.splitlines()
         self.assertEqual(
             [r.split()[:2] for r in rows[2:]], [["19.f", "1"], ["19.f", "0"]]
@@ -1056,23 +1133,67 @@ class MainTest(unittest.TestCase):
 
     def test_import_mappings_is_valid_json_even_with_nothing_to_apply(self):
         # nothing arriving at all
-        out, err = self.run_main("--import-mappings", "682", pgs=[self.PGS[2]])
+        out, err = self.run_main("--import-mappings", "--osd", "682", pgs=[self.PGS[2]])
         self.assertEqual(json.loads(out), [])
         self.assertIn("No backfills", err)
         # only an unpinnable shard (no acting OSD)
-        out, err = self.run_main("--import-mappings", "682", pgs=[self.PGS[1]])
+        out, err = self.run_main("--import-mappings", "--osd", "682", pgs=[self.PGS[1]])
         self.assertEqual(json.loads(out), [])
         self.assertIn("19.a", err)
 
     def test_no_backfills_prints_nothing_on_stdout(self):
-        out, err = self.run_main("--pgremapper", "682", pgs=[self.PGS[2]])
+        out, err = self.run_main("--pgremapper", "--osd", "682", pgs=[self.PGS[2]])
         self.assertEqual(out, "")
         self.assertIn("No backfills", err)
 
     def test_unknown_osd_is_an_error(self):
         with self.assertRaises(SystemExit) as ctx:
-            self.run_main("5000")
+            self.run_main("--osd", "5000")
         self.assertIn("5000", str(ctx.exception))
+
+    def test_exclude_pgs_removes_the_named_pg_only(self):
+        out, err = self.run_main(
+            "--pgremapper", "--osd", "682", "--exclude-pgs", "19.9"
+        )
+        # 19.9 (a plain arrival) is gone; 19.d's companion pin remains
+        self.assertEqual(out, "19.d 682 8\n19.d 9 4\n")
+        self.assertIn("1 of 1 given PG id(s) matched", err)
+        self.assertNotIn("matched nothing", err)
+
+    def test_exclude_pgs_reports_an_entry_that_matched_nothing(self):
+        out, err = self.run_main(
+            "--pgremapper", "--osd", "682", "--exclude-pgs", "19.9", "19.zzz"
+        )
+        self.assertEqual(out, "19.d 682 8\n19.d 9 4\n")
+        self.assertIn("1 of 2 given PG id(s) matched", err)
+        self.assertIn("1 matched nothing (check for typos): 19.zzz", err)
+
+    def test_exclude_pgs_all_entries_matched_nothing(self):
+        # none of PGS involves osd.5000 at all: matched must read as zero,
+        # not silently omit the count.
+        out, err = self.run_main(
+            "--pgremapper", "--osd", "682", "--exclude-pgs", "19.zzz"
+        )
+        self.assertEqual(out, "19.9 682 8\n19.d 682 8\n19.d 9 4\n")
+        self.assertIn("0 of 1 given PG id(s) matched", err)
+        self.assertIn("1 matched nothing (check for typos): 19.zzz", err)
+
+    def test_no_exclude_pgs_note_when_the_flag_is_not_given(self):
+        _, err = self.run_main("--pgremapper", "--osd", "682")
+        self.assertNotIn("--exclude-pgs", err)
+
+    def test_exclude_pgs_note_does_not_claim_a_backfill_that_never_existed(self):
+        # osd.682 is stable here (shard 0); only shard 4 is remapped, and not
+        # onto osd.682. The note must not claim a backfill was skipped, only
+        # that the PG (which does list osd.682 in 'up') matched.
+        stable = pg("19.99", [OSD, 2, 3, 4, 20, 6], [OSD, 2, 3, 4, 9, 6])
+        out, err = self.run_main(
+            "--pgremapper", "--osd", "682", "--exclude-pgs", "19.99", pgs=[stable]
+        )
+        self.assertEqual(out, "")
+        self.assertIn("No backfills into osd.682", err)
+        self.assertIn("1 of 1 given PG id(s) matched", err)
+        self.assertNotIn("had a backfill", err)
 
 
 class AnonymizeTest(unittest.TestCase):
@@ -1268,7 +1389,12 @@ class StateOptionsCliTest(unittest.TestCase):
     def test_save_then_load_reproduces_the_output_without_ceph(self):
         state = self.root / "state"
         live = run_cli(
-            "--save-state", str(state), "--pgremapper", "682", path=self.with_ceph
+            "--save-state",
+            str(state),
+            "--pgremapper",
+            "--osd",
+            "682",
+            path=self.with_ceph,
         )
         self.assertEqual(live.returncode, 0, live.stderr)
         self.assertEqual(live.stdout, "19.9 682 8\n19.d 682 8\n19.d 9 4\n")
@@ -1277,14 +1403,19 @@ class StateOptionsCliTest(unittest.TestCase):
         )
 
         replay = run_cli(
-            "--load-state", str(state), "--pgremapper", "682", path=self.without_ceph
+            "--load-state",
+            str(state),
+            "--pgremapper",
+            "--osd",
+            "682",
+            path=self.without_ceph,
         )
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertEqual(replay.stdout, live.stdout)
 
     def test_saved_state_is_anonymized_but_the_run_reports_real_names(self):
         state = self.root / "state"
-        live = run_cli("--save-state", str(state), "682", path=self.with_ceph)
+        live = run_cli("--save-state", str(state), "--osd", "682", path=self.with_ceph)
         self.assertIn("h2", live.stdout)  # the live table shows the real host
         saved = "".join(f.read_text() for f in state.glob("*.json"))
         for secret in ("h1.example", "secret-rule", "10.1.2.3", "11111111-2222"):
@@ -1292,7 +1423,9 @@ class StateOptionsCliTest(unittest.TestCase):
 
     def test_save_still_happens_when_the_analysis_exits_with_an_error(self):
         state = self.root / "state"
-        result = run_cli("--save-state", str(state), "5000", path=self.with_ceph)
+        result = run_cli(
+            "--save-state", str(state), "--osd", "5000", path=self.with_ceph
+        )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("5000", result.stderr)
         self.assertEqual(
@@ -1303,7 +1436,9 @@ class StateOptionsCliTest(unittest.TestCase):
         state = self.root / "state"
         state.mkdir()
         (state / "x").write_text("")
-        result = run_cli("--save-state", str(state), "682", path=self.with_ceph)
+        result = run_cli(
+            "--save-state", str(state), "--osd", "682", path=self.with_ceph
+        )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not empty", result.stderr)
 
@@ -1311,28 +1446,30 @@ class StateOptionsCliTest(unittest.TestCase):
         state = self.root / "state"
         state.mkdir()
         self.assertEqual(
-            run_cli("--save-state", str(state), "682", path=self.with_ceph).returncode,
+            run_cli(
+                "--save-state", str(state), "--osd", "682", path=self.with_ceph
+            ).returncode,
             0,
         )
 
     def test_load_reports_a_missing_directory_and_a_missing_file(self):
-        result = run_cli("--load-state", str(self.root / "nope"), "682")
+        result = run_cli("--load-state", str(self.root / "nope"), "--osd", "682")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not found", result.stderr)
 
         partial = self.root / "partial"
         partial.mkdir()
-        result = run_cli("--load-state", str(partial), "682")
+        result = run_cli("--load-state", str(partial), "--osd", "682")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing", result.stderr)
 
     def test_pgremapper_and_import_mappings_are_mutually_exclusive(self):
-        result = run_cli("--pgremapper", "--import-mappings", "682")
+        result = run_cli("--pgremapper", "--import-mappings", "--osd", "682")
         self.assertEqual(result.returncode, 2)
         self.assertIn("not allowed with", result.stderr)
 
     def test_the_two_options_are_mutually_exclusive(self):
-        result = run_cli("--load-state", "a", "--save-state", "b", "682")
+        result = run_cli("--load-state", "a", "--save-state", "b", "--osd", "682")
         self.assertEqual(result.returncode, 2)
         self.assertIn("not allowed with", result.stderr)
 
@@ -1390,7 +1527,7 @@ class FixtureReplayTest(unittest.TestCase):
     """Replay the real-cluster snapshot in tests/pg-osd/test-data (see its README.txt)."""
 
     def replay(self, osd, *flags):
-        result = run_cli("--load-state", str(FIXTURE), *flags, str(osd))
+        result = run_cli("--load-state", str(FIXTURE), *flags, "--osd", str(osd))
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -1545,7 +1682,7 @@ class ChainFixtureReplayTest(unittest.TestCase):
     while osd.579 still holds shard 8, which is going to osd.825."""
 
     def replay(self, *flags):
-        result = run_cli("--load-state", str(FIXTURE), *flags, "891")
+        result = run_cli("--load-state", str(FIXTURE), *flags, "--osd", "891")
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -1603,7 +1740,7 @@ class BlockerFixtureReplayTest(unittest.TestCase):
     with --pin-blockers -- this fixture is the reason the flag exists."""
 
     def replay(self, *flags):
-        result = run_cli("--load-state", str(FIXTURE_BLOCKER), *flags, "896")
+        result = run_cli("--load-state", str(FIXTURE_BLOCKER), *flags, "--osd", "896")
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 

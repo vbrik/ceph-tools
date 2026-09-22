@@ -8,7 +8,7 @@ stop-backfills-into-osd-ceph2-osd896-host-clash-companions, once the operator
 had cancelled the other backfills into osd.896 and expected 19.92e to start.
 Made with
 
-  stop-backfills-into-osd.py --save-state <this directory> 896
+  stop-backfills-into-osd.py --save-state <this directory> --osd 896
 
 (same six files as the sibling; osd_dump.json is cut down to the erasure code
 profiles and the full ratios, backfillfull_ratio being 0.91 here.)

@@ -7,7 +7,7 @@ backfillfull_ratio, which keeps the whole PG in backfill_toofull.
 
 Captured: 2026-09-21 from a live cluster, with
 
-  stop-backfills-into-osd.py --save-state <this directory> 896
+  stop-backfills-into-osd.py --save-state <this directory> --osd 896
 
 which stores the (anonymized) output of these commands:
 
