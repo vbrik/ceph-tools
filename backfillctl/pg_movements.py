@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """
 For each PG where 'up' != 'acting', print:
@@ -92,8 +91,9 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 # ---------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    parser = subparsers.add_parser(
+        "pg-movements",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
         help="column to sort output rows by (default: pgid)",
     )
     add_state_args(parser, SNAPSHOT_COMMANDS)
-    return parser.parse_args()
+    return parser
 
 
 # The parts of each pg_stat this script reads.
@@ -222,9 +222,7 @@ _SORT_KEYS = {
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    args = parse_args()
-
+def run(args: argparse.Namespace) -> None:
     store = SnapshotStore.from_args(
         args, SNAPSHOT_COMMANDS, anonymize=anonymize_snapshots
     )
@@ -449,7 +447,3 @@ def main() -> None:
 
     num_pgs = len({r.pgid for r in rows})
     print(f"\n{len(rows)} shard movement(s) across {num_pgs} PG(s).")
-
-
-if __name__ == "__main__":
-    main()

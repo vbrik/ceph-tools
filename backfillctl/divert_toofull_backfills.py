@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """
 Propose upmap re-targets that divert stuck backfill_toofull PGs to emptier OSDs.
@@ -55,7 +54,7 @@ candidates dropped by --min-up-util are counted separately; both are
 reported on stderr so the silence is not ambiguous.
 
 'up'/'acting' are diffed differently per pool type, for the same reason as in
-pg-movements.py: EC shards are identified by position, so index i is diffed
+the pg-movements subcommand: EC shards are identified by position, so index i is diffed
 against index i and the shard index is reported. Replicated replicas are
 interchangeable, so position carries no identity (a same-OSD-set reorder from
 primary-affinity or pg-upmap-items is not movement) and the sets are diffed
@@ -295,12 +294,12 @@ second one when its source osd is that pair's 'to' — so a single call handles
 both cases above. Running it several times in a row for the same PG is a
 different matter: a PG can have more than one diverted shard (rare — one PG
 out of 51 proposed on the cluster-sized test fixture — but real), and
-stop-backfills-into-osd.py's own docstring records a later 'remap' run
-overwriting the pair an earlier one had just added, on a live cluster.
---import-mappings sidesteps that: import-mappings reads the cluster's upmaps
-once and applies every pair of a PG together, so it is the reliable way to
-apply the proposals. --pgremapper warns on stderr whenever a PG needs more
-than one line, for the same reason stop-backfills-into-osd.py does.
+the stop-backfills-into-osd subcommand's own docstring records a later
+'remap' run overwriting the pair an earlier one had just added, on a live
+cluster. --import-mappings sidesteps that: import-mappings reads the
+cluster's upmaps once and applies every pair of a PG together, so it is the
+reliable way to apply the proposals. --pgremapper warns on stderr whenever a
+PG needs more than one line, for the same reason stop-backfills-into-osd does.
 
   - If the upmap balancer is active ('ceph balancer status'), it may undo
     manually placed upmap entries. Consider 'ceph balancer off' while the
@@ -308,13 +307,13 @@ than one line, for the same reason stop-backfills-into-osd.py does.
 
 Review the proposals before applying them. To hand them to pgremapper:
 
-    divert-toofull-backfills.py --import-mappings > mappings.json
+    backfillctl divert-toofull-backfills --import-mappings > mappings.json
     pgremapper-v1.0.0-linux-amd64 import-mappings mappings.json
 
 Give it the file path, not stdin, or its confirmation prompt reads EOF.
 --pgremapper's lines are applied differently, one 'remap' call per line:
 
-    divert-toofull-backfills.py --pgremapper > remaps.txt
+    backfillctl divert-toofull-backfills --pgremapper > remaps.txt
     xargs -a remaps.txt -L1 pgremapper-v1.0.0-linux-amd64 remap
 
 Use 'xargs -a', not '< remaps.txt': with a redirect, xargs points each child's
@@ -399,8 +398,9 @@ def positive_int(text: str) -> int:
     return value
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    parser = subparsers.add_parser(
+        "divert-toofull-backfills",
         description="Propose upmap re-targets that divert stuck "
         "backfill_toofull PGs to emptier OSDs. Every backfill_toofull PG in "
         "the cluster is examined, and each shard newly arriving on an OSD "
@@ -486,7 +486,7 @@ def parse_args() -> argparse.Namespace:
         "usually means a typo.",
     )
     add_state_args(parser, SNAPSHOT_COMMANDS)
-    return parser.parse_args()
+    return parser
 
 
 # ---------------------------------------------------------------------------
@@ -1088,8 +1088,9 @@ def warn_separate_remaps(pgids: list[str]) -> None:
     'pgremapper remap' merges a single invocation's pair into a PG's existing
     upmap entry (see module docstring), but running it once per line for a PG
     with several proposed remaps means several invocations against the same
-    PG, and stop-backfills-into-osd.py's own docstring records a later run
-    overwriting the pair an earlier one had just added, on a live cluster.
+    PG, and the stop-backfills-into-osd subcommand's own docstring records a
+    later run overwriting the pair an earlier one had just added, on a live
+    cluster.
     """
     shown = ", ".join(pgids[:8]) + (
         f", ... ({len(pgids)} in all)" if len(pgids) > 8 else ""
@@ -1109,9 +1110,7 @@ def warn_separate_remaps(pgids: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    args = parse_args()
-
+def run(args: argparse.Namespace) -> None:
     store = SnapshotStore.from_args(args, SNAPSHOT_COMMANDS)
 
     osd_host = fetch_osd_hosts(store)
@@ -1259,7 +1258,3 @@ def main() -> None:
             "Apply these, let them drain, then re-run.",
             file=sys.stderr,
         )
-
-
-if __name__ == "__main__":
-    main()

@@ -1,4 +1,4 @@
-"""Unit tests for divert-toofull-backfills.py.
+"""Unit tests for backfillctl's divert-toofull-backfills subcommand.
 
 Two kinds of bug drive what is tested here, both of which read as
 plausible output rather than as an obvious failure.
@@ -38,13 +38,15 @@ import unittest
 from collections import Counter
 from typing import ClassVar
 
-from _support import FakeStore, load_script, script_path, shared
+from _support import REPO_ROOT, FakeStore, shared
+
+from backfillctl import divert_toofull_backfills as ut
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = script_path("divert-toofull-backfills.py")
+# Argv prefix that runs this subcommand as a subprocess (directory-execution
+# form, works from any cwd): [sys.executable, *CLI, ...subcommand args].
+CLI = [str(REPO_ROOT / "backfillctl"), "divert-toofull-backfills"]
 TEST_DATA = os.path.join(TESTS_DIR, "test-data")
-
-ut = load_script("divert-toofull-backfills.py")
 
 
 # The column labels in order, as print_table's label line splits: the OSD/UTIL/
@@ -579,7 +581,7 @@ class FixtureReplayTest(unittest.TestCase):
 
     def run_proc(self, fixture, *extra):
         return subprocess.run(
-            [sys.executable, SCRIPT, "--load-state", os.path.join(TEST_DATA, fixture)]
+            [sys.executable, *CLI, "--load-state", os.path.join(TEST_DATA, fixture)]
             + list(extra),
             capture_output=True,
             text=True,
@@ -651,7 +653,7 @@ class FixtureReplayTest(unittest.TestCase):
         proc = subprocess.run(
             [
                 sys.executable,
-                SCRIPT,
+                *CLI,
                 "--load-state",
                 os.path.join(
                     TEST_DATA, "divert-toofull-backfills-osd263-existing-upmap-chain"
@@ -689,7 +691,7 @@ class PgsFlagTest(unittest.TestCase):
         return subprocess.run(
             [
                 sys.executable,
-                SCRIPT,
+                *CLI,
                 "--load-state",
                 os.path.join(TEST_DATA, self.FIXTURE),
             ]
@@ -1283,7 +1285,7 @@ def run_ceph2(*extra):
     return subprocess.run(
         [
             sys.executable,
-            SCRIPT,
+            *CLI,
             "--load-state",
             os.path.join(TEST_DATA, CEPH2_FIXTURE),
             *extra,
@@ -1309,7 +1311,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         cls.proc = subprocess.run(
             [
                 sys.executable,
-                SCRIPT,
+                *CLI,
                 "--load-state",
                 os.path.join(TEST_DATA, CEPH2_FIXTURE),
             ],
@@ -1455,7 +1457,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
                 proc = subprocess.run(
                     [
                         sys.executable,
-                        SCRIPT,
+                        *CLI,
                         "--load-state",
                         os.path.join(TEST_DATA, CEPH2_FIXTURE),
                         "--max-target-uses",
@@ -1500,7 +1502,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
                 proc = subprocess.run(
                     [
                         sys.executable,
-                        SCRIPT,
+                        *CLI,
                         "--load-state",
                         os.path.join(TEST_DATA, CEPH2_FIXTURE),
                         "--max-target-util",
@@ -1524,7 +1526,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
                 proc = subprocess.run(
                     [
                         sys.executable,
-                        SCRIPT,
+                        *CLI,
                         "--load-state",
                         os.path.join(TEST_DATA, CEPH2_FIXTURE),
                         f"--max-target-util={value}",
@@ -1540,7 +1542,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         proc = subprocess.run(
             [
                 sys.executable,
-                SCRIPT,
+                *CLI,
                 "--load-state",
                 os.path.join(TEST_DATA, CEPH2_FIXTURE),
                 "--pgremapper",
@@ -1574,7 +1576,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         proc = subprocess.run(
             [
                 sys.executable,
-                SCRIPT,
+                *CLI,
                 "--load-state",
                 os.path.join(TEST_DATA, CEPH2_FIXTURE),
                 "--pgremapper",
@@ -1626,7 +1628,7 @@ class UnknownPoolTest(unittest.TestCase):
             with open(path, "w") as f:
                 json.dump([p for p in pools if p["pool_id"] != 19], f)
             proc = subprocess.run(
-                [sys.executable, SCRIPT, "--load-state", dst],
+                [sys.executable, *CLI, "--load-state", dst],
                 capture_output=True,
                 text=True,
                 check=False,

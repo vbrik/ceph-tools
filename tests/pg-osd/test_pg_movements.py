@@ -1,8 +1,8 @@
-"""Unit tests for pg-movements.py.
+"""Unit tests for backfillctl's pg-movements subcommand.
 
-The progress arithmetic and OSD-slot helpers it shares with the other scripts
+The progress arithmetic and OSD-slot helpers it shares with the others
 are tested in test_shared.py. Here: how PG states are classified and
-abbreviated, and main() end to end over canned snapshots, which pins how
+abbreviated, and run() end to end over canned snapshots, which pins how
 EC (positional) and replicated (set-difference) PGs turn into rows.
 """
 
@@ -14,9 +14,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import SCRIPT_DIR, load_script, shared
+from _support import REPO_ROOT, parse_args, shared
 
-pm = load_script("pg-movements.py")
+from backfillctl import pg_movements as pm
 
 NONE = shared.CRUSH_ITEM_NONE
 
@@ -100,14 +100,14 @@ SNAPSHOTS = {
 class MainTest(unittest.TestCase):
     def run_main(self, *argv, snapshots=SNAPSHOTS):
         out = io.StringIO()
+        args = parse_args(pm, argv)
         with (
             mock.patch.object(
                 shared.SnapshotStore, "json", lambda self, key: snapshots[key]
             ),
-            mock.patch("sys.argv", ["pg-movements.py", *argv]),
             contextlib.redirect_stdout(out),
         ):
-            pm.main()
+            pm.run(args)
         return out.getvalue()
 
     def rows(self, out):
@@ -230,14 +230,12 @@ class MainTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             out = io.StringIO()
+            save_args = parse_args(pm, ["--save-state", tmp + "/snap"])
             with (
                 mock.patch.object(shared, "ceph_json", lambda c: by_command[tuple(c)]),
-                mock.patch(
-                    "sys.argv", ["pg-movements.py", "--save-state", tmp + "/snap"]
-                ),
                 contextlib.redirect_stdout(out),
             ):
-                pm.main()
+                pm.run(save_args)
             saved = json.loads(
                 (pathlib.Path(tmp) / "snap" / "pg_dump_pgs.json").read_text()
             )
@@ -250,14 +248,12 @@ class MainTest(unittest.TestCase):
                 set().union(*(pg["stat_sum"].keys() for pg in saved["pg_stats"])),
             )
             replayed = io.StringIO()
+            load_args = parse_args(pm, ["--load-state", tmp + "/snap"])
             with (
                 mock.patch.object(shared, "ceph_json", side_effect=AssertionError),
-                mock.patch(
-                    "sys.argv", ["pg-movements.py", "--load-state", tmp + "/snap"]
-                ),
                 contextlib.redirect_stdout(replayed),
             ):
-                pm.main()
+                pm.run(load_args)
         self.assertEqual(out.getvalue(), replayed.getvalue())
 
     def test_load_state_reads_the_saved_snapshots(self):
@@ -265,21 +261,17 @@ class MainTest(unittest.TestCase):
             for key, data in SNAPSHOTS.items():
                 (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
             out = io.StringIO()
+            args = parse_args(pm, ["--load-state", tmp])
             with (
                 mock.patch.object(shared, "ceph_json", side_effect=AssertionError),
-                mock.patch("sys.argv", ["pg-movements.py", "--load-state", tmp]),
                 contextlib.redirect_stdout(out),
             ):
-                pm.main()
+                pm.run(args)
         self.assertIn("4 shard movement(s) across 4 PG(s).", out.getvalue())
 
 
 FIXTURE_STUCK_AT_100 = (
-    SCRIPT_DIR.parent
-    / "tests"
-    / "pg-osd"
-    / "test-data"
-    / "ceph1-backfills-stuck-at-100-pct"
+    REPO_ROOT / "tests" / "pg-osd" / "test-data" / "ceph1-backfills-stuck-at-100-pct"
 )
 
 
@@ -288,14 +280,9 @@ class FixtureReplayTest(unittest.TestCase):
 
     def test_progress_100_note_appears_for_the_real_stuck_pgs(self):
         out = io.StringIO()
-        with (
-            mock.patch(
-                "sys.argv",
-                ["pg-movements.py", "--load-state", str(FIXTURE_STUCK_AT_100)],
-            ),
-            contextlib.redirect_stdout(out),
-        ):
-            pm.main()
+        args = parse_args(pm, ["--load-state", str(FIXTURE_STUCK_AT_100)])
+        with contextlib.redirect_stdout(out):
+            pm.run(args)
         value = out.getvalue()
         self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", value)
         # 27.126 has two shards genuinely still backfilling despite reading

@@ -12,19 +12,24 @@ answer questions that come up repeatedly during cluster operation but
 aren't answered directly by a single `ceph` subcommand.
 
 Every script is standalone and can be copied out and run on its own, with
-one exception: `osds-of-pg.py`, `pg-movements.py`, `stop-backfills-into-osd.py`
-and `divert-toofull-backfills.py` in `pg-osd/` share code through
-`pg-osd/shared.py` and must be kept in the same directory (symlinks to them
-work). There is no install step beyond the requirements below. CephFS tools
-live in the `cephfs/` directory and PG/OSD tools in `pg-osd/`; everything else
-is at the top level.
+one exception: `backfillctl` (see below) is a small package, not a single
+file, because its four subcommands share code and more subcommands are
+coming; copy the whole `backfillctl/` directory (symlinks to it work), not
+individual files out of it. There is no install step beyond the requirements
+below. CephFS tools live in the `cephfs/` directory, PG/OSD tools in
+`pg-osd/`, and `backfillctl` at the top level next to them, since — like
+those directories — it stands on its own; everything else is at the top
+level too.
 
 ## Requirements
 
 - A working `ceph` CLI (and `rados`, `ceph-dencoder` for a couple of tools)
   pointed at the target cluster.
-- Python 3 for the `.py` scripts. Most run under the `python3` shebang;
-  `cephfs/client-inodes.py`, `cephfs/find-recent-rctime.py` and
+- Python 3 for the `.py` scripts and for `backfillctl` (run as
+  `python3 backfillctl <subcommand>` or `python3 -m backfillctl <subcommand>`
+  from this repo's root; it's a package, not a single executable file, so it
+  has no shebang of its own). Most `.py` scripts run under the `python3`
+  shebang; `cephfs/client-inodes.py`, `cephfs/find-recent-rctime.py` and
   `pg-osd/scrub-all-pgs-that-need-it.py` use `python`. Stdlib only, except:
   - `cephfs/find-recent-rctime.py` requires `python-dateutil` for its
     flexible `--min-ctime` date parsing.
@@ -48,35 +53,41 @@ other environments.
 
 ### RADOS / OSD
 
-- **`pg-osd/osds-of-pg.py`** — Show a PG's `acting` and `up` OSDs, one row per
+`backfillctl` is a small package (see Requirements above for how to run it),
+not a set of standalone scripts, because its subcommands share code and more
+are coming that will be variations on the existing ones. Run
+`python3 backfillctl <subcommand> --help` (or
+`python3 -m backfillctl <subcommand> --help`) for any of the four below.
+
+- **`backfillctl osds-of-pg`** — Show a PG's `acting` and `up` OSDs, one row per
   shard, with each OSD's utilization and host, the PG's primaries
   marked `*`, remap PROGRESS for shards that are moving (same estimate as
-  `pg-osd/pg-movements.py`, per PG), and the PG's `pg_upmap_items` pairs that touch
+  `backfillctl pg-movements`, per PG), and the PG's `pg_upmap_items` pairs that touch
   each row (UPMAPS). Same grouped ACTING/UP table style as
-  `pg-osd/divert-toofull-backfills.py`. `--save-state DIR` / `--load-state DIR`
+  `backfillctl divert-toofull-backfills`. `--save-state DIR` / `--load-state DIR`
   save the cluster state it read (anonymized, and cut down to the fields the
-  script uses), and replay it offline.
-  `pg-osd/osds-of-pg.py [--save-state DIR | --load-state DIR] <pgid>`
+  subcommand uses), and replay it offline.
+  `backfillctl osds-of-pg [--save-state DIR | --load-state DIR] <pgid>`
 
-- **`pg-osd/pg-movements.py`** — For every PG where `up` != `acting`,
+- **`backfillctl pg-movements`** — For every PG where `up` != `acting`,
   print source/destination OSDs, movement type, per-PG progress, and PG
   state. Progress is derived from the misplaced/degraded object counters,
   which count copies, so it is scaled by the number of shards/replicas
   moving. Those counters can hit zero before the PG actually finishes
   (a known gap, seen on large/contended PGs), so a run where any row reads
-  100% prints a note explaining that; `osds-of-pg.py` and
-  `stop-backfills-into-osd.py` do the same. Handles EC (per-shard) and
+  100% prints a note explaining that; `osds-of-pg` and
+  `stop-backfills-into-osd` do the same. Handles EC (per-shard) and
   replicated (set-diff) pools differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
   `--save-state DIR` / `--load-state DIR` save the cluster state it read
-  (anonymized, and cut down to the fields the script uses), and replay it offline.
-  `pg-osd/pg-movements.py [--sort-by {pgid,from-osd,to-osd}] [--save-state DIR | --load-state DIR]`
+  (anonymized, and cut down to the fields the subcommand uses), and replay it offline.
+  `backfillctl pg-movements [--sort-by {pgid,from-osd,to-osd}] [--save-state DIR | --load-state DIR]`
 
 - **`pg-osd/upmaps-of-osd.sh`** — Show `pg_upmap_items` entries where a
   given OSD is a source or destination.
   `pg-osd/upmaps-of-osd.sh <osd>`
 
-- **`pg-osd/divert-toofull-backfills.py`** —
+- **`backfillctl divert-toofull-backfills`** —
   Propose upmap re-targets that unwedge PGs stuck in `backfill_toofull` on
   full hosts. When an OSD goes out, a `chooseleaf ... type host` CRUSH rule
   retries *inside the same host bucket*, so the dead OSD's PGs pile onto its
@@ -102,7 +113,7 @@ other environments.
   `ceph osd pg-upmap-items`, which replaces the whole entry. A single `remap`
   call merges into a PG's existing `pg_upmap_items`, but separate `remap` runs
   against the same PG can overwrite each other's pairs (seen on a live
-  cluster with the same tool in `stop-backfills-into-osd.py`), so
+  cluster with the same tool in `stop-backfills-into-osd`), so
   `--pgremapper` warns on stderr whenever a PG needs more than one line. An
   OSD can be the
   target of several shards: each shard's size is estimated from its PG
@@ -134,13 +145,13 @@ other environments.
   `--save-state DIR` writes the run's cluster state as JSON, anonymized so it
   can be shared, and `--load-state DIR` replays such a capture offline with no
   cluster access. Handles EC pools per-shard and replicated pools by set
-  difference. See the script's module docstring for the full explanation and
+  difference. See the subcommand's module docstring for the full explanation and
   caveats (`--help` summarizes and points there).
-  `pg-osd/divert-toofull-backfills.py [--import-mappings | --pgremapper]
+  `backfillctl divert-toofull-backfills [--import-mappings | --pgremapper]
   [--min-up-util PERCENT] [--max-target-util PERCENT] [--max-target-uses N]
   [--pgs PGID [PGID ...]] [--save-state DIR | --load-state DIR]`
 
-- **`pg-osd/stop-backfills-into-osd.py`** — List the upmaps needed to stop *all*
+- **`backfillctl stop-backfills-into-osd`** — List the upmaps needed to stop *all*
   backfills into a given OSD, by pinning each arriving shard to the OSD that
   holds it now. Ceph refuses a backfill when the target's *projected* usage
   would pass `backfillfull_ratio`, and every other backfill headed for that OSD
@@ -191,7 +202,7 @@ other environments.
   OSD/pool granularity. `--save-state DIR` writes the run's cluster state as
   JSON, anonymized so it can be shared, and `--load-state DIR` replays such a
   capture offline with no cluster access.
-  `pg-osd/stop-backfills-into-osd.py --osd OSD [--exclude-pgs PGID [PGID ...]] [--pin-blockers] [--import-mappings | --pgremapper] [--save-state DIR | --load-state DIR]`
+  `backfillctl stop-backfills-into-osd --osd OSD [--exclude-pgs PGID [PGID ...]] [--pin-blockers] [--import-mappings | --pgremapper] [--save-state DIR | --load-state DIR]`
 
 - **`pg-osd/scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /
@@ -309,15 +320,15 @@ python3 -m unittest discover -s tests/pg-osd
 python3 -m unittest discover -s tests/cephfs
 ```
 
-The tests load the hyphen-named scripts through `tests/pg-osd/_support.py`,
-which also puts `pg-osd/` on `sys.path` so their `import shared` resolves.
-`tests/pg-osd/test_shared.py` covers `pg-osd/shared.py`: the progress
+The tests import `backfillctl`'s modules through `tests/pg-osd/_support.py`,
+which puts this repo's root on `sys.path` so `from backfillctl import ...`
+resolves. `tests/pg-osd/test_shared.py` covers `backfillctl/shared.py`: the progress
 arithmetic (EC and replicated copy counting), PG/pool helpers, the shared table
 printer and cell formatters, the `--load-state`/`--save-state` snapshot layer,
 and its anonymizer (idempotent, keeps two hosts distinct, scrubs fsid, addresses,
 uuids and names).
 
-The `pg-osd/divert-toofull-backfills.py` tests replay the
+The `backfillctl divert-toofull-backfills` tests replay the
 cluster-state snapshots under `tests/pg-osd/test-data/` via `--load-state` and check the
 output against what each fixture's `README.txt` documents, so fixture and
 code cannot drift apart: the exact table for the small fixtures, and for the
@@ -326,7 +337,7 @@ invariants that matter — no target projected above `--max-target-util`
 (`backfillfull_ratio` minus 1 by default), no target used more than
 `--max-target-uses` times, no shard diverted off an OSD below `nearfull_ratio`.
 
-The `pg-osd/stop-backfills-into-osd.py` tests do the same with two real-cluster
+The `backfillctl stop-backfills-into-osd` tests do the same with two real-cluster
 snapshots in `tests/pg-osd/test-data/stop-backfills-into-osd-*/` (688 remapped PGs;
 one where stopping the backfills into an OSD needs companion pins for 5 of 6
 arriving PGs, and `--pin-blockers` adds blocker pins for those same 5 plus the

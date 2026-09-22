@@ -1,4 +1,4 @@
-Fixture: real, live-cluster snapshot showing pg-movements.py's false-100%
+Fixture: real, live-cluster snapshot showing pg-movements's false-100%
 PROGRESS case (see PROGRESS_100_NOTE / progress_reads_100 in shared.py).
 
 Captured: 2026-09-22, cluster ceph1 (ad1bf53c-a6ca-11ec-b47e-b04f13b8e306),
@@ -6,7 +6,7 @@ Captured: 2026-09-22, cluster ceph1 (ad1bf53c-a6ca-11ec-b47e-b04f13b8e306),
 were the source of 2118 of the cluster's 3623 in-flight shard backfills,
 osd_max_backfills=1). Made with
 
-  pg-movements.py --save-state <this directory>
+  backfillctl pg-movements --save-state <this directory>
 
 19 shard rows read PROGRESS 100% (stat_sum.num_objects_misplaced +
 num_objects_degraded == 0) while still listed (up != acting), all in pool 27
@@ -21,7 +21,7 @@ non-empty backfill_targets, and its backfill scan position
 between repeated queries minutes apart -- genuinely still copying data, not
 wedged. Ceph's own misplaced/degraded counters had simply already hit zero
 before the scan itself reached the PG's actual end. The same 19 PG/shard rows
-were still present, unchanged, across two full pg-movements.py runs several
+were still present, unchanged, across two full pg-movements runs several
 minutes apart, i.e. this can persist far longer than the "reads 100%, about
 to finish" case this heuristic was written for.
 

@@ -1,8 +1,8 @@
-"""Unit tests for osds-of-pg.py.
+"""Unit tests for backfillctl's osds-of-pg subcommand.
 
 The row pairing (EC positional vs replicated set-diff), the UPMAPS matching and
-the table layout are this script's own; the progress arithmetic and cell
-formatting it shares with the other scripts are tested in test_shared.py.
+the table layout are this subcommand's own; the progress arithmetic and cell
+formatting it shares with the others are tested in test_shared.py.
 """
 
 import contextlib
@@ -13,9 +13,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import load_script, shared
+from _support import parse_args, shared
 
-op = load_script("osds-of-pg.py")
+from backfillctl import osds_of_pg as op
 
 NONE = shared.CRUSH_ITEM_NONE
 Row = op.ShardRow
@@ -207,11 +207,9 @@ class MainTest(unittest.TestCase):
 
     def run_main(self, *argv):
         out = io.StringIO()
-        with (
-            mock.patch("sys.argv", ["osds-of-pg.py", *argv]),
-            contextlib.redirect_stdout(out),
-        ):
-            op.main()
+        args = parse_args(op, argv)
+        with contextlib.redirect_stdout(out):
+            op.run(args)
         return out.getvalue()
 
     def test_replicated_pg_from_a_saved_state(self):
