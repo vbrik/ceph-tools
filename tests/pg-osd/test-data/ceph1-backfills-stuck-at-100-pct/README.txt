@@ -33,7 +33,7 @@ it was still active+remapped+backfilling (backfill_targets 208(3), 515(4)),
 with the same two rows still at 100%: this can persist far longer than the
 "reads 100%, about to finish" case the heuristic was written for.
 
-tests/pg-osd/test_pg_movements.py replays this snapshot with --load-state and
+tests/pg-osd/test_show_backfill.py replays this snapshot with --load-state and
 checks that PROGRESS_100_NOTE is printed and that 27.126's two rows still read
 literal 100%; tests/pg-osd/test_backfillctl.py uses it as a real --load-state
 directory for the dispatcher.

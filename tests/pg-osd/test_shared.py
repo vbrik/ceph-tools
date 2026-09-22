@@ -603,7 +603,7 @@ class AnonymizeTest(unittest.TestCase):
         self.assertEqual(once, twice)
 
     def test_works_on_whichever_keys_are_present(self):
-        # show-pg-osds and pg-movements snapshot different keys from the others.
+        # show-pg-osds and show-backfill snapshot different keys from the others.
         for keys in (["osd_tree"], ["osd_dump"], ["pool_ls_detail"], []):
             snaps = {k: v for k, v in self.snapshots().items() if k in keys}
             shared.anonymize_snapshots(snaps)
@@ -622,6 +622,17 @@ class AnonymizeTest(unittest.TestCase):
         fake = shared._fake_hostname("nodigits.example")
         self.assertRegex(fake, r"^host-[0-9a-f]{8}$")
         self.assertEqual(shared._fake_hostname(fake), fake)
+
+
+class ParseOsdTest(unittest.TestCase):
+    def test_bare_and_prefixed(self):
+        self.assertEqual(shared.parse_osd("682"), 682)
+        self.assertEqual(shared.parse_osd("osd.682"), 682)
+
+    def test_rejects_garbage_and_negatives(self):
+        for text in ("", "osd.", "x", "-1", "6.8"):
+            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
+                shared.parse_osd(text)
 
 
 if __name__ == "__main__":

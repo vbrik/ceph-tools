@@ -29,23 +29,23 @@ def run_backfillctl(*argv: str) -> subprocess.CompletedProcess:
 
 class GlobalLoadStateTest(unittest.TestCase):
     def test_accepted_before_the_subcommand(self):
-        result = run_backfillctl("--load-state", str(FIXTURE), "pg-movements")
+        result = run_backfillctl("--load-state", str(FIXTURE), "show-backfill")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("PGID", result.stdout)
 
     def test_rejected_after_the_subcommand(self):
-        result = run_backfillctl("pg-movements", "--load-state", str(FIXTURE))
+        result = run_backfillctl("show-backfill", "--load-state", str(FIXTURE))
         self.assertEqual(result.returncode, 2)
         self.assertIn("unrecognized arguments: --load-state", result.stderr)
 
     def test_listed_in_top_level_help_not_subcommand_help(self):
         self.assertIn("--load-state", run_backfillctl("--help").stdout)
         self.assertNotIn(
-            "--load-state DIR", run_backfillctl("pg-movements", "--help").stdout
+            "--load-state DIR", run_backfillctl("show-backfill", "--help").stdout
         )
 
     def test_missing_directory_is_reported(self):
-        result = run_backfillctl("--load-state", "/nonexistent-dir", "pg-movements")
+        result = run_backfillctl("--load-state", "/nonexistent-dir", "show-backfill")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--load-state directory not found", result.stderr)
 

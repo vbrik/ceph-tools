@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """
-For each PG where 'up' != 'acting', print:
+Show backfills: for each PG where 'up' != 'acting', print:
   - shard index (EC pools only — see below)
   - source OSD(s): OSD(s) losing data (see Note)
   - destination OSD(s): OSD(s) gaining data
@@ -48,13 +48,23 @@ source(s) plus the primary marked with '*', since the primary is doing
 real work here too and showing only the real source would make the row
 look like a plain one-to-one move when the primary is quietly also
 fan-ing out to a second destination.
+
+Filters (all rows by default; given together, a row must pass both):
+  --osds  keep rows showing any of the given OSDs in FROM_OSD or TO_OSD,
+          the '*'-marked primary included, since it carries recovery load.
+          Filters rows, not PGs: for an EC PG, only the shards that touch
+          one of the OSDs are shown.
+  --pgs   keep only rows of the given PGs. A given PG with no movement is
+          named on stderr, since that usually means a typo.
 """
 
 import argparse
+import sys
 from typing import NamedTuple
 
 from shared import (
     PROGRESS_100_NOTE,
+    PgidFilter,
     SnapshotStore,
     abbreviate_state,
     copies_moving,
@@ -66,6 +76,7 @@ from shared import (
     format_progress,
     is_erasure,
     is_real_osd,
+    parse_osd,
     pg_progress_pct,
     pgid_pool_id,
     pgid_sort_key,
@@ -90,7 +101,7 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
-        "pg-movements",
+        "show-backfill",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -99,6 +110,25 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         choices=["pgid", "from-osd", "to-osd"],
         default="pgid",
         help="column to sort output rows by (default: pgid)",
+    )
+    parser.add_argument(
+        "--osds",
+        nargs="+",
+        type=parse_osd,
+        default=[],
+        metavar="OSD",
+        help="Show only rows involving any of these OSDs: as a source, a "
+        "destination, or the '*'-marked primary driving recovery. "
+        "Space-separated, e.g. --osds 12 osd.34.",
+    )
+    parser.add_argument(
+        "--pgs",
+        nargs="+",
+        default=[],
+        metavar="PGID",
+        help="Show only rows of these PG id(s). Space-separated, e.g. --pgs "
+        "19.92e 20.1a3. A given id with no movement is reported on stderr, "
+        "since that usually means a typo.",
     )
     return parser
 
@@ -167,11 +197,16 @@ def _row_pgid_key(row: MovementRow) -> tuple:
     return (*pgid_sort_key(row.pgid), shard_key)
 
 
-def _row_from_osd_key(row: MovementRow) -> tuple:
+def from_osds(row: MovementRow) -> set[int]:
+    """OSD ids the row's FROM_OSD cell shows: sources plus any '*' primary."""
     ids = set(row.sources)
     if (not ids or row.needs_primary_marker) and row.primary is not None:
         ids.add(row.primary)
-    return (tuple(sorted(ids)), pgid_sort_key(row.pgid))
+    return ids
+
+
+def _row_from_osd_key(row: MovementRow) -> tuple:
+    return (tuple(sorted(from_osds(row))), pgid_sort_key(row.pgid))
 
 
 def _row_to_osd_key(row: MovementRow) -> tuple:
@@ -197,13 +232,19 @@ class MovementsResult(NamedTuple):
     carried along only because the table shows them.
     """
 
-    rows: list[MovementRow]  # sorted by --sort-by
+    rows: list[MovementRow]  # sorted by --sort-by; --osds/--pgs applied
+    pgs_filter: PgidFilter | None  # None without --pgs
+    filtered: bool  # --osds or --pgs given
     osd_df: dict[int, dict]
     osd_host: dict[int, str]
 
 
 def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
-    """Fetch the cluster state from store and find every PG movement in it."""
+    """Fetch the cluster state from store and find the PG movements in it.
+
+    All of them, unless narrowed down by --osds and --pgs (see
+    filter_rows).
+    """
     pg_stats = fetch_pg_stats(store, "pg_dump_pgs")
     osd_df = fetch_osd_df(store)
     osd_host = fetch_osd_hosts(store)
@@ -295,15 +336,62 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
                 )
             )
 
+    rows, pgs_filter = filter_rows(rows, set(args.osds), set(args.pgs))
     rows.sort(key=_SORT_KEYS[args.sort_by])
-    return MovementsResult(rows, osd_df, osd_host)
+    return MovementsResult(
+        rows, pgs_filter, bool(args.osds or args.pgs), osd_df, osd_host
+    )
+
+
+def filter_rows(
+    rows: list[MovementRow], osds: set[int], pgids: set[str]
+) -> tuple[list[MovementRow], PgidFilter | None]:
+    """Keep the rows that pass both filters; an empty filter passes everything.
+
+    A row passes osds if any OSD it shows (FROM_OSD, '*' primary included, or
+    TO_OSD) is in it, and passes pgids if its PG is in it. Returns the kept
+    rows and, if pgids is non-empty, which of them matched a moving PG at all
+    (regardless of osds, so that only real typos are flagged as unmatched).
+    """
+    pgs_filter = None
+    if pgids:
+        matched = pgids & {r.pgid for r in rows}
+        pgs_filter = PgidFilter(len(pgids), len(matched), sorted(pgids - matched))
+        rows = [r for r in rows if r.pgid in pgids]
+    if osds:
+        rows = [r for r in rows if osds & (from_osds(r) | r.destinations)]
+    return rows, pgs_filter
+
+
+def print_pgs_filter(pgs_filter: PgidFilter) -> None:
+    """Report on stderr what --pgs matched, naming the ids that matched nothing."""
+    print(
+        f"--pgs: {pgs_filter.matched} of {pgs_filter.given} given PG id(s) "
+        "have movement"
+        + (
+            f"; {len(pgs_filter.unmatched)} matched nothing (not moving, or "
+            "a typo): " + ", ".join(pgs_filter.unmatched)
+            if pgs_filter.unmatched
+            else ""
+        ),
+        file=sys.stderr,
+    )
 
 
 def render(result: MovementsResult) -> None:
-    """Print result's rows as a table, then the footnotes that apply to them."""
-    rows, osd_df, osd_host = result
+    """Print result's rows as a table, then the footnotes that apply to them.
+
+    The --pgs note, if any, goes to stderr first.
+    """
+    rows, pgs_filter, filtered, osd_df, osd_host = result
+    if pgs_filter is not None:
+        print_pgs_filter(pgs_filter)
     if not rows:
-        print("No PG movements detected.")
+        print(
+            "No PG movements match --osds/--pgs."
+            if filtered
+            else "No PG movements detected."
+        )
         return
 
     SEP = "  ->  "  # separator between FROM and TO columns

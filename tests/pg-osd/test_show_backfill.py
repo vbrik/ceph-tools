@@ -1,10 +1,10 @@
-"""Unit tests for backfillctl's pg-movements subcommand.
+"""Unit tests for backfillctl's show-backfill subcommand.
 
 The progress arithmetic and OSD-slot helpers it shares with the others
 are tested in test_shared.py. Here: how PG states are classified and
 abbreviated; plan() over canned snapshots, which pins how EC (positional)
-and replicated (set-difference) PGs turn into rows; and how render() prints
-them.
+and replicated (set-difference) PGs turn into rows; the --osds/--pgs
+filters; and how render() prints them.
 """
 
 import contextlib
@@ -17,7 +17,7 @@ from unittest import mock
 
 from _support import REPO_ROOT, FakeStore, parse_args, plan_from_state, shared
 
-from backfillctl import pg_movements as pm
+from backfillctl import show_backfill as pm
 
 NONE = shared.CRUSH_ITEM_NONE
 
@@ -226,6 +226,78 @@ class MainTest(unittest.TestCase):
             with mock.patch.object(shared, "ceph_json", side_effect=AssertionError):
                 result = plan_from_state(pm, tmp)
         self.assertEqual(4, len(result.rows))
+
+
+class FilterTest(unittest.TestCase):
+    """--osds and --pgs, over PGS: rows 5.3 (2->3), 5.1f (0*->2), 27.9 shard 3
+    (0*->1) and 27.10 shard 1 (3->2); osd.0 is every PG's primary."""
+
+    def pgids(self, *argv, snapshots=SNAPSHOTS):
+        store = FakeStore(snapshots, commands=pm.SNAPSHOT_COMMANDS)
+        return [r.pgid for r in pm.plan(parse_args(pm, argv), store).rows]
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(
+                shared.SnapshotStore, "json", lambda self, key: SNAPSHOTS[key]
+            ),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            pm.run(parse_args(pm, argv))
+        return out.getvalue(), err.getvalue()
+
+    def test_osds_matches_sources_and_destinations(self):
+        self.assertEqual(["5.3", "27.10"], self.pgids("--osds", "3"))
+        self.assertEqual(["5.3", "5.1f", "27.10"], self.pgids("--osds", "2"))
+
+    def test_osds_matches_the_marked_primary_only_where_it_is_shown(self):
+        # osd.0 is primary everywhere, but only 5.1f and 27.9 show it with '*'.
+        self.assertEqual(["5.1f", "27.9"], self.pgids("--osds", "0"))
+
+    def test_osds_is_any_of_and_accepts_osd_prefix(self):
+        self.assertEqual(["5.3", "27.9", "27.10"], self.pgids("--osds", "osd.1", "3"))
+
+    def test_osds_rejects_garbage(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(pm, ["--osds", "x"])
+
+    def test_osds_filters_ec_rows_not_pgs(self):
+        # Shard 0 moves 3->0 and shard 3 moves 0->1; only shard 0 touches osd.3.
+        snaps = {
+            **SNAPSHOTS,
+            "pg_dump_pgs": [
+                pg("27.20", [0, 2, 4, 1], [3, 2, 4, 0], "active+remapped+backfilling")
+            ],
+        }
+        store = FakeStore(snaps, commands=pm.SNAPSHOT_COMMANDS)
+        rows = pm.plan(parse_args(pm, ["--osds", "3"]), store).rows
+        self.assertEqual([("27.20", 0)], [(r.pgid, r.shard) for r in rows])
+
+    def test_pgs_keeps_only_the_given_pgs(self):
+        self.assertEqual(["5.1f", "27.10"], self.pgids("--pgs", "27.10", "5.1f"))
+
+    def test_pgs_and_osds_must_both_match(self):
+        self.assertEqual(["5.3"], self.pgids("--pgs", "5.3", "5.1f", "--osds", "3"))
+
+    def test_pgs_names_ids_with_no_movement_on_stderr(self):
+        # 27.a is clean, 99.1 does not exist: both matched nothing.
+        out, err = self.run_main("--pgs", "5.3", "27.a", "99.1")
+        self.assertIn("--pgs: 1 of 3 given PG id(s) have movement", err)
+        self.assertIn("2 matched nothing (not moving, or a typo): 27.a, 99.1", err)
+        self.assertTrue(out.startswith("PGID"))
+
+    def test_pgs_unmatched_is_judged_before_osds(self):
+        # 5.3 moves, so it is not a typo even though --osds filters it out.
+        out, err = self.run_main("--pgs", "5.3", "--osds", "1")
+        self.assertIn("1 of 1 given PG id(s) have movement", err)
+        self.assertNotIn("matched nothing", err)
+        self.assertEqual("No PG movements match --osds/--pgs.\n", out)
+
+    def test_no_note_without_pgs(self):
+        _, err = self.run_main("--osds", "3")
+        self.assertEqual("", err)
 
 
 FIXTURE_STUCK_AT_100 = (

@@ -6,21 +6,21 @@ its own script (see the module docstring of each file in this directory);
 this wires them together under one command. The one exception is
 --load-state, which every subcommand used to define for itself: it is now a
 global option, given before the subcommand name
-('backfillctl --load-state DIR pg-movements').
+('backfillctl --load-state DIR show-backfill').
 """
 
 import argparse
 
 import divert_toofull_backfills
-import pg_movements
 import save_state
+import show_backfill
 import show_pg_osds
 import stop_backfills_into_osd
 from shared import add_load_state_arg
 
 _COMMAND_MODULES = (
     show_pg_osds,
-    pg_movements,
+    show_backfill,
     divert_toofull_backfills,
     stop_backfills_into_osd,
     save_state,
