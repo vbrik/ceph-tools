@@ -15,21 +15,25 @@ Every script is standalone and can be copied out and run on its own, with
 one exception: `backfillctl` (see below) is a small package, not a single
 file, because its four subcommands share code and more subcommands are
 coming; copy the whole `backfillctl/` directory (symlinks to it work), not
-individual files out of it. There is no install step beyond the requirements
-below. CephFS tools live in the `cephfs/` directory, PG/OSD tools in
-`pg-osd/`, and `backfillctl` at the top level next to them, since — like
-those directories — it stands on its own; everything else is at the top
-level too.
+individual files out of it. `backfillctl.py` at the top level is an optional
+executable shim to `backfillctl/`; copy it alongside `backfillctl/` if you
+want `./backfillctl.py <subcommand>`, otherwise it's not needed. There is no
+install step beyond the requirements below. CephFS tools live in the
+`cephfs/` directory, PG/OSD tools in `pg-osd/`, and `backfillctl` at the top
+level next to them, since — like those directories — it stands on its own;
+everything else is at the top level too.
 
 ## Requirements
 
 - A working `ceph` CLI (and `rados`, `ceph-dencoder` for a couple of tools)
   pointed at the target cluster.
-- Python 3 for the `.py` scripts and for `backfillctl` (run as
+- Python 3 for the `.py` scripts and for `backfillctl`, run as
   `python3 backfillctl <subcommand>` or `python3 -m backfillctl <subcommand>`
-  from this repo's root; it's a package, not a single executable file, so it
-  has no shebang of its own). Most `.py` scripts run under the `python3`
-  shebang; `cephfs/client-inodes.py`, `cephfs/find-recent-rctime.py` and
+  from this repo's root (it's a package, not a single executable file, so it
+  has no shebang of its own), or as `./backfillctl.py <subcommand>` from
+  anywhere, via the executable shim described above. Most `.py` scripts run
+  under the `python3` shebang; `cephfs/client-inodes.py`,
+  `cephfs/find-recent-rctime.py` and
   `pg-osd/scrub-all-pgs-that-need-it.py` use `python`. Stdlib only, except:
   - `cephfs/find-recent-rctime.py` requires `python-dateutil` for its
     flexible `--min-ctime` date parsing.
@@ -62,6 +66,16 @@ Four analyze a cluster; the fifth, `save-state`, captures one so the other
 four can replay it offline with the global `--load-state DIR` option, given
 before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
 (`save-state` itself rejects it).
+
+Shell tab completion is available via [`shtab`](https://docs.iterative.ai/shtab/)
+(not a `backfillctl` dependency; install it separately to generate
+completions): `shtab --shell=bash backfillctl.__main__.build_parser >
+completions.bash` from this repo's root, then source `completions.bash`
+(similarly for `--shell=zsh`). That registers completion only for the literal
+command name `backfillctl`; if you invoke it as `backfillctl.py` (see above),
+also add `complete -F _shtab_backfillctl backfillctl backfillctl.py` after
+sourcing `completions.bash`, to cover both names with the one generated
+script.
 
 - **`backfillctl save-state`** — Capture the live cluster state every other
   subcommand needs into `DIR` (created if missing, must be empty), as one
