@@ -603,7 +603,7 @@ class AnonymizeTest(unittest.TestCase):
         self.assertEqual(once, twice)
 
     def test_works_on_whichever_keys_are_present(self):
-        # osds-of-pg and pg-movements snapshot different keys from the others.
+        # show-pg-osds and pg-movements snapshot different keys from the others.
         for keys in (["osd_tree"], ["osd_dump"], ["pool_ls_detail"], []):
             snaps = {k: v for k, v in self.snapshots().items() if k in keys}
             shared.anonymize_snapshots(snaps)

@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: MIT
 """
-Show the 'acting' and 'up' OSDs of a given Ceph PG, one row per shard, with
-each OSD's utilization and host (CRUSH bucket of type 'host'), the progress of
-shards that are being remapped, and the PG's pg_upmap_items pairs that touch
-the row.
+Show the 'acting' and 'up' OSDs of the given Ceph PGs, one row per shard,
+with each OSD's utilization and host (CRUSH bucket of type 'host'), the
+progress of shards that are being remapped, and the PG's pg_upmap_items pairs
+that touch the row.
 
-Usage: backfillctl osds-of-pg <pgid>
-  e.g. backfillctl osds-of-pg 3.1a2
+Usage: backfillctl show-pg-osds <pgid> [<pgid> ...]
+  e.g. backfillctl show-pg-osds 3.1a2 3.1a3
+
+Each PG gets its own block (a 'PG <pgid>  state: ...' line and a table), in
+the order given, with duplicates dropped; the footnotes follow once, after the
+last block. Every PG is looked up before anything is printed, so an unknown
+PGID fails the run without partial output.
 
 Columns (same two-line grouped header as the divert-toofull-backfills subcommand):
 
@@ -36,8 +41,9 @@ every remapped row shows the same value.
 
 'backfillctl save-state DIR' captures a cluster's state (anonymized, and
 covering every subcommand, not just this one) into DIR; 'backfillctl
---load-state DIR osds-of-pg PGID' then replays it here instead of calling
-'ceph', reading the given PG's row out of the capture's pg_dump_pgs.json.
+--load-state DIR show-pg-osds PGID...' then replays it here instead of
+calling 'ceph', reading the given PGs' rows out of the capture's
+pg_dump_pgs.json.
 """
 
 import argparse
@@ -67,10 +73,10 @@ from shared import (
 )
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces
-# it. pg_query is filled in by run() with this invocation's pgid: live, it is
-# the one command actually issued (one PG, not the whole cluster); --load-state
-# never looks it up, reading pg_dump_pgs.json instead (what 'backfillctl
-# save-state' captures, covering every PG -- see fetch_pg_info).
+# it. run() adds one pg_query_key(pgid) entry per PGID given: live, those are
+# the per-PG commands actually issued (one PG each, not the whole cluster);
+# --load-state never looks them up, reading pg_dump_pgs.json instead (what
+# 'backfillctl save-state' captures, covering every PG -- see fetch_pg_info).
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
     "osd_df": ["ceph", "osd", "df", "--format", "json"],
@@ -99,17 +105,22 @@ COLUMNS = [
 # ---------------------------------------------------------------------------
 
 
+def pg_query_key(pgid: str) -> str:
+    """Return the SnapshotStore key of 'ceph pg <pgid> query' (see run())."""
+    return f"pg_query_{pgid}"
+
+
 def fetch_pg_info(store: SnapshotStore, pgid: str) -> dict:
     """Return the PG's up/acting sets, primaries, state and counters.
 
-    Live, this reads 'pg_query' (see SNAPSHOT_COMMANDS: 'ceph pg <pgid>
-    query', filled in by run() -- one PG, not the whole cluster). From a
+    Live, this reads pg_query_key(pgid) (see SNAPSHOT_COMMANDS: 'ceph pg
+    <pgid> query', added by run() -- one PG, not the whole cluster). From a
     --load-state snapshot (pg_dump_pgs.json, covering every PG -- see the
     save-state subcommand), the same values are read off that PG's own
     pg_stat entry instead.
     """
     if store.load_dir is None:
-        data = store.json("pg_query")
+        data = store.json(pg_query_key(pgid))
         try:
             stats = data.get("info", {}).get("stats", {})
             return {
@@ -203,45 +214,57 @@ def format_row(
 
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
-        "osds-of-pg",
-        description="Show acting/up OSDs of a Ceph PG per shard, with "
+        "show-pg-osds",
+        description="Show acting/up OSDs of Ceph PGs per shard, with "
         "utilization, host, remap progress and upmaps.",
     )
-    parser.add_argument("pgid", help="PG id, e.g. 3.1a2")
+    parser.add_argument("pgids", nargs="+", metavar="pgid", help="PG id, e.g. 3.1a2")
     return parser
 
 
 def run(args: argparse.Namespace) -> None:
-    commands = {
-        **SNAPSHOT_COMMANDS,
-        "pg_query": ["ceph", "pg", args.pgid, "query", "--format", "json"],
+    pgids = list(dict.fromkeys(args.pgids))  # drop duplicates, keep order
+    commands = SNAPSHOT_COMMANDS | {
+        pg_query_key(pgid): ["ceph", "pg", pgid, "query", "--format", "json"]
+        for pgid in pgids
     }
     store = SnapshotStore.from_args(args, commands)
-    pg = fetch_pg_info(store, args.pgid)
-    pool = fetch_pools(store).get(pgid_pool_id(args.pgid))
+    # Look up every PG first, so an unknown one exits before any output.
+    pgs = {pgid: fetch_pg_info(store, pgid) for pgid in pgids}
+    pools = fetch_pools(store)
     osd_host = fetch_osd_hosts(store)
     osd_df = fetch_osd_df(store)
-    pairs = fetch_upmap_items(store).get(args.pgid, [])
+    upmap_items = fetch_upmap_items(store)
 
-    erasure = is_erasure(pool)
-    rows = build_rows(pg["up"], pg["acting"], erasure)
-    pct = pg_progress_pct(
-        pg,
-        copies_moving(
-            pg["up"], pg["acting"], erasure, pool.get("size", 0) if pool else 0
-        ),
-    )
+    any_remapped = any_reads_100 = False
+    for i, (pgid, pg) in enumerate(pgs.items()):
+        pool = pools.get(pgid_pool_id(pgid))
+        pairs = upmap_items.get(pgid, [])
+        erasure = is_erasure(pool)
+        rows = build_rows(pg["up"], pg["acting"], erasure)
+        pct = pg_progress_pct(
+            pg,
+            copies_moving(
+                pg["up"], pg["acting"], erasure, pool.get("size", 0) if pool else 0
+            ),
+        )
 
-    print(f"PG {args.pgid}  state: {pg['state']}\n")
-    print_table(
-        COLUMNS, [format_row(r, pg, pct, osd_df, osd_host, pairs) for r in rows]
-    )
+        if i:
+            print()
+        print(f"PG {pgid}  state: {pg['state']}\n")
+        print_table(
+            COLUMNS, [format_row(r, pg, pct, osd_df, osd_host, pairs) for r in rows]
+        )
 
-    if any(r.remapped for r in rows):
+        if any(r.remapped for r in rows):
+            any_remapped = True
+            any_reads_100 |= progress_reads_100(pct)
+
+    if any_remapped:
         print(
             "\nPROGRESS is per PG (from its object counters), not per shard: "
-            "every remapped row shows the same %."
+            "every remapped row of a PG shows the same %."
         )
-    if any(r.remapped for r in rows) and progress_reads_100(pct):
+    if any_reads_100:
         print(f"\n{PROGRESS_100_NOTE}")
     print("\n* primary")

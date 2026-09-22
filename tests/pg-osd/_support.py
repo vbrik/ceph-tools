@@ -35,7 +35,7 @@ def parse_args(
     """Parse argv through module.build_parser, as backfillctl's dispatcher would.
 
     module is one of backfillctl's command modules (e.g.
-    backfillctl.osds_of_pg); argv excludes the subcommand name, which is
+    backfillctl.show_pg_osds); argv excludes the subcommand name, which is
     inferred from the single subparser the module registers. load_state, if
     given, is passed as the global --load-state, before the subcommand name.
     """

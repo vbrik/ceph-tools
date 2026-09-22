@@ -1,4 +1,4 @@
-"""Unit tests for backfillctl's osds-of-pg subcommand.
+"""Unit tests for backfillctl's show-pg-osds subcommand.
 
 The row pairing (EC positional vs replicated set-diff), the UPMAPS matching and
 the table layout are this subcommand's own; the progress arithmetic and cell
@@ -15,7 +15,7 @@ from unittest import mock
 
 from _support import parse_args, shared
 
-from backfillctl import osds_of_pg as op
+from backfillctl import show_pg_osds as op
 
 NONE = shared.CRUSH_ITEM_NONE
 Row = op.ShardRow
@@ -205,7 +205,7 @@ class MainTest(unittest.TestCase):
     }
 
     SNAPSHOTS = {  # noqa: RUF012
-        "pg_query": PG_QUERY,
+        "pg_query_5.3": PG_QUERY,
         "pg_dump_pgs": PG_DUMP_PGS,
         "osd_tree": {
             "nodes": [
@@ -230,6 +230,26 @@ class MainTest(unittest.TestCase):
         "pool_ls_detail": [{"pool_id": 5, "pool_name": "rep", "type": 1, "size": 2}],
     }
 
+    # A second, clean PG of the same pool (in pg_dump_pgs.json's shape).
+    CLEAN_PG = {  # noqa: RUF012
+        "pgid": "5.4",
+        "state": "active+clean",
+        "up": [2, 4],
+        "up_primary": 2,
+        "acting": [2, 4],
+        "acting_primary": 2,
+        "stat_sum": {"num_objects": 10, "num_objects_misplaced": 0},
+    }
+
+    def write_snapshots(self, tmp, snaps=None):
+        for key, data in (snaps or self.SNAPSHOTS).items():
+            (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
+
+    def two_pg_snapshots(self):
+        snaps = json.loads(json.dumps(self.SNAPSHOTS))  # deep copy
+        snaps["pg_dump_pgs"]["pg_stats"].append(self.CLEAN_PG)
+        return snaps
+
     def run_main(self, *argv, load_state=None):
         out = io.StringIO()
         args = parse_args(op, argv, load_state=load_state)
@@ -239,8 +259,7 @@ class MainTest(unittest.TestCase):
 
     def test_replicated_pg_from_a_saved_state(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for key, data in self.SNAPSHOTS.items():
-                (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
+            self.write_snapshots(tmp)
             out = self.run_main("5.3", load_state=tmp)
         lines = out.splitlines()
         self.assertEqual("PG 5.3  state: active+remapped+backfilling", lines[0])
@@ -275,8 +294,7 @@ class MainTest(unittest.TestCase):
 
     def test_progress_100_note_absent_below_100(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for key, data in self.SNAPSHOTS.items():
-                (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
+            self.write_snapshots(tmp)
             out = self.run_main("5.3", load_state=tmp)
         self.assertNotIn("PROGRESS reads 100%", out)
 
@@ -284,16 +302,14 @@ class MainTest(unittest.TestCase):
         snaps = json.loads(json.dumps(self.SNAPSHOTS))  # deep copy
         snaps["pg_dump_pgs"]["pg_stats"][0]["stat_sum"]["num_objects_misplaced"] = 0
         with tempfile.TemporaryDirectory() as tmp:
-            for key, data in snaps.items():
-                (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
+            self.write_snapshots(tmp, snaps)
             out = self.run_main("5.3", load_state=tmp)
         self.assertIn(" 100%", out)
         self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", out)
 
     def test_load_state_reports_a_pgid_missing_from_the_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for key, data in self.SNAPSHOTS.items():
-                (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
+            self.write_snapshots(tmp)
             with self.assertRaises(SystemExit) as ctx:
                 self.run_main("99.99", load_state=tmp)
         self.assertIn("99.99", str(ctx.exception))
@@ -306,6 +322,88 @@ class MainTest(unittest.TestCase):
         ):
             out = self.run_main("5.3")
         self.assertIn("50%", out)
+
+    def test_several_pgs_print_a_block_each_and_footnotes_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_snapshots(tmp, self.two_pg_snapshots())
+            out = self.run_main("5.4", "5.3", load_state=tmp)
+        headers = [ln for ln in out.splitlines() if ln.startswith("PG ")]
+        self.assertEqual(
+            [
+                "PG 5.4  state: active+clean",
+                "PG 5.3  state: active+remapped+backfilling",
+            ],
+            headers,
+        )
+        # Blocks are separated by a blank line.
+        self.assertIn("\n\nPG 5.3  state:", out)
+        self.assertEqual(1, out.count("* primary"))
+        self.assertEqual(1, out.count("PROGRESS is per PG"))
+
+    def test_footnote_on_progress_only_when_some_pg_is_remapped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_snapshots(tmp, self.two_pg_snapshots())
+            out = self.run_main("5.4", load_state=tmp)
+        self.assertNotIn("PROGRESS is per PG", out)
+        self.assertIn("* primary", out)
+
+    def test_duplicate_pgids_are_shown_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_snapshots(tmp)
+            out = self.run_main("5.3", "5.3", load_state=tmp)
+        self.assertEqual(1, out.count("PG 5.3  state:"))
+
+    def test_unknown_pgid_among_several_fails_before_any_output(self):
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_snapshots(tmp)
+            args = parse_args(op, ["5.3", "99.99"], load_state=tmp)
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
+                op.run(args)
+        self.assertIn("99.99", str(ctx.exception))
+        self.assertEqual("", out.getvalue())
+
+    def test_live_queries_each_pg_once(self):
+        clean_query = {
+            "state": "active+clean",
+            "up": [2, 4],
+            "acting": [2, 4],
+            "info": {"stats": {"up_primary": 2, "acting_primary": 2}},
+        }
+        snaps = {**self.SNAPSHOTS, "pg_query_5.4": clean_query}
+        requested = []
+
+        def fake_json(store, key):
+            requested.append(key)
+            return snaps[key]
+
+        with mock.patch.object(shared.SnapshotStore, "json", fake_json):
+            out = self.run_main("5.3", "5.4", "5.3")
+        self.assertIn("PG 5.3  state:", out)
+        self.assertIn("PG 5.4  state: active+clean", out)
+        pg_queries = [k for k in requested if k.startswith("pg_query_")]
+        self.assertEqual(["pg_query_5.3", "pg_query_5.4"], pg_queries)
+        self.assertNotIn("pg_dump_pgs", requested)
+
+    def test_live_command_per_pgid(self):
+        args = parse_args(op, ["5.3", "5.4"])
+        with mock.patch.object(op.SnapshotStore, "from_args") as from_args:
+            from_args.side_effect = SystemExit  # stop right after building it
+            with self.assertRaises(SystemExit):
+                op.run(args)
+        commands = from_args.call_args.args[1]
+        self.assertEqual(
+            ["ceph", "pg", "5.4", "query", "--format", "json"],
+            commands["pg_query_5.4"],
+        )
+        self.assertIn("pg_query_5.3", commands)
+
+    def test_at_least_one_pgid_required(self):
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            parse_args(op, [])
 
 
 if __name__ == "__main__":
