@@ -92,11 +92,19 @@ other environments.
   follows one shard's path, giving the OSD, utilization and host at each step,
   under a two-line header whose first line spans each group: `ACTING` where
   its data sits now, `UP` the too-full OSD the stalled backfill is aimed at,
-  `TARGET` the proposed replacement. `--pgremapper` switches the output to
-  headerless `<pgid> <from osd> <target osd>` lines, ready to feed to
-  `pgremapper remap` (via `xargs -a remaps.txt -L1 …`), which merges into a
-  PG's existing `pg_upmap_items` — apply with it rather than by hand with
-  `ceph osd pg-upmap-items`, which replaces the whole entry. An OSD can be the
+  `TARGET` the proposed replacement. `--import-mappings` prints a JSON array
+  for `pgremapper import-mappings` instead (prune it with `jq`, then
+  `pgremapper import-mappings file.json`), which applies all of a PG's pairs
+  in one call — the reliable way to apply the proposals, since a PG can (rarely)
+  have more than one diverted shard. `--pgremapper` instead prints headerless
+  `<pgid> <from osd> <target osd>` lines for `pgremapper remap` (via
+  `xargs -a remaps.txt -L1 …`); apply with it rather than by hand with
+  `ceph osd pg-upmap-items`, which replaces the whole entry. A single `remap`
+  call merges into a PG's existing `pg_upmap_items`, but separate `remap` runs
+  against the same PG can overwrite each other's pairs (seen on a live
+  cluster with the same tool in `stop-backfills-into-osd.py`), so
+  `--pgremapper` warns on stderr whenever a PG needs more than one line. An
+  OSD can be the
   target of several shards: each shard's size is estimated from its PG
   (`num_bytes`, divided by `k` for EC pools) and projected onto the target —
   together with the shards already sent to it and every shard still arriving
@@ -128,9 +136,9 @@ other environments.
   cluster access. Handles EC pools per-shard and replicated pools by set
   difference. See the script's module docstring for the full explanation and
   caveats (`--help` summarizes and points there).
-  `pg-osd/divert-toofull-backfills.py [--pgremapper] [--min-up-util
-  PERCENT] [--max-target-util PERCENT] [--max-target-uses N] [--pgs PGID
-  [PGID ...]] [--save-state DIR | --load-state DIR]`
+  `pg-osd/divert-toofull-backfills.py [--import-mappings | --pgremapper]
+  [--min-up-util PERCENT] [--max-target-util PERCENT] [--max-target-uses N]
+  [--pgs PGID [PGID ...]] [--save-state DIR | --load-state DIR]`
 
 - **`pg-osd/stop-backfills-into-osd.py`** — List the upmaps needed to stop *all*
   backfills into a given OSD, by pinning each arriving shard to the OSD that
