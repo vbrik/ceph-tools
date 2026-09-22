@@ -32,12 +32,6 @@ class MovementTypeTest(unittest.TestCase):
     def test_remapped_without_an_active_pipeline(self):
         self.assertEqual(pm.movement_type("active+remapped"), "remapped")
 
-    def test_abbreviations_keep_unknown_flags(self):
-        self.assertEqual(
-            pm.abbreviate_state("active+remapped+backfill_wait+brand_new"),
-            "act+remap+bkfl_wt+brand_new",
-        )
-
 
 def pg(pgid, up, acting, state, **stat):
     return {

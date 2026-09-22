@@ -57,6 +57,7 @@ from typing import NamedTuple
 from shared import (
     PROGRESS_COUNTERS,
     SnapshotStore,
+    abbreviate_state,
     add_state_args,
     copies_moving,
     ec_shard_moves,
@@ -141,40 +142,6 @@ def anonymize_snapshots(snapshots: dict[str, object]) -> None:
 # A PG can be in multiple states simultaneously (e.g. degraded+backfilling).
 _RECOVERY_FLAGS = {"recovering", "recovery_wait", "recovery_toofull"}
 _BACKFILL_FLAGS = {"backfilling", "backfill_wait", "backfill_toofull"}
-
-_STATE_ABBREVS = {
-    "active": "act",
-    "clean": "cln",
-    "degraded": "deg",
-    "undersized": "undsz",
-    "remapped": "remap",
-    "recovering": "rcvr",
-    "recovery_wait": "rcvr_wt",
-    "recovery_toofull": "rcvr_tf",
-    "forced_recovery": "frc_rcvr",
-    "backfilling": "bkfl",
-    "backfill_wait": "bkfl_wt",
-    "backfill_toofull": "bkfl_tf",
-    "forced_backfill": "frc_bkfl",
-    "peering": "prng",
-    "peered": "prd",
-    "scrubbing": "scrb",
-    "deep": "dp",
-    "repair": "rep",
-    "inconsistent": "incon",
-    "incomplete": "incomp",
-    "stale": "stl",
-    "down": "dn",
-    "creating": "crt",
-    "snaptrim": "snptrim",
-    "snaptrim_wait": "snptrim_wt",
-    "snaptrim_error": "snptrim_err",
-    "wait": "wt",
-}
-
-
-def abbreviate_state(state: str) -> str:
-    return "+".join(_STATE_ABBREVS.get(f, f) for f in state.split("+"))
 
 
 def movement_type(state: str) -> str:

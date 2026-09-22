@@ -566,22 +566,62 @@ def format_progress(pct: float | None) -> str:
     return NOT_APPLICABLE if pct is None else f"{math.floor(pct)}%"
 
 
+# Short forms of PG state flags for table cells; unknown flags pass through.
+_STATE_ABBREVS = {
+    "active": "act",
+    "clean": "cln",
+    "degraded": "deg",
+    "undersized": "undsz",
+    "remapped": "remap",
+    "recovering": "rcvr",
+    "recovery_wait": "rcvr_wt",
+    "recovery_toofull": "rcvr_tf",
+    "forced_recovery": "frc_rcvr",
+    "backfilling": "bkfl",
+    "backfill_wait": "bkfl_wt",
+    "backfill_toofull": "bkfl_tf",
+    "forced_backfill": "frc_bkfl",
+    "peering": "prng",
+    "peered": "prd",
+    "scrubbing": "scrb",
+    "deep": "dp",
+    "repair": "rep",
+    "inconsistent": "incon",
+    "incomplete": "incomp",
+    "stale": "stl",
+    "down": "dn",
+    "creating": "crt",
+    "snaptrim": "snptrim",
+    "snaptrim_wait": "snptrim_wt",
+    "snaptrim_error": "snptrim_err",
+    "wait": "wt",
+}
+
+
+def abbreviate_state(state: str) -> str:
+    """Abbreviate each flag of a '+'-joined PG state, e.g. 'act+remap+bkfl_wt'."""
+    return "+".join(_STATE_ABBREVS.get(flag, flag) for flag in state.split("+"))
+
+
 def osd_cells(
     osd_df: dict[int, dict],
     osd_host: dict[int, str],
     osd_id: int | None,
     primary: int | None = None,
+    *,
+    bare_id: bool = False,
 ) -> list[str]:
     """Return the [OSD, UTIL, HOST] cells for one slot.
 
-    An empty slot (osd_id None) reads 'none', '-', '-'. The OSD that is the
-    PG's `primary` gets a trailing '*'.
+    The OSD reads 'osd.N', or just 'N' with bare_id. An empty slot (osd_id
+    None) reads 'none', '-', '-'. The OSD that is the PG's `primary` gets a
+    trailing '*'.
     """
     if osd_id is None:
         return ["none", NOT_APPLICABLE, NOT_APPLICABLE]
     star = "*" if osd_id == primary else ""
     return [
-        f"osd.{osd_id}{star}",
+        f"{osd_id if bare_id else f'osd.{osd_id}'}{star}",
         format_utilization(osd_df, osd_id),
         osd_host.get(osd_id, "?"),
     ]

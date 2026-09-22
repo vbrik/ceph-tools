@@ -141,10 +141,10 @@ other environments.
     whole PG back, including the shard you want to keep (e.g. `99 -> 337`
     blocking `231 -> 896`).
 
-  It does not pick which backfills to keep: the table shows each shard's up and
-  acting OSD (with utilization and host, under a two-line header whose first
-  line spans each of the `UP` and `ACTING` groups), size, PG progress and state
-  (cancelling a running backfill discards its progress). You drop the entries
+  It does not pick which backfills to keep: the table shows each shard's acting and
+  up OSD (bare ids, with utilization and host, under a two-line header whose
+  first line spans each of the `ACTING` and `UP` groups), size, PG progress and
+  abbreviated state (cancelling a running backfill discards its progress). You drop the entries
   for the ones to let proceed, but keep the blockers of any shard you keep,
   and drop companions with the entry they belong to.
   `--import-mappings` prints a JSON array for `pgremapper import-mappings`

@@ -591,7 +591,7 @@ class PlanCompanionsTest(unittest.TestCase):
 
 
 def column_names() -> list[str]:
-    """The table columns as one name each, e.g. 'UP OSD'; 'SIZE' has no group."""
+    """The table columns as one name each, e.g. 'ACTING OSD'; 'SIZE' has no group."""
     return [f"{group} {label}".strip() for group, label in cb.COLUMNS]
 
 
@@ -607,7 +607,7 @@ class OutputTest(unittest.TestCase):
 
     def test_row_marks_companions_in_the_note_column(self):
         cells = dict(zip(column_names(), cb.format_row(self.cancellation(0), {}, {})))
-        self.assertEqual(cells["UP OSD"], "osd.149")
+        self.assertEqual(cells["UP OSD"], "149")
         self.assertEqual((cells["UP UTIL"], cells["UP HOST"]), ("?", "?"))
         self.assertEqual(cells["NOTE"], "companion of shard 0")
         plain = dict(zip(column_names(), cb.format_row(self.cancellation(), {}, {})))
@@ -621,12 +621,32 @@ class UpAndActingColumnsTest(unittest.TestCase):
         cells = dict(zip(column_names(), cb.format_row(c, osd_df, {5: "hu", 7: "ha"})))
         self.assertEqual(
             (cells["UP OSD"], cells["UP UTIL"], cells["UP HOST"]),
-            ("osd.5", "91.2%", "hu"),
+            ("5", "91.2%", "hu"),
         )
         self.assertEqual(
             (cells["ACTING OSD"], cells["ACTING UTIL"], cells["ACTING HOST"]),
-            ("osd.7", "80.0%", "ha"),
+            ("7", "80.0%", "ha"),
         )
+
+    def test_acting_columns_come_before_up_columns(self):
+        self.assertEqual(
+            column_names()[2:8],
+            [
+                "ACTING OSD",
+                "ACTING UTIL",
+                "ACTING HOST",
+                "UP OSD",
+                "UP UTIL",
+                "UP HOST",
+            ],
+        )
+
+    def test_state_is_abbreviated(self):
+        c = cb.Cancellation(
+            "19.1", 0, 5, 7, 1_000, "active+remapped+backfill_wait", None
+        )
+        cells = dict(zip(column_names(), cb.format_row(c, {}, {})))
+        self.assertEqual(cells["STATE"], "act+remap+bkfl_wt")
 
     def test_missing_figures_show_a_question_mark(self):
         c = cb.Cancellation("19.1", 0, 5, 7, 1_000, "s", None)
@@ -725,29 +745,29 @@ class PrintTableTest(unittest.TestCase):
     def test_no_rows_prints_just_the_two_header_lines(self):
         group_line, label_line = self.printed([])
         self.assertEqual(label_line.split(), [label for _, label in cb.COLUMNS])
-        self.assertEqual(group_line.replace("-", " ").split(), ["UP", "ACTING"])
+        self.assertEqual(group_line.replace("-", " ").split(), ["ACTING", "UP"])
 
     def test_group_names_are_centered_in_dashes_over_their_columns(self):
-        row = ["19.1", "0", "osd.5", "91.2%", "host05", "osd.7", "80.0%", "host07"]
+        row = ["19.1", "0", "77", "80.0%", "host07", "55", "91.2%", "host05"]
         row += ["1.0 GiB", "50%", "active+remapped+backfilling", ""]
         group_line, label_line, data_line = self.printed([row])
         # each group's name sits centered in dashes over its OSD..HOST columns
         # (as wide as their widest cells), and nothing spans the ungrouped ones
-        up_start = label_line.index("OSD")
-        up_end = data_line.index("host05") + len("host05")
-        span = group_line[up_start:up_end]
-        self.assertEqual(span.strip("- "), "UP")
-        self.assertTrue(span.startswith("-") and span.endswith("-"))
-        acting_start = label_line.index("OSD", up_end)
+        acting_start = label_line.index("OSD")
         acting_end = data_line.index("host07") + len("host07")
         span = group_line[acting_start:acting_end]
         self.assertEqual(span.strip("- "), "ACTING")
         self.assertTrue(span.startswith("-") and span.endswith("-"))
-        self.assertEqual(group_line[:up_start].strip(), "")
-        self.assertEqual(len(group_line.rstrip()), acting_end)
+        up_start = label_line.index("OSD", acting_end)
+        up_end = data_line.index("host05") + len("host05")
+        span = group_line[up_start:up_end]
+        self.assertEqual(span.strip("- "), "UP")
+        self.assertTrue(span.startswith("-") and span.endswith("-"))
+        self.assertEqual(group_line[:acting_start].strip(), "")
+        self.assertEqual(len(group_line.rstrip()), up_end)
         # each cell sits under its own label
-        self.assertEqual(data_line.index("osd.5"), up_start)
-        self.assertEqual(data_line.index("osd.7"), acting_start)
+        self.assertEqual(data_line.index("77"), acting_start)
+        self.assertEqual(data_line.index("55"), up_start)
 
     def test_groups_are_set_apart_by_wider_gaps_than_columns(self):
         _, label_line = self.printed([])
@@ -859,10 +879,11 @@ class MainTest(unittest.TestCase):
         lines = out.splitlines()
         self.assertIn("PGID", lines[1])
         self.assertEqual(len(lines), 5)  # two header lines + the 3 pins
-        for cell in ("19.9", "osd.682", "osd.8", "90.5%", "h2", "backfilling"):
+        for cell in ("19.9", "682", "8", "90.5%", "h2", "bkfl"):
             self.assertIn(cell, lines[2])
-        # the UP OSD (osd.682) gets its own utilization and host too
-        self.assertRegex(lines[2], r"osd\.682\s+88\.0%\s+h1\s+osd\.8\s+90\.5%\s+h2")
+        # the acting OSD (8) comes first, then the UP OSD (682) with its own
+        # utilization and host; both are bare ids
+        self.assertRegex(lines[2], r"\s8\s+90\.5%\s+h2\s+682\s+88\.0%\s+h1")
         self.assertIn("companion of shard 0", lines[4])
 
     def test_import_mappings_is_json_with_every_pair_and_no_warning(self):
@@ -1380,8 +1401,8 @@ class ChainFixtureReplayTest(unittest.TestCase):
     def test_the_table_lists_the_pair_that_frees_osd_579_first(self):
         rows = [r.split() for r in self.replay().stdout.splitlines() if "19.1299" in r]
         self.assertEqual(
-            [(r[1], r[2], r[5]) for r in rows],
-            [("8", "osd.579", "osd.825"), ("1", "osd.891", "osd.579")],
+            [(r[1], r[5], r[2]) for r in rows],  # shard, UP OSD, ACTING OSD
+            [("8", "579", "825"), ("1", "891", "579")],
         )
 
     def test_machine_formats_leave_it_out_and_the_warning_gives_the_command(self):

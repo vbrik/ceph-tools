@@ -346,6 +346,25 @@ class CellTest(unittest.TestCase):
         self.assertEqual(shared.osd_cells(self.DF, {}, 1, primary=1)[0], "osd.1*")
         self.assertEqual(shared.osd_cells(self.DF, {}, 1, primary=2)[0], "osd.1")
 
+    def test_osd_cells_bare_id(self):
+        host = {1: "h1"}
+        self.assertEqual(
+            shared.osd_cells(self.DF, host, 1, bare_id=True), ["1", "92.5%", "h1"]
+        )
+        self.assertEqual(
+            shared.osd_cells(self.DF, {}, 1, primary=1, bare_id=True)[0], "1*"
+        )
+        self.assertEqual(
+            shared.osd_cells(self.DF, {}, None, bare_id=True), ["none", "-", "-"]
+        )
+
+    def test_abbreviate_state(self):
+        self.assertEqual(
+            shared.abbreviate_state("active+remapped+backfill_wait+brand_new"),
+            "act+remap+bkfl_wt+brand_new",
+        )
+        self.assertEqual(shared.abbreviate_state(""), "")
+
     def test_osd_cells_empty_slot(self):
         self.assertEqual(shared.osd_cells(self.DF, {}, None), ["none", "-", "-"])
 

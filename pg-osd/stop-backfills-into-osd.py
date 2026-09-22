@@ -148,6 +148,7 @@ from shared import (
     KIB,
     POOL_TYPE_ERASURE,
     SnapshotStore,
+    abbreviate_state,
     add_state_args,
     copies_moving,
     fetch_crush_rules,
@@ -604,18 +605,19 @@ def plan_cancellations(
 
 # Each entry is (group, label); the header is printed on two lines, the group
 # name spanning its columns above their labels, and an empty group means the
-# column has no group line. The UP group is where CRUSH wants the shard (the
-# 'from' of the upmap pair), ACTING where its data is now (the 'to').
-# print_table leaves the final column unpadded.
+# column has no group line. The ACTING group is where the shard's data is now
+# (the 'to' of the upmap pair), UP where CRUSH wants it (the 'from'). OSDs are
+# bare ids, as 'pgremapper' takes them. print_table leaves the final column
+# unpadded.
 COLUMNS = [
     ("", "PGID"),
     ("", "SHARD"),
-    ("UP", "OSD"),
-    ("UP", "UTIL"),
-    ("UP", "HOST"),
     ("ACTING", "OSD"),
     ("ACTING", "UTIL"),
     ("ACTING", "HOST"),
+    ("UP", "OSD"),
+    ("UP", "UTIL"),
+    ("UP", "HOST"),
     ("", "SIZE"),
     ("", "PROGRESS"),
     ("", "STATE"),
@@ -653,11 +655,11 @@ def format_row(
     return [
         c.pgid,
         str(c.shard),
-        *osd_cells(osd_df, osd_host, c.up_osd),
-        *osd_cells(osd_df, osd_host, c.acting_osd),
+        *osd_cells(osd_df, osd_host, c.acting_osd, bare_id=True),
+        *osd_cells(osd_df, osd_host, c.up_osd, bare_id=True),
         format_bytes(c.size_bytes),
         format_progress(c.progress_pct),
-        c.state,
+        abbreviate_state(c.state),
         format_note(c),
     ]
 
