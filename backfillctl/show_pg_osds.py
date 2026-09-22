@@ -13,7 +13,7 @@ the order given, with duplicates dropped; the footnotes follow once, after the
 last block. Every PG is looked up before anything is printed, so an unknown
 PGID fails the run without partial output.
 
-Columns (same two-line grouped header as the divert-toofull-backfills subcommand):
+Columns (same two-line grouped header as the divert-toofull subcommand):
 
   SHARD      EC shard index, '-' for replicated pools (see below)
   ACTING     OSD holding the shard's data now, with its UTIL and HOST

@@ -1,4 +1,4 @@
-Fixture: genuine no-problems path for divert-toofull-backfills
+Fixture: genuine no-problems path for divert-toofull
 -- i.e. the case where 'ceph pg ls backfill_toofull' matches nothing.
 
 SYNTHETIC: pg_dump_pgs.json (originally saved as pg_ls_backfill_toofull.json;
@@ -6,7 +6,7 @@ renamed, content unchanged, to match 'backfillctl save-state''s later
 unified snapshot format) is hand-written, not captured. At
 capture time (2026-08-11 ~09:05) the live cluster had an active instance of
 the target scenario (osd.457 down on host27 -- see the sibling
-../divert-toofull-backfills-osd457-down/ fixture), so there was no genuinely
+../divert-toofull-osd457-down/ fixture), so there was no genuinely
 problem-free moment to capture from. Its content is exactly what
 'ceph pg ls backfill_toofull --format json' returns when nothing matches
 (see _extract_pg_stats()'s "pg_ready" comment in the script):
@@ -15,7 +15,7 @@ problem-free moment to capture from. Its content is exactly what
 
 The other five files (osd_tree.json, osd_df.json, osd_dump.json,
 pool_ls_detail.json, crush_rule_dump.json) are the real snapshot from that
-same capture, copied verbatim from ../divert-toofull-backfills-osd457-down/ --
+same capture, copied verbatim from ../divert-toofull-osd457-down/ --
 cluster topology/weights are independent of which PGs are backfill_toofull,
 so reusing them here is faithful, not fabricated.
 
@@ -30,7 +30,7 @@ osd.457 is back up/replaced and 19.21f has cleared backfill_toofull.
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 
-  backfillctl divert-toofull-backfills --load-state .
+  backfillctl divert-toofull --load-state .
 
 ANONYMIZED: cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule
 names have been replaced with deterministic fake values (see

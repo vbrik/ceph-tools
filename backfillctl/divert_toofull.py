@@ -232,10 +232,10 @@ fetch_backfill_toofull_pg_stats) rather than a full 'pg dump pgs'.
 'backfillctl save-state DIR' captures a cluster's state — anonymized, and
 covering every subcommand, not just this one — into DIR, as one '<key>.json'
 file per command including a full 'ceph pg dump pgs'. 'backfillctl
---load-state DIR divert-toofull-backfills ...' then reads those files back
+--load-state DIR divert-toofull ...' then reads those files back
 instead of calling 'ceph', filtering pg_dump_pgs client-side for the PGs in
 backfill_toofull, so a captured state can be replayed offline with no
-cluster access. tests/pg-osd/test-data/divert-toofull-backfills-*/ hold
+cluster access. tests/pg-osd/test-data/divert-toofull-*/ hold
 sample captures usable directly as --load-state arguments, each with a
 README.txt describing the scenario and what the script should reproduce
 from it — the exact table for the small fixtures, and for the cluster-sized
@@ -295,13 +295,13 @@ PG needs more than one line, for the same reason stop-backfills-into-osd does.
 
 Review the proposals before applying them. To hand them to pgremapper:
 
-    backfillctl divert-toofull-backfills --import-mappings > mappings.json
+    backfillctl divert-toofull --import-mappings > mappings.json
     pgremapper-v1.0.0-linux-amd64 import-mappings mappings.json
 
 Give it the file path, not stdin, or its confirmation prompt reads EOF.
 --pgremapper's lines are applied differently, one 'remap' call per line:
 
-    backfillctl divert-toofull-backfills --pgremapper > remaps.txt
+    backfillctl divert-toofull --pgremapper > remaps.txt
     xargs -a remaps.txt -L1 pgremapper-v1.0.0-linux-amd64 remap
 
 Use 'xargs -a', not '< remaps.txt': with a redirect, xargs points each child's
@@ -354,7 +354,7 @@ DEFAULT_MAX_TARGET_USES = 5
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces
 # it. Keys match the fixtures under tests/pg-osd/test-data/
-# divert-toofull-backfills-*/ verbatim, so those directories can be passed
+# divert-toofull-*/ verbatim, so those directories can be passed
 # straight to --load-state. pg_ls_backfill_toofull is what a live run
 # actually issues (see fetch_backfill_toofull_pg_stats): a small fraction of
 # the full 'pg dump pgs' on a big cluster. --load-state instead reads
@@ -408,7 +408,7 @@ def positive_int(text: str) -> int:
 
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
-        "divert-toofull-backfills",
+        "divert-toofull",
         description="Propose upmap re-targets that divert stuck "
         "backfill_toofull PGs to emptier OSDs. Every backfill_toofull PG in "
         "the cluster is examined, and each shard newly arriving on an OSD "
@@ -604,7 +604,7 @@ def shard_size_bytes(pg: dict, pool: dict, ec_profiles: dict[str, dict]) -> int:
     return size
 
 
-class DivertedShard(NamedTuple):
+class ArrivingShard(NamedTuple):
     """A shard newly arriving on a host that is too full to take it."""
 
     pgid: str
@@ -635,9 +635,9 @@ def filter_toofull_pgs(
     return kept, matched
 
 
-def find_diverted_shards(
+def find_arriving_shards(
     pg: dict, is_ec: bool, size_bytes: int = 0
-) -> list[DivertedShard]:
+) -> list[ArrivingShard]:
     """Return the shards of one PG that are newly arriving on their up OSD.
 
     size_bytes is the size of each of them (all shards of a PG are the same
@@ -657,7 +657,7 @@ def find_diverted_shards(
             acting_osd = slot(acting, i)
             if up_osd is None or up_osd == acting_osd:
                 continue
-            found.append(DivertedShard(pgid, i, up_osd, acting_osd, up, size_bytes))
+            found.append(ArrivingShard(pgid, i, up_osd, acting_osd, up, size_bytes))
     else:
         # Replicated: replicas are interchangeable, so position means nothing
         # and only the set difference is real movement.
@@ -673,16 +673,16 @@ def find_diverted_shards(
         pairing_is_clear = len(departing) == 1 and len(arriving) == 1
         for up_osd in arriving:
             acting_osd = departing[0] if pairing_is_clear else None
-            found.append(DivertedShard(pgid, "-", up_osd, acting_osd, up, size_bytes))
+            found.append(ArrivingShard(pgid, "-", up_osd, acting_osd, up, size_bytes))
 
     return found
 
 
 def select_stuck_shards(
-    shards: list[DivertedShard],
+    shards: list[ArrivingShard],
     osd_df: dict[int, dict],
     min_up_util: float,
-) -> tuple[list[DivertedShard], list[DivertedShard]]:
+) -> tuple[list[ArrivingShard], list[ArrivingShard]]:
     """Split arriving shards into those worth diverting and those to leave be.
 
     backfill_toofull is reported per PG, but a PG can have several shards
@@ -787,7 +787,7 @@ class SourcePressure:
     def __init__(self, osd_df: dict[int, dict]):
         self._used, self._capacity = usage_and_capacity(osd_df)
 
-    def utilization(self, shard: DivertedShard) -> float:
+    def utilization(self, shard: ArrivingShard) -> float:
         """Return the shard's acting OSD's projected utilization (percent).
 
         -inf when it is not known (the usual out-OSD case, where the acting
@@ -798,7 +798,7 @@ class SourcePressure:
             return -math.inf
         return self._used[osd_id] / self._capacity[osd_id] * 100
 
-    def relieve(self, shard: DivertedShard) -> None:
+    def relieve(self, shard: ArrivingShard) -> None:
         """Record that shard is placed, so its acting OSD will lose it."""
         if shard.acting_osd in self._used:
             self._used[shard.acting_osd] -= shard.size_bytes
@@ -826,7 +826,7 @@ class ProjectedUsage:
     projected usage rather than today's (see module docstring).
     """
 
-    def __init__(self, osd_df: dict[int, dict], arriving: list[DivertedShard]):
+    def __init__(self, osd_df: dict[int, dict], arriving: list[ArrivingShard]):
         self._used, self._capacity = usage_and_capacity(osd_df)
         for shard in arriving:
             if shard.up_osd in self._used:
@@ -836,7 +836,7 @@ class ProjectedUsage:
         """Return the OSD's projected utilization (percent) with extra_bytes more."""
         return (self._used[osd_id] + extra_bytes) / self._capacity[osd_id] * 100
 
-    def redirect(self, shard: DivertedShard, target_osd: int) -> None:
+    def redirect(self, shard: ArrivingShard, target_osd: int) -> None:
         """Record that shard goes to target_osd instead of its UP OSD."""
         if shard.up_osd in self._used:
             self._used[shard.up_osd] -= shard.size_bytes
@@ -844,7 +844,7 @@ class ProjectedUsage:
 
 
 class Proposal(NamedTuple):
-    shard: DivertedShard
+    shard: ArrivingShard
     target_osd: int
     target_host: str
     target_utilization: float  # current, from 'ceph osd df'
@@ -852,7 +852,7 @@ class Proposal(NamedTuple):
 
 
 def assign_targets(
-    shards: list[DivertedShard],
+    shards: list[ArrivingShard],
     candidates: dict[str, list[int]],
     osd_host: dict[int, str],
     osd_df: dict[int, dict],
@@ -861,7 +861,7 @@ def assign_targets(
     projection: ProjectedUsage,
     max_uses: int,
     max_target_util: float,
-) -> tuple[list[Proposal], list[DivertedShard]]:
+) -> tuple[list[Proposal], list[ArrivingShard]]:
     """Greedily give each diverted shard the legal target that ends up emptiest.
 
     Legal means: same device class, host and OSD not already used by the PG,
@@ -1126,7 +1126,7 @@ class DivertResult(NamedTuple):
     """
 
     proposals: list[Proposal]  # in PG, then shard, order
-    unplaceable: list[DivertedShard]
+    unplaceable: list[ArrivingShard]
     toofull_pg_count: int  # backfill_toofull PGs considered (after --pgs)
     pgs_with_shards: int  # of those, the ones with a newly-arriving shard
     arriving_count: int  # arriving shards in all
@@ -1207,7 +1207,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
     pgs_with_shards = 0
     for pg in toofull_pgs:
         pool_id = pgid_pool_id(pg["pgid"])
-        found = find_diverted_shards(
+        found = find_arriving_shards(
             pg,
             pool_id in ec_pool_ids,
             shard_size_bytes(pg, pools_by_id[pool_id], ec_profiles),

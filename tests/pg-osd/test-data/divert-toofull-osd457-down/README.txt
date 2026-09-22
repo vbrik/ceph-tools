@@ -1,5 +1,5 @@
 Fixture: real, small-scale instance of the exact scenario
-divert-toofull-backfills targets (single OSD down, its host's
+divert-toofull targets (single OSD down, its host's
 siblings absorb the vacated PG and blow past backfillfull_ratio).
 
 Captured: 2026-08-11 ~09:05 from a live cluster, via:
@@ -55,14 +55,14 @@ table shows as 'none' with '-' for the utilization and host that would
 have been derived from it.
 
 Use this fixture to exercise the "found something to divert" path. It is
-NOT a no-problems fixture -- see divert-toofull-backfills-nominal-synthetic/ for that
+NOT a no-problems fixture -- see divert-toofull-nominal-synthetic/ for that
 (same topology files, but pg_dump_pgs.json is a hand-edited
 empty result, since the live cluster had no genuinely problem-free moment
 available at capture time).
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 
-  backfillctl --load-state . divert-toofull-backfills
+  backfillctl --load-state . divert-toofull
 
 ANONYMIZED: cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule
 names have been replaced with deterministic fake values (see
