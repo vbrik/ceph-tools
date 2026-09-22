@@ -1,13 +1,13 @@
 Fixture: real, live-cluster snapshot in which stopping the backfills into
 osd.896 needs pins beyond the shards arriving on it (see "Companion pins" and
-"Blockers" in stop-backfills-into-osd.py's module docstring): pinning a shard
+"Blockers" in stop-backfills-into-osd's module docstring): pinning a shard
 back to its acting OSD can put two shards of the PG on one host, which Ceph
 silently drops, and other shards of the same PG can be headed for OSDs over
 backfillfull_ratio, which keeps the whole PG in backfill_toofull.
 
 Captured: 2026-09-21 from a live cluster, with
 
-  stop-backfills-into-osd.py --save-state <this directory> --osd 896
+  backfillctl stop-backfills-into-osd --save-state <this directory> --osd 896
 
 which stores the (anonymized) output of these commands:
 

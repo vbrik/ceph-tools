@@ -1,36 +1,46 @@
-"""Test support: load the hyphen-named scripts in pg-osd/, and fake cluster state.
+"""Test support: import backfillctl's modules, and fake cluster state.
 
-The scripts import their sibling `shared`, which only resolves when pg-osd/ is
-on sys.path (as it is when a script is run directly), so it is added here.
+REPO_ROOT is put on sys.path so `from backfillctl import ...` resolves.
+backfillctl/'s own directory is put on sys.path here too (the same thing
+backfillctl/__init__.py does when the package is imported, and what running
+it directly relies on), so a bare `import shared` below -- and the command
+modules' own `import shared` / `from shared import ...` -- resolve to the
+exact same module object. That identity matters: tests that
+mock.patch.object(shared, ...) need to be patching the module the code under
+test actually calls, not a separate `backfillctl.shared` copy. This is set up
+with an explicit sys.path.insert rather than an `import backfillctl` side
+effect, since an isort/ruff cleanup could otherwise reorder that import after
+`import shared` and silently break it.
 """
 
-import importlib.util
+import argparse
 import sys
 from pathlib import Path
-from types import ModuleType
 
-SCRIPT_DIR = Path(__file__).resolve().parents[2] / "pg-osd"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BACKFILLCTL_DIR = REPO_ROOT / "backfillctl"
 
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+for path in (REPO_ROOT, BACKFILLCTL_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 import shared
 
-__all__ = ["SCRIPT_DIR", "FakeStore", "load_script", "script_path", "shared"]
+__all__ = ["REPO_ROOT", "FakeStore", "parse_args", "shared"]
 
 
-def script_path(filename: str) -> str:
-    """Return the path of a script in pg-osd/, e.g. for running it as a subprocess."""
-    return str(SCRIPT_DIR / filename)
+def parse_args(module, argv: list[str]) -> argparse.Namespace:
+    """Parse argv through module.build_parser, as backfillctl's dispatcher would.
 
-
-def load_script(filename: str) -> ModuleType:
-    """Import a script in pg-osd/ (e.g. 'osds-of-pg.py') without running its main()."""
-    name = Path(filename).stem.replace("-", "_")
-    spec = importlib.util.spec_from_file_location(name, script_path(filename))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    module is one of backfillctl's command modules (e.g.
+    backfillctl.osds_of_pg); argv excludes the subcommand name, which is
+    inferred from the single subparser the module registers.
+    """
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    module.build_parser(subparsers)
+    (name,) = subparsers.choices
+    return parser.parse_args([name, *argv])
 
 
 class FakeStore:

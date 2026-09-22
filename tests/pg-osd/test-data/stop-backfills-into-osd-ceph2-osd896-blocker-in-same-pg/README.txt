@@ -1,5 +1,5 @@
 Fixture: real, live-cluster snapshot of the case blockers exist for (see
-"Blockers" in stop-backfills-into-osd.py's module docstring): osd.896 has just
+"Blockers" in stop-backfills-into-osd's module docstring): osd.896 has just
 ONE backfill arriving, the one the operator wants (19.92e shard 4, from osd.231),
 and it is still backfill_toofull although osd.896 is at 81.1%.
 
@@ -8,7 +8,7 @@ stop-backfills-into-osd-ceph2-osd896-host-clash-companions, once the operator
 had cancelled the other backfills into osd.896 and expected 19.92e to start.
 Made with
 
-  stop-backfills-into-osd.py --save-state <this directory> --osd 896
+  backfillctl stop-backfills-into-osd --save-state <this directory> --osd 896
 
 (same six files as the sibling; osd_dump.json is cut down to the erasure code
 profiles and the full ratios, backfillfull_ratio being 0.91 here.)

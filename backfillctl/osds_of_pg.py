@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """
 Show the 'acting' and 'up' OSDs of a given Ceph PG, one row per shard, with
@@ -6,10 +5,10 @@ each OSD's utilization and host (CRUSH bucket of type 'host'), the progress of
 shards that are being remapped, and the PG's pg_upmap_items pairs that touch
 the row.
 
-Usage: osds-of-pg.py <pgid>
-  e.g. osds-of-pg.py 3.1a2
+Usage: backfillctl osds-of-pg <pgid>
+  e.g. backfillctl osds-of-pg 3.1a2
 
-Columns (same two-line grouped header as divert-toofull-backfills.py):
+Columns (same two-line grouped header as the divert-toofull-backfills subcommand):
 
   SHARD      EC shard index, '-' for replicated pools (see below)
   ACTING     OSD holding the shard's data now, with its UTIL and HOST
@@ -23,7 +22,7 @@ Columns (same two-line grouped header as divert-toofull-backfills.py):
 An OSD that is the PG's primary in that set is marked with '*'. An empty slot
 is shown as 'none'.
 
-Rows are built as in pg-movements.py:
+Rows are built as in the pg-movements subcommand:
 
   - EC pools: index i is shard i, a fixed identity, so acting[i] is paired
     with up[i].
@@ -31,8 +30,8 @@ Rows are built as in pg-movements.py:
     identity. OSDs in both sets share a row; OSDs only in acting are paired
     (in OSD id order) with OSDs only in up.
 
-PROGRESS is estimated from the PG's object counters exactly as in
-pg-movements.py (both use shared.pg_progress_pct). It is a per-PG figure, so
+PROGRESS is estimated from the PG's object counters exactly as in the
+pg-movements subcommand (both use shared.pg_progress_pct). It is a per-PG figure, so
 every remapped row shows the same value.
 
 --save-state DIR also writes the cluster state this run read (one '<key>.json'
@@ -214,15 +213,18 @@ def format_row(
     ]
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
+def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    parser = subparsers.add_parser(
+        "osds-of-pg",
         description="Show acting/up OSDs of a Ceph PG per shard, with "
         "utilization, host, remap progress and upmaps.",
     )
     parser.add_argument("pgid", help="PG id, e.g. 3.1a2")
     add_state_args(parser, snapshot_commands("<pgid>"))
-    args = parser.parse_args()
+    return parser
 
+
+def run(args: argparse.Namespace) -> None:
     store = SnapshotStore.from_args(
         args, snapshot_commands(args.pgid), anonymize=anonymize_snapshots
     )
@@ -255,7 +257,3 @@ def main() -> None:
     if any(r.remapped for r in rows) and progress_reads_100(pct):
         print(f"\n{PROGRESS_100_NOTE}")
     print("\n* primary")
-
-
-if __name__ == "__main__":
-    main()

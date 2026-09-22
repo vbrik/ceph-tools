@@ -1,4 +1,4 @@
-Fixture: genuine no-problems path for divert-toofull-backfills.py
+Fixture: genuine no-problems path for divert-toofull-backfills
 -- i.e. the case where 'ceph pg ls backfill_toofull' matches nothing.
 
 SYNTHETIC: pg_ls_backfill_toofull.json is hand-written, not captured. At
@@ -28,7 +28,7 @@ osd.457 is back up/replaced and 19.21f has cleared backfill_toofull.
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 
-  divert-toofull-backfills.py --load-state .
+  backfillctl divert-toofull-backfills --load-state .
 
 ANONYMIZED: cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule
 names have been replaced with deterministic fake values (see

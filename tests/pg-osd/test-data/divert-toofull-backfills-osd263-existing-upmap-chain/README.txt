@@ -1,5 +1,5 @@
 Fixture: real, live-cluster instance of the "arriving OSD is itself the 'to'
-of an existing upmap pair" case that divert-toofull-backfills.py's
+of an existing upmap pair" case that divert-toofull-backfills's
 raw-CRUSH-mapping handling exists for (see "Why the raw CRUSH mapping
 matters" in the script's module docstring).
 
@@ -58,7 +58,7 @@ the "no problems" path see divert-toofull-backfills-nominal-synthetic/.
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 
-  divert-toofull-backfills.py --load-state .
+  backfillctl divert-toofull-backfills --load-state .
 
 ANONYMIZED: cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule
 names have been replaced with deterministic fake values (see

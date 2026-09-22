@@ -1,10 +1,10 @@
-"""Unit tests for stop-backfills-into-osd.py.
+"""Unit tests for backfillctl's stop-backfills-into-osd subcommand.
 
 The risky parts are deciding which acting OSD a shard can be pinned back to
 (EC by position, replicated by set difference), and refusing to propose a pin
 that Ceph would silently drop (acting OSD already elsewhere in 'up') or that
 has nothing to pin to (empty acting slot). Those rules are tested on
-hand-built PG dicts; one end-to-end test runs main() against canned 'ceph'
+hand-built PG dicts; one end-to-end test runs run() against canned 'ceph'
 output.
 """
 
@@ -21,10 +21,9 @@ import unittest
 from typing import ClassVar
 from unittest import mock
 
-from _support import SCRIPT_DIR, FakeStore, load_script, script_path, shared
+from _support import REPO_ROOT, FakeStore, parse_args, shared
 
-SCRIPT = script_path("stop-backfills-into-osd.py")
-cb = load_script("stop-backfills-into-osd.py")
+from backfillctl import stop_backfills_into_osd as cb
 
 
 def flat(text: str) -> str:
@@ -873,8 +872,7 @@ class ParseOsdTest(unittest.TestCase):
 
 class ParseArgsCliTest(unittest.TestCase):
     def parse(self, *argv):
-        with mock.patch("sys.argv", ["stop-backfills-into-osd.py", *argv]):
-            return cb.parse_args()
+        return parse_args(cb, argv)
 
     def test_osd_is_a_required_flag_not_positional(self):
         with self.assertRaises(SystemExit):
@@ -961,13 +959,13 @@ class MainTest(unittest.TestCase):
     def run_main(self, *argv, pgs=None, extra_osds=(), drop=()):
         out, err = io.StringIO(), io.StringIO()
         fake = canned_ceph(self.PGS if pgs is None else pgs, extra_osds, drop)
+        args = parse_args(cb, argv)
         with (
             mock.patch.object(shared.SnapshotStore, "json", fake),
-            mock.patch("sys.argv", ["stop-backfills-into-osd.py", *argv]),
             contextlib.redirect_stdout(out),
             contextlib.redirect_stderr(err),
         ):
-            cb.main()
+            cb.run(args)
         return out.getvalue(), err.getvalue()
 
     def test_pgremapper_output_is_bare_lines_only(self):
@@ -1380,10 +1378,15 @@ class NoPgsTest(unittest.TestCase):
 
 
 def run_cli(*argv, path=None):
-    """Run the script as a subprocess; path replaces PATH when given."""
+    """Run the subcommand as a subprocess; path replaces PATH when given."""
     env = {**os.environ, "PATH": path} if path is not None else None
     return subprocess.run(
-        [sys.executable, SCRIPT, *argv],
+        [
+            sys.executable,
+            str(REPO_ROOT / "backfillctl"),
+            "stop-backfills-into-osd",
+            *argv,
+        ],
         capture_output=True,
         text=True,
         env=env,
@@ -1502,11 +1505,11 @@ class StateOptionsCliTest(unittest.TestCase):
 
 
 FIXTURE = (
-    SCRIPT_DIR.parent
+    REPO_ROOT
     / "tests"
     / "pg-osd"
     / "test-data"
-    / ("stop-backfills-into-osd-ceph2-osd896-host-clash-companions")
+    / "stop-backfills-into-osd-ceph2-osd896-host-clash-companions"
 )
 
 FIXTURE_BLOCKER = (

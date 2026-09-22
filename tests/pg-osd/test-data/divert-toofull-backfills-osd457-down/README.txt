@@ -1,5 +1,5 @@
 Fixture: real, small-scale instance of the exact scenario
-divert-toofull-backfills.py targets (single OSD down, its host's
+divert-toofull-backfills targets (single OSD down, its host's
 siblings absorb the vacated PG and blow past backfillfull_ratio).
 
 Captured: 2026-08-11 ~09:05 from a live cluster, via:
@@ -54,7 +54,7 @@ available at capture time).
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 
-  divert-toofull-backfills.py --load-state .
+  backfillctl divert-toofull-backfills --load-state .
 
 ANONYMIZED: cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule
 names have been replaced with deterministic fake values (see

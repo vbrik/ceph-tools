@@ -77,13 +77,13 @@ The count limit is not what runs out: --max-target-uses 2 places 37, 5
 places 52, 10 places 54, because the projection is. --max-target-uses 1
 gives every OSD at most one shard:
 
-  divert-toofull-backfills.py --load-state . --max-target-uses 1
+  backfillctl divert-toofull-backfills --load-state . --max-target-uses 1
   -> 26 remaps proposed, 950 unplaceable
 
 Raising the cap to backfillfull_ratio itself admits targets projected right
 up to the ratio, with no margin:
 
-  divert-toofull-backfills.py --load-state . --max-target-util 91
+  backfillctl divert-toofull-backfills --load-state . --max-target-util 91
   -> 199 remaps proposed, 777 unplaceable
 
 The table is 52 rows, too long to quote here the way the small fixtures
@@ -97,7 +97,7 @@ For reference, the closest to the pre-threshold behavior that is still
 reachable (--max-target-util can no longer exceed backfillfull_ratio, and 100
 is an error), and what the invariant test guards against regressing past:
 
-  divert-toofull-backfills.py --load-state . \
+  backfillctl divert-toofull-backfills --load-state . \
       --min-up-util 0 --max-target-util 91
   -> 210 remaps proposed, 1303 unplaceable, none projected past backfillfull
 
@@ -108,7 +108,7 @@ backfillfull.)
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 
-  divert-toofull-backfills.py --load-state .
+  backfillctl divert-toofull-backfills --load-state .
 
 ANONYMIZED: cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule
 names have been replaced with deterministic fake values (see

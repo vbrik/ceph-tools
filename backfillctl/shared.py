@@ -214,9 +214,9 @@ def progress_reads_100(pct: float | None) -> bool:
     return pct == 100.0
 
 
-# Printed once by a script when any row's PROGRESS reads 100% (see
+# Printed once by a subcommand when any row's PROGRESS reads 100% (see
 # progress_reads_100). Kept in one place so the wording can't drift between
-# pg-movements.py, osds-of-pg.py and stop-backfills-into-osd.py. No leading
+# pg-movements, osds-of-pg and stop-backfills-into-osd. No leading
 # newline/hard-wrapping: each caller adds its own paragraph spacing and either
 # prints this as-is (fixed-width footnote style) or hands it to a wrapper that
 # reflows it (textwrap.fill treats the embedded newlines as plain whitespace).

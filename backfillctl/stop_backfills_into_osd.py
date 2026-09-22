@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """
 Propose upmaps that cancel every backfill into a given OSD.
@@ -42,8 +41,8 @@ it only reports the OSD's utilization and how much data is arriving.
 (pgremapper's own 'cancel-backfill --include-osds N --target' does the same
 job at OSD/pool granularity; this script exists to review and pick per shard.)
 
-'up'/'acting' are diffed differently per pool type, as in pg-movements.py:
-EC shards are identified by position, so index i is diffed against index i.
+'up'/'acting' are diffed differently per pool type, as in the pg-movements
+subcommand: EC shards are identified by position, so index i is diffed against index i.
 Replicated replicas are interchangeable, so the sets are diffed and SHARD is
 '-'; a replica can only be paired with the acting OSD it replaces when
 exactly one replica is arriving and one is leaving.
@@ -130,7 +129,7 @@ Applying the output
 --import-mappings prints a JSON array for 'pgremapper import-mappings', one
 {pgid, mapping: {from, to}} entry per line (all other output goes to stderr):
 
-    stop-backfills-into-osd.py --pin-blockers --import-mappings --osd 682 > mappings.json
+    backfillctl stop-backfills-into-osd --pin-blockers --import-mappings --osd 682 > mappings.json
     # drop the entry into the OSD for each backfill you want to keep, but not
     # its blockers (other entries of the same PG, present with --pin-blockers),
     # e.g. keep 19.92e's 896->231:
@@ -241,8 +240,9 @@ def parse_osd(text: str) -> int:
     return int(match[1])
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    parser = subparsers.add_parser(
+        "stop-backfills-into-osd",
         description="Propose the upmaps needed to stop ALL backfills into an "
         "OSD. Each shard arriving on it is pinned to the OSD it is on now. "
         "That can also mean pinning back a shard heading for another OSD, a "
@@ -304,7 +304,7 @@ def parse_args() -> argparse.Namespace:
         "overwrite each other; prefer --import-mappings.",
     )
     add_state_args(parser, SNAPSHOT_COMMANDS)
-    return parser.parse_args()
+    return parser
 
 
 # ---------------------------------------------------------------------------
@@ -938,8 +938,7 @@ def print_summary(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    args = parse_args()
+def run(args: argparse.Namespace) -> None:
     osd = args.osd
     exclude_pgs = set(args.exclude_pgs)
 
@@ -1041,7 +1040,3 @@ def main() -> None:
         "NOTE: cancelling a running backfill discards its progress. Consider "
         "'ceph balancer off' while these are pinned."
     )
-
-
-if __name__ == "__main__":
-    main()
