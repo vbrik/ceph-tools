@@ -174,10 +174,10 @@ leaving an OSD is not credited either.
 
 The cluster-wide run can still have more stuck shards than the targets have
 room for, in which case the tail is left unplaced. The number of shards that
-get no target is reported on stderr after the table (in --pgremapper mode
-too), without a reason or a list: that the greedy pass found nothing is a
-limitation of this heuristic, and a suitable OSD may well exist. Applying the
-proposals, letting them drain and re-running is the usual next step.
+get no target is reported on stderr after the table, without a reason or a
+list: that the greedy pass found nothing is a limitation of this heuristic,
+and a suitable OSD may well exist. Applying the proposals, letting them drain
+and re-running is the usual next step.
 --max-target-uses 1 gives every OSD at most one shard.
 
 In what order shards are placed
@@ -243,20 +243,17 @@ one the counts and invariants its test asserts instead.
 
 Applying the output
 -------------------
-Three output formats are available. The default is a human-readable table
-for review. --import-mappings prints a JSON array for 'pgremapper
-import-mappings', one {pgid, mapping: {from, to}} entry per line (from is
-UP OSD, to is TARGET OSD; all other output goes to stderr). --pgremapper
-instead emits one bare '<pgid> <from osd> <target osd>' line per remap — the
-table's PGID, UP OSD and TARGET OSD columns, which are exactly the positional
-arguments of 'pgremapper remap' (which calls UP OSD the "source osd", meaning
-the upmap's 'from'). In either machine format only the rows go to stdout —
-everything else is on stderr — so it stays parseable.
+Two output formats are available. The default is a human-readable table for
+review. --pgremapper-mappings prints a JSON array for 'pgremapper
+import-mappings' instead, one {pgid, mapping: {from, to}} entry per line
+(from is UP OSD, to is TARGET OSD; all other output goes to stderr), so only
+the rows go to stdout — everything else is on stderr — and it stays
+parseable.
 
-Those machine formats carry no utilization, so nothing in them tells an
-operator how full a proposed target is. That is why the capacity check is
-built in rather than a flag to remember: by the time the output is being fed
-to pgremapper, the only thing standing between the operator and a batch of
+The machine format carries no utilization, so nothing in it tells an operator
+how full a proposed target is. That is why the capacity check is built in
+rather than a flag to remember: by the time the output is being fed to
+pgremapper, the only thing standing between the operator and a batch of
 remaps that re-wedge is the projection, which never lets a target exceed
 --max-target-util (itself capped at backfillfull_ratio).
 
@@ -275,19 +272,14 @@ existing upmap pairs, and 'pg-upmap-items' cannot be driven without them:
     silently dropped by Ceph, because UP OSD is not an OSD CRUSH chose. The
     existing pair's 'to' has to be rewritten instead.
 
-'pgremapper remap' is per-pair, and per its source (mappingstate.go,
-tryRemap) merges a single invocation's pair into the existing entry rather
-than replacing it, rewriting an existing pair's 'to' instead of adding a
-second one when its source osd is that pair's 'to' — so a single call handles
-both cases above. Running it several times in a row for the same PG is a
-different matter: a PG can have more than one diverted shard (rare — one PG
-out of 51 proposed on the cluster-sized test fixture — but real), and
-the cancel-backfill subcommand's own docstring records a later
-'remap' run overwriting the pair an earlier one had just added, on a live
-cluster. --import-mappings sidesteps that: import-mappings reads the
-cluster's upmaps once and applies every pair of a PG together, so it is the
-reliable way to apply the proposals. --pgremapper warns on stderr whenever a
-PG needs more than one line, for the same reason cancel-backfill does.
+'pgremapper import-mappings' avoids both: dry runs (pgremapper 1.0.0) showed
+that it reads a PG's existing upmap once and applies all its proposed pairs
+together as one combined change, keeping the PG's existing pairs and
+rewriting an existing pair's 'to' instead of adding a second one when its
+source osd is that pair's 'to'. That also makes it the reliable way to handle
+a PG with more than one diverted shard (rare — one PG out of 51 proposed on
+the cluster-sized test fixture — but real): applied together, its pairs
+cannot overwrite each other the way a sequence of separate commands could.
 
   - If the upmap balancer is active ('ceph balancer status'), it may undo
     manually placed upmap entries. Consider 'ceph balancer off' while the
@@ -295,19 +287,11 @@ PG needs more than one line, for the same reason cancel-backfill does.
 
 Review the proposals before applying them. To hand them to pgremapper:
 
-    backfillctl divert-toofull --import-mappings > mappings.json
+    backfillctl divert-toofull --pgremapper-mappings > mappings.json
     pgremapper-v1.0.0-linux-amd64 import-mappings mappings.json
 
-Give it the file path, not stdin, or its confirmation prompt reads EOF.
---pgremapper's lines are applied differently, one 'remap' call per line:
-
-    backfillctl divert-toofull --pgremapper > remaps.txt
-    xargs -a remaps.txt -L1 pgremapper-v1.0.0-linux-amd64 remap
-
-Use 'xargs -a', not '< remaps.txt': with a redirect, xargs points each child's
-stdin at /dev/null, so pgremapper's per-remap confirmation prompt reads EOF
-instead of an answer. '-a' leaves stdin on the terminal. (Add '--yes' to
-pgremapper to skip the prompt and its dry-run entirely.)
+Give it the file path, not stdin, or its confirmation prompt reads EOF. (Add
+'--yes' to pgremapper to skip the prompt and its dry-run entirely.)
 """
 
 import argparse
@@ -428,24 +412,14 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "it is not.",
         epilog="See the docstring at the top of this script for how targets "
         "are chosen, which shards get skipped and why, and the caveats that "
-        "apply when turning these rows into 'pgremapper remap' commands.",
+        "apply when applying these proposals with 'pgremapper import-mappings'.",
     )
-    fmt = parser.add_mutually_exclusive_group()
-    fmt.add_argument(
-        "--import-mappings",
+    parser.add_argument(
+        "--pgremapper-mappings",
         action="store_true",
         help="Print a JSON array for 'pgremapper import-mappings' instead of "
         "the table, one {pgid, mapping} entry per line. This is the reliable "
         "way to apply the proposals: all pairs of a PG go in together.",
-    )
-    fmt.add_argument(
-        "--pgremapper",
-        action="store_true",
-        help="Print '<pgid> <from osd> <target osd>' lines with no header "
-        "instead of the table, so each line can be passed as the arguments "
-        "of 'pgremapper remap' (the script's docstring has the xargs form). "
-        "Warns if a PG needs more than one line, since separate runs can "
-        "overwrite each other; prefer --import-mappings.",
     )
     parser.add_argument(
         "--min-up-util",
@@ -1045,21 +1019,7 @@ def print_unplaceable(count: int) -> None:
     )
 
 
-def print_pgremapper(proposals: list[Proposal]) -> None:
-    """Print one '<pgid> <from osd> <target osd>' line per proposal.
-
-    These are the positional arguments of 'pgremapper remap', in order and
-    with nothing else on the line, so the output can be fed to it directly.
-    pgremapper's "source osd" is the upmap's 'from', i.e. the table's
-    UP OSD — not ACTING OSD, which is where the data actually sits. OSD ids
-    are bare integers: pgremapper parses them with strconv.Atoi and rejects
-    the 'osd.N' form the table uses.
-    """
-    for proposal in proposals:
-        print(f"{proposal.shard.pgid} {proposal.shard.up_osd} {proposal.target_osd}")
-
-
-def print_import_mappings(proposals: list[Proposal]) -> None:
+def print_pgremapper_mappings(proposals: list[Proposal]) -> None:
     """Print the proposals as JSON for 'pgremapper import-mappings'.
 
     One {pgid, mapping: {from, to}} entry per proposal (from is UP OSD, the
@@ -1081,35 +1041,6 @@ def print_import_mappings(proposals: list[Proposal]) -> None:
         }
         print(f"  {json.dumps(entry)}{',' if i < len(proposals) - 1 else ''}")
     print("]")
-
-
-def pgs_needing_several_targets(proposals: list[Proposal]) -> list[str]:
-    """Return the PGs (in PG order) with more than one proposed remap."""
-    counts = Counter(p.shard.pgid for p in proposals)
-    return sorted((pgid for pgid, n in counts.items() if n > 1), key=pgid_sort_key)
-
-
-def warn_separate_remaps(pgids: list[str]) -> None:
-    """Warn on stderr that these PGs are not safe to apply with 'remap' lines.
-
-    'pgremapper remap' merges a single invocation's pair into a PG's existing
-    upmap entry (see module docstring), but running it once per line for a PG
-    with several proposed remaps means several invocations against the same
-    PG, and the cancel-backfill subcommand's own docstring records a
-    later run overwriting the pair an earlier one had just added, on a live
-    cluster.
-    """
-    shown = ", ".join(pgids[:8]) + (
-        f", ... ({len(pgids)} in all)" if len(pgids) > 8 else ""
-    )
-    print(
-        f"WARNING: {len(pgids)} PG(s) have more than one proposed remap "
-        f"({shown}). Running these lines as separate 'pgremapper remap' "
-        "commands (e.g. xargs -L1) can silently lose pairs: a later run may "
-        "overwrite the pair an earlier one just added. Use --import-mappings "
-        "instead, which applies all pairs of a PG together.",
-        file=sys.stderr,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1296,18 +1227,13 @@ def render(result: DivertResult, args: argparse.Namespace) -> None:
     )
 
     proposals, unplaceable = result.proposals, result.unplaceable
-    if args.import_mappings:
-        print_import_mappings(proposals)
+    if args.pgremapper_mappings:
+        print_pgremapper_mappings(proposals)
     elif proposals:
-        if args.pgremapper:
-            print_pgremapper(proposals)
-            if multi := pgs_needing_several_targets(proposals):
-                warn_separate_remaps(multi)
-        else:
-            print_table(
-                COLUMNS,
-                [format_row(p, result.osd_host, osd_df) for p in proposals],
-            )
+        print_table(
+            COLUMNS,
+            [format_row(p, result.osd_host, osd_df) for p in proposals],
+        )
 
     if unplaceable:
         print_unplaceable(len(unplaceable))

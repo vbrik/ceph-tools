@@ -49,8 +49,9 @@ without --pin-blockers it gets only its one pin into 896; with the flag, its
 shard 6 (osd.99 -> osd.337, 92.5% used) is found as a pure blocker that keeps
 its shard 4 (osd.231 -> osd.896) from starting.
 
-Expected output for osd 896 --pgremapper --pin-blockers: 6 pins into osd.896
-and 7 blockers (all of them NOTE "blocks shard N"):
+Expected pairs for osd 896 --pin-blockers (as '<pgid> <up osd> <acting osd>'):
+6 pins into osd.896 and 7 blockers (all of them NOTE "blocks shard N" in the
+table):
 
   19.7e9 896 627
   19.7e9 149 497
@@ -76,11 +77,11 @@ Without --pin-blockers (the default), the same command drops the 2 pure-blocker
 lines (19.92e's "337 99" and 19.14cd's "314 347"), leaving 11 lines for 5 PGs;
 19.92e then has just its one pin ("896 231") and no second line.
 
---import-mappings prints the same 13 pairs (11 without --pin-blockers) as a
-JSON array (one entry per pair, in this order). Applying them with separate
-'pgremapper remap' runs is what fails on this cluster, so --pgremapper warns
-that 6 PGs need more than one line with --pin-blockers (5 without it, since
-19.92e then has only one line).
+--pgremapper-mappings prints the same 13 pairs (11 without --pin-blockers) as
+a JSON array (one entry per pair, in this order), the reliable way to apply
+them: applying them with separate 'pgremapper remap' runs one PG at a time is
+what fails on this cluster (6 PGs have more than one pair with
+--pin-blockers, 5 without it, since 19.92e then has only one).
 
 Chained pairs ("Chained pairs" in the module docstring): 13 of the 688 remapped
 PGs have an OSD that CRUSH wants in one shard slot while it currently holds
@@ -91,7 +92,7 @@ Dry runs of pgremapper 1.0.0 on exactly this PG: in the valid order
 import-mappings panics ("conflicting mapping 579->825 found when trying to map
 891->579"), and in the order 891->579, 579->825 it plans the single pair
 891->825, a different mapping. So the tool leaves such PGs out of
---import-mappings/--pgremapper and prints 'ceph osd pg-upmap-items 19.1299 579 825
+--pgremapper-mappings and prints 'ceph osd pg-upmap-items 19.1299 579 825
 891 579' on stderr. Replay with osd 891 (or 274, 883, 884, ... for the others);
 none of the 13 is a ring.
 

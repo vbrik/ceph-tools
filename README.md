@@ -114,19 +114,14 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   follows one shard's path, giving the OSD, utilization and host at each step,
   under a two-line header whose first line spans each group: `ACTING` where
   its data sits now, `UP` the too-full OSD the stalled backfill is aimed at,
-  `TARGET` the proposed replacement. `--import-mappings` prints a JSON array
-  for `pgremapper import-mappings` instead (prune it with `jq`, then
-  `pgremapper import-mappings file.json`), which applies all of a PG's pairs
-  in one call — the reliable way to apply the proposals, since a PG can (rarely)
-  have more than one diverted shard. `--pgremapper` instead prints headerless
-  `<pgid> <from osd> <target osd>` lines for `pgremapper remap` (via
-  `xargs -a remaps.txt -L1 …`); apply with it rather than by hand with
-  `ceph osd pg-upmap-items`, which replaces the whole entry. A single `remap`
-  call merges into a PG's existing `pg_upmap_items`, but separate `remap` runs
-  against the same PG can overwrite each other's pairs (seen on a live
-  cluster with the same tool in `cancel-backfill`), so
-  `--pgremapper` warns on stderr whenever a PG needs more than one line. An
-  OSD can be the
+  `TARGET` the proposed replacement. `--pgremapper-mappings` prints a JSON
+  array for `pgremapper import-mappings` instead (prune it with `jq`, then
+  `pgremapper import-mappings file.json`); apply with it rather than by hand
+  with `ceph osd pg-upmap-items`, which replaces the whole entry. Dry runs
+  showed `import-mappings` reads a PG's existing upmap once and applies all
+  of a PG's proposed pairs together as one combined change, keeping the PG's
+  existing pairs — the reliable way to apply the proposals, since a PG can
+  (rarely) have more than one diverted shard. An OSD can be the
   target of several shards: each shard's size is estimated from its PG
   (`num_bytes`, divided by `k` for EC pools) and projected onto the target —
   together with the shards already sent to it and every shard still arriving
@@ -137,9 +132,9 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   fullest-`ACTING`-OSD first, re-ranked as each placement relieves its source,
   so the scarce room goes to the OSDs most urgent to relieve (shards with no
   known acting OSD go last, and rows are printed in PG order regardless). A
-  large run may still leave a tail unplaced; how many is reported on stderr,
-  in `--pgremapper` mode too (a limitation of the heuristic, not proof that no
-  OSD would do); apply, drain, re-run. Two safety thresholds default to the
+  large run may still leave a tail unplaced; how many is reported on stderr
+  (a limitation of the heuristic, not proof that no OSD would do); apply,
+  drain, re-run. Two safety thresholds default to the
   cluster's own ratios and can be overridden. `--min-up-util PERCENT` (default
   `nearfull_ratio`) only diverts a shard whose arriving OSD is that full:
   `backfill_toofull` is a property of the PG, not of each shard arriving on
@@ -158,7 +153,7 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   replicated pools by set difference. See the subcommand's module docstring
   for the full explanation and caveats (`--help` summarizes and points there).
   `backfillctl [--load-state DIR] divert-toofull
-  [--import-mappings | --pgremapper] [--min-up-util PERCENT]
+  [--pgremapper-mappings] [--min-up-util PERCENT]
   [--max-target-util PERCENT] [--max-target-uses N] [--pgs PGID [PGID ...]]`
 
 - **`backfillctl cancel-backfill`** — List the upmaps needed to cancel
@@ -201,24 +196,20 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   their companions/blockers) never appear in the output. A given id that
   doesn't match a remapped PG (with `--osd` in its `up` set, if given) is
   reported on stderr, since that usually means a typo.
-  `--import-mappings` prints a JSON array for `pgremapper import-mappings`
+  `--pgremapper-mappings` prints a JSON array for `pgremapper import-mappings`
   (prune it with `jq`, then `pgremapper import-mappings file.json`), which
   takes all pairs in one run and, as dry runs showed, keeps a PG's existing
   pairs; this is the way to apply the output. PGs whose pairs chain (an OSD
   that moves between shard slots, about 2% of PGs on the test cluster) are left
   out, since pgremapper cannot apply them in either order; the tool prints
-  `ceph osd pg-upmap-items` commands for them on stderr.
-  `--pgremapper` prints bare `<pgid> <up osd> <acting osd>` lines for
-  `pgremapper remap` instead, but separate `remap` runs on one PG can overwrite
-  each other's pairs (seen on a live cluster), so it warns on stderr whenever a
-  PG needs more than one line. Shards that cannot be pinned (no acting OSD,
-  ambiguous replicated pairing with `--osd`, a clash that no companion can
-  resolve) are
+  `ceph osd pg-upmap-items` commands for them on stderr. Shards that cannot be
+  pinned (no acting OSD, ambiguous replicated pairing with `--osd`, a clash
+  that no companion can resolve) are
   listed on stderr. Assumes the pools' CRUSH failure domain is `host`.
   pgremapper's own `cancel-backfill` (optionally `--include-osds N --target`)
   does the same at cluster/OSD/pool granularity. `--load-state DIR` replays a `backfillctl save-state`
   capture offline instead of querying the live cluster.
-  `backfillctl [--load-state DIR] cancel-backfill [--osd OSD [--pin-blockers]] [--exclude-pgs PGID [PGID ...]] [--import-mappings | --pgremapper]`
+  `backfillctl [--load-state DIR] cancel-backfill [--osd OSD [--pin-blockers]] [--exclude-pgs PGID [PGID ...]] [--pgremapper-mappings]`
 
 - **`pg-osd/scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /

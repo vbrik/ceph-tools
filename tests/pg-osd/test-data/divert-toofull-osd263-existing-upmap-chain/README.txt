@@ -55,10 +55,10 @@ reference, the PGs' pg_upmap_items pairs were:
   19.122e  866->356,487->263                        (263 is a 'to')
   19.1ce0  655->454,575->831,723->263               (263 is a 'to')
 
---pgremapper still emits '<pgid> 263 <target>' for all six, e.g. "19.bd5 263
-842". 'pgremapper remap' turns that into a rewrite of the existing 625->263
-pair to 625->842 for the four 'to' PGs, and adds a fresh pair for the other
-two.
+--pgremapper-mappings still maps 'from' 263 for all six, e.g. {"pgid":
+"19.bd5", "mapping": {"from": 263, "to": 842}}. 'pgremapper import-mappings'
+turns that into a rewrite of the existing 625->263 pair to 625->842 for the
+four 'to' PGs, and adds a fresh pair for the other two.
 
 Use this fixture to exercise the raw-CRUSH-mapping path end-to-end. For the
 plain "found something to divert" path see divert-toofull-osd457-down/; for
