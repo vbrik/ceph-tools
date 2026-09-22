@@ -119,15 +119,18 @@ other environments.
   a target's *projected* utilization: an OSD stops being used once the next
   shard would take it above that, so a proposal never re-wedges. It cannot
   exceed `backfillfull_ratio`, and the script exits with an error if it is
-  set higher (`100` no longer disables it).
+  set higher (`100` no longer disables it). `--pgs PGID [PGID ...]` restricts
+  the run to just the given PG(s), as if every other `backfill_toofull` PG
+  were not stuck; a given id that isn't currently `backfill_toofull` is
+  reported on stderr, since that usually means a typo.
   `--save-state DIR` writes the run's cluster state as JSON, anonymized so it
   can be shared, and `--load-state DIR` replays such a capture offline with no
   cluster access. Handles EC pools per-shard and replicated pools by set
   difference. See the script's module docstring for the full explanation and
   caveats (`--help` summarizes and points there).
   `pg-osd/divert-toofull-backfills.py [--pgremapper] [--min-up-util
-  PERCENT] [--max-target-util PERCENT] [--max-target-uses N] [--save-state DIR
-  | --load-state DIR]`
+  PERCENT] [--max-target-util PERCENT] [--max-target-uses N] [--pgs PGID
+  [PGID ...]] [--save-state DIR | --load-state DIR]`
 
 - **`pg-osd/stop-backfills-into-osd.py`** — List the upmaps needed to stop *all*
   backfills into a given OSD, by pinning each arriving shard to the OSD that

@@ -246,6 +246,35 @@ class FindDivertedShardsTest(unittest.TestCase):
         self.assertEqual(ut.find_diverted_shards(pg, is_ec=False), [])
 
 
+class FilterToofullPgsTest(unittest.TestCase):
+    """filter_toofull_pgs: the --pgs restriction, kept apart from argparse/IO."""
+
+    def pgs(self, *pgids):
+        return [{"pgid": p} for p in pgids]
+
+    def test_only_wanted_pgs_are_kept(self):
+        kept, matched = ut.filter_toofull_pgs(
+            self.pgs("19.1", "19.2", "19.3"), {"19.2"}
+        )
+        self.assertEqual([pg["pgid"] for pg in kept], ["19.2"])
+        self.assertEqual(matched, {"19.2"})
+
+    def test_input_order_is_preserved(self):
+        kept, _ = ut.filter_toofull_pgs(
+            self.pgs("19.3", "19.1", "19.2"), {"19.1", "19.3"}
+        )
+        self.assertEqual([pg["pgid"] for pg in kept], ["19.3", "19.1"])
+
+    def test_wanted_id_that_matches_nothing_is_left_out_of_matched(self):
+        kept, matched = ut.filter_toofull_pgs(self.pgs("19.1"), {"19.1", "19.zzz"})
+        self.assertEqual([pg["pgid"] for pg in kept], ["19.1"])
+        self.assertEqual(matched, {"19.1"})
+
+    def test_empty_wanted_set_keeps_nothing(self):
+        kept, matched = ut.filter_toofull_pgs(self.pgs("19.1", "19.2"), set())
+        self.assertEqual((kept, matched), ([], set()))
+
+
 class FullRatiosTest(unittest.TestCase):
     """The thresholds both defaults derive from."""
 
@@ -528,6 +557,72 @@ class FixtureReplayTest(unittest.TestCase):
                 err = self.run_proc(fixture).stderr
                 self.assertIn(f"--min-up-util {nearfull}%", err)
                 self.assertIn(f"--max-target-util {max_target}%", err)
+
+
+class PgsFlagTest(unittest.TestCase):
+    """--pgs restricts the run to shards of the named PG(s) only."""
+
+    FIXTURE = "divert-toofull-backfills-osd263-existing-upmap-chain"
+
+    def run_proc(self, *extra):
+        return subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--load-state",
+                os.path.join(TEST_DATA, self.FIXTURE),
+            ]
+            + list(extra),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def test_only_the_named_pg_is_proposed(self):
+        proc = self.run_proc("--pgs", "19.bd5", "--pgremapper")
+        self.assertEqual(proc.stdout.splitlines(), ["19.bd5 263 842"])
+        self.assertIn(
+            "--pgs: 1 of 1 given PG id(s) are currently backfill_toofull "
+            "and will be the only ones considered",
+            proc.stderr,
+        )
+        self.assertIn("1 backfill_toofull PG(s) cluster-wide", proc.stderr)
+
+    def test_several_named_pgs_are_all_kept(self):
+        # Targets are not pinned here: with only two of the six PGs in play,
+        # the greedy assignment (see assign_targets) can pick a different
+        # target than the full run does, since room is contended
+        # differently. Only which PGs got a proposal is guaranteed.
+        proc = self.run_proc("--pgs", "19.bd5", "19.7be", "--pgremapper")
+        pgids = {line.split()[0] for line in proc.stdout.splitlines()}
+        self.assertEqual(pgids, {"19.bd5", "19.7be"})
+        self.assertIn("2 backfill_toofull PG(s) cluster-wide", proc.stderr)
+
+    def test_id_that_matches_nothing_is_reported_and_yields_no_output(self):
+        proc = self.run_proc("--pgs", "19.zzz", "--pgremapper")
+        self.assertEqual(proc.stdout, "")
+        self.assertIn(
+            "--pgs: 0 of 1 given PG id(s) are currently backfill_toofull "
+            "and will be the only ones considered; 1 matched nothing "
+            "(check for typos): 19.zzz",
+            proc.stderr,
+        )
+        self.assertIn("0 backfill_toofull PG(s) cluster-wide", proc.stderr)
+
+    def test_a_mix_of_matching_and_unmatched_ids_reports_both(self):
+        proc = self.run_proc("--pgs", "19.bd5", "19.zzz", "--pgremapper")
+        self.assertEqual(proc.stdout.splitlines(), ["19.bd5 263 842"])
+        self.assertIn(
+            "--pgs: 1 of 2 given PG id(s) are currently backfill_toofull "
+            "and will be the only ones considered; 1 matched nothing "
+            "(check for typos): 19.zzz",
+            proc.stderr,
+        )
+
+    def test_no_pgs_flag_considers_every_pg(self):
+        proc = self.run_proc("--pgremapper")
+        self.assertEqual(len(proc.stdout.splitlines()), 6)
+        self.assertNotIn("--pgs", proc.stderr)
 
 
 def osd_df_of(utils):

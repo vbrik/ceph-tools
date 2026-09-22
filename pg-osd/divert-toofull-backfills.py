@@ -61,6 +61,16 @@ interchangeable, so position carries no identity (a same-OSD-set reorder from
 primary-affinity or pg-upmap-items is not movement) and the sets are diffed
 instead, with SHARD shown as '-'.
 
+--pgs PGID [PGID ...] narrows all of the above to just the given PG(s):
+every other backfill_toofull PG in the cluster is treated as though it
+were not stuck, so its shards compete for none of the room described
+above and are not what the unknown-pool and host-failure-domain checks
+(see check_host_failure_domain) validate. This is a filter on which PGs
+are examined, not a change to how any one of them is analyzed — useful
+for probing a handful of PGs in isolation, or re-running against just
+the ones an earlier pass left unplaced. A given id that is not currently
+backfill_toofull is reported on stderr, since that usually means a typo.
+
 Which way a row points
 ----------------------
 The table's header has two lines: a group name (ACTING, UP or TARGET) spanning
@@ -435,6 +445,17 @@ def parse_args() -> argparse.Namespace:
         "utilization above --max-target-util; 1 gives every OSD at most one "
         "shard.",
     )
+    parser.add_argument(
+        "--pgs",
+        nargs="+",
+        default=[],
+        metavar="PGID",
+        help="Restrict analysis to only these PG id(s): every other "
+        "backfill_toofull PG is ignored, as if it were not stuck. "
+        "Space-separated, e.g. --pgs 19.92e 20.1a3. A given id that is not "
+        "currently backfill_toofull is reported on stderr, since that "
+        "usually means a typo.",
+    )
     add_state_args(parser, SNAPSHOT_COMMANDS)
     return parser.parse_args()
 
@@ -563,6 +584,19 @@ class DivertedShard(NamedTuple):
     # reconstructing the raw CRUSH mapping
     size_bytes: int = 0  # what the shard will occupy once backfilled, see
     # shard_size_bytes; 0 means "not known", which projects no usage
+
+
+def filter_toofull_pgs(
+    pgs: list[dict], wanted: set[str]
+) -> tuple[list[dict], set[str]]:
+    """Restrict pgs to only those whose pgid is in wanted (the --pgs filter).
+
+    Returns (kept, matched), where matched is the subset of wanted that was
+    actually found, so the caller can report the rest as likely typos.
+    """
+    matched = {pg["pgid"] for pg in pgs if pg["pgid"] in wanted}
+    kept = [pg for pg in pgs if pg["pgid"] in wanted]
+    return kept, matched
 
 
 def find_diverted_shards(
@@ -1030,6 +1064,23 @@ def main() -> None:
             f"at most the cluster's backfillfull_ratio ({ratios.backfillfull:g}%): "
             "Ceph refuses to backfill onto an OSD past that, so a higher cap "
             "would let the script propose targets that re-wedge."
+        )
+
+    if args.pgs:
+        wanted_pgs = set(args.pgs)
+        toofull_pgs, matched_pgs = filter_toofull_pgs(toofull_pgs, wanted_pgs)
+        unmatched_pgs = sorted(wanted_pgs - matched_pgs)
+        print(
+            f"--pgs: {len(matched_pgs)} of {len(wanted_pgs)} given PG id(s) "
+            "are currently backfill_toofull and will be the only ones "
+            "considered"
+            + (
+                f"; {len(unmatched_pgs)} matched nothing (check for typos): "
+                + ", ".join(unmatched_pgs)
+                if unmatched_pgs
+                else ""
+            ),
+            file=sys.stderr,
         )
 
     toofull_pool_ids = {pgid_pool_id(pg["pgid"]) for pg in toofull_pgs}
