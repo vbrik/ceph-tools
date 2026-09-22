@@ -8,6 +8,16 @@ osd_max_backfills=1). Made with
 
   backfillctl pg-movements --save-state <this directory>
 
+PATCHED: at capture time, pg-movements's own --save-state trimmed each PG
+down to the handful of fields it reads, which did not include up_primary
+(pg-movements never used it). 'backfillctl save-state''s later unified
+snapshot format keeps up_primary too (osds-of-pg needs it), so it has been
+added back here synthetically -- the first real OSD of each PG's 'up' list
+(falling back to acting_primary), not the genuine value from the live
+cluster -- so this fixture's pg_dump_pgs.json matches the shape a real
+capture now has. pg-movements itself never reads up_primary, so this does
+not affect what its test asserts.
+
 19 shard rows read PROGRESS 100% (stat_sum.num_objects_misplaced +
 num_objects_degraded == 0) while still listed (up != acting), all in pool 27
 (an EC k8m2 pool, pg_num=4096), and every one of the 19 PGs has at least one

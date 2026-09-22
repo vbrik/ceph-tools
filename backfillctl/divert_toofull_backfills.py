@@ -225,33 +225,21 @@ pair, so such rows are proposed like any other (see "Applying the output").
 
 Testing against saved cluster state
 ------------------------------------
-By default every run calls the live 'ceph' CLI (see SNAPSHOT_COMMANDS for
-the six commands and their JSON output). --save-state DIR captures that
-same JSON, one '<key>.json' file per command, into DIR as a side effect of
-an otherwise normal run — analysis and output proceed as usual against the
-real data, so the run's own proposals are unaffected by the save. DIR must
-be empty or not yet exist.
+By default every run calls the live 'ceph' CLI: the five commands in
+SNAPSHOT_COMMANDS, plus the mons-filtered 'ceph pg ls backfill_toofull' (see
+fetch_backfill_toofull_pg_stats) rather than a full 'pg dump pgs'.
 
-The saved copy is anonymized (see shared.anonymize_snapshots): cluster fsid, OSD
-IP addresses, OSD uuids, hostnames and pool/CRUSH-rule names are replaced
-with deterministic fake values before writing, so a --save-state capture is
-safe to hand to someone outside the cluster (or commit to a public repo)
-without hand-editing it first. Every substitution is a pure function of an
-id already in the same record (OSD id, pool id, rule id) or of the real
-value itself, so the same real entity always anonymizes to the same fake
-one — including across separate runs against the same cluster, with no
-shared state needed. PG ids, OSD ids, utilizations and the overall topology
-are left untouched, since those are what the analysis (and a replay via
---load-state) actually depends on.
-
---load-state DIR reads those six files back instead of calling 'ceph', so a
-captured state — anonymized or not — can be replayed offline with no
-cluster access. The two flags are mutually exclusive. tests/pg-osd/test-data/
-divert-toofull-backfills-*/ hold sample captures usable directly as --load-state
-arguments, each with a README.txt describing the scenario and what the
-script should reproduce from it — the exact table for the small fixtures,
-and for the cluster-sized one the counts and invariants its test asserts
-instead.
+'backfillctl save-state DIR' captures a cluster's state — anonymized, and
+covering every subcommand, not just this one — into DIR, as one '<key>.json'
+file per command including a full 'ceph pg dump pgs'. --load-state DIR then
+reads those files back instead of calling 'ceph', filtering pg_dump_pgs
+client-side for the PGs in backfill_toofull, so a captured state can be
+replayed offline with no cluster access. tests/pg-osd/test-data/
+divert-toofull-backfills-*/ hold sample captures usable directly as
+--load-state arguments, each with a README.txt describing the scenario and
+what the script should reproduce from it — the exact table for the small
+fixtures, and for the cluster-sized one the counts and invariants its test
+asserts instead.
 
 Applying the output
 -------------------
@@ -335,7 +323,7 @@ from shared import (
     KIB,
     POOL_TYPE_ERASURE,
     SnapshotStore,
-    add_state_args,
+    add_load_state_arg,
     fetch_crush_rules,
     fetch_ec_profiles,
     fetch_osd_df,
@@ -365,9 +353,13 @@ DEFAULT_MAX_TARGET_USES = 5
 
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces
-# it and the '<key>.json' filename it is saved/loaded as under --save-state/
-# --load-state. Keys match the fixtures under tests/pg-osd/test-data/divert-toofull-backfills-*/
-# verbatim, so those directories can be passed straight to --load-state.
+# it. Keys match the fixtures under tests/pg-osd/test-data/
+# divert-toofull-backfills-*/ verbatim, so those directories can be passed
+# straight to --load-state. pg_ls_backfill_toofull is what a live run
+# actually issues (see fetch_backfill_toofull_pg_stats): a small fraction of
+# the full 'pg dump pgs' on a big cluster. --load-state instead reads
+# pg_dump_pgs.json -- what 'backfillctl save-state' captures, covering every
+# PG -- and filters it client-side for the same PGs.
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
     "osd_df": ["ceph", "osd", "df", "--format", "json"],
@@ -382,7 +374,23 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
         "--format",
         "json",
     ],
+    "pg_dump_pgs": ["ceph", "pg", "dump", "pgs", "--format", "json"],
 }
+
+
+def fetch_backfill_toofull_pg_stats(store: SnapshotStore) -> list[dict]:
+    """Return the PGs with 'backfill_toofull' in their state, live or from a snapshot.
+
+    See SNAPSHOT_COMMANDS: live reads pg_ls_backfill_toofull, --load-state
+    instead filters pg_dump_pgs client-side by the same state flag.
+    """
+    if store.load_dir is None:
+        return fetch_pg_stats(store, "pg_ls_backfill_toofull")
+    return [
+        pg
+        for pg in fetch_pg_stats(store, "pg_dump_pgs")
+        if "backfill_toofull" in pg["state"].split("+")
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +493,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "currently backfill_toofull is reported on stderr, since that "
         "usually means a typo.",
     )
-    add_state_args(parser, SNAPSHOT_COMMANDS)
+    add_load_state_arg(parser)
     return parser
 
 
@@ -1119,15 +1127,9 @@ def run(args: argparse.Namespace) -> None:
     pools_by_id = fetch_pools(store)
     pools = list(pools_by_id.values())
     ec_pool_ids = ec_pool_ids_from(pools)
-    toofull_pgs = fetch_pg_stats(store, "pg_ls_backfill_toofull")
+    toofull_pgs = fetch_backfill_toofull_pg_stats(store)
     crush_rules = fetch_crush_rules(store)
     ec_profiles = fetch_ec_profiles(store)
-
-    # Saved before the validation below, which can sys.exit: a cluster that
-    # fails those checks is exactly the kind of surprising state worth having
-    # captured, so the save must not be skipped just because the rest of the
-    # analysis can't proceed.
-    store.save()
 
     # Both thresholds track the cluster's own idea of full unless overridden.
     ratios = fetch_full_ratios(store)

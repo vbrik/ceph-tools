@@ -159,29 +159,54 @@ class TableTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
-    """main() end to end over canned snapshots, including --load/--save-state."""
+    """main() end to end: a live run (mocked SnapshotStore.json) and
+    --load-state (a pg_dump_pgs.json-based directory, what 'backfillctl
+    save-state' produces -- see op.fetch_pg_info)."""
+
+    # 'ceph pg <pgid> query''s shape, used for live runs (fetch_pg_info's
+    # SnapshotStore.load_dir-is-None branch).
+    PG_QUERY = {  # noqa: RUF012
+        "state": "active+remapped+backfilling",
+        "up": [1, 4],
+        "acting": [1, 2],
+        "info": {
+            "stats": {
+                "up_primary": 1,
+                "acting_primary": 1,
+                "stat_sum": {
+                    "num_objects": 100,
+                    "num_objects_misplaced": 50,
+                    "num_bytes": 4096,
+                },
+                "reported_epoch": 7,
+            }
+        },
+        # Fields the script never reads, and that may name hosts or addresses.
+        "peer_info": [{"peer": "1", "addr": "10.1.2.3:6800"}],
+        "recovery_state": [{"name": "Started/Primary/Active"}],
+    }
+
+    # The same PG's data in pg_dump_pgs.json's pg_stat shape (what
+    # --load-state reads instead -- see fetch_pg_info's other branch): flat,
+    # not wrapped in 'info.stats', and up_primary/acting_primary are siblings
+    # of up/acting rather than nested.
+    PG_DUMP_PGS = {  # noqa: RUF012
+        "pg_stats": [
+            {
+                "pgid": "5.3",
+                "state": "active+remapped+backfilling",
+                "up": [1, 4],
+                "up_primary": 1,
+                "acting": [1, 2],
+                "acting_primary": 1,
+                "stat_sum": {"num_objects": 100, "num_objects_misplaced": 50},
+            }
+        ]
+    }
 
     SNAPSHOTS = {  # noqa: RUF012
-        "pg_query": {
-            "state": "active+remapped+backfilling",
-            "up": [1, 4],
-            "acting": [1, 2],
-            "info": {
-                "stats": {
-                    "up_primary": 1,
-                    "acting_primary": 1,
-                    "stat_sum": {
-                        "num_objects": 100,
-                        "num_objects_misplaced": 50,
-                        "num_bytes": 4096,
-                    },
-                    "reported_epoch": 7,
-                }
-            },
-            # Fields the script never reads, and that may name hosts or addresses.
-            "peer_info": [{"peer": "1", "addr": "10.1.2.3:6800"}],
-            "recovery_state": [{"name": "Started/Primary/Active"}],
-        },
+        "pg_query": PG_QUERY,
+        "pg_dump_pgs": PG_DUMP_PGS,
         "osd_tree": {
             "nodes": [
                 {"id": -2, "type": "host", "name": "ceph1-1", "children": [1, 2]},
@@ -257,7 +282,7 @@ class MainTest(unittest.TestCase):
 
     def test_progress_100_note_appears_when_the_pg_reads_100(self):
         snaps = json.loads(json.dumps(self.SNAPSHOTS))  # deep copy
-        snaps["pg_query"]["info"]["stats"]["stat_sum"]["num_objects_misplaced"] = 0
+        snaps["pg_dump_pgs"]["pg_stats"][0]["stat_sum"]["num_objects_misplaced"] = 0
         with tempfile.TemporaryDirectory() as tmp:
             for key, data in snaps.items():
                 (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
@@ -265,75 +290,14 @@ class MainTest(unittest.TestCase):
         self.assertIn(" 100%", out)
         self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", out)
 
-    def test_save_state_writes_the_pg_specific_capture_anonymized(self):
-        by_command = {
-            tuple(cmd): self.SNAPSHOTS[key]
-            for key, cmd in op.snapshot_commands("5.3").items()
-        }
-
-        def fake(cmd):
-            return by_command[tuple(cmd)]
-
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.object(shared, "ceph_json", fake),
-        ):
-            out = self.run_main("--save-state", tmp + "/snap", "5.3")
-            saved = {
-                p.stem: json.loads(p.read_text())
-                for p in pathlib.Path(tmp, "snap").glob("*.json")
-            }
-        self.assertIn("PG 5.3", out)
-        self.assertEqual(set(saved), set(op.snapshot_commands("5.3")))
-        hosts = [n["name"] for n in saved["osd_tree"]["nodes"] if n["type"] == "host"]
-        self.assertEqual(["host01", "host02"], hosts)
-        # Cut down to the six values fetch_pg_info reads, so nothing else in
-        # the (release-dependent) document can identify the cluster.
-        self.assertEqual(
-            saved["pg_query"],
-            {
-                "state": "active+remapped+backfilling",
-                "up": [1, 4],
-                "acting": [1, 2],
-                "info": {
-                    "stats": {
-                        "up_primary": 1,
-                        "acting_primary": 1,
-                        "stat_sum": {"num_objects": 100, "num_objects_misplaced": 50},
-                    }
-                },
-            },
-        )
-        self.assertNotIn("10.1.2.3", json.dumps(saved))
-        # osd dump is cut down to the upmaps this script reads: no client
-        # blocklist entries, no other cluster-wide state.
-        self.assertEqual(
-            saved["osd_dump"],
-            {"pg_upmap_items": self.SNAPSHOTS["osd_dump"]["pg_upmap_items"]},
-        )
-        self.assertNotIn("10.9.8.7", json.dumps(saved))
-
-    def test_saved_state_replays_to_the_same_output(self):
-        # Hostnames already in their anonymized form map to themselves, so the
-        # replay of a capture is comparable to the live run it came from.
-        snaps = {
-            **self.SNAPSHOTS,
-            "osd_tree": json.loads(
-                json.dumps(self.SNAPSHOTS["osd_tree"])
-                .replace("ceph1-1", "host01")
-                .replace("ceph1-2", "host02")
-            ),
-        }
-        by_command = {
-            tuple(cmd): snaps[key] for key, cmd in op.snapshot_commands("5.3").items()
-        }
+    def test_load_state_reports_a_pgid_missing_from_the_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(shared, "ceph_json", lambda c: by_command[tuple(c)]):
-                live = self.run_main("--save-state", tmp + "/snap", "5.3")
-            with mock.patch.object(shared, "ceph_json", side_effect=AssertionError):
-                replayed = self.run_main("--load-state", tmp + "/snap", "5.3")
-        self.assertIn("host01", live)
-        self.assertEqual(live, replayed)
+            for key, data in self.SNAPSHOTS.items():
+                (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
+            with self.assertRaises(SystemExit) as ctx:
+                self.run_main("--load-state", tmp, "99.99")
+        self.assertIn("99.99", str(ctx.exception))
+        self.assertIn("pg_dump_pgs.json", str(ctx.exception))
 
     def test_pool_missing_from_pool_ls_is_treated_as_replicated_of_unknown_size(self):
         snaps = {**self.SNAPSHOTS, "pool_ls_detail": []}

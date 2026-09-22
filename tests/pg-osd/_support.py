@@ -46,16 +46,20 @@ def parse_args(module, argv: list[str]) -> argparse.Namespace:
 class FakeStore:
     """Stand-in for shared.SnapshotStore serving canned snapshots by key.
 
-    Enough for the fetch_* helpers, which only call json() and read commands.
-    Pass either {key: parsed JSON} or, to also exercise error messages that name
-    the ceph command, the store's commands.
+    Enough for the fetch_* helpers, which only call json(), read commands and
+    (for the ones with a live/--load-state fork, e.g. fetch_remapped_pg_stats)
+    check load_dir. Pass either {key: parsed JSON} or, to also exercise error
+    messages that name the ceph command, the store's commands. load_dir
+    defaults to non-None: FakeStore always stands in for already-fetched
+    data, the --load-state side of that fork, never a live ceph call.
     """
 
-    def __init__(self, snapshots: dict[str, object], commands=None):
+    def __init__(self, snapshots: dict[str, object], commands=None, load_dir="fake"):
         self.snapshots = snapshots
         self.commands = commands or {
             k: ["ceph", k, "--format", "json"] for k in snapshots
         }
+        self.load_dir = load_dir
 
     def json(self, key: str) -> object:
         return self.snapshots[key]

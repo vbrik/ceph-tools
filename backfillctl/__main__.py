@@ -11,6 +11,7 @@ import argparse
 import divert_toofull_backfills
 import osds_of_pg
 import pg_movements
+import save_state
 import stop_backfills_into_osd
 
 _COMMAND_MODULES = (
@@ -18,6 +19,7 @@ _COMMAND_MODULES = (
     pg_movements,
     divert_toofull_backfills,
     stop_backfills_into_osd,
+    save_state,
 )
 
 

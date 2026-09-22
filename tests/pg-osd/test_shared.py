@@ -503,22 +503,16 @@ class SnapshotStoreTest(unittest.TestCase):
 class StateArgsTest(unittest.TestCase):
     def parse(self, *argv):
         parser = argparse.ArgumentParser()
-        shared.add_state_args(parser, {"a": ["ceph", "a"], "b": ["ceph", "b"]})
+        shared.add_load_state_arg(parser)
         return parser.parse_args(argv)
 
-    def test_defaults_are_off(self):
-        args = self.parse()
-        self.assertIsNone(args.load_state)
-        self.assertIsNone(args.save_state)
+    def test_default_is_off(self):
+        self.assertIsNone(self.parse().load_state)
 
-    def test_load_and_save_are_mutually_exclusive(self):
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            self.parse("--load-state", "x", "--save-state", "y")
-
-    def test_help_lists_the_files_the_script_reads(self):
+    def test_help_points_at_save_state(self):
         parser = argparse.ArgumentParser()
-        shared.add_state_args(parser, {"a": ["ceph", "a"], "b": ["ceph", "b"]})
-        self.assertIn("a.json, b.json", " ".join(parser.format_help().split()))
+        shared.add_load_state_arg(parser)
+        self.assertIn("backfillctl", parser.format_help())
 
     def test_from_args_requires_an_existing_load_directory(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -527,20 +521,19 @@ class StateArgsTest(unittest.TestCase):
             )
         self.assertIn("not found", str(ctx.exception))
 
-    def test_from_args_creates_a_missing_save_directory(self):
+
+class ResolveSaveDirTest(unittest.TestCase):
+    def test_creates_a_missing_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = pathlib.Path(tmp) / "new" / "dir"
-            store = shared.SnapshotStore.from_args(
-                self.parse("--save-state", str(target)), {}
-            )
+            self.assertEqual(shared.resolve_save_dir(str(target)), target)
             self.assertTrue(target.is_dir())
-            self.assertEqual(store.save_dir, target)
 
-    def test_from_args_refuses_a_non_empty_save_directory(self):
+    def test_refuses_a_non_empty_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             (pathlib.Path(tmp) / "old.json").write_text("{}")
             with self.assertRaises(SystemExit) as ctx:
-                shared.SnapshotStore.from_args(self.parse("--save-state", tmp), {})
+                shared.resolve_save_dir(tmp)
         self.assertIn("not empty", str(ctx.exception))
 
 

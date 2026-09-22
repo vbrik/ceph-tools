@@ -11,6 +11,12 @@ Captured: 2026-08-11 ~09:05 from a live cluster, via:
   ceph osd crush rule dump --format json > crush_rule_dump.json
   ceph pg ls backfill_toofull --format json > pg_ls_backfill_toofull.json
 
+RENAMED: pg_ls_backfill_toofull.json has since been renamed to
+pg_dump_pgs.json, content unchanged, to match 'backfillctl save-state''s
+later unified snapshot format, which every subcommand's --load-state now
+reads that PG data from (filtering it client-side for the flag it cares
+about).
+
 What's actually going on: osd.457 is down/out, on host27. PG 19.21f
 (EC pool 19) lost its acting OSD in shard slot 7, and CRUSH re-placed that
 slot within the same host bucket, landing it on osd.625 -- also on
@@ -48,7 +54,7 @@ host that would have been derived from it.
 
 Use this fixture to exercise the "found something to divert" path. It is
 NOT a no-problems fixture -- see divert-toofull-backfills-nominal-synthetic/ for that
-(same topology files, but pg_ls_backfill_toofull.json is a hand-edited
+(same topology files, but pg_dump_pgs.json is a hand-edited
 empty result, since the live cluster had no genuinely problem-free moment
 available at capture time).
 

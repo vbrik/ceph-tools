@@ -113,16 +113,18 @@ Shards that cannot be pinned are listed on stderr, never dropped silently:
 
 Testing against saved cluster state
 -----------------------------------
-By default every run calls the live 'ceph' CLI (see SNAPSHOT_COMMANDS for the
-six commands and their JSON output). --save-state DIR also writes that JSON,
-one '<key>.json' file per command, into DIR (empty or not yet existing) as a
-side effect of an otherwise normal run. The copy is anonymized (see
-anonymize_snapshots here and shared.anonymize_snapshots), so it can be shared or
-committed. --load-state DIR reads
-such a directory back instead of calling 'ceph', so a captured state can be
-replayed offline with no cluster access. The two options are mutually
-exclusive. tests/pg-osd/test-data/stop-backfills-into-osd-*/ hold captures for use
-as --load-state arguments, each with a README.txt describing the scenario.
+By default every run calls the live 'ceph' CLI: the five commands in
+SNAPSHOT_COMMANDS, plus the mons-filtered 'ceph pg ls remapped' (see
+fetch_remapped_pg_stats) rather than a full 'pg dump pgs'.
+
+'backfillctl save-state DIR' captures a cluster's state (anonymized, and
+covering every subcommand, not just this one) into DIR, as one '<key>.json'
+file per command including a full 'ceph pg dump pgs'. --load-state DIR then
+reads those files back instead of calling 'ceph', filtering pg_dump_pgs
+client-side for the PGs with up != acting, so a captured state can be
+replayed offline with no cluster access. tests/pg-osd/test-data/
+stop-backfills-into-osd-*/ hold captures for use as --load-state arguments,
+each with a README.txt describing the scenario.
 
 Applying the output
 -------------------
@@ -188,7 +190,7 @@ from shared import (
     PROGRESS_100_NOTE,
     SnapshotStore,
     abbreviate_state,
-    add_state_args,
+    add_load_state_arg,
     copies_moving,
     fetch_crush_rules,
     fetch_ec_profiles,
@@ -208,21 +210,37 @@ from shared import (
     shard_size_bytes,
     slot,
 )
-from shared import anonymize_snapshots as anonymize_common
 
-# Maps each snapshot to the 'ceph ... --format json' command that produces it
-# and the '<key>.json' filename it is saved/loaded as under --save-state/
-# --load-state.
+# Maps each snapshot to the 'ceph ... --format json' command that produces it.
+# pg_ls_remapped is what a live run actually issues (see
+# fetch_remapped_pg_stats): exactly the PGs whose up != acting, a small
+# fraction of the full 'pg dump pgs' on a big cluster. --load-state instead
+# reads pg_dump_pgs.json -- what 'backfillctl save-state' captures, covering
+# every PG -- and filters it client-side for the same PGs.
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
     "osd_df": ["ceph", "osd", "df", "--format", "json"],
     "osd_dump": ["ceph", "osd", "dump", "--format", "json"],
     "pool_ls_detail": ["ceph", "osd", "pool", "ls", "detail", "--format", "json"],
     "crush_rule_dump": ["ceph", "osd", "crush", "rule", "dump", "--format", "json"],
-    # Exactly the PGs whose up != acting, filtered by the mons: a small fraction
-    # of what 'ceph pg dump pgs' would return on a big cluster.
     "pg_ls_remapped": ["ceph", "pg", "ls", "remapped", "--format", "json"],
+    "pg_dump_pgs": ["ceph", "pg", "dump", "pgs", "--format", "json"],
 }
+
+
+def fetch_remapped_pg_stats(store: SnapshotStore) -> list[dict]:
+    """Return the PGs with up != acting ('remapped' state flag), live or from a snapshot.
+
+    See SNAPSHOT_COMMANDS: live reads pg_ls_remapped, --load-state instead
+    filters pg_dump_pgs client-side by the same state flag.
+    """
+    if store.load_dir is None:
+        return fetch_pg_stats(store, "pg_ls_remapped")
+    return [
+        pg
+        for pg in fetch_pg_stats(store, "pg_dump_pgs")
+        if "remapped" in pg["state"].split("+")
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +321,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "Warns if a PG needs several lines, since separate runs can "
         "overwrite each other; prefer --import-mappings.",
     )
-    add_state_args(parser, SNAPSHOT_COMMANDS)
+    add_load_state_arg(parser)
     return parser
 
 
@@ -316,31 +334,6 @@ def fetch_backfillfull_pct(store: SnapshotStore) -> float | None:
     """Return the cluster's backfillfull_ratio as a percentage, or None if absent."""
     ratio = store.json("osd_dump").get("backfillfull_ratio")
     return None if ratio is None else ratio * 100
-
-
-# ---------------------------------------------------------------------------
-# Anonymization for --save-state
-# ---------------------------------------------------------------------------
-
-# The parts of 'ceph osd dump' besides the erasure code profiles that the
-# analysis reads, and so that --save-state keeps.
-KEPT_OSD_DUMP_RATIOS = ("full_ratio", "backfillfull_ratio", "nearfull_ratio")
-
-
-def anonymize_snapshots(snapshots: dict[str, object]) -> None:
-    """Anonymize a complete set of parsed snapshots in place.
-
-    shared.anonymize_snapshots does the general scrub (hostnames, pool and CRUSH
-    rule names, fsid, OSD addresses and uuids). 'ceph osd dump' is then cut down
-    to the erasure code profiles and the full ratios, the only parts this script
-    reads, which also keeps everything else in it out of the capture.
-    """
-    anonymize_common(snapshots)
-    dump = snapshots["osd_dump"]
-    snapshots["osd_dump"] = {
-        "erasure_code_profiles": dump.get("erasure_code_profiles", {}),
-        **{k: dump[k] for k in KEPT_OSD_DUMP_RATIOS if k in dump},
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -942,20 +935,14 @@ def run(args: argparse.Namespace) -> None:
     osd = args.osd
     exclude_pgs = set(args.exclude_pgs)
 
-    store = SnapshotStore.from_args(
-        args, SNAPSHOT_COMMANDS, anonymize=anonymize_snapshots
-    )
+    store = SnapshotStore.from_args(args, SNAPSHOT_COMMANDS)
 
     osd_df = fetch_osd_df(store)
     osd_host = fetch_osd_hosts(store)
-    pg_stats = fetch_pg_stats(store, "pg_ls_remapped")
+    pg_stats = fetch_remapped_pg_stats(store)
     pools = fetch_pools(store)
     ec_profiles = fetch_ec_profiles(store)
     crush_rules = fetch_crush_rules(store)
-
-    # Saved before the checks below, which can exit: a cluster that trips them
-    # is just the kind of state worth having captured.
-    store.save()
 
     if osd not in osd_df:
         sys.exit(f"ERROR: osd.{osd} not found in 'ceph osd df'.")

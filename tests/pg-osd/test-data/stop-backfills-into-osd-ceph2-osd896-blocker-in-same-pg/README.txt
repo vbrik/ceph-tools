@@ -13,6 +13,13 @@ Made with
 (same six files as the sibling; osd_dump.json is cut down to the erasure code
 profiles and the full ratios, backfillfull_ratio being 0.91 here.)
 
+RENAMED: this used --save-state's own capture, so the PG listing was saved
+as pg_ls_remapped.json (what 'ceph pg ls remapped' returns). It has since
+been renamed to pg_dump_pgs.json, content unchanged, to match
+'backfillctl save-state''s later unified snapshot format, which every
+subcommand's --load-state now reads that PG data from (filtering it
+client-side for the flag it cares about).
+
 Why the PG is stuck: backfill_toofull is a property of the PG. 19.92e has a
 second shard moving, shard 6 from osd.99 to osd.337, and osd.337 is at 92.5%,
 over backfillfull_ratio, so it refuses the reservation and the whole PG waits,

@@ -55,13 +55,11 @@ from typing import NamedTuple
 
 from shared import (
     PROGRESS_100_NOTE,
-    PROGRESS_COUNTERS,
     SnapshotStore,
     abbreviate_state,
-    add_state_args,
+    add_load_state_arg,
     copies_moving,
     ec_shard_moves,
-    extract_pg_stats,
     fetch_osd_df,
     fetch_osd_hosts,
     fetch_pg_stats,
@@ -75,10 +73,10 @@ from shared import (
     progress_reads_100,
     real_osd_set,
 )
-from shared import anonymize_snapshots as anonymize_common
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces it
-# and the '<key>.json' filename it is saved/loaded as (--save-state/--load-state).
+# and the '<key>.json' filename it is read back from under --load-state (see
+# the save-state subcommand, which captures this same file).
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
     "osd_df": ["ceph", "osd", "df", "--format", "json"],
@@ -103,36 +101,8 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         default="pgid",
         help="column to sort output rows by (default: pgid)",
     )
-    add_state_args(parser, SNAPSHOT_COMMANDS)
+    add_load_state_arg(parser)
     return parser
-
-
-# The parts of each pg_stat this script reads.
-KEPT_PG_STAT_KEYS = ("pgid", "state", "up", "acting", "acting_primary")
-
-
-def anonymize_snapshots(snapshots: dict[str, object]) -> None:
-    """Anonymize the snapshots for --save-state, in place.
-
-    'ceph pg dump pgs' carries dozens of fields per PG, of which this script
-    reads a handful; only those are kept, which also keeps the capture small
-    on a big cluster.
-    """
-    anonymize_common(snapshots)
-    pg_stats = extract_pg_stats(snapshots["pg_dump_pgs"], "ceph pg dump pgs")
-    snapshots["pg_dump_pgs"] = {
-        "pg_stats": [
-            {
-                **{k: pg[k] for k in KEPT_PG_STAT_KEYS if k in pg},
-                "stat_sum": {
-                    k: v
-                    for k, v in pg.get("stat_sum", {}).items()
-                    if k in PROGRESS_COUNTERS
-                },
-            }
-            for pg in pg_stats
-        ]
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -223,14 +193,11 @@ _SORT_KEYS = {
 
 
 def run(args: argparse.Namespace) -> None:
-    store = SnapshotStore.from_args(
-        args, SNAPSHOT_COMMANDS, anonymize=anonymize_snapshots
-    )
+    store = SnapshotStore.from_args(args, SNAPSHOT_COMMANDS)
     pg_stats = fetch_pg_stats(store, "pg_dump_pgs")
     osd_df = fetch_osd_df(store)
     osd_host = fetch_osd_hosts(store)
     pools = fetch_pools(store)
-    store.save()
 
     rows: list[MovementRow] = []
 
