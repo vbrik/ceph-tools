@@ -25,18 +25,18 @@ second shard moving, shard 6 from osd.99 to osd.337, and osd.337 is at 92.5%,
 over backfillfull_ratio, so it refuses the reservation and the whole PG waits,
 including shard 4 going to the nearly empty osd.896.
 
-Expected output for osd 896 (--pgremapper --pin-blockers):
+Expected pairs for osd 896 --pin-blockers (as '<pgid> <up osd> <acting osd>'):
 
   19.92e 896 231
   19.92e 337 99
 
-The first line stops the backfill into osd.896, the second -- NOTE "blocks shard
-4: target osd.337 would be at 93.4%, over backfillfull" -- stops the one into a
-different OSD that is holding the PG. An operator who wants 231 -> 896 to
-proceed drops the FIRST line and keeps the second; the pin is valid on its own
-(osd.99 on host17, no other shard of the PG there), and with it 19.92e has only
-the wanted backfill left. In --import-mappings form the same is a
-two-entry array.
+The first pin stops the backfill into osd.896, the second -- NOTE "blocks shard
+4: target osd.337 would be at 93.4%, over backfillfull" in the table -- stops
+the one into a different OSD that is holding the PG. An operator who wants
+231 -> 896 to proceed drops the FIRST entry and keeps the second; the pin is
+valid on its own (osd.99 on host17, no other shard of the PG there), and with
+it 19.92e has only the wanted backfill left. In --pgremapper-mappings form the
+same is a two-entry JSON array.
 
 Without --pin-blockers (the default), the second line is never found: the
 output is just "19.92e 896 231" and a NOTE that a shard of the PG blocking it

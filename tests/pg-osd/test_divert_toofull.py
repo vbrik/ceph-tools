@@ -460,7 +460,7 @@ def fixture_plan(fixture, *argv):
 
 
 def remap_triples(proposals):
-    """The (pgid, up OSD, target OSD) of each proposal, as --pgremapper prints them."""
+    """The (pgid, up OSD, target OSD) of each proposal, as '<pgid> <up> <target>'."""
     return [f"{p.shard.pgid} {p.shard.up_osd} {p.target_osd}" for p in proposals]
 
 
@@ -515,12 +515,12 @@ class PrintUnplaceableTest(unittest.TestCase):
 
 
 def proposal(pgid, up_osd, target_osd, shard=0):
-    """A Proposal with just enough fields set for the import-mappings tests."""
+    """A Proposal with just enough fields set for the pgremapper-mappings tests."""
     ds = ut.ArrivingShard(pgid, shard, up_osd, None, [up_osd])
     return ut.Proposal(ds, target_osd, "h", 50.0, 55.0)
 
 
-class ImportMappingsOutputTest(unittest.TestCase):
+class PgremapperMappingsOutputTest(unittest.TestCase):
     def proposals(self):
         return [
             proposal("19.14cd", 232, 337, shard=5),
@@ -531,7 +531,7 @@ class ImportMappingsOutputTest(unittest.TestCase):
     def printed(self, proposals):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            ut.print_import_mappings(proposals)
+            ut.print_pgremapper_mappings(proposals)
         return out.getvalue()
 
     def test_is_a_json_array_of_pgid_and_mapping_entries(self):
@@ -560,41 +560,6 @@ class ImportMappingsOutputTest(unittest.TestCase):
             json.loads(self.printed(self.proposals()[:1])),
             [{"pgid": "19.14cd", "mapping": {"from": 232, "to": 337}}],
         )
-
-    def test_same_pairs_as_the_pgremapper_lines(self):
-        proposals = self.proposals()
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            ut.print_pgremapper(proposals)
-        from_lines = [tuple(line.split()) for line in out.getvalue().splitlines()]
-        from_json = [
-            (e["pgid"], str(e["mapping"]["from"]), str(e["mapping"]["to"]))
-            for e in json.loads(self.printed(proposals))
-        ]
-        self.assertEqual(from_lines, from_json)
-
-
-class MultiTargetWarningTest(unittest.TestCase):
-    def test_pgs_needing_several_targets_only_lists_pgs_with_more_than_one(self):
-        proposals = [
-            proposal("19.2", 100, 200),
-            proposal("19.2", 101, 201),
-            proposal("19.3", 102, 202),
-        ]
-        self.assertEqual(ut.pgs_needing_several_targets(proposals), ["19.2"])
-
-    def test_no_pg_with_more_than_one_target_yields_nothing(self):
-        proposals = [proposal("19.2", 100, 200), proposal("19.3", 101, 201)]
-        self.assertEqual(ut.pgs_needing_several_targets(proposals), [])
-
-    def test_warning_names_the_pgs_and_recommends_import_mappings(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            ut.warn_separate_remaps(["19.2", "19.3"])
-        text = err.getvalue()
-        self.assertIn("WARNING: 2 PG(s)", text)
-        self.assertIn("19.2, 19.3", text)
-        self.assertIn("--import-mappings", text)
 
 
 class FixturePlanTest(unittest.TestCase):
@@ -659,67 +624,38 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertNotIn("*", out)
         self.assertNotIn("EXISTING_UPMAPS", out)
 
-    def test_pgremapper_lists_existing_upmap_rows_like_any_other(self):
-        # 19.bd5's existing pair is 625->263, so 263 is a 'to': the line must
-        # still be '<pgid> 263 <target>' for 'pgremapper remap' to rewrite
-        # that pair's 'to'.
+    def test_pgremapper_mappings_lists_existing_upmap_rows_like_any_other(self):
+        # 19.bd5's existing pair is 625->263, so 263 is a 'to': the entry must
+        # still map 'from' 263 to the target, for 'pgremapper import-mappings'
+        # to rewrite that pair's 'to'.
         proc = self.run_proc(
-            "divert-toofull-osd263-existing-upmap-chain", "--pgremapper"
+            "divert-toofull-osd263-existing-upmap-chain", "--pgremapper-mappings"
         )
-        lines = proc.stdout.splitlines()
-        self.assertEqual(len(lines), 6)
-        self.assertIn("19.bd5 263 842", lines)
+        entries = json.loads(proc.stdout)
+        self.assertEqual(len(entries), 6)
+        self.assertIn({"pgid": "19.bd5", "mapping": {"from": 263, "to": 842}}, entries)
         self.assertEqual(proc.stderr.count("NOTE"), 0)
 
-    def test_pgremapper_emits_up_osd_not_acting_osd(self):
-        # 'pgremapper remap' takes the upmap's 'from', which is the UP OSD.
-        # Emitting the ACTING OSD here would remap the wrong OSD, and the table
-        # would still look right.
+    def test_pgremapper_mappings_emits_up_osd_not_acting_osd(self):
+        # 'pgremapper import-mappings' takes the upmap's 'from', which is the
+        # UP OSD. Emitting the ACTING OSD here would remap the wrong OSD, and
+        # the table would still look right.
         fixture = "divert-toofull-osd457-down"
-        out = self.run_script(fixture, "--pgremapper")
+        out = self.run_script(fixture, "--pgremapper-mappings")
         self.assertEqual(
-            out.splitlines(), remap_triples(fixture_plan(fixture).proposals)
+            json.loads(out), [{"pgid": "19.21f", "mapping": {"from": 625, "to": 849}}]
         )
-        self.assertEqual(out, "19.21f 625 849")
 
     def test_no_backfill_toofull_pgs_prints_nothing_on_stdout(self):
         self.assertEqual(self.run_script("divert-toofull-nominal-synthetic"), "")
 
-    def test_import_mappings_carries_the_same_pairs_as_pgremapper(self):
-        fixture = "divert-toofull-osd263-existing-upmap-chain"
-        pgremapper = self.run_script(fixture, "--pgremapper")
-        import_mappings = self.run_script(fixture, "--import-mappings")
-        from_lines = [tuple(line.split()) for line in pgremapper.splitlines()]
-        from_json = [
-            (e["pgid"], str(e["mapping"]["from"]), str(e["mapping"]["to"]))
-            for e in json.loads(import_mappings)
-        ]
-        self.assertEqual(from_lines, from_json)
-
     def test_no_backfill_toofull_pgs_prints_an_empty_json_array(self):
         self.assertEqual(
-            self.run_script("divert-toofull-nominal-synthetic", "--import-mappings"),
+            self.run_script(
+                "divert-toofull-nominal-synthetic", "--pgremapper-mappings"
+            ),
             "[]",
         )
-
-    def test_import_mappings_and_pgremapper_are_mutually_exclusive(self):
-        proc = subprocess.run(
-            [
-                *cli(
-                    os.path.join(
-                        TEST_DATA,
-                        "divert-toofull-osd263-existing-upmap-chain",
-                    )
-                ),
-                "--pgremapper",
-                "--import-mappings",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("not allowed with argument", proc.stderr)
 
     def test_default_thresholds_are_reported_on_stderr(self):
         err = self.run_proc("divert-toofull-osd457-down").stderr
@@ -1601,9 +1537,16 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("ERROR: max target utilization", proc.stderr)
 
-    def test_pgremapper_mode_prints_the_planned_proposals(self):
-        lines = run_ceph2("--pgremapper").stdout.splitlines()
-        self.assertEqual(lines, remap_triples(self.proposals))
+    def test_pgremapper_mappings_mode_prints_the_planned_proposals(self):
+        entries = json.loads(run_ceph2("--pgremapper-mappings").stdout)
+        expected = [
+            {
+                "pgid": p.shard.pgid,
+                "mapping": {"from": p.shard.up_osd, "to": p.target_osd},
+            }
+            for p in self.proposals
+        ]
+        self.assertEqual(entries, expected)
 
     def test_unplaceable_shards_are_only_counted(self):
         lines = self.proc.stderr.splitlines()
@@ -1617,32 +1560,12 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
         # No per-shard '<pgid>:<shard>' list, however long the tail is.
         self.assertNotRegex(self.proc.stderr, r"\d+\.\w+:[\d-]+, ")
 
-    def test_pgremapper_mode_reports_the_unplaceable_count_on_stderr(self):
-        proc = run_ceph2("--pgremapper")
+    def test_pgremapper_mappings_mode_reports_the_unplaceable_count_on_stderr(self):
+        proc = run_ceph2("--pgremapper-mappings")
         self.assertIn(f"{CEPH2_UNPLACEABLE} shard(s) could not be placed", proc.stderr)
         self.assertNotRegex(proc.stderr, r"\d+\.\w+:[\d-]+, ")
-        # Stdout stays parseable: only remap triples.
+        # Stdout stays parseable: only the JSON array.
         self.assertNotIn("could not be placed", proc.stdout)
-
-    def test_pgremapper_mode_warns_about_the_one_pg_with_two_targets(self):
-        # 19.6 is the one PG in this capture with more than one diverted
-        # shard, so it's the one --pgremapper's per-PG warning must name.
-        proc = run_ceph2("--pgremapper")
-        self.assertIn(
-            "WARNING: 1 PG(s) have more than one proposed remap (19.6)",
-            proc.stderr,
-        )
-        self.assertIn("--import-mappings", proc.stderr)
-
-    def test_import_mappings_mode_carries_the_same_pairs_as_pgremapper(self):
-        pgremapper = run_ceph2("--pgremapper").stdout
-        import_mappings = run_ceph2("--import-mappings").stdout
-        from_lines = [tuple(line.split()) for line in pgremapper.splitlines()]
-        from_json = [
-            (e["pgid"], str(e["mapping"]["from"]), str(e["mapping"]["to"]))
-            for e in json.loads(import_mappings)
-        ]
-        self.assertEqual(from_lines, from_json)
 
 
 class UnknownPoolTest(unittest.TestCase):

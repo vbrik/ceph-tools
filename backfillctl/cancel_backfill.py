@@ -144,10 +144,10 @@ describing the scenario.
 
 Applying the output
 -------------------
---import-mappings prints a JSON array for 'pgremapper import-mappings', one
+--pgremapper-mappings prints a JSON array for 'pgremapper import-mappings', one
 {pgid, mapping: {from, to}} entry per line (all other output goes to stderr):
 
-    backfillctl cancel-backfill --pin-blockers --import-mappings --osd 682 > mappings.json
+    backfillctl cancel-backfill --pin-blockers --pgremapper-mappings --osd 682 > mappings.json
     # drop the entry into the OSD for each backfill you want to keep, but not
     # its blockers (other entries of the same PG, present with --pin-blockers),
     # e.g. keep 19.92e's 896->231:
@@ -162,13 +162,6 @@ existing pairs and adds the new ones to them, which is why pgremapper is used
 rather than 'ceph osd pg-upmap-items' (that replaces the whole entry). What it
 sends to the mons when actually applying was not observed.
 
---pgremapper prints bare '<pgid> <up osd> <acting osd>' lines instead, for
-'pgremapper remap', but a PG that needs several lines (a companion pin always
-does) is not safe to apply that way: run as separate commands, a later run can
-overwrite the pair an earlier one just added, and a lone pair can be invalid (two
-shards on one host) and is then silently dropped by the mons. Both were seen
-on a live cluster, so the option warns whenever it prints such a PG.
-
 Chained pairs
 -------------
 A few PGs (13 of 688 on the cluster the tests were captured from) have an OSD
@@ -182,10 +175,10 @@ ring is reported on stderr as unpinnable.
 pgremapper cannot apply a chain, in either order: import-mappings aborts with a
 panic ("conflicting mapping ... found when trying to map") on the valid order,
 which would take a whole batch with it, and in the reverse order it silently
-turns the chain into one different pair. So --import-mappings and --pgremapper
-leave such PGs out and print 'ceph osd pg-upmap-items <pgid> <pairs>' commands
-for them on stderr (not tried on a live cluster; that command replaces the PG's
-whole entry). The table shows them.
+turns the chain into one different pair. So --pgremapper-mappings leaves such
+PGs out and prints 'ceph osd pg-upmap-items <pgid> <pairs>' commands for them
+on stderr (not tried on a live cluster; that command replaces the PG's whole
+entry). The table shows them.
 
 Consider 'ceph balancer off' while the cancelled PGs are pinned: the upmap
 balancer may otherwise undo them.
@@ -196,7 +189,6 @@ import json
 import shutil
 import sys
 import textwrap
-from collections import Counter
 from typing import NamedTuple
 
 from shared import (
@@ -317,21 +309,12 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "the shard it blocks; that pin is what lets it start. Requires "
         "--osd: without it every moving shard is pinned anyway.",
     )
-    fmt = parser.add_mutually_exclusive_group()
-    fmt.add_argument(
-        "--import-mappings",
+    parser.add_argument(
+        "--pgremapper-mappings",
         action="store_true",
         help="Print a JSON array for 'pgremapper import-mappings' instead of "
         "the table, one {pgid, mapping} entry per line. This is the reliable "
         "way to apply the proposals: all pairs of a PG go in together.",
-    )
-    fmt.add_argument(
-        "--pgremapper",
-        action="store_true",
-        help="Print '<pgid> <up osd> <acting osd>' lines with no header "
-        "instead of the table, for 'pgremapper remap', one run per line. "
-        "Warns if a PG needs several lines, since separate runs can "
-        "overwrite each other; prefer --import-mappings.",
     )
     return parser
 
@@ -848,17 +831,7 @@ def format_row(
     ]
 
 
-def print_pgremapper(cancellations: list[Cancellation]) -> None:
-    """Print '<pgid> <up osd> <acting osd>' per cancellation.
-
-    These are 'pgremapper remap's positional arguments; OSD ids must be bare
-    integers, it rejects the 'osd.N' form.
-    """
-    for c in cancellations:
-        print(f"{c.pgid} {c.up_osd} {c.acting_osd}")
-
-
-def print_import_mappings(cancellations: list[Cancellation]) -> None:
+def print_pgremapper_mappings(cancellations: list[Cancellation]) -> None:
     """Print the cancellations as JSON for 'pgremapper import-mappings'.
 
     One {pgid, mapping: {from, to}} entry per pair, in a JSON array with one
@@ -926,34 +899,6 @@ def warn_chained_pgs(chained: dict[str, list[Cancellation]], left_out: bool) -> 
         pairs = " ".join(f"{c.up_osd} {c.acting_osd}" for c in cs)
         # Not wrapped: these are meant to be copy-pasted as shell commands.
         print(f"  ceph osd pg-upmap-items {pgid} {pairs}", file=sys.stderr)
-
-
-def pgs_needing_several_pins(cancellations: list[Cancellation]) -> list[str]:
-    """Return the PGs (in PG order) that have more than one cancellation."""
-    counts = Counter(c.pgid for c in cancellations)
-    return sorted((pgid for pgid, n in counts.items() if n > 1), key=pgid_sort_key)
-
-
-def warn_separate_remaps(pgids: list[str]) -> None:
-    """Warn on stderr that these PGs are not safe to apply with 'remap' lines.
-
-    Each 'pgremapper remap' run adds one pair to a PG's upmap entry, and
-    'ceph osd pg-upmap-items' replaces the whole entry. On a live cluster the
-    run after the first was seen to send only its own pair, undoing the one
-    before; and a pair left alone can be invalid (two shards on one host) and
-    is then silently dropped by the mons, so the PG never changes.
-    """
-    shown = ", ".join(pgids[:8]) + (
-        f", ... ({len(pgids)} in all)" if len(pgids) > 8 else ""
-    )
-    stderr_para(
-        f"WARNING: {len(pgids)} PG(s) need more than one remap ({shown}). Running "
-        "these lines as separate 'pgremapper remap' commands (e.g. xargs -L1) "
-        "can silently lose pairs: a later run may overwrite the pair an earlier "
-        "one just added, and a lone pair can be invalid and dropped by the "
-        "mons. Use --import-mappings instead, which applies all pairs of a PG "
-        "together."
-    )
 
 
 def print_summary(
@@ -1128,13 +1073,13 @@ def render(result: StopResult, args: argparse.Namespace) -> None:
     if not cancellations and not result.skipped:
         into = "" if osd is None else f" into osd.{osd}"
         print(f"No backfills{into}.", file=sys.stderr)
-        if args.import_mappings:
-            print_import_mappings([])
+        if args.pgremapper_mappings:
+            print_pgremapper_mappings([])
         return
 
     print_summary(osd, result.osd_df, result.osd_host, cancellations, result.skipped)
     chained = result.chained
-    machine_format = args.import_mappings or args.pgremapper
+    machine_format = args.pgremapper_mappings
     # pgremapper cannot apply chained pairs (see warn_chained_pgs), so they are
     # kept out of what is meant to be fed to it.
     printable = (
@@ -1142,12 +1087,8 @@ def render(result: StopResult, args: argparse.Namespace) -> None:
         if machine_format
         else cancellations
     )
-    if args.import_mappings:
-        print_import_mappings(printable)
-    elif args.pgremapper:
-        print_pgremapper(printable)
-        if multi := pgs_needing_several_pins(printable):
-            warn_separate_remaps(multi)
+    if args.pgremapper_mappings:
+        print_pgremapper_mappings(printable)
     elif cancellations:
         print_table(
             COLUMNS,

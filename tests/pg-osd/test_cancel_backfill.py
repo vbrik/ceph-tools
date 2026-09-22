@@ -682,12 +682,6 @@ class OutputTest(unittest.TestCase):
     def cancellation(self, companion_of=None):
         return cb.Cancellation("19.7e9", 3, 149, 497, 1_000, "s", 50.0, companion_of)
 
-    def test_pgremapper_uses_each_lines_own_up_osd(self):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            cb.print_pgremapper([self.cancellation(), self.cancellation(0)])
-        self.assertEqual(out.getvalue(), "19.7e9 149 497\n19.7e9 149 497\n")
-
     def test_row_marks_companions_in_the_note_column(self):
         cells = dict(zip(column_names(), cb.format_row(self.cancellation(0), {}, {})))
         self.assertEqual(cells["UP OSD"], "149")
@@ -726,14 +720,12 @@ class RenderTest(unittest.TestCase):
             cb.render(result, parse_args(cb, [*argv, "--osd", "682"]))
         return out.getvalue(), err.getvalue()
 
-    def test_chained_pgs_are_left_out_of_the_machine_formats(self):
-        out, err = self.render("--pgremapper")
-        self.assertEqual(out, "19.2 682 8\n")
-        self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
-        out, _ = self.render("--import-mappings")
+    def test_chained_pgs_are_left_out_of_the_machine_format(self):
+        out, err = self.render("--pgremapper-mappings")
         self.assertEqual(
             json.loads(out), [{"pgid": "19.2", "mapping": {"from": 682, "to": 8}}]
         )
+        self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
 
     def test_the_table_keeps_chained_pgs(self):
         out, _ = self.render()
@@ -760,7 +752,7 @@ class RenderTest(unittest.TestCase):
 
     def test_nothing_to_pin_says_so(self):
         out, err = self.render(
-            "--import-mappings", cancellations=[], chained={}, osd_df={682: {}}
+            "--pgremapper-mappings", cancellations=[], chained={}, osd_df={682: {}}
         )
         self.assertEqual(json.loads(out), [])
         self.assertIn("No backfills into osd.682.", err)
@@ -809,7 +801,7 @@ class UpAndActingColumnsTest(unittest.TestCase):
         )
 
 
-class ImportMappingsOutputTest(unittest.TestCase):
+class PgremapperMappingsOutputTest(unittest.TestCase):
     def cancellations(self):
         return [
             cb.Cancellation("19.14cd", 5, 232, 337, 1_000, "s", None, 8),
@@ -820,7 +812,7 @@ class ImportMappingsOutputTest(unittest.TestCase):
     def printed(self, cancellations):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            cb.print_import_mappings(cancellations)
+            cb.print_pgremapper_mappings(cancellations)
         return out.getvalue()
 
     def test_is_a_json_array_of_pgid_and_mapping_entries(self):
@@ -846,45 +838,6 @@ class ImportMappingsOutputTest(unittest.TestCase):
             json.loads(self.printed(self.cancellations()[:1])),
             [{"pgid": "19.14cd", "mapping": {"from": 232, "to": 337}}],
         )
-
-    def test_same_pairs_as_the_pgremapper_lines(self):
-        cancellations = self.cancellations()
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            cb.print_pgremapper(cancellations)
-        from_lines = [tuple(line.split()) for line in out.getvalue().splitlines()]
-        from_json = [
-            (e["pgid"], str(e["mapping"]["from"]), str(e["mapping"]["to"]))
-            for e in json.loads(self.printed(cancellations))
-        ]
-        self.assertEqual(from_lines, from_json)
-
-
-class SeveralPinsTest(unittest.TestCase):
-    def c(self, pgid, shard):
-        return cb.Cancellation(pgid, shard, 1, 2, None, "s", None)
-
-    def test_lists_only_pgs_with_more_than_one_pin_in_pg_order(self):
-        cs = [self.c("19.16fc", 1), self.c("19.16fc", 2), self.c("19.9", 0)]
-        cs += [self.c("7.a", 0), self.c("7.a", 1), self.c("7.b", 0)]
-        self.assertEqual(cb.pgs_needing_several_pins(cs), ["7.a", "19.16fc"])
-
-    def test_none_when_every_pg_has_one(self):
-        self.assertEqual(cb.pgs_needing_several_pins([self.c("19.9", 0)]), [])
-
-    def test_warning_names_the_pgs_and_the_remedy(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            cb.warn_separate_remaps(["19.1", "19.2"])
-        self.assertIn("19.1, 19.2", err.getvalue())
-        self.assertIn("--import-mappings", err.getvalue())
-
-    def test_a_long_list_of_pgs_is_shortened(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            cb.warn_separate_remaps([f"19.{i:x}" for i in range(20)])
-        self.assertIn("20 in all", err.getvalue())
-        self.assertNotIn("19.13", err.getvalue())
 
 
 class PrintTableTest(unittest.TestCase):
@@ -1051,14 +1004,6 @@ class MainTest(unittest.TestCase):
         # the unpinnable shard is reported, not silently dropped
         self.assertEqual([(s.pgid, s.shard) for s in result.skipped], [("19.a", 0)])
 
-    def test_pgremapper_output_is_bare_lines_only(self):
-        out, err = self.run_main("--pgremapper", "--osd", "osd.682")
-        # 19.d's companion line has its own up OSD, not 682
-        self.assertEqual(out, "19.9 682 8\n19.d 682 8\n19.d 9 4\n")
-        # the unpinnable shard is reported, not silently dropped
-        self.assertIn("19.a", err)
-        self.assertIn("1 more shard(s)", err)
-
     def test_table_shows_acting_osd_state_and_host(self):
         out, _ = self.run_main("--osd", "682")
         lines = out.splitlines()
@@ -1090,8 +1035,8 @@ class MainTest(unittest.TestCase):
         _, err = self.run_main("--osd", "682", pgs=pgs)
         self.assertNotIn("PROGRESS reads 100%", err)
 
-    def test_import_mappings_is_json_with_every_pair_and_no_warning(self):
-        out, err = self.run_main("--import-mappings", "--osd", "682")
+    def test_pgremapper_mappings_is_json_with_every_pair_and_no_warning(self):
+        out, err = self.run_main("--pgremapper-mappings", "--osd", "682")
         self.assertEqual(
             json.loads(out),
             [
@@ -1102,18 +1047,6 @@ class MainTest(unittest.TestCase):
         )
         self.assertNotIn("WARNING", err)
         self.assertIn("19.a", err)  # unpinnable shards are still reported
-
-    def test_pgremapper_warns_when_a_pg_needs_several_remaps(self):
-        _, err = self.run_main("--pgremapper", "--osd", "682")
-        self.assertIn("WARNING", err)
-        self.assertIn("19.d", err)  # the PG with the companion
-        self.assertNotIn("19.9,", err)  # a single-line PG is not named
-        self.assertIn("--import-mappings", err)
-
-    def test_pgremapper_does_not_warn_when_every_pg_has_one_remap(self):
-        out, err = self.run_main("--pgremapper", "--osd", "682", pgs=[self.PGS[0]])
-        self.assertEqual(out, "19.9 682 8\n")
-        self.assertNotIn("WARNING", err)
 
     def test_table_output_does_not_warn(self):
         _, err = self.run_main("--osd", "682")
@@ -1193,31 +1126,29 @@ class MainTest(unittest.TestCase):
         # anyway: neither note is worth printing.
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, err = self.run_main(
-            "--pgremapper",
+            "--pgremapper-mappings",
             "--osd",
             "682",
             pgs=pgs,
             extra_osds=[osd_df_node(77, 92.0)],
             drop=["backfillfull_ratio"],
         )
-        self.assertEqual(out, "19.e 682 8\n")
+        self.assertEqual(
+            json.loads(out), [{"pgid": "19.e", "mapping": {"from": 682, "to": 8}}]
+        )
         self.assertNotIn("no backfillfull_ratio", err)
         self.assertNotIn("--pin-blockers was not given", err)
 
-    def test_chained_pgs_are_left_out_of_the_machine_formats(self):
+    def test_chained_pgs_are_left_out_of_the_machine_format(self):
         chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
         plain = pg("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])
         out, err = self.run_main(
-            "--import-mappings", "--osd", "682", pgs=[chain, plain]
+            "--pgremapper-mappings", "--osd", "682", pgs=[chain, plain]
         )
         self.assertEqual(
             json.loads(out), [{"pgid": "19.2", "mapping": {"from": 682, "to": 8}}]
         )
         self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
-        out, err = self.run_main("--pgremapper", "--osd", "682", pgs=[chain, plain])
-        self.assertEqual(out, "19.2 682 8\n")
-        self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
-        self.assertNotIn("need more than one remap", err)  # 19.2 has one line
 
     def test_the_table_still_shows_a_chained_pg_in_apply_order(self):
         chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
@@ -1232,18 +1163,22 @@ class MainTest(unittest.TestCase):
         self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
         self.assertNotIn("left out", err)
 
-    def test_import_mappings_is_valid_json_even_with_nothing_to_apply(self):
+    def test_pgremapper_mappings_is_valid_json_even_with_nothing_to_apply(self):
         # nothing arriving at all
-        out, err = self.run_main("--import-mappings", "--osd", "682", pgs=[self.PGS[2]])
+        out, err = self.run_main(
+            "--pgremapper-mappings", "--osd", "682", pgs=[self.PGS[2]]
+        )
         self.assertEqual(json.loads(out), [])
         self.assertIn("No backfills", err)
         # only an unpinnable shard (no acting OSD)
-        out, err = self.run_main("--import-mappings", "--osd", "682", pgs=[self.PGS[1]])
+        out, err = self.run_main(
+            "--pgremapper-mappings", "--osd", "682", pgs=[self.PGS[1]]
+        )
         self.assertEqual(json.loads(out), [])
         self.assertIn("19.a", err)
 
     def test_no_backfills_prints_nothing_on_stdout(self):
-        out, err = self.run_main("--pgremapper", "--osd", "682", pgs=[self.PGS[2]])
+        out, err = self.run_main("--osd", "682", pgs=[self.PGS[2]])
         self.assertEqual(out, "")
         self.assertIn("No backfills", err)
 
@@ -1278,7 +1213,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("0 of 1 given PG id(s) matched", err)
 
     def test_no_exclude_pgs_note_when_the_flag_is_not_given(self):
-        _, err = self.run_main("--pgremapper", "--osd", "682")
+        _, err = self.run_main("--osd", "682")
         self.assertNotIn("--exclude-pgs", err)
 
     def test_exclude_pgs_note_does_not_claim_a_backfill_that_never_existed(self):
@@ -1286,9 +1221,7 @@ class MainTest(unittest.TestCase):
         # onto osd.682. The note must not claim a backfill was skipped, only
         # that the PG (which does list osd.682 in 'up') matched.
         stable = pg("19.99", [OSD, 2, 3, 4, 20, 6], [OSD, 2, 3, 4, 9, 6])
-        out, err = self.run_main(
-            "--pgremapper", "--osd", "682", "--exclude-pgs", "19.99", pgs=[stable]
-        )
+        out, err = self.run_main("--osd", "682", "--exclude-pgs", "19.99", pgs=[stable])
         self.assertEqual(out, "")
         self.assertIn("No backfills into osd.682", err)
         self.assertIn("1 of 1 given PG id(s) matched", err)
@@ -1435,11 +1368,20 @@ class LoadStateCliTest(unittest.TestCase):
         )
 
     def test_load_state_reproduces_the_live_output(self):
-        live = run_cli("--pgremapper", "--osd", "682", path=self.with_ceph)
+        live = run_cli("--pgremapper-mappings", "--osd", "682", path=self.with_ceph)
         self.assertEqual(live.returncode, 0, live.stderr)
-        self.assertEqual(live.stdout, "19.9 682 8\n19.d 682 8\n19.d 9 4\n")
+        self.assertEqual(
+            json.loads(live.stdout),
+            [
+                {"pgid": "19.9", "mapping": {"from": 682, "to": 8}},
+                {"pgid": "19.d", "mapping": {"from": 682, "to": 8}},
+                {"pgid": "19.d", "mapping": {"from": 9, "to": 4}},
+            ],
+        )
 
-        replay = run_cli("--pgremapper", "--osd", "682", load_state=str(self.state))
+        replay = run_cli(
+            "--pgremapper-mappings", "--osd", "682", load_state=str(self.state)
+        )
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertEqual(replay.stdout, live.stdout)
 
@@ -1452,11 +1394,6 @@ class LoadStateCliTest(unittest.TestCase):
         result = run_cli("--osd", "682", load_state=str(self.state))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing", result.stderr)
-
-    def test_pgremapper_and_import_mappings_are_mutually_exclusive(self):
-        result = run_cli("--pgremapper", "--import-mappings", "--osd", "682")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("not allowed with", result.stderr)
 
 
 FIXTURE = (
@@ -1534,23 +1471,13 @@ class FixtureReplayTest(unittest.TestCase):
             EXPECTED_896_WITH_BLOCKERS.splitlines(),
         )
 
-    def test_pgremapper_prints_the_planned_pins(self):
-        for osd, flags in ((896, ()), (896, ("--pin-blockers",)), (74, ())):
-            with self.subTest(osd=osd, flags=flags):
-                result = self.plan(osd, *flags)
-                self.assertFalse(result.chained)  # nothing is left out
-                self.assertEqual(
-                    self.replay(osd, *flags, "--pgremapper").stdout.splitlines(),
-                    pins(result.cancellations),
-                )
-
-    def test_osd_896_import_mappings_matches_the_pgremapper_lines(self):
+    def test_osd_896_pgremapper_mappings_matches_the_planned_pins(self):
         for flags, expected in (
             ((), EXPECTED_896_DEFAULT),
             (("--pin-blockers",), EXPECTED_896_WITH_BLOCKERS),
         ):
             with self.subTest(flags=flags):
-                result = self.replay(896, *flags, "--import-mappings")
+                result = self.replay(896, *flags, "--pgremapper-mappings")
                 entries = json.loads(result.stdout)
                 self.assertEqual(
                     [
@@ -1560,23 +1487,6 @@ class FixtureReplayTest(unittest.TestCase):
                     expected.splitlines(),
                 )
                 self.assertNotIn("WARNING", result.stderr)
-
-    def test_osd_896_pgremapper_lines_carry_the_warning(self):
-        # 19.92e needs only one line without --pin-blockers (its second shard,
-        # a pure blocker, is not found), so it drops out of the warning.
-        err = self.replay(896, "--pgremapper").stderr
-        self.assertIn("WARNING: 5 PG(s) need more than one remap", err)
-        for pgid in ("19.7e9", "19.94c", "19.14cd", "19.1b16", "19.1fed"):
-            self.assertIn(pgid, err)
-        self.assertNotIn("19.92e,", err)
-
-        err = self.replay(896, "--pin-blockers", "--pgremapper").stderr
-        self.assertIn("WARNING: 6 PG(s) need more than one remap", err)
-        for pgid in ("19.7e9", "19.92e", "19.94c", "19.14cd", "19.1b16", "19.1fed"):
-            self.assertIn(pgid, err)
-
-    def test_osd_74_pgremapper_lines_need_no_warning(self):
-        self.assertNotIn("WARNING", self.replay(74, "--pgremapper").stderr)
 
     def summary_counts(self, result):
         """(requested pins, other pins, blockers, skipped): what the summary reports."""
@@ -1638,7 +1548,7 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertAlmostEqual(blocker.blocker_util, 91.6, places=1)
 
     def test_an_osd_with_no_backfills_prints_nothing(self):
-        result = self.replay(231, "--pgremapper")
+        result = self.replay(231)
         self.assertEqual(result.stdout, "")
         self.assertIn("No backfills", result.stderr)
 
@@ -1710,13 +1620,10 @@ class ChainFixtureReplayTest(unittest.TestCase):
             result.chained["19.1299"],
         )
 
-    def test_machine_formats_leave_it_out_and_the_warning_gives_the_command(self):
-        for flag in ("--import-mappings", "--pgremapper"):
-            result = self.replay(flag)
-            self.assertNotIn("19.1299", result.stdout, flag)
-            self.assertIn(
-                "ceph osd pg-upmap-items 19.1299 579 825 891 579", result.stderr, flag
-            )
+    def test_machine_format_leaves_it_out_and_the_warning_gives_the_command(self):
+        result = self.replay("--pgremapper-mappings")
+        self.assertNotIn("19.1299", result.stdout)
+        self.assertIn("ceph osd pg-upmap-items 19.1299 579 825 891 579", result.stderr)
 
     def test_every_chained_pg_in_the_cluster_is_ordered_or_reported(self):
         """Across every OSD that is a target of a remapped shard: no output ever
@@ -1774,9 +1681,9 @@ class BlockerFixtureReplayTest(unittest.TestCase):
             ["19.92e 896 231", "19.92e 337 99"],
         )
 
-    def test_import_mappings_output(self):
+    def test_pgremapper_mappings_output(self):
         self.assertEqual(
-            json.loads(self.replay("--pin-blockers", "--import-mappings").stdout),
+            json.loads(self.replay("--pin-blockers", "--pgremapper-mappings").stdout),
             [
                 {"pgid": "19.92e", "mapping": {"from": 896, "to": 231}},
                 {"pgid": "19.92e", "mapping": {"from": 337, "to": 99}},
@@ -1803,7 +1710,9 @@ class BlockerFixtureReplayTest(unittest.TestCase):
 
     def test_keeping_the_wanted_backfill_means_dropping_only_its_own_entry(self):
         # the user's case: keep 231->896, so drop that entry and keep the blocker
-        entries = json.loads(self.replay("--pin-blockers", "--import-mappings").stdout)
+        entries = json.loads(
+            self.replay("--pin-blockers", "--pgremapper-mappings").stdout
+        )
         kept = [e for e in entries if e["mapping"]["from"] != 896]
         self.assertEqual(kept, [{"pgid": "19.92e", "mapping": {"from": 337, "to": 99}}])
 
@@ -1946,7 +1855,7 @@ class MainAllTest(unittest.TestCase):
         self.assertIn("--pin-blockers requires --osd", str(cm.exception))
 
     def test_summary_counts_shards_and_pgs_and_no_blocker_note(self):
-        _, err = self.run_main("--pgremapper")
+        _, err = self.run_main()
         err = flat(err)
         self.assertIn("3 moving shard(s) in 2 PG(s) can be pinned back", err)
         self.assertIn("1 cannot be pinned", err)
@@ -1960,7 +1869,7 @@ class MainAllTest(unittest.TestCase):
         self.assertIn("matched nothing (check for typos): 19.zzz", err)
 
     def test_nothing_to_pin_says_so(self):
-        out, err = self.run_main("--import-mappings", pgs=[])
+        out, err = self.run_main("--pgremapper-mappings", pgs=[])
         self.assertEqual(json.loads(out), [])
         self.assertIn("No backfills.", err)
 
