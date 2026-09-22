@@ -345,10 +345,22 @@ non-matching PGs. `test_backfillctl.py` runs the dispatcher itself, checking
 that `--load-state` is global (accepted only before the subcommand name) and
 that `save-state` rejects it.
 
+Each `backfillctl` subcommand is split into `plan()`, which returns what the
+run decided as a typed result (e.g. `DivertResult`, `StopResult`), and
+`render()`, which prints it (only notes on what the run was given, such as
+`--pgs` ids that matched nothing, are printed by `plan()`, so that they still
+show when planning exits with an error). Tests of the logic assert on the result
+(`_support.plan_from_state` runs `plan()` on a `--load-state` directory);
+tests of the output format feed results to `render()` and its helpers, plus
+a few subprocess runs that check the two are wired together. A change of
+output format, like reordering columns, should therefore break only
+rendering tests.
+
 The `backfillctl divert-toofull-backfills` tests replay the
 cluster-state snapshots under `tests/pg-osd/test-data/` via `--load-state` and check the
-output against what each fixture's `README.txt` documents, so fixture and
-code cannot drift apart: the exact table for the small fixtures, and for the
+plan against what each fixture's `README.txt` documents, so fixture and
+code cannot drift apart: the exact proposals (the README's machine-checked
+"Expected proposals" block) for the small fixtures, and for the
 cluster-sized one (808 stuck PGs, 1513 arriving shards) the counts plus the
 invariants that matter — no target projected above `--max-target-util`
 (`backfillfull_ratio` minus 1 by default), no target used more than
@@ -361,7 +373,7 @@ arriving PGs, and `--pin-blockers` adds blocker pins for those same 5 plus the
 6th, whose own backfill would otherwise be held up by an unrelated shard in
 its PG; and one where `--pin-blockers` is the only thing standing between a
 single wanted backfill and the blocker in its own PG that is holding it up).
-Besides the exact `--pgremapper` output documented in each `README.txt`, they
+Besides the exact pins documented in each `README.txt`, they
 check independently that applying the proposed pins leaves
 every PG with no repeated host or OSD, and that a `--load-state` directory
 replays to the same result with no `ceph` available.

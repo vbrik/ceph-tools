@@ -24,6 +24,7 @@ from collections import Counter
 from collections.abc import Callable
 from itertools import groupby
 from pathlib import Path
+from typing import NamedTuple
 
 # Sentinel used by CRUSH/Ceph for "no OSD in this slot" (crush/crush.h).
 # 'ceph pg' JSON uses this value, not -1, to mark unfilled up/acting slots.
@@ -82,6 +83,14 @@ def pgid_sort_key(pgid: str) -> tuple[int, int]:
     """Sort PG ids numerically: pool id (decimal), then pg id (hex)."""
     pool_str, pg_hex = pgid.split(".")
     return (int(pool_str), int(pg_hex, 16))
+
+
+class PgidFilter(NamedTuple):
+    """What a list of PG ids given on the command line (e.g. --pgs) matched."""
+
+    given: int
+    matched: int
+    unmatched: list[str]  # sorted; usually typos
 
 
 def is_erasure(pool: dict | None) -> bool:

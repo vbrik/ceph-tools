@@ -38,7 +38,7 @@ import unittest
 from collections import Counter
 from typing import ClassVar
 
-from _support import REPO_ROOT, FakeStore, shared
+from _support import REPO_ROOT, FakeStore, plan_from_state, shared
 
 from backfillctl import divert_toofull_backfills as ut
 
@@ -413,31 +413,55 @@ class BuildCandidateOsdsTest(unittest.TestCase):
 
 class PrintTableEdgeCaseTest(unittest.TestCase):
     def test_empty_rows_prints_just_the_header(self):
-        # main() guards this today, but the star-args width form used to
+        # render() guards this today, but the star-args width form used to
         # raise TypeError here rather than degrade gracefully.
         group_line, label_line = table_lines([])
         self.assertEqual(re.findall(r"[A-Z]+", group_line), ["ACTING", "UP", "TARGET"])
         self.assertEqual(label_line.split(), LABELS)
 
 
-def table_from_readme(fixture):
-    """Return the table block quoted after 'Table output:' in a fixture README.
+def proposals_from_readme(fixture):
+    """Return the 'Expected proposals' block of a fixture README as tuples.
 
-    Pulling the expected output out of the README, rather than duplicating
-    it here, is what keeps the two from drifting apart.
+    Each is (pgid, shard, acting OSD, up OSD, target OSD), as strings, the
+    acting OSD 'none' when unknown. Pulling the expected proposals out of the
+    README, rather than duplicating them here, is what keeps the two from
+    drifting apart.
     """
     path = os.path.join(TEST_DATA, fixture, "README.txt")
     with open(path) as f:
         lines = f.read().splitlines()
-    # The marker ends a wrapped sentence rather than standing alone.
-    start = next(i for i, ln in enumerate(lines) if ln.endswith("Table output:")) + 1
+    # The heading wraps onto further lines before the indented block.
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("Expected proposals"))
     block = []
     for line in lines[start:]:
         if line.startswith("  "):
-            block.append(line[2:])
+            block.append(tuple(line.split()))
         elif block:
             break
-    return "\n".join(block)
+    return block
+
+
+def proposal_tuple(p):
+    """p in the form proposals_from_readme returns."""
+    acting = "none" if p.shard.acting_osd is None else str(p.shard.acting_osd)
+    return (
+        p.shard.pgid,
+        str(p.shard.shard),
+        acting,
+        str(p.shard.up_osd),
+        str(p.target_osd),
+    )
+
+
+def fixture_plan(fixture, *argv):
+    """Return plan()'s DivertResult for a fixture under test-data."""
+    return plan_from_state(ut, os.path.join(TEST_DATA, fixture), *argv)
+
+
+def remap_triples(proposals):
+    """The (pgid, up OSD, target OSD) of each proposal, as --pgremapper prints them."""
+    return [f"{p.shard.pgid} {p.shard.up_osd} {p.target_osd}" for p in proposals]
 
 
 CEPH2_FIXTURE = "divert-toofull-backfills-ceph2-util-emergency-2-new-hosts"
@@ -474,21 +498,6 @@ CEPH2_NO_MARGIN_PROPOSED = 199
 # 342 of them already past backfillfull_ratio. The projection now keeps every
 # target at or below the cap.
 CEPH2_UNCAPPED_PROPOSED = 210
-
-
-def parse_table(stdout):
-    """Return the table's data rows as dicts keyed by ut.COLUMNS."""
-    lines = stdout.splitlines()[2:]  # group line, label line, then rows
-    rows = []
-    for line in lines:
-        cells = line.split()
-        assert len(cells) == len(ut.COLUMNS), line
-        rows.append(dict(zip(ut.COLUMNS, cells)))
-    return rows
-
-
-def percent(cell):
-    return float(cell.rstrip("%"))
 
 
 class PrintUnplaceableTest(unittest.TestCase):
@@ -588,8 +597,49 @@ class MultiTargetWarningTest(unittest.TestCase):
         self.assertIn("--import-mappings", text)
 
 
+class FixturePlanTest(unittest.TestCase):
+    """plan() on the small fixtures, checked against their READMEs."""
+
+    def test_osd457_down_proposals_match_readme(self):
+        fixture = "divert-toofull-backfills-osd457-down"
+        result = fixture_plan(fixture)
+        self.assertEqual(
+            [proposal_tuple(p) for p in result.proposals],
+            proposals_from_readme(fixture),
+        )
+        self.assertEqual((result.toofull_pg_count, result.arriving_count), (1, 1))
+
+    def test_existing_upmap_chain_proposals_match_readme(self):
+        fixture = "divert-toofull-backfills-osd263-existing-upmap-chain"
+        result = fixture_plan(fixture)
+        self.assertEqual(
+            [proposal_tuple(p) for p in result.proposals],
+            proposals_from_readme(fixture),
+        )
+        self.assertEqual(result.unplaceable, [])
+
+    def test_no_backfill_toofull_pgs_proposes_nothing(self):
+        result = fixture_plan("divert-toofull-backfills-nominal-synthetic")
+        self.assertEqual((result.proposals, result.unplaceable), ([], []))
+
+    def test_default_thresholds_come_from_the_clusters_own_ratios(self):
+        # osd457-down has backfillfull_ratio 0.90, ceph2 has it raised to
+        # 0.91: the caps must track the capture, not a constant. The target
+        # cap is backfillfull_ratio minus one point.
+        for fixture, nearfull, max_target in [
+            ("divert-toofull-backfills-osd457-down", 85, 89),
+            (CEPH2_FIXTURE, 85, 90),
+        ]:
+            with self.subTest(fixture=fixture):
+                # Ceph keeps the ratios as float32, so 0.85 reads back as
+                # 85.0000024%.
+                result = fixture_plan(fixture)
+                self.assertAlmostEqual(result.min_up_util, nearfull, places=3)
+                self.assertAlmostEqual(result.max_target_util, max_target, places=3)
+
+
 class FixtureReplayTest(unittest.TestCase):
-    """End-to-end --load-state runs, checked against the fixtures' READMEs."""
+    """End-to-end --load-state runs: how run() prints what plan() decides."""
 
     def run_proc(self, fixture, *extra):
         return subprocess.run(
@@ -601,14 +651,6 @@ class FixtureReplayTest(unittest.TestCase):
 
     def run_script(self, fixture, *extra):
         return self.run_proc(fixture, *extra).stdout.rstrip("\n")
-
-    def test_osd457_down_table_matches_readme(self):
-        fixture = "divert-toofull-backfills-osd457-down"
-        self.assertEqual(self.run_script(fixture), table_from_readme(fixture))
-
-    def test_existing_upmap_chain_table_matches_readme(self):
-        fixture = "divert-toofull-backfills-osd263-existing-upmap-chain"
-        self.assertEqual(self.run_script(fixture), table_from_readme(fixture))
 
     def test_existing_upmap_row_is_unmarked_and_has_no_upmap_column(self):
         # The UP OSD is a plain 'osd.N' even when it is the 'to' of an
@@ -633,7 +675,11 @@ class FixtureReplayTest(unittest.TestCase):
         # 'pgremapper remap' takes the upmap's 'from', which is the UP OSD.
         # Emitting the ACTING OSD here would remap the wrong OSD, and the table
         # would still look right.
-        out = self.run_script("divert-toofull-backfills-osd457-down", "--pgremapper")
+        fixture = "divert-toofull-backfills-osd457-down"
+        out = self.run_script(fixture, "--pgremapper")
+        self.assertEqual(
+            out.splitlines(), remap_triples(fixture_plan(fixture).proposals)
+        )
         self.assertEqual(out, "19.21f 625 849")
 
     def test_no_backfill_toofull_pgs_prints_nothing_on_stdout(self):
@@ -679,18 +725,10 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("not allowed with argument", proc.stderr)
 
-    def test_default_thresholds_come_from_the_clusters_own_ratios(self):
-        # osd457-down has backfillfull_ratio 0.90, ceph2 has it raised to
-        # 0.91: the reported caps must track the capture, not a constant.
-        # The target cap is backfillfull_ratio minus one point.
-        for fixture, nearfull, max_target in [
-            ("divert-toofull-backfills-osd457-down", "85", "89"),
-            (CEPH2_FIXTURE, "85", "90"),
-        ]:
-            with self.subTest(fixture=fixture):
-                err = self.run_proc(fixture).stderr
-                self.assertIn(f"--min-up-util {nearfull}%", err)
-                self.assertIn(f"--max-target-util {max_target}%", err)
+    def test_default_thresholds_are_reported_on_stderr(self):
+        err = self.run_proc("divert-toofull-backfills-osd457-down").stderr
+        self.assertIn("--min-up-util 85%", err)
+        self.assertIn("--max-target-util 89%", err)
 
 
 class PgsFlagTest(unittest.TestCase):
@@ -698,62 +736,95 @@ class PgsFlagTest(unittest.TestCase):
 
     FIXTURE = "divert-toofull-backfills-osd263-existing-upmap-chain"
 
-    def run_proc(self, *extra):
-        return subprocess.run(
-            [
-                *cli(os.path.join(TEST_DATA, self.FIXTURE)),
-            ]
-            + list(extra),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+    def plan(self, *argv):
+        return fixture_plan(self.FIXTURE, *argv)
 
     def test_only_the_named_pg_is_proposed(self):
-        proc = self.run_proc("--pgs", "19.bd5", "--pgremapper")
-        self.assertEqual(proc.stdout.splitlines(), ["19.bd5 263 842"])
-        self.assertIn(
-            "--pgs: 1 of 1 given PG id(s) are currently backfill_toofull "
-            "and will be the only ones considered",
-            proc.stderr,
-        )
-        self.assertIn("1 backfill_toofull PG(s) cluster-wide", proc.stderr)
+        result = self.plan("--pgs", "19.bd5")
+        self.assertEqual(remap_triples(result.proposals), ["19.bd5 263 842"])
+        self.assertEqual(result.pgs_filter, shared.PgidFilter(1, 1, []))
+        self.assertEqual(result.toofull_pg_count, 1)
 
     def test_several_named_pgs_are_all_kept(self):
         # Targets are not pinned here: with only two of the six PGs in play,
         # the greedy assignment (see assign_targets) can pick a different
         # target than the full run does, since room is contended
         # differently. Only which PGs got a proposal is guaranteed.
-        proc = self.run_proc("--pgs", "19.bd5", "19.7be", "--pgremapper")
-        pgids = {line.split()[0] for line in proc.stdout.splitlines()}
-        self.assertEqual(pgids, {"19.bd5", "19.7be"})
-        self.assertIn("2 backfill_toofull PG(s) cluster-wide", proc.stderr)
+        result = self.plan("--pgs", "19.bd5", "19.7be")
+        self.assertEqual({p.shard.pgid for p in result.proposals}, {"19.bd5", "19.7be"})
+        self.assertEqual(result.toofull_pg_count, 2)
 
-    def test_id_that_matches_nothing_is_reported_and_yields_no_output(self):
-        proc = self.run_proc("--pgs", "19.zzz", "--pgremapper")
-        self.assertEqual(proc.stdout, "")
-        self.assertIn(
-            "--pgs: 0 of 1 given PG id(s) are currently backfill_toofull "
-            "and will be the only ones considered; 1 matched nothing "
-            "(check for typos): 19.zzz",
-            proc.stderr,
-        )
-        self.assertIn("0 backfill_toofull PG(s) cluster-wide", proc.stderr)
+    def test_id_that_matches_nothing_is_reported_and_yields_no_proposals(self):
+        result = self.plan("--pgs", "19.zzz")
+        self.assertEqual(result.proposals, [])
+        self.assertEqual(result.pgs_filter, shared.PgidFilter(1, 0, ["19.zzz"]))
+        self.assertEqual(result.toofull_pg_count, 0)
 
     def test_a_mix_of_matching_and_unmatched_ids_reports_both(self):
-        proc = self.run_proc("--pgs", "19.bd5", "19.zzz", "--pgremapper")
-        self.assertEqual(proc.stdout.splitlines(), ["19.bd5 263 842"])
-        self.assertIn(
-            "--pgs: 1 of 2 given PG id(s) are currently backfill_toofull "
-            "and will be the only ones considered; 1 matched nothing "
-            "(check for typos): 19.zzz",
-            proc.stderr,
-        )
+        result = self.plan("--pgs", "19.bd5", "19.zzz")
+        self.assertEqual(remap_triples(result.proposals), ["19.bd5 263 842"])
+        self.assertEqual(result.pgs_filter, shared.PgidFilter(2, 1, ["19.zzz"]))
 
     def test_no_pgs_flag_considers_every_pg(self):
-        proc = self.run_proc("--pgremapper")
-        self.assertEqual(len(proc.stdout.splitlines()), 6)
-        self.assertNotIn("--pgs", proc.stderr)
+        result = self.plan()
+        self.assertEqual(len(result.proposals), 6)
+        self.assertIsNone(result.pgs_filter)
+
+
+class PrintPgsFilterTest(unittest.TestCase):
+    def capture(self, pgs_filter):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ut.print_pgs_filter(pgs_filter)
+        return err.getvalue()
+
+    def test_all_matched(self):
+        self.assertEqual(
+            self.capture(shared.PgidFilter(1, 1, [])),
+            "--pgs: 1 of 1 given PG id(s) are currently backfill_toofull "
+            "and will be the only ones considered\n",
+        )
+
+    def test_unmatched_ids_are_named(self):
+        self.assertIn(
+            "--pgs: 1 of 3 given PG id(s) are currently backfill_toofull "
+            "and will be the only ones considered; 2 matched nothing "
+            "(check for typos): 19.yyy, 19.zzz",
+            self.capture(shared.PgidFilter(3, 1, ["19.yyy", "19.zzz"])),
+        )
+
+    def test_printed_even_when_planning_then_exits(self):
+        # A typo in --pgs can be what trips a later error, so the note naming
+        # it must not wait for render(), which an exit never reaches.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(TEST_DATA, "divert-toofull-backfills-osd457-down")
+            dst = os.path.join(tmp, "fixture")
+            shutil.copytree(src, dst)
+            path = os.path.join(dst, "pool_ls_detail.json")
+            with open(path) as f:
+                pools = json.load(f)
+            with open(path, "w") as f:
+                json.dump([p for p in pools if p["pool_id"] != 19], f)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                plan_from_state(ut, dst, "--pgs", "19.21f", "19.zzz")
+        self.assertIn("pool id(s) 19", str(ctx.exception))
+        self.assertIn("1 matched nothing (check for typos): 19.zzz", err.getvalue())
+
+    def test_printed_only_with_pgs(self):
+        # The note goes to stderr, ahead of the summary, only under --pgs.
+        fixture = os.path.join(
+            TEST_DATA, "divert-toofull-backfills-osd263-existing-upmap-chain"
+        )
+        for extra, shown in [((), False), (("--pgs", "19.zzz"), True)]:
+            with self.subTest(extra=extra):
+                proc = subprocess.run(
+                    [*cli(fixture), *extra],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertEqual("--pgs:" in proc.stderr, shown)
 
 
 def osd_df_of(utils):
@@ -1302,7 +1373,7 @@ def run_ceph2(*extra):
 
 
 class Ceph2FixtureInvariantTest(unittest.TestCase):
-    """The cluster-sized capture, checked by invariant rather than by table.
+    """The cluster-sized capture's plan, checked by invariant rather than by list.
 
     This is the fixture that exposed both threshold bugs: a general
     utilization emergency with two newly-added, still-empty hosts. Before
@@ -1313,145 +1384,171 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.proc = subprocess.run(
-            [
-                *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        cls.rows = parse_table(cls.proc.stdout)
+        cls.result = fixture_plan(CEPH2_FIXTURE)
+        cls.proposals = cls.result.proposals
+
+    def util(self, osd_id):
+        return self.result.osd_df[osd_id]["utilization"]
 
     def test_proposal_and_unplaceable_counts_match_the_readme(self):
-        self.assertEqual(len(self.rows), CEPH2_PROPOSED)
-        self.assertIn(
-            f"proposed {CEPH2_PROPOSED} remap(s), {CEPH2_UNPLACEABLE} unplaceable",
-            self.proc.stderr,
-        )
+        self.assertEqual(len(self.proposals), CEPH2_PROPOSED)
+        self.assertEqual(len(self.result.unplaceable), CEPH2_UNPLACEABLE)
 
     def test_shard_counts_match_the_readme(self):
-        skipped = CEPH2_ARRIVING - CEPH2_STUCK
-        self.assertIn(
-            f"{CEPH2_ARRIVING} arriving shard(s), of which {CEPH2_STUCK} on an OSD",
-            self.proc.stderr,
+        self.assertEqual(self.result.arriving_count, CEPH2_ARRIVING)
+        self.assertEqual(self.result.stuck_count, CEPH2_STUCK)
+        self.assertEqual(self.result.left_alone_count, CEPH2_ARRIVING - CEPH2_STUCK)
+
+    def test_every_usable_osd_is_a_candidate(self):
+        self.assertEqual(
+            sum(map(len, self.result.candidates.values())), CEPH2_CANDIDATES
         )
-        self.assertIn(f"({skipped} left alone as not the blocker)", self.proc.stderr)
 
     def test_no_target_is_projected_above_the_default_cap(self):
         # The headline invariant: every one of these remaps can actually
         # complete. Before --max-target-util defaulted, 342 could not.
-        over = [
-            r
-            for r in self.rows
-            if percent(r[("TARGET", "PROJ")]) > CEPH2_MAX_TARGET_UTIL
-        ]
+        over = [p for p in self.proposals if p.target_projected > CEPH2_MAX_TARGET_UTIL]
         self.assertEqual(over, [])
 
     def test_default_cap_keeps_a_margin_below_backfillfull(self):
         # Capping at backfillfull_ratio itself lets targets be projected
         # into the last point below it. Pin that the margin is what keeps
         # them out, not merely that the cap is below the ratio.
-        rows = parse_table(
-            run_ceph2("--max-target-util", f"{CEPH2_BACKFILLFULL:g}").stdout
-        )
-        self.assertEqual(len(rows), CEPH2_NO_MARGIN_PROPOSED)
-        in_margin = [
-            r for r in rows if CEPH2_MAX_TARGET_UTIL < percent(r[("TARGET", "PROJ")])
-        ]
+        proposals = fixture_plan(
+            CEPH2_FIXTURE, "--max-target-util", f"{CEPH2_BACKFILLFULL:g}"
+        ).proposals
+        self.assertEqual(len(proposals), CEPH2_NO_MARGIN_PROPOSED)
+        in_margin = [p for p in proposals if CEPH2_MAX_TARGET_UTIL < p.target_projected]
         self.assertTrue(in_margin)
 
     def test_no_shard_is_diverted_off_a_healthy_osd(self):
         # The two new hosts sit around 70% and are absorbing shards, not
         # blocking them; diverting off them wasted targets.
-        under = [r for r in self.rows if percent(r[("UP", "UTIL")]) < CEPH2_NEARFULL]
+        under = [
+            p for p in self.proposals if self.util(p.shard.up_osd) < CEPH2_NEARFULL
+        ]
         self.assertEqual(under, [])
 
     def test_the_new_empty_hosts_receive_shards_instead_of_losing_them(self):
-        targets = {r[("TARGET", "HOST")] for r in self.rows}
+        targets = {p.target_host for p in self.proposals}
         self.assertTrue({"host50", "host51"} <= targets)
 
     def test_every_target_is_strictly_emptier_than_the_osd_it_replaces(self):
-        # Compared on the fixture's own figures: the table rounds to one
-        # decimal, so two OSDs can print alike while differing underneath.
-        with open(os.path.join(TEST_DATA, CEPH2_FIXTURE, "osd_df.json")) as f:
-            util = {n["id"]: n["utilization"] for n in json.load(f)["nodes"]}
-
-        def osd_id(cell):
-            return int(cell.removeprefix("osd."))
-
         not_emptier = [
-            r
-            for r in self.rows
-            if util[osd_id(r[("TARGET", "OSD")])] >= util[osd_id(r[("UP", "OSD")])]
+            p
+            for p in self.proposals
+            if self.util(p.target_osd) >= self.util(p.shard.up_osd)
         ]
         self.assertEqual(not_emptier, [])
 
     def test_no_target_is_used_more_than_the_default_limit(self):
-        uses = Counter(r[("TARGET", "OSD")] for r in self.rows)
+        uses = Counter(p.target_osd for p in self.proposals)
         self.assertEqual(max(uses.values()), CEPH2_MAX_USES)
 
     def test_targets_are_reused(self):
         # 52 shards land on 27 of the 900 candidates: some are reused.
-        targets = {r[("TARGET", "OSD")] for r in self.rows}
-        self.assertLess(len(targets), len(self.rows))
+        targets = {p.target_osd for p in self.proposals}
+        self.assertLess(len(targets), len(self.proposals))
         self.assertLessEqual(len(targets), CEPH2_CANDIDATES)
 
     def test_projection_stays_within_the_cap_and_grows_with_each_use(self):
-        # The table rounds to one decimal, so a projection just under the cap
-        # can print as exactly the cap; it is never printed above it. Rows
-        # are in PG order, not the order shards were placed in, so an OSD's
-        # successive uses are compared as a set: each adds a shard, so its
-        # projections are all different and all above its current utilization.
+        # Proposals are in PG order, not the order shards were placed in, so
+        # an OSD's successive uses are compared as a set: each adds a shard,
+        # so its projections are all different and all above its current
+        # utilization.
         projections = {}
-        for r in self.rows:
-            projected = percent(r[("TARGET", "PROJ")])
-            self.assertGreater(projected, percent(r[("TARGET", "UTIL")]))
-            self.assertLessEqual(projected, CEPH2_MAX_TARGET_UTIL)
-            projections.setdefault(r[("TARGET", "OSD")], []).append(projected)
+        for p in self.proposals:
+            self.assertGreater(p.target_projected, p.target_utilization)
+            self.assertLessEqual(p.target_projected, CEPH2_MAX_TARGET_UTIL)
+            projections.setdefault(p.target_osd, []).append(p.target_projected)
         for osd, values in projections.items():
             with self.subTest(osd=osd):
                 self.assertEqual(len(values), len(set(values)))
 
-    def test_rows_are_in_pg_order_whatever_order_shards_were_placed_in(self):
-        keys = [
-            (ut.pgid_sort_key(r[("", "PGID")]), int(r[("", "SHARD")]))
-            for r in self.rows
-        ]
+    def test_proposals_are_in_pg_order_whatever_order_shards_were_placed_in(self):
+        keys = [(ut.pgid_sort_key(p.shard.pgid), p.shard.shard) for p in self.proposals]
         self.assertEqual(keys, sorted(keys))
 
     def test_only_shards_on_the_fullest_acting_osds_get_the_scarce_room(self):
         # 578 of the 976 stuck shards have an acting OSD at or above
         # backfillfull_ratio and there is room for only 52, so every placed
         # shard should come from one. (In PG order far fewer did.)
-        # (Compared with slack: the table rounds a 90.96% OSD up to 91.0%.)
         below = [
-            r
-            for r in self.rows
-            if percent(r[("ACTING", "UTIL")]) < CEPH2_BACKFILLFULL - 0.05
+            p
+            for p in self.proposals
+            if self.util(p.shard.acting_osd) < CEPH2_BACKFILLFULL
         ]
         self.assertEqual(below, [])
 
     def test_single_use_gives_every_osd_at_most_one_shard(self):
-        proc = run_ceph2("--max-target-uses", "1")
-        rows = parse_table(proc.stdout)
-        self.assertEqual(len(rows), CEPH2_SINGLE_USE_PROPOSED)
-        self.assertEqual(len({r[("TARGET", "OSD")] for r in rows}), len(rows))
-        self.assertIn(
-            f"proposed {CEPH2_SINGLE_USE_PROPOSED} remap(s), "
-            f"{CEPH2_SINGLE_USE_UNPLACEABLE} unplaceable",
-            proc.stderr,
-        )
+        result = fixture_plan(CEPH2_FIXTURE, "--max-target-uses", "1")
+        self.assertEqual(len(result.proposals), CEPH2_SINGLE_USE_PROPOSED)
+        self.assertEqual(len(result.unplaceable), CEPH2_SINGLE_USE_UNPLACEABLE)
+        targets = {p.target_osd for p in result.proposals}
+        self.assertEqual(len(targets), len(result.proposals))
 
     def test_a_higher_limit_places_at_least_as_many(self):
         # The projection, not the count, becomes the constraint: 10 barely
         # beats 5 because the OSDs run out of room first.
         counts = [
-            len(parse_table(run_ceph2("--max-target-uses", n).stdout))
+            len(fixture_plan(CEPH2_FIXTURE, "--max-target-uses", n).proposals)
             for n in ("1", "2", "5", "10")
         ]
         self.assertEqual(counts, sorted(counts))
         self.assertLess(counts[0], counts[-1])
+
+    def test_no_target_is_on_a_host_already_in_its_pgs_up_set(self):
+        osd_host = self.result.osd_host
+        for p in self.proposals:
+            up_hosts = {osd_host[o] for o in p.shard.up_set if o in osd_host}
+            self.assertNotIn(p.target_host, up_hosts)
+
+    def test_loosest_thresholds_still_never_target_past_backfillfull(self):
+        # Opting out of the thresholds used to re-open targets that re-wedge on
+        # arrival (93 of them), with a warning. The loosest cap allowed is
+        # backfillfull_ratio itself, so nothing is doomed any more.
+        proposals = fixture_plan(
+            CEPH2_FIXTURE,
+            "--min-up-util",
+            "0",
+            "--max-target-util",
+            f"{CEPH2_BACKFILLFULL:g}",
+        ).proposals
+        self.assertEqual(len(proposals), CEPH2_UNCAPPED_PROPOSED)
+        for p in proposals:
+            self.assertLess(p.target_utilization, CEPH2_BACKFILLFULL)
+            self.assertLessEqual(p.target_projected, CEPH2_BACKFILLFULL)
+
+    def test_a_cap_equal_to_backfillfull_is_accepted(self):
+        fixture_plan(CEPH2_FIXTURE, "--max-target-util", f"{CEPH2_BACKFILLFULL:g}")
+
+
+class Ceph2FixtureOutputTest(unittest.TestCase):
+    """The cluster-sized capture run as a subprocess: CLI checks and output."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.proc = run_ceph2()
+        cls.proposals = fixture_plan(CEPH2_FIXTURE).proposals
+
+    def test_the_counts_are_reported_on_stderr(self):
+        self.assertIn(
+            f"proposed {CEPH2_PROPOSED} remap(s), {CEPH2_UNPLACEABLE} unplaceable",
+            self.proc.stderr,
+        )
+        self.assertIn(
+            f"{CEPH2_ARRIVING} arriving shard(s), of which {CEPH2_STUCK} on an OSD",
+            self.proc.stderr,
+        )
+        skipped = CEPH2_ARRIVING - CEPH2_STUCK
+        self.assertIn(f"({skipped} left alone as not the blocker)", self.proc.stderr)
+
+    def test_the_table_has_a_row_per_proposal(self):
+        group_and_label_lines = 2
+        self.assertEqual(
+            len(self.proc.stdout.splitlines()),
+            group_and_label_lines + CEPH2_PROPOSED,
+        )
 
     def test_non_positive_limit_is_refused(self):
         for value in ("0", "-1", "many"):
@@ -1476,24 +1573,6 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
             self.proc.stderr,
         )
 
-    def test_no_row_targets_a_host_already_in_its_pgs_up_set(self):
-        for row in self.rows:
-            self.assertNotEqual(row[("TARGET", "HOST")], row[("UP", "HOST")])
-
-    def test_loosest_thresholds_still_never_target_past_backfillfull(self):
-        # Opting out of the thresholds used to re-open targets that re-wedge on
-        # arrival (93 of them), with a warning. The loosest cap allowed is
-        # backfillfull_ratio itself, so nothing is doomed any more.
-        proc = run_ceph2(
-            "--min-up-util", "0", "--max-target-util", f"{CEPH2_BACKFILLFULL:g}"
-        )
-        rows = parse_table(proc.stdout)
-        self.assertEqual(len(rows), CEPH2_UNCAPPED_PROPOSED)
-        for r in rows:
-            self.assertLess(percent(r[("TARGET", "UTIL")]), CEPH2_BACKFILLFULL)
-            self.assertLessEqual(percent(r[("TARGET", "PROJ")]), CEPH2_BACKFILLFULL)
-        self.assertNotIn("WARNING", proc.stderr)
-
     def test_a_cap_above_backfillfull_is_an_error(self):
         # 100 used to mean "no cap"; it must now fail rather than be honored.
         for value in ("91.1", "100"):
@@ -1513,9 +1592,6 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
                 self.assertIn("ERROR: max target utilization", proc.stderr)
                 self.assertIn("backfillfull_ratio (91%)", proc.stderr)
 
-    def test_a_cap_equal_to_backfillfull_is_accepted(self):
-        run_ceph2("--max-target-util", f"{CEPH2_BACKFILLFULL:g}")
-
     def test_a_non_positive_cap_is_an_error(self):
         for value in ("0", "-5"):
             with self.subTest(value=value):
@@ -1531,24 +1607,9 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("ERROR: max target utilization", proc.stderr)
 
-    def test_pgremapper_mode_agrees_with_the_table(self):
-        proc = subprocess.run(
-            [
-                *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
-                "--pgremapper",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        lines = proc.stdout.splitlines()
-        self.assertEqual(len(lines), CEPH2_PROPOSED)
-        expected = [
-            f"{r[('', 'PGID')]} {r[('UP', 'OSD')].removeprefix('osd.')} "
-            f"{r[('TARGET', 'OSD')].removeprefix('osd.')}"
-            for r in self.rows
-        ]
-        self.assertEqual(lines, expected)
+    def test_pgremapper_mode_prints_the_planned_proposals(self):
+        lines = run_ceph2("--pgremapper").stdout.splitlines()
+        self.assertEqual(lines, remap_triples(self.proposals))
 
     def test_unplaceable_shards_are_only_counted(self):
         lines = self.proc.stderr.splitlines()
@@ -1563,15 +1624,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         self.assertNotRegex(self.proc.stderr, r"\d+\.\w+:[\d-]+, ")
 
     def test_pgremapper_mode_reports_the_unplaceable_count_on_stderr(self):
-        proc = subprocess.run(
-            [
-                *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
-                "--pgremapper",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        proc = run_ceph2("--pgremapper")
         self.assertIn(f"{CEPH2_UNPLACEABLE} shard(s) could not be placed", proc.stderr)
         self.assertNotRegex(proc.stderr, r"\d+\.\w+:[\d-]+, ")
         # Stdout stays parseable: only remap triples.

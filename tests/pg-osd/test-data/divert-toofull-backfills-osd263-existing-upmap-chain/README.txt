@@ -32,18 +32,20 @@ Verified against the live cluster: running the script reports 6
 backfill_toofull PGs cluster-wide, 6 arriving shards, all 6 at or above the
 default --min-up-util (osd.263 is at 87.6%, this cluster's
 nearfull_ratio is 85%), and 0 unplaceable. Every proposed target clears the
-default --max-target-util of 89%. Table output:
+default --max-target-util of 89%: each is at 86.9-87.0% now and projected
+to reach 87.7% once its shard has landed.
 
-                    ------- ACTING -------    --------- UP ---------    ----------- TARGET ----------
-  PGID     SHARD    OSD      UTIL   HOST      OSD      UTIL   HOST      OSD      UTIL   PROJ   HOST
-  19.7be   1        osd.863  88.4%  host35    osd.263  87.6%  host12    osd.837  87.0%  87.7%  host35
-  19.bd5   8        osd.625  88.7%  host27    osd.263  87.6%  host12    osd.842  86.9%  87.7%  host36
-  19.d85   9        osd.189  87.8%  host30    osd.263  87.6%  host12    osd.850  87.0%  87.7%  host34
-  19.118a  2        osd.618  88.4%  host13    osd.263  87.6%  host12    osd.839  87.0%  87.7%  host36
-  19.122e  7        osd.487  88.7%  host12    osd.263  87.6%  host12    osd.813  87.0%  87.7%  host35
-  19.1ce0  0        osd.723  88.7%  host27    osd.263  87.6%  host12    osd.829  87.0%  87.7%  host34
+Expected proposals, one per line as PGID SHARD ACTING_OSD UP_OSD TARGET_OSD
+(checked by the tests against what the script plans):
 
-The table does not mark which rows are the "existing upmap" kind; for
+  19.7be   1  863  263  837
+  19.bd5   8  625  263  842
+  19.d85   9  189  263  850
+  19.118a  2  618  263  839
+  19.122e  7  487  263  813
+  19.1ce0  0  723  263  829
+
+The output does not mark which proposals are the "existing upmap" kind; for
 reference, the PGs' pg_upmap_items pairs were:
 
   19.7be   554->687                                 (263 is CRUSH's own pick)
@@ -55,7 +57,7 @@ reference, the PGs' pg_upmap_items pairs were:
 
 --pgremapper still emits '<pgid> 263 <target>' for all six, e.g. "19.bd5 263
 842". 'pgremapper remap' turns that into a rewrite of the existing 625->263
-pair to 625->842 for the four 'to' rows, and adds a fresh pair for the other
+pair to 625->842 for the four 'to' PGs, and adds a fresh pair for the other
 two.
 
 Use this fixture to exercise the raw-CRUSH-mapping path end-to-end. For the
@@ -64,7 +66,7 @@ the "no problems" path see divert-toofull-backfills-nominal-synthetic/.
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 
-  backfillctl divert-toofull-backfills --load-state .
+  backfillctl --load-state . divert-toofull-backfills
 
 ANONYMIZED: cluster fsid, OSD IPs/uuids, hostnames and pool/CRUSH-rule
 names have been replaced with deterministic fake values (see

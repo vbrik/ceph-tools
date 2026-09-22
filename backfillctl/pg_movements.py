@@ -145,7 +145,7 @@ def movement_type(state: str) -> str:
 class MovementRow(NamedTuple):
     pgid: str
     shard: "int | str"  # shard index for EC pools (per-shard row), or "-" for
-    # replicated pools (one aggregate row per PG — see main() for why).
+    # replicated pools (one aggregate row per PG — see plan() for why).
     sources: frozenset  # OSD ids losing data; may be empty (see module Note)
     destinations: frozenset  # OSD ids gaining data
     move_type: str
@@ -153,12 +153,12 @@ class MovementRow(NamedTuple):
     primary: "int | None"  # acting primary OSD id; shown (marked '*') when
     # sources is empty or needs_primary_marker is set
     needs_primary_marker: bool  # True when at least one destination has no
-    # counterpart source anywhere in this row (see main() for derivation).
+    # counterpart source anywhere in this row (see plan() for derivation).
     # Always False for EC rows, where each row is a single shard and can't
     # mix the two cases.
     progress_pct: "float | None"  # % of the PG's objects already in their
     # target location, or None if the PG reports zero objects. Computed
-    # per-PG (from pg_stat.stat_sum), not per-shard — see main() for why
+    # per-PG (from pg_stat.stat_sum), not per-shard — see plan() for why
     # that matters for EC rows.
 
 
@@ -190,8 +190,20 @@ _SORT_KEYS = {
 # ---------------------------------------------------------------------------
 
 
-def run(args: argparse.Namespace) -> None:
-    store = SnapshotStore.from_args(args, SNAPSHOT_COMMANDS)
+class MovementsResult(NamedTuple):
+    """Everything a run found, independent of how it is printed.
+
+    plan() computes it and render() prints it. osd_df and osd_host are
+    carried along only because the table shows them.
+    """
+
+    rows: list[MovementRow]  # sorted by --sort-by
+    osd_df: dict[int, dict]
+    osd_host: dict[int, str]
+
+
+def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
+    """Fetch the cluster state from store and find every PG movement in it."""
     pg_stats = fetch_pg_stats(store, "pg_dump_pgs")
     osd_df = fetch_osd_df(store)
     osd_host = fetch_osd_hosts(store)
@@ -283,15 +295,16 @@ def run(args: argparse.Namespace) -> None:
                 )
             )
 
+    rows.sort(key=_SORT_KEYS[args.sort_by])
+    return MovementsResult(rows, osd_df, osd_host)
+
+
+def render(result: MovementsResult) -> None:
+    """Print result's rows as a table, then the footnotes that apply to them."""
+    rows, osd_df, osd_host = result
     if not rows:
         print("No PG movements detected.")
         return
-
-    rows.sort(key=_SORT_KEYS[args.sort_by])
-
-    # ------------------------------------------------------------------
-    # Tabular output
-    # ------------------------------------------------------------------
 
     SEP = "  ->  "  # separator between FROM and TO columns
     SEP_HDR = " " * len(SEP)  # same width, plain spaces in the header row
@@ -412,3 +425,7 @@ def run(args: argparse.Namespace) -> None:
 
     num_pgs = len({r.pgid for r in rows})
     print(f"\n{len(rows)} shard movement(s) across {num_pgs} PG(s).")
+
+
+def run(args: argparse.Namespace) -> None:
+    render(plan(args, SnapshotStore.from_args(args, SNAPSHOT_COMMANDS)))

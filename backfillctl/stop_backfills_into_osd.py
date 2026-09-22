@@ -189,6 +189,7 @@ from shared import (
     KIB,
     POOL_TYPE_ERASURE,
     PROGRESS_100_NOTE,
+    PgidFilter,
     SnapshotStore,
     abbreviate_state,
     copies_moving,
@@ -930,11 +931,35 @@ def print_summary(
 # ---------------------------------------------------------------------------
 
 
-def run(args: argparse.Namespace) -> None:
+class StopResult(NamedTuple):
+    """Everything a run decides, independent of how it is printed.
+
+    plan() computes it and render() prints it, so tests of the planning can
+    assert on these fields and survive changes to the output format. osd_df
+    and osd_host are carried along only because the output shows them.
+    """
+
+    osd: int
+    cancellations: list[Cancellation]  # in apply order, see plan_cancellations
+    skipped: list[Skipped]
+    chained: dict[str, list[Cancellation]]  # see chained_pgs
+    backfillfull_pct: float | None  # None if 'osd dump' has no backfillfull_ratio
+    exclude_filter: PgidFilter | None  # None without --exclude-pgs
+    osd_df: dict[int, dict]
+    osd_host: dict[int, str]
+
+
+def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
+    """Fetch the cluster state from store and work out which shards to pin back.
+
+    Exits with an error message if args.osd is unknown or a PG cannot be
+    analyzed safely (see plan_cancellations). The only output is the notes on
+    what the run is working from (a missing backfillfull_ratio, what
+    --exclude-pgs matched), printed before planning so that they are seen even
+    if it exits: a typo in --exclude-pgs is worth knowing about either way.
+    """
     osd = args.osd
     exclude_pgs = set(args.exclude_pgs)
-
-    store = SnapshotStore.from_args(args, SNAPSHOT_COMMANDS)
 
     osd_df = fetch_osd_df(store)
     osd_host = fetch_osd_hosts(store)
@@ -952,28 +977,21 @@ def run(args: argparse.Namespace) -> None:
             "capture?), so --pin-blockers has nothing to work from and no "
             "blockers are looked for."
         )
+    exclude_filter = None
     if exclude_pgs:
         # "matched" only means osd is somewhere in the PG's 'up' (i.e. it is
         # one of the PGs plan_cancellations would otherwise have looked at);
         # it does not mean osd itself has a backfill (see find_arrivals), so
-        # the note below must not claim more than that.
+        # print_exclude_filter must not claim more than that.
         matched = {
             pg["pgid"]
             for pg in pg_stats
             if osd in pg["up"] and pg["pgid"] in exclude_pgs
         }
-        unmatched = sorted(exclude_pgs - matched)
-        stderr_para(
-            f"NOTE: --exclude-pgs: {len(matched)} of {len(exclude_pgs)} given "
-            f"PG id(s) matched a remapped PG involving osd.{osd} and were "
-            "left alone"
-            + (
-                f"; {len(unmatched)} matched nothing (check for typos): "
-                f"{', '.join(unmatched)}."
-                if unmatched
-                else "."
-            )
+        exclude_filter = PgidFilter(
+            len(exclude_pgs), len(matched), sorted(exclude_pgs - matched)
         )
+        print_exclude_filter(osd, exclude_filter)
     cancellations, skipped = plan_cancellations(
         pg_stats,
         pools,
@@ -986,14 +1004,45 @@ def run(args: argparse.Namespace) -> None:
         args.pin_blockers,
         exclude_pgs,
     )
-    if not cancellations and not skipped:
+    return StopResult(
+        osd=osd,
+        cancellations=cancellations,
+        skipped=skipped,
+        chained=chained_pgs(cancellations),
+        backfillfull_pct=backfillfull_pct,
+        exclude_filter=exclude_filter,
+        osd_df=osd_df,
+        osd_host=osd_host,
+    )
+
+
+def print_exclude_filter(osd: int, exclude_filter: PgidFilter) -> None:
+    """Report on stderr what --exclude-pgs matched, naming the ids that matched nothing."""
+    unmatched = exclude_filter.unmatched
+    stderr_para(
+        f"NOTE: --exclude-pgs: {exclude_filter.matched} of {exclude_filter.given} "
+        f"given PG id(s) matched a remapped PG involving osd.{osd} and were "
+        "left alone"
+        + (
+            f"; {len(unmatched)} matched nothing (check for typos): "
+            f"{', '.join(unmatched)}."
+            if unmatched
+            else "."
+        )
+    )
+
+
+def render(result: StopResult, args: argparse.Namespace) -> None:
+    """Print result: pins on stdout in the format args asks for, notes on stderr."""
+    osd, cancellations = result.osd, result.cancellations
+    if not cancellations and not result.skipped:
         print(f"No backfills into osd.{osd}.", file=sys.stderr)
         if args.import_mappings:
             print_import_mappings([])
         return
 
-    print_summary(osd, osd_df, osd_host, cancellations, skipped)
-    chained = chained_pgs(cancellations)
+    print_summary(osd, result.osd_df, result.osd_host, cancellations, result.skipped)
+    chained = result.chained
     machine_format = args.import_mappings or args.pgremapper
     # pgremapper cannot apply chained pairs (see warn_chained_pgs), so they are
     # kept out of what is meant to be fed to it.
@@ -1009,12 +1058,15 @@ def run(args: argparse.Namespace) -> None:
         if multi := pgs_needing_several_pins(printable):
             warn_separate_remaps(multi)
     elif cancellations:
-        print_table(COLUMNS, [format_row(c, osd_df, osd_host) for c in cancellations])
+        print_table(
+            COLUMNS,
+            [format_row(c, result.osd_df, result.osd_host) for c in cancellations],
+        )
         if any(progress_reads_100(c.progress_pct) for c in cancellations):
             stderr_para(f"NOTE: {PROGRESS_100_NOTE}")
     if chained:
         warn_chained_pgs(chained, left_out=machine_format)
-    if backfillfull_pct is not None and not args.pin_blockers:
+    if result.backfillfull_pct is not None and not args.pin_blockers:
         stderr_para(
             "NOTE: --pin-blockers was not given, so a shard of the same PG "
             "whose own target OSD is over backfillfull_ratio was not pinned "
@@ -1026,3 +1078,7 @@ def run(args: argparse.Namespace) -> None:
         "NOTE: cancelling a running backfill discards its progress. Consider "
         "'ceph balancer off' while these are pinned."
     )
+
+
+def run(args: argparse.Namespace) -> None:
+    render(plan(args, SnapshotStore.from_args(args, SNAPSHOT_COMMANDS)), args)
