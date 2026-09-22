@@ -558,7 +558,7 @@ class ChainedPgsTest(unittest.TestCase):
 class NoteTest(unittest.TestCase):
     def note(self, **kw):
         c = cb.Cancellation("19.1", 3, 77, 66, 1_000, "s", None, **kw)
-        return cb.format_note(c)
+        return shared.format_note(c)
 
     def test_requested_shards_have_no_note(self):
         self.assertEqual(self.note(), "")
@@ -1285,7 +1285,7 @@ class HostnameCollisionTest(unittest.TestCase):
 class NoPgsTest(unittest.TestCase):
     def fetch(self, raw):
         store = FakeStore({"pg_ls_remapped": raw})
-        return cb.fetch_pg_stats(store, "pg_ls_remapped")
+        return shared.fetch_pg_stats(store, "pg_ls_remapped")
 
     def test_pg_ls_that_is_not_ready_is_an_error_not_no_pgs(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -1631,7 +1631,7 @@ class ChainFixtureReplayTest(unittest.TestCase):
         snap = {p.stem: json.loads(p.read_text()) for p in FIXTURE.glob("*.json")}
         store = FakeStore(snap)
         osd_df, osd_host = cb.fetch_osd_df(store), cb.fetch_osd_hosts(store)
-        pgs, pools = cb.fetch_pg_stats(store, "pg_dump_pgs"), cb.fetch_pools(store)
+        pgs, pools = shared.fetch_pg_stats(store, "pg_dump_pgs"), cb.fetch_pools(store)
         ecp, rules = cb.fetch_ec_profiles(store), cb.fetch_crush_rules(store)
         pct = cb.fetch_backfillfull_pct(store)
         targets = {

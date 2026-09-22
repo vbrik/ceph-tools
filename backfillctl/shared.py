@@ -2,14 +2,18 @@
 """Code shared by the scripts in this directory.
 
 Not a script itself: the others import it (`from shared import ...`), so it
-has to sit next to them. Four groups of things live here:
+has to sit next to them. Five groups of things live here:
 
 * OSD-slot helpers and PG arithmetic (progress, copies in flight, shard size);
 * reading cluster state, live or from a saved snapshot (`SnapshotStore`), the
   global `--load-state` flag built on it, and the anonymizer (used by the
   `save-state` subcommand) that makes a saved snapshot safe to share;
 * `fetch_*` helpers that turn snapshot keys into lookup tables;
-* the two-line grouped table (`print_table`) and its cell formatters.
+* the two-line grouped table (`print_table`) and its cell formatters;
+* turning a chosen shard into a valid, orderable upmap proposal --
+  `close_pins` and friends, `Cancellation`/`Skipped`, chain detection and the
+  cancellation-proposal table/JSON output -- shared by `cancel-backfill` and
+  `cancel-uphill`, the two subcommands that pin moving shards back.
 """
 
 import argparse
@@ -18,8 +22,10 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import subprocess
 import sys
+import textwrap
 from collections import Counter
 from collections.abc import Callable
 from itertools import groupby
@@ -672,6 +678,42 @@ def osd_cells(
     ]
 
 
+def wrap_text(text: str, indent: str = "") -> str:
+    """Wrap a stderr paragraph or list item to a readable width.
+
+    Capped at 100 columns (and no narrower than 40) so a long NOTE/WARNING/
+    ERROR stays readable on a wide terminal instead of stretching edge to
+    edge; 'indent' (e.g. "  " for a list item under a paragraph) is repeated
+    on wrapped lines plus two more spaces, so the continuation hangs under
+    the item's own text rather than the margin.
+    """
+    width = min(100, max(40, shutil.get_terminal_size().columns))
+    return textwrap.fill(
+        text,
+        width=width,
+        initial_indent=indent,
+        subsequent_indent=indent + "  ",
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+
+
+def stderr_para(text: str) -> None:
+    """Print a wrapped stderr paragraph, blank-line-separated from the last one.
+
+    Without the blank line, a run's several NOTE/WARNING messages read as one
+    undifferentiated block once each has wrapped across multiple terminal
+    lines; this makes each message its own visually distinct paragraph.
+    """
+    if stderr_para.printed:
+        print(file=sys.stderr)
+    print(wrap_text(text), file=sys.stderr)
+    stderr_para.printed = True
+
+
+stderr_para.printed = False
+
+
 def print_table(columns: Columns, rows: list[list[str]]) -> None:
     """Print rows under a two-line header: group spans, then column labels.
 
@@ -713,3 +755,295 @@ def print_table(columns: Columns, rows: list[list[str]]) -> None:
     emit([label for _, label in columns])
     for row in rows:
         emit(row)
+
+
+# ---------------------------------------------------------------------------
+# Cancelling backfills: pins, companions, chains, output
+#
+# Shared by cancel-backfill and cancel-uphill, both of which propose upmaps
+# that pin a moving shard back to its acting OSD. Picking *which* shard to
+# pin is each subcommand's own job (by target OSD for cancel-backfill, by
+# utilization direction for cancel-uphill); everything here is about turning
+# one or more chosen shards into a valid, orderable set of upmap pairs and
+# printing the result the same way in both.
+# ---------------------------------------------------------------------------
+
+
+def fetch_remapped_pg_stats(store: SnapshotStore) -> list[dict]:
+    """Return the PGs with up != acting ('remapped' state flag), live or from a snapshot.
+
+    Live reads 'pg_ls_remapped' (a small fraction of the full PG population on
+    a big cluster); --load-state instead filters the 'pg_dump_pgs' snapshot
+    client-side by the same state flag. Both keys must be present in the
+    caller's SNAPSHOT_COMMANDS.
+    """
+    if store.load_dir is None:
+        return fetch_pg_stats(store, "pg_ls_remapped")
+    return [
+        pg
+        for pg in fetch_pg_stats(store, "pg_dump_pgs")
+        if "remapped" in pg["state"].split("+")
+    ]
+
+
+class Cancellation(NamedTuple):
+    """One shard pinned back from the OSD it was moving to onto its acting OSD."""
+
+    pgid: str
+    shard: "int | str"  # EC shard index, or '-' for replicated pools
+    up_osd: int  # where CRUSH is sending it: the 'from' of the upmap pair
+    acting_osd: int  # where it is now: the 'to'
+    size_bytes: int | None  # estimated, None if unknown
+    state: str
+    progress_pct: float | None  # of the whole PG's movement, not this shard's
+    companion_of: "int | str | None" = None  # the requested shard this one is
+    # pinned along with (see close_pins), None if requested directly
+    blocker_util: float | None = None  # cancel-backfill's --pin-blockers only:
+    # set when this shard's target OSD would reach backfillfull_ratio (percent
+    # it would be at), i.e. it is a blocker. Always None for cancel-uphill.
+
+
+class Skipped(NamedTuple):
+    """A shard that could not be pinned, and why."""
+
+    pgid: str
+    shard: "int | str"
+    reason: str
+
+
+def same_place(a: int, b: int, osd_host: dict[int, str]) -> bool:
+    """True if two OSDs are one and the same or on one host (host known)."""
+    host = osd_host.get(a)
+    return a == b or (host is not None and host == osd_host.get(b))
+
+
+def close_pins(
+    up: list, acting: list, pins: dict[int, int], osd_host: dict[int, str]
+) -> tuple[dict[int, int], str | None]:
+    """Extend pins ({shard: acting_osd}) until the resulting mapping is valid.
+
+    Pinning a shard back puts its acting OSD into the up set, and Ceph drops an
+    upmap whose result puts two shards on one host (the pool's failure domain)
+    or the same OSD twice. That happens whenever another shard of the PG is
+    moving too and its destination shares a host with the pinned shard's acting
+    OSD: CRUSH re-placed the two together. The way out is to pin that other
+    shard back as well ("companion"), which can in turn clash with a third, and
+    so on until the mapping is valid.
+
+    Returns (pins, None) with the given pins first, or ({}, reason) when a
+    clashing shard cannot be pinned back (it is not moving, or has no acting
+    OSD), so that nothing partial is proposed.
+    """
+    pins = dict(pins)
+    while True:
+        new_up = [pins.get(i, osd) for i, osd in enumerate(up)]
+        added = {}
+        for i in pins:
+            for j, other in enumerate(new_up):
+                if j == i or j in pins or not is_real_osd(other):
+                    continue
+                if not same_place(new_up[i], other, osd_host):
+                    continue
+                companion = slot(acting, j)
+                if companion is None or companion == up[j]:
+                    why = "has no acting OSD" if companion is None else "is not moving"
+                    return {}, (
+                        f"acting osd.{new_up[i]} shares a host with shard {j} "
+                        f"(osd.{other}), which {why} so cannot be pinned too"
+                    )
+                added[j] = companion
+        if not added:
+            return pins, None
+        pins.update(added)
+
+
+def pin_with_companions(
+    up: list, acting: list, slot: int, osd_host: dict[int, str]
+) -> tuple[dict[int, int], str | None]:
+    """Pin EC shard 'slot' to its acting OSD, plus whatever that requires.
+
+    Returns ({shard: acting_osd}, None) with the requested shard first, or
+    ({}, reason); see close_pins.
+    """
+    return close_pins(up, acting, {slot: acting[slot]}, osd_host)
+
+
+def pin_replica(
+    up: list, osd: int, acting_osd: int, osd_host: dict[int, str]
+) -> str | None:
+    """Return why a replicated PG's replica cannot be pinned, or None if it can.
+
+    The replica swaps osd for acting_osd; the same-host clash with the other
+    replicas is checked as for EC. Replicas have no identity, so a clashing
+    replica cannot be pinned too: a PG with a second replica moving is
+    already ambiguous to pair and is the caller's job to refuse before
+    calling this, so it is never seen here.
+    """
+    for other in up:
+        if (
+            other != osd
+            and is_real_osd(other)
+            and same_place(acting_osd, other, osd_host)
+        ):
+            return (
+                f"acting osd.{acting_osd} shares a host with replica "
+                f"osd.{other}, which is not moving"
+            )
+    return None
+
+
+def order_moves(
+    moves: list[tuple[int, int, int]],
+) -> tuple[list[tuple[int, int, int]], str | None]:
+    """Order (shard, from_osd, to_osd) moves so Ceph applies all of them.
+
+    Ceph applies the pairs of a pg_upmap_items entry in order and skips a pair
+    whose 'to' OSD is still in the mapping. So a pair may only come after the
+    pair that moves its 'to' OSD away (the one whose 'from' it is). Shard order
+    is kept wherever nothing depends on anything else. Pairs that depend on each
+    other in a ring (osd.A -> B and B -> A) cannot be expressed as upmaps at
+    all: returns ([], reason) for those.
+    """
+    remaining = sorted(moves, key=lambda move: move[0])
+    ordered = []
+    while remaining:
+        for move in remaining:
+            if not any(other[1] == move[2] for other in remaining if other is not move):
+                break
+        else:
+            ring = ", ".join(f"osd.{f}->osd.{t}" for _, f, t in remaining)
+            return [], f"the pins form a cycle ({ring}), which upmaps cannot express"
+        ordered.append(move)
+        remaining.remove(move)
+    return ordered, None
+
+
+def chained_pgs(cancellations: list[Cancellation]) -> dict[str, list[Cancellation]]:
+    """Return {pgid: its cancellations}, in PG order, for PGs whose pairs chain.
+
+    Pairs chain when one's target OSD is another's source (osd.A -> B and
+    B -> C), which order_moves puts in the order Ceph needs. pgremapper cannot
+    apply those, see warn_chained_pgs.
+    """
+    by_pg: dict[str, list[Cancellation]] = {}
+    for c in cancellations:
+        by_pg.setdefault(c.pgid, []).append(c)
+    return {
+        pgid: cs
+        for pgid, cs in by_pg.items()
+        if any(
+            c.acting_osd == other.up_osd for c in cs for other in cs if other is not c
+        )
+    }
+
+
+def warn_chained_pgs(chained: dict[str, list[Cancellation]], left_out: bool) -> None:
+    """Warn on stderr about PGs with chained pairs, with how to apply them.
+
+    Ceph applies the pairs of an entry in order and skips a pair whose target is
+    still in the mapping, so a chain has to go in the order order_moves gives.
+    Dry runs of pgremapper (1.0.0) on a real chain showed it cannot: in that
+    order 'import-mappings' aborts with a panic ("conflicting mapping"), which
+    would take a whole batch down with it, and in the reverse order it silently
+    folds the chain into one different pair. So in the machine formats these
+    PGs are left out (left_out) and the pairs are given here as commands
+    instead.
+    """
+    stderr_para(
+        f"WARNING: {len(chained)} PG(s) have chained pairs (one pair's target is "
+        f"another's source, e.g. osd.A->B and osd.B->C): {', '.join(chained)}. "
+        "Ceph applies an entry's pairs in order and skips one whose target is "
+        "still in the mapping, so they must be given in the order below. "
+        "pgremapper cannot apply them: import-mappings aborts with a panic on "
+        "this order, and in the other order rewrites the chain into a different "
+        "mapping (seen in dry runs)."
+        + (" They are therefore left out of this output." if left_out else "")
+        + " Apply each with 'ceph osd pg-upmap-items', which replaces the PG's "
+        "whole upmap entry, so add the PG's existing pairs from 'ceph osd dump' "
+        "first (this has not been tried on your cluster):"
+    )
+    for pgid, cs in chained.items():
+        pairs = " ".join(f"{c.up_osd} {c.acting_osd}" for c in cs)
+        # Not wrapped: these are meant to be copy-pasted as shell commands.
+        print(f"  ceph osd pg-upmap-items {pgid} {pairs}", file=sys.stderr)
+
+
+def format_bytes(num: int | None) -> str:
+    """Format a byte count in binary units, or '?' if unknown."""
+    if num is None:
+        return "?"
+    value = float(num)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+
+def format_note(c: Cancellation) -> str:
+    """Say why a shard is in the proposal, if not because it was chosen directly."""
+    if c.blocker_util is not None:
+        return (
+            f"blocks shard {c.companion_of}: target osd.{c.up_osd} "
+            f"would be at {c.blocker_util:.1f}%, over backfillfull"
+        )
+    if c.companion_of is not None:
+        return f"companion of shard {c.companion_of}"
+    return ""
+
+
+# Each entry is (group, label); the header is printed on two lines, the group
+# name spanning its columns above their labels, and an empty group means the
+# column has no group line. The ACTING group is where the shard's data is now
+# (the 'to' of the upmap pair), UP where CRUSH wants it (the 'from'). OSDs are
+# bare ids, as 'pgremapper' takes them. print_table leaves the final column
+# unpadded.
+COLUMNS = [
+    ("", "PGID"),
+    ("", "SHARD"),
+    ("ACTING", "OSD"),
+    ("ACTING", "UTIL"),
+    ("ACTING", "HOST"),
+    ("UP", "OSD"),
+    ("UP", "UTIL"),
+    ("UP", "HOST"),
+    ("", "SIZE"),
+    ("", "PROGRESS"),
+    ("", "STATE"),
+    ("", "NOTE"),
+]
+
+
+def format_row(
+    c: Cancellation, osd_df: dict[int, dict], osd_host: dict[int, str]
+) -> list[str]:
+    return [
+        c.pgid,
+        str(c.shard),
+        *osd_cells(osd_df, osd_host, c.acting_osd, bare_id=True),
+        *osd_cells(osd_df, osd_host, c.up_osd, bare_id=True),
+        format_bytes(c.size_bytes),
+        format_progress(c.progress_pct),
+        abbreviate_state(c.state),
+        format_note(c),
+    ]
+
+
+def print_pgremapper_mappings(cancellations: list[Cancellation]) -> None:
+    """Print the cancellations as JSON for 'pgremapper import-mappings'.
+
+    One {pgid, mapping: {from, to}} entry per pair, in a JSON array with one
+    entry per line, so it is easy to read and to prune with jq ("[]" when there
+    are none, so the output is always valid JSON). import-mappings
+    reads the cluster's upmaps once and applies all pairs of a PG together, so
+    unlike separate 'pgremapper remap' runs the pairs of a PG cannot overwrite
+    each other.
+    """
+    if not cancellations:
+        print("[]")
+        return
+    print("[")
+    for i, c in enumerate(cancellations):
+        entry = {"pgid": c.pgid, "mapping": {"from": c.up_osd, "to": c.acting_osd}}
+        print(f"  {json.dumps(entry)}{',' if i < len(cancellations) - 1 else ''}")
+    print("]")

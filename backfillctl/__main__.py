@@ -16,6 +16,7 @@ generate shell completions (https://docs.iterative.ai/shtab/).
 import argparse
 
 import cancel_backfill
+import cancel_uphill
 import divert_toofull
 import save_state
 import show_backfill
@@ -27,6 +28,7 @@ _COMMAND_MODULES = (
     show_backfill,
     divert_toofull,
     cancel_backfill,
+    cancel_uphill,
     save_state,
 )
 

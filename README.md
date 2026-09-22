@@ -13,7 +13,7 @@ aren't answered directly by a single `ceph` subcommand.
 
 Every script is standalone and can be copied out and run on its own, with
 one exception: `backfillctl` (see below) is a small package, not a single
-file, because its four subcommands share code and more subcommands are
+file, because its six subcommands share code and more subcommands are
 coming; copy the whole `backfillctl/` directory (symlinks to it work), not
 individual files out of it. `backfillctl.py` at the top level is an optional
 executable shim to `backfillctl/`; copy it alongside `backfillctl/` if you
@@ -61,9 +61,9 @@ other environments.
 not a set of standalone scripts, because its subcommands share code and more
 are coming that will be variations on the existing ones. Run
 `python3 backfillctl <subcommand> --help` (or
-`python3 -m backfillctl <subcommand> --help`) for any of the five below.
-Four analyze a cluster; the fifth, `save-state`, captures one so the other
-four can replay it offline with the global `--load-state DIR` option, given
+`python3 -m backfillctl <subcommand> --help`) for any of the six below.
+Five analyze a cluster; the sixth, `save-state`, captures one so the other
+five can replay it offline with the global `--load-state DIR` option, given
 before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
 (`save-state` itself rejects it).
 
@@ -83,7 +83,7 @@ script.
   a full `ceph pg dump pgs`, covering every PG, not just the remapped or
   `backfill_toofull` ones the other subcommands ask for live. Each of them
   then reads `DIR` via `backfillctl --load-state DIR`, filtering `pg_dump_pgs.json`
-  itself for the PGs it cares about, so one capture serves all four.
+  itself for the PGs it cares about, so one capture serves all five.
   `backfillctl save-state DIR`
 
 - **`backfillctl show-pg-osds`** — Show one or more PGs' `acting` and `up` OSDs,
@@ -224,6 +224,36 @@ script.
   does the same at cluster/OSD/pool granularity. `--load-state DIR` replays a `backfillctl save-state`
   capture offline instead of querying the live cluster.
   `backfillctl [--load-state DIR] cancel-backfill [--osd OSD [--pin-blockers]] [--exclude-pgs PGID [PGID ...]] [--pgremapper-mappings]`
+
+- **`backfillctl cancel-uphill`** — List the upmaps needed to cancel
+  backfills that move data "uphill": from a less-utilized OSD to a
+  more-utilized one, the opposite of what backfill is supposed to
+  accomplish (this can happen as a side effect of a manual CRUSH/OSD
+  change). Every moving shard of every
+  remapped PG is compared by `ceph osd df` utilization; a replicated PG is
+  only judged when exactly one replica is arriving and one departing, and a
+  shard with no utilization figure on either end (e.g. a down OSD) is left
+  alone rather than guessed at — both reported on stderr, distinct from the
+  (usually much larger) set of shards that are simply not uphill, which are
+  not reported at all. A destination OSD's reported utilization already
+  includes whatever this backfill has copied so far, while the source keeps
+  its full copy until the PG goes clean, so a move that actually started
+  downhill can read as uphill once it is partway done; `--min-delta PERCENT`
+  (default `1.0`) only counts a shard as uphill when the destination is at
+  least that many percentage points more utilized than the source, to filter
+  out deltas small enough to plausibly be that artifact. Uses the same
+  pinning, companion, chain and output machinery as `cancel-backfill` (see
+  its entry above and its module docstring), so the two behave identically
+  once a shard is selected; when a PG has more than one uphill shard, all of
+  them are pinned together as one unit, so their companions and chain order
+  stay consistent — if that combined pin is not valid, none of the PG's
+  uphill shards are proposed, not just the one that clashed. Prints
+  proposals only; changes nothing.
+  `--exclude-pgs PGID [PGID ...]` and `--pgremapper-mappings` work the same
+  way as in `cancel-backfill`. `--load-state DIR` replays a
+  `backfillctl save-state` capture offline instead of querying the live
+  cluster.
+  `backfillctl [--load-state DIR] cancel-uphill [--min-delta PERCENT] [--exclude-pgs PGID [PGID ...]] [--pgremapper-mappings]`
 
 - **`pg-osd/scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /
@@ -391,6 +421,26 @@ Besides the exact pins documented in each `README.txt`, they
 check independently that applying the proposed pins leaves
 every PG with no repeated host or OSD, and that a `--load-state` directory
 replays to the same result with no `ceph` available.
+
+`cancel-backfill` and `cancel-uphill` share the pinning, companion, chain
+and output code (`shared.close_pins` and friends) that turns a chosen shard
+into a valid, orderable upmap proposal; it is tested once, through
+`cancel-backfill`'s suite (that code used to live in `cancel_backfill.py`
+itself, private to it; it moved to `shared.py`, importable under its own
+name, when `cancel-uphill` needed it too, and `cancel_backfill.py` now
+imports it back rather than defining it). `test_cancel_uphill.py` only
+tests what is actually new: `find_uphill_shards` (EC and replicated,
+`--min-delta` thresholding, unknown utilization, ambiguous/missing-replica
+pairing, several uphill shards in one PG) and that `plan_cancellations`
+wires selection into a pin correctly, including a companion needed by two
+independently-uphill shards and the all-or-nothing skip when a PG's
+combined pin is not valid. A replay of the real-cluster fixture also used
+by `cancel-backfill`'s tests checks two invariants against live data
+(every directly-selected shard's delta actually exceeds `--min-delta`,
+and applying the proposed pins never repeats a host or OSD in any PG's
+`up`), and a subprocess run through the real `backfillctl` entry point
+checks `cancel-uphill` is actually registered in `__main__.py`, not just
+reachable through the test's own throwaway parser.
 
 ## License
 
