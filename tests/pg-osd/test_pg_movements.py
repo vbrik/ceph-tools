@@ -208,7 +208,7 @@ class MainTest(unittest.TestCase):
             for key, data in SNAPSHOTS.items():
                 (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
             out = io.StringIO()
-            args = parse_args(pm, ["--load-state", tmp])
+            args = parse_args(pm, [], load_state=tmp)
             with (
                 mock.patch.object(shared, "ceph_json", side_effect=AssertionError),
                 contextlib.redirect_stdout(out),
@@ -227,7 +227,7 @@ class FixtureReplayTest(unittest.TestCase):
 
     def test_progress_100_note_appears_for_the_real_stuck_pgs(self):
         out = io.StringIO()
-        args = parse_args(pm, ["--load-state", str(FIXTURE_STUCK_AT_100)])
+        args = parse_args(pm, [], load_state=str(FIXTURE_STUCK_AT_100))
         with contextlib.redirect_stdout(out):
             pm.run(args)
         value = out.getvalue()

@@ -35,9 +35,9 @@ pg-movements subcommand (both use shared.pg_progress_pct). It is a per-PG figure
 every remapped row shows the same value.
 
 'backfillctl save-state DIR' captures a cluster's state (anonymized, and
-covering every subcommand, not just this one) into DIR; --load-state DIR
-then replays it here instead of calling 'ceph', reading the given PG's row
-out of the capture's pg_dump_pgs.json.
+covering every subcommand, not just this one) into DIR; 'backfillctl
+--load-state DIR osds-of-pg PGID' then replays it here instead of calling
+'ceph', reading the given PG's row out of the capture's pg_dump_pgs.json.
 """
 
 import argparse
@@ -49,7 +49,6 @@ from shared import (
     NOT_APPLICABLE,
     PROGRESS_100_NOTE,
     SnapshotStore,
-    add_load_state_arg,
     copies_moving,
     fetch_osd_df,
     fetch_osd_hosts,
@@ -209,7 +208,6 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "utilization, host, remap progress and upmaps.",
     )
     parser.add_argument("pgid", help="PG id, e.g. 3.1a2")
-    add_load_state_arg(parser)
     return parser
 
 

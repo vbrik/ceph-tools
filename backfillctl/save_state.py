@@ -11,7 +11,8 @@ ones some subcommands ask for live -- see "Cost" below). Each subcommand's
 itself for the PGs it cares about.
 
 DIR is created if missing and must be empty, so a capture is never partially
-overwritten by an unrelated one.
+overwritten by an unrelated one. The global --load-state is rejected here:
+this command exists to capture a live cluster, not to copy a capture.
 
 Anonymization
 --------------
@@ -35,6 +36,7 @@ when replaying a --load-state snapshot this command produced.
 """
 
 import argparse
+import sys
 
 from shared import (
     PROGRESS_COUNTERS,
@@ -121,6 +123,10 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
 
 
 def run(args: argparse.Namespace) -> None:
+    if args.load_state:
+        sys.exit(
+            "ERROR: save-state captures the live cluster; --load-state does not apply to it."
+        )
     save_dir = resolve_save_dir(args.dir)
     store = SnapshotStore(
         SNAPSHOT_COMMANDS, save_dir=save_dir, anonymize=anonymize_snapshots

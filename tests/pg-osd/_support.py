@@ -29,18 +29,23 @@ import shared
 __all__ = ["REPO_ROOT", "FakeStore", "parse_args", "shared"]
 
 
-def parse_args(module, argv: list[str]) -> argparse.Namespace:
+def parse_args(
+    module, argv: list[str], *, load_state: str | None = None
+) -> argparse.Namespace:
     """Parse argv through module.build_parser, as backfillctl's dispatcher would.
 
     module is one of backfillctl's command modules (e.g.
     backfillctl.osds_of_pg); argv excludes the subcommand name, which is
-    inferred from the single subparser the module registers.
+    inferred from the single subparser the module registers. load_state, if
+    given, is passed as the global --load-state, before the subcommand name.
     """
     parser = argparse.ArgumentParser()
+    shared.add_load_state_arg(parser)
     subparsers = parser.add_subparsers(dest="command")
     module.build_parser(subparsers)
     (name,) = subparsers.choices
-    return parser.parse_args([name, *argv])
+    global_argv = ["--load-state", load_state] if load_state is not None else []
+    return parser.parse_args([*global_argv, name, *argv])
 
 
 class FakeStore:

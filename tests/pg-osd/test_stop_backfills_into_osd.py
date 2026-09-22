@@ -1296,13 +1296,19 @@ class NoPgsTest(unittest.TestCase):
             self.fetch({"what": 1})
 
 
-def run_cli(*argv, path=None):
-    """Run the subcommand as a subprocess; path replaces PATH when given."""
+def run_cli(*argv, load_state=None, path=None):
+    """Run the subcommand as a subprocess.
+
+    load_state, when given, is passed as the global --load-state; path
+    replaces PATH when given.
+    """
     env = {**os.environ, "PATH": path} if path is not None else None
+    global_argv = ["--load-state", load_state] if load_state is not None else []
     return subprocess.run(
         [
             sys.executable,
             str(REPO_ROOT / "backfillctl"),
+            *global_argv,
             "stop-backfills-into-osd",
             *argv,
         ],
@@ -1359,19 +1365,17 @@ class LoadStateCliTest(unittest.TestCase):
         self.assertEqual(live.returncode, 0, live.stderr)
         self.assertEqual(live.stdout, "19.9 682 8\n19.d 682 8\n19.d 9 4\n")
 
-        replay = run_cli(
-            "--load-state", str(self.state), "--pgremapper", "--osd", "682"
-        )
+        replay = run_cli("--pgremapper", "--osd", "682", load_state=str(self.state))
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertEqual(replay.stdout, live.stdout)
 
     def test_load_reports_a_missing_directory_and_a_missing_file(self):
-        result = run_cli("--load-state", str(self.root / "nope"), "--osd", "682")
+        result = run_cli("--osd", "682", load_state=str(self.root / "nope"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not found", result.stderr)
 
         (self.state / "pg_dump_pgs.json").unlink()
-        result = run_cli("--load-state", str(self.state), "--osd", "682")
+        result = run_cli("--osd", "682", load_state=str(self.state))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing", result.stderr)
 
@@ -1434,7 +1438,7 @@ class FixtureReplayTest(unittest.TestCase):
     """Replay the real-cluster snapshot in tests/pg-osd/test-data (see its README.txt)."""
 
     def replay(self, osd, *flags):
-        result = run_cli("--load-state", str(FIXTURE), *flags, "--osd", str(osd))
+        result = run_cli(*flags, "--osd", str(osd), load_state=str(FIXTURE))
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -1589,7 +1593,7 @@ class ChainFixtureReplayTest(unittest.TestCase):
     while osd.579 still holds shard 8, which is going to osd.825."""
 
     def replay(self, *flags):
-        result = run_cli("--load-state", str(FIXTURE), *flags, "--osd", "891")
+        result = run_cli(*flags, "--osd", "891", load_state=str(FIXTURE))
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -1647,7 +1651,7 @@ class BlockerFixtureReplayTest(unittest.TestCase):
     with --pin-blockers -- this fixture is the reason the flag exists."""
 
     def replay(self, *flags):
-        result = run_cli("--load-state", str(FIXTURE_BLOCKER), *flags, "--osd", "896")
+        result = run_cli(*flags, "--osd", "896", load_state=str(FIXTURE_BLOCKER))
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
