@@ -1,7 +1,7 @@
 # ceph-tools
 
 Command-line tools for Ceph and CephFS cluster administration, debugging,
-and troubleshooting: PG movement/remapping, upmap manipulation, stopping and diverting backfills, scrub
+and troubleshooting: PG movement/remapping, upmap manipulation, cancelling and diverting backfills, scrub
 scheduling, OSD/PG lookups, MDS ops inspection, CephFS client load and
 inode-to-path resolution, and finding large, wide, or fast-growing
 directories on a mounted CephFS. Most tools wrap `ceph` CLI / `rados`
@@ -88,7 +88,7 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   moving. Those counters can hit zero before the PG actually finishes
   (a known gap, seen on large/contended PGs), so a run where any row reads
   100% prints a note explaining that; `show-pg-osds` and
-  `stop-backfills-into-osd` do the same. Handles EC (per-shard) and
+  `cancel-backfill` do the same. Handles EC (per-shard) and
   replicated (set-diff) pools differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
   `--osds` narrows the output to rows involving any of the given OSDs (as
@@ -124,7 +124,7 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   `ceph osd pg-upmap-items`, which replaces the whole entry. A single `remap`
   call merges into a PG's existing `pg_upmap_items`, but separate `remap` runs
   against the same PG can overwrite each other's pairs (seen on a live
-  cluster with the same tool in `stop-backfills-into-osd`), so
+  cluster with the same tool in `cancel-backfill`), so
   `--pgremapper` warns on stderr whenever a PG needs more than one line. An
   OSD can be the
   target of several shards: each shard's size is estimated from its PG
@@ -161,14 +161,19 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   [--import-mappings | --pgremapper] [--min-up-util PERCENT]
   [--max-target-util PERCENT] [--max-target-uses N] [--pgs PGID [PGID ...]]`
 
-- **`backfillctl stop-backfills-into-osd`** — List the upmaps needed to stop *all*
-  backfills into a given OSD, by pinning each arriving shard to the OSD that
-  holds it now. Ceph refuses a backfill when the target's *projected* usage
-  would pass `backfillfull_ratio`, and every other backfill headed for that OSD
-  counts towards it, so stopping those frees room for the ones you want (e.g.
-  draining the fullest OSD). Prints proposals only; changes nothing. The list
-  is everything required, which can include pins that stop backfills into
-  **other** OSDs, marked in the `NOTE` column:
+- **`backfillctl cancel-backfill`** — List the upmaps needed to cancel
+  backfills by pinning each moving shard to the OSD that holds it now: by
+  default *every* backfill in the cluster (freeze data movement, then let
+  through only what you want), or with `--osd` all backfills into one OSD.
+  Ceph refuses a backfill when the target's *projected* usage would pass
+  `backfillfull_ratio`, and every other backfill headed for that OSD counts
+  towards it, so stopping those frees room for the ones you want (e.g.
+  draining the fullest OSD). Prints proposals only; changes nothing. Without
+  `--osd`, a PG with every moving shard pinned back is simply its `acting` set
+  again, and replicated PGs with several replicas moving are paired in sorted
+  order (any pairing restores `acting`). With `--osd`, the list is everything
+  required, which can include pins that stop backfills into **other** OSDs,
+  marked in the `NOTE` column:
   - a *companion*: another shard of the same PG that is moving onto the host
     of a shard you pin back. Ceph checks the failure domain on the `up` set, so
     pinning only one of the two would leave two shards of the PG on one host
@@ -176,7 +181,8 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
     cancel the other. (A shard moving onto a host that holds another shard of
     its PG is harmless by itself: a PG's backfills run together and `acting`
     switches to `up` only once all of them have finished.)
-  - a *blocker*, only with `--pin-blockers` (off by default): another shard of
+  - a *blocker*, only with `--pin-blockers` (off by default; requires `--osd`,
+    since without it no moving shard is left unpinned): another shard of
     the PG whose target OSD would reach `backfillfull_ratio`.
     `backfill_toofull` is a per-PG state, so it holds the whole PG back,
     including the shard you want to keep (e.g. `99 -> 337` blocking
@@ -193,8 +199,8 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   shard you keep, and always drop companions with the entry they belong to.
   `--exclude-pgs PGID [PGID ...]` does this up front instead: those PGs (and
   their companions/blockers) never appear in the output. A given id that
-  doesn't match a remapped PG with `--osd` in its `up` set is reported on
-  stderr, since that usually means a typo.
+  doesn't match a remapped PG (with `--osd` in its `up` set, if given) is
+  reported on stderr, since that usually means a typo.
   `--import-mappings` prints a JSON array for `pgremapper import-mappings`
   (prune it with `jq`, then `pgremapper import-mappings file.json`), which
   takes all pairs in one run and, as dry runs showed, keeps a PG's existing
@@ -206,12 +212,13 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   `pgremapper remap` instead, but separate `remap` runs on one PG can overwrite
   each other's pairs (seen on a live cluster), so it warns on stderr whenever a
   PG needs more than one line. Shards that cannot be pinned (no acting OSD,
-  ambiguous replicated pairing, a clash that no companion can resolve) are
+  ambiguous replicated pairing with `--osd`, a clash that no companion can
+  resolve) are
   listed on stderr. Assumes the pools' CRUSH failure domain is `host`.
-  pgremapper's `cancel-backfill --include-osds N --target` does the same at
-  OSD/pool granularity. `--load-state DIR` replays a `backfillctl save-state`
+  pgremapper's own `cancel-backfill` (optionally `--include-osds N --target`)
+  does the same at cluster/OSD/pool granularity. `--load-state DIR` replays a `backfillctl save-state`
   capture offline instead of querying the live cluster.
-  `backfillctl [--load-state DIR] stop-backfills-into-osd --osd OSD [--exclude-pgs PGID [PGID ...]] [--pin-blockers] [--import-mappings | --pgremapper]`
+  `backfillctl [--load-state DIR] cancel-backfill [--osd OSD [--pin-blockers]] [--exclude-pgs PGID [PGID ...]] [--import-mappings | --pgremapper]`
 
 - **`pg-osd/scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /
@@ -365,13 +372,16 @@ invariants that matter — no target projected above `--max-target-util`
 (`backfillfull_ratio` minus 1 by default), no target used more than
 `--max-target-uses` times, no shard diverted off an OSD below `nearfull_ratio`.
 
-The `backfillctl stop-backfills-into-osd` tests do the same with two real-cluster
-snapshots in `tests/pg-osd/test-data/stop-backfills-into-osd-*/` (688 remapped PGs;
+The `backfillctl cancel-backfill` tests do the same with two real-cluster
+snapshots in `tests/pg-osd/test-data/cancel-backfill-*/` (688 remapped PGs;
 one where stopping the backfills into an OSD needs companion pins for 5 of 6
 arriving PGs, and `--pin-blockers` adds blocker pins for those same 5 plus the
 6th, whose own backfill would otherwise be held up by an unrelated shard in
 its PG; and one where `--pin-blockers` is the only thing standing between a
 single wanted backfill and the blocker in its own PG that is holding it up).
+Without `--osd`, they check that the first snapshot's 688 PGs are all
+covered with nothing unpinnable, and that applying each PG's pins in order
+turns its `up` back into its `acting`.
 Besides the exact pins documented in each `README.txt`, they
 check independently that applying the proposed pins leaves
 every PG with no repeated host or OSD, and that a `--load-state` directory

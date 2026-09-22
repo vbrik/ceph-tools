@@ -1,14 +1,14 @@
 Fixture: real, live-cluster snapshot of the case blockers exist for (see
-"Blockers" in stop-backfills-into-osd's module docstring): osd.896 has just
+"Blockers" in cancel-backfill's module docstring): osd.896 has just
 ONE backfill arriving, the one the operator wants (19.92e shard 4, from osd.231),
 and it is still backfill_toofull although osd.896 is at 81.1%.
 
 Captured: 2026-09-21, later the same day as the sibling fixture
-stop-backfills-into-osd-ceph2-osd896-host-clash-companions, once the operator
+cancel-backfill-ceph2-osd896-host-clash-companions, once the operator
 had cancelled the other backfills into osd.896 and expected 19.92e to start.
 Made with
 
-  backfillctl stop-backfills-into-osd --save-state <this directory> --osd 896
+  backfillctl cancel-backfill --save-state <this directory> --osd 896
 
 (same six files as the sibling; osd_dump.json is cut down to the erasure code
 profiles and the full ratios, backfillfull_ratio being 0.91 here.)
@@ -43,4 +43,4 @@ output is just "19.92e 896 231" and a NOTE that a shard of the PG blocking it
 may not have been pinned. That is the whole point of this fixture -- see
 "Blockers" in the module docstring.
 
-tests/pg-osd/test_stop_backfills_into_osd.py replays this snapshot with --load-state.
+tests/pg-osd/test_cancel_backfill.py replays this snapshot with --load-state.
