@@ -12,14 +12,14 @@ global option, given before the subcommand name
 import argparse
 
 import divert_toofull_backfills
-import osds_of_pg
 import pg_movements
 import save_state
+import show_pg_osds
 import stop_backfills_into_osd
 from shared import add_load_state_arg
 
 _COMMAND_MODULES = (
-    osds_of_pg,
+    show_pg_osds,
     pg_movements,
     divert_toofull_backfills,
     stop_backfills_into_osd,

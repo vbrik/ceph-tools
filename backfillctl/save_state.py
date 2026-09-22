@@ -60,7 +60,7 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 }
 
 # The parts of each pg_stat entry that some subcommand reads: identity and
-# movement (pg-movements, osds-of-pg), the flags stop-backfills-into-osd and
+# movement (pg-movements, show-pg-osds), the flags stop-backfills-into-osd and
 # divert-toofull-backfills filter on (part of 'state'), and the progress/size
 # counters (shared.pg_progress_pct, shared.shard_size_bytes).
 KEPT_PG_STAT_KEYS = ("pgid", "state", "up", "acting", "acting_primary", "up_primary")
@@ -68,7 +68,7 @@ KEPT_STAT_SUM_KEYS = (*PROGRESS_COUNTERS, "num_bytes")
 
 # The parts of 'ceph osd dump' some subcommand reads: erasure code profiles
 # (shard sizing), the full/backfillfull/nearfull ratios (divert-toofull-backfills,
-# stop-backfills-into-osd), and pg_upmap_items (osds-of-pg, divert-toofull-backfills).
+# stop-backfills-into-osd), and pg_upmap_items (show-pg-osds, divert-toofull-backfills).
 KEPT_OSD_DUMP_KEYS = (
     "erasure_code_profiles",
     "full_ratio",

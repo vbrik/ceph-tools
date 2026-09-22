@@ -72,14 +72,14 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   itself for the PGs it cares about, so one capture serves all four.
   `backfillctl save-state DIR`
 
-- **`backfillctl osds-of-pg`** — Show a PG's `acting` and `up` OSDs, one row per
-  shard, with each OSD's utilization and host, the PG's primaries
-  marked `*`, remap PROGRESS for shards that are moving (same estimate as
+- **`backfillctl show-pg-osds`** — Show one or more PGs' `acting` and `up` OSDs,
+  a table per PG with one row per shard, with each OSD's utilization and
+  host, the PG's primaries marked `*`, remap PROGRESS for shards that are moving (same estimate as
   `backfillctl pg-movements`, per PG), and the PG's `pg_upmap_items` pairs that touch
   each row (UPMAPS). Same grouped ACTING/UP table style as
   `backfillctl divert-toofull-backfills`. `--load-state DIR` replays a
   `backfillctl save-state` capture instead of querying the live cluster.
-  `backfillctl [--load-state DIR] osds-of-pg <pgid>`
+  `backfillctl [--load-state DIR] show-pg-osds <pgid> [<pgid> ...]`
 
 - **`backfillctl pg-movements`** — For every PG where `up` != `acting`,
   print source/destination OSDs, movement type, per-PG progress, and PG
@@ -87,7 +87,7 @@ before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
   which count copies, so it is scaled by the number of shards/replicas
   moving. Those counters can hit zero before the PG actually finishes
   (a known gap, seen on large/contended PGs), so a run where any row reads
-  100% prints a note explaining that; `osds-of-pg` and
+  100% prints a note explaining that; `show-pg-osds` and
   `stop-backfills-into-osd` do the same. Handles EC (per-shard) and
   replicated (set-diff) pools differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
