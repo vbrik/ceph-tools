@@ -250,6 +250,23 @@ class MainTest(unittest.TestCase):
             rows,
         )
 
+    def test_progress_100_note_absent_below_100(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for key, data in self.SNAPSHOTS.items():
+                (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
+            out = self.run_main("--load-state", tmp, "5.3")
+        self.assertNotIn("PROGRESS reads 100%", out)
+
+    def test_progress_100_note_appears_when_the_pg_reads_100(self):
+        snaps = json.loads(json.dumps(self.SNAPSHOTS))  # deep copy
+        snaps["pg_query"]["info"]["stats"]["stat_sum"]["num_objects_misplaced"] = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            for key, data in snaps.items():
+                (pathlib.Path(tmp) / f"{key}.json").write_text(json.dumps(data))
+            out = self.run_main("--load-state", tmp, "5.3")
+        self.assertIn(" 100%", out)
+        self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", out)
+
     def test_save_state_writes_the_pg_specific_capture_anonymized(self):
         by_command = {
             tuple(cmd): self.SNAPSHOTS[key]

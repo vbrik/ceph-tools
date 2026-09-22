@@ -186,6 +186,7 @@ from typing import NamedTuple
 from shared import (
     KIB,
     POOL_TYPE_ERASURE,
+    PROGRESS_100_NOTE,
     SnapshotStore,
     abbreviate_state,
     add_state_args,
@@ -202,6 +203,7 @@ from shared import (
     pg_progress_pct,
     pgid_sort_key,
     print_table,
+    progress_reads_100,
     real_osd_set,
     rule_failure_domain,
     shard_size_bytes,
@@ -1023,6 +1025,8 @@ def main() -> None:
             warn_separate_remaps(multi)
     elif cancellations:
         print_table(COLUMNS, [format_row(c, osd_df, osd_host) for c in cancellations])
+        if any(progress_reads_100(c.progress_pct) for c in cancellations):
+            stderr_para(f"NOTE: {PROGRESS_100_NOTE}")
     if chained:
         warn_chained_pgs(chained, left_out=machine_format)
     if backfillfull_pct is not None and not args.pin_blockers:

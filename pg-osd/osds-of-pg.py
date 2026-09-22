@@ -47,6 +47,7 @@ from typing import NamedTuple
 
 from shared import (
     NOT_APPLICABLE,
+    PROGRESS_100_NOTE,
     PROGRESS_COUNTERS,
     SnapshotStore,
     add_state_args,
@@ -61,6 +62,7 @@ from shared import (
     pg_progress_pct,
     pgid_pool_id,
     print_table,
+    progress_reads_100,
     real_osd_set,
     slot,
 )
@@ -250,6 +252,8 @@ def main() -> None:
             "\nPROGRESS is per PG (from its object counters), not per shard: "
             "every remapped row shows the same %."
         )
+    if any(r.remapped for r in rows) and progress_reads_100(pct):
+        print(f"\n{PROGRESS_100_NOTE}")
     print("\n* primary")
 
 

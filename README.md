@@ -62,8 +62,11 @@ other environments.
   print source/destination OSDs, movement type, per-PG progress, and PG
   state. Progress is derived from the misplaced/degraded object counters,
   which count copies, so it is scaled by the number of shards/replicas
-  moving. Handles EC (per-shard) and replicated (set-diff) pools
-  differently; see
+  moving. Those counters can hit zero before the PG actually finishes
+  (a known gap, seen on large/contended PGs), so a run where any row reads
+  100% prints a note explaining that; `osds-of-pg.py` and
+  `stop-backfills-into-osd.py` do the same. Handles EC (per-shard) and
+  replicated (set-diff) pools differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
   `--save-state DIR` / `--load-state DIR` save the cluster state it read
   (anonymized, and cut down to the fields the script uses), and replay it offline.

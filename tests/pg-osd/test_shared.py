@@ -132,6 +132,14 @@ class ProgressTest(unittest.TestCase):
         self.assertIsNone(shared.pg_progress_pct({}, 1))
 
 
+class ProgressReads100Test(unittest.TestCase):
+    def test_only_exact_100_reads_as_100(self):
+        self.assertTrue(shared.progress_reads_100(100.0))
+        self.assertFalse(shared.progress_reads_100(99.9))
+        self.assertFalse(shared.progress_reads_100(0.0))
+        self.assertFalse(shared.progress_reads_100(None))
+
+
 class EcShardMovesTest(unittest.TestCase):
     def test_no_movement(self):
         self.assertEqual(shared.ec_shard_moves([1, 2, 3], [1, 2, 3]), [])

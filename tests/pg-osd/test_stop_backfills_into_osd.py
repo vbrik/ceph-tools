@@ -990,6 +990,25 @@ class MainTest(unittest.TestCase):
         self.assertRegex(lines[2], r"\s8\s+90\.5%\s+h2\s+682\s+88\.0%\s+h1")
         self.assertIn("companion of shard 0", lines[4])
 
+    def test_progress_100_note_appears_when_a_row_reads_100(self):
+        # pg()'s misplaced/degraded default to 0, so every PGS row here reads
+        # literal 100% by default.
+        _, err = self.run_main("--osd", "682")
+        self.assertIn("NOTE: PROGRESS reads 100% once Ceph's own misplaced", err)
+
+    def test_progress_100_note_absent_when_nothing_reads_100(self):
+        pgs = [
+            pg(
+                "19.9",
+                [OSD, 2, 3, 4],
+                [8, 2, 3, 4],
+                "active+remapped+backfilling",
+                misplaced=25,
+            ),
+        ]
+        _, err = self.run_main("--osd", "682", pgs=pgs)
+        self.assertNotIn("PROGRESS reads 100%", err)
+
     def test_import_mappings_is_json_with_every_pair_and_no_warning(self):
         out, err = self.run_main("--import-mappings", "--osd", "682")
         self.assertEqual(

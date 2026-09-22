@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import load_script, shared
+from _support import SCRIPT_DIR, load_script, shared
 
 pm = load_script("pg-movements.py")
 
@@ -151,6 +151,24 @@ class MainTest(unittest.TestCase):
         self.assertIn("0(ceph1)*", line)
         self.assertIn("* this is the PG's primary OSD", out)
 
+    def test_progress_100_note_appears_when_a_row_reads_100(self):
+        # 5.1f has no misplaced/degraded objects in its stat_sum, so its lone
+        # moving copy reads 100% while still up != acting (see pg()/PGS above).
+        out = self.run_main()
+        line = next(ln for ln in out.splitlines() if ln.startswith("5.1f"))
+        self.assertIn(" 100% ", line)
+        self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", out)
+
+    def test_progress_100_note_absent_when_nothing_reads_100(self):
+        snaps = {
+            **SNAPSHOTS,
+            "pg_dump_pgs": {
+                "pg_map": {"pg_stats": [p for p in PGS if p["pgid"] != "5.1f"]}
+            },
+        }
+        out = self.run_main(snapshots=snaps)
+        self.assertNotIn("PROGRESS reads 100%", out)
+
     def test_stray_osd_hosts_and_utilization_resolve(self):
         snaps = {
             **SNAPSHOTS,
@@ -254,6 +272,38 @@ class MainTest(unittest.TestCase):
             ):
                 pm.main()
         self.assertIn("4 shard movement(s) across 4 PG(s).", out.getvalue())
+
+
+FIXTURE_STUCK_AT_100 = (
+    SCRIPT_DIR.parent
+    / "tests"
+    / "pg-osd"
+    / "test-data"
+    / "ceph1-backfills-stuck-at-100-pct"
+)
+
+
+class FixtureReplayTest(unittest.TestCase):
+    """Replay the real-cluster snapshot in tests/pg-osd/test-data (see its README.txt)."""
+
+    def test_progress_100_note_appears_for_the_real_stuck_pgs(self):
+        out = io.StringIO()
+        with (
+            mock.patch(
+                "sys.argv",
+                ["pg-movements.py", "--load-state", str(FIXTURE_STUCK_AT_100)],
+            ),
+            contextlib.redirect_stdout(out),
+        ):
+            pm.main()
+        value = out.getvalue()
+        self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", value)
+        # 27.126 has two shards genuinely still backfilling despite reading
+        # 100% (see the fixture's README.txt).
+        pg_lines = [ln for ln in value.splitlines() if ln.startswith("27.126")]
+        self.assertEqual(2, len(pg_lines))
+        for line in pg_lines:
+            self.assertIn(" 100% ", line)
 
 
 if __name__ == "__main__":

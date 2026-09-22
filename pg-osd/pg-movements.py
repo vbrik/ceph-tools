@@ -55,6 +55,7 @@ import argparse
 from typing import NamedTuple
 
 from shared import (
+    PROGRESS_100_NOTE,
     PROGRESS_COUNTERS,
     SnapshotStore,
     abbreviate_state,
@@ -72,6 +73,7 @@ from shared import (
     pg_progress_pct,
     pgid_pool_id,
     pgid_sort_key,
+    progress_reads_100,
     real_osd_set,
 )
 from shared import anonymize_snapshots as anonymize_common
@@ -441,6 +443,9 @@ def main() -> None:
             "independently\n(see module docstring), every shard row for that PG shows the "
             "same % — the PG's\noverall remaining work, not this shard's individually."
         )
+
+    if any(progress_reads_100(r.progress_pct) for r in rows):
+        print(f"\n{PROGRESS_100_NOTE}")
 
     num_pgs = len({r.pgid for r in rows})
     print(f"\n{len(rows)} shard movement(s) across {num_pgs} PG(s).")

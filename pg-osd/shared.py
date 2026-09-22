@@ -187,6 +187,11 @@ def pg_progress_pct(pg: dict, n_copies: int) -> float | None:
     dividing by num_objects alone would read 0% until more than 1/n_copies of
     the work was done. An object-count approximation, not byte-exact: it
     assumes objects are of similar size. None if the PG has no objects.
+
+    Can read 100% while the PG is still listed as moving (up != acting):
+    these counters are Ceph's own estimate and can hit zero before the
+    backfill scan itself actually finishes, especially on a very large or
+    contended PG. See PROGRESS_100_NOTE.
     """
     stat_sum = pg.get("stat_sum", {})
     total = stat_sum.get("num_objects", 0) * n_copies
@@ -198,6 +203,31 @@ def pg_progress_pct(pg: dict, n_copies: int) -> float | None:
         "num_objects_degraded", 0
     )
     return max(0.0, min(100.0, 100.0 * (1 - remaining / total)))
+
+
+def progress_reads_100(pct: float | None) -> bool:
+    """True when pg_progress_pct's return value displays as '100%'.
+
+    Centralized so every script that prints PROGRESS decides, the same way,
+    whether to print PROGRESS_100_NOTE.
+    """
+    return pct == 100.0
+
+
+# Printed once by a script when any row's PROGRESS reads 100% (see
+# progress_reads_100). Kept in one place so the wording can't drift between
+# pg-movements.py, osds-of-pg.py and stop-backfills-into-osd.py. No leading
+# newline/hard-wrapping: each caller adds its own paragraph spacing and either
+# prints this as-is (fixed-width footnote style) or hands it to a wrapper that
+# reflows it (textwrap.fill treats the embedded newlines as plain whitespace).
+PROGRESS_100_NOTE = (
+    "PROGRESS reads 100% once Ceph's own misplaced/degraded object counters "
+    "hit zero\nfor the PG — not proof it has actually finished (it's still "
+    "listed here because\nup != acting). On a very large or heavily contended "
+    "PG those counters can read\ncomplete well before the backfill scan itself "
+    "finishes, so 100% can persist for a\nwhile; it does not by itself mean "
+    "anything is stuck."
+)
 
 
 # ---------------------------------------------------------------------------
