@@ -20,9 +20,17 @@ shard, so nothing moves. That is 'pgremapper remap <pgid> <X> <acting osd>'.
 This script lists those remaps for every PG shard that is arriving on the
 OSD, and whatever else must be pinned for them to work: the output is the
 complete set of pins that stops ALL backfills into the OSD, which includes pins
-that stop backfills into OTHER OSDs (see "Companion pins" and "Blockers"). It
-changes nothing. It does not decide which backfills to keep: review the output
-and delete the entries for the ones you want to let proceed.
+that stop backfills into OTHER OSDs (see "Companion pins"). It changes
+nothing. It does not decide which backfills to keep: review the output and
+delete the entries for the ones you want to let proceed.
+
+That covers the script's name: by default it does exactly and only what
+"stop backfills into an OSD" says. It has a second, less obvious job, off by
+default and enabled with --pin-blockers: making sure that whichever backfills
+you end up keeping (by deleting their entries) actually run, rather than
+sitting in backfill_toofull because of some unrelated shard of the same PG
+(see "Blockers"). Without --pin-blockers the tool never looks for those, so a
+kept backfill can still be stuck for a reason the output never mentions.
 
 Cancelling a backfill that is already running throws away its progress; the
 PROGRESS and STATE columns are there to help judge that. The script cannot
@@ -61,26 +69,40 @@ cannot cancel shard 1's move and keep shard 4's, because no valid 'up' set has
 both.
 Companions are backfills into *other* OSDs that you did not ask about: check
 the NOTE column, and note that dropping a companion entry invalidates the pin
-it goes with. (A companion whose target is also over backfillfull_ratio is
-shown as a blocker, which is the more useful description.)
+it goes with. (With --pin-blockers, a companion whose target is also over
+backfillfull_ratio is shown as a blocker instead, which is the more useful
+description; without it, every companion is shown as a companion regardless.)
 
 Blockers
 --------
 backfill_toofull is a property of the PG, not of a shard: while any backfill
 target of a PG refuses its reservation, the whole PG waits, including a shard
 heading for a nearly empty OSD. So stopping the backfills into an OSD is not
-always enough to let the ones you keep run. For every PG with a pinned shard
-the tool also pins back each other shard that is moving to an OSD whose
-utilization, once the shard lands, would reach the cluster's backfillfull_ratio
-(from 'ceph osd dump'), listed as "blocks shard N" in the NOTE column with that
-projected utilization. The projection adds only this shard, to what
-'ceph osd df' reports, so it is a lower bound of what Ceph will see.
+always enough to let the ones you keep run: if you delete a shard's entry to
+keep its backfill, but some other shard of the same PG is heading for an OSD
+that is itself over backfillfull_ratio, the PG stays backfill_toofull and the
+one you kept never moves either -- for a reason this script would otherwise
+never mention.
+
+--pin-blockers turns this analysis on (off by default: it is a second job
+beyond stopping backfills into the named OSD, see "How", and finding it
+changes what PGs the output touches, not just how it explains them). With it,
+for every PG with a pinned shard the tool also pins back each other shard that
+is moving to an OSD whose utilization, once the shard lands, would reach the
+cluster's backfillfull_ratio (from 'ceph osd dump'), listed as "blocks shard
+N" in the NOTE column with that projected utilization. The projection adds
+only this shard, to what 'ceph osd df' reports, so it is a lower bound of what
+Ceph will see.
 
 To keep a backfill that these entries would cancel, delete its own entry, but
 keep the entries of its blockers, since those are what let it start. A blocker
 is only cancelled if it can be pinned validly: one that cannot is listed on
-stderr and the requested pin is kept regardless. Without a backfillfull_ratio
-(an older --load-state capture) no blockers are looked for, and a note says so.
+stderr and the requested pin is kept regardless. Without --pin-blockers, a
+trailing note points at the option (unless the cluster has no
+backfillfull_ratio to begin with, e.g. an older --load-state capture, in
+which case there is nothing it could find anyway and no note is printed).
+Given --pin-blockers with no backfillfull_ratio available, a note says so
+instead.
 
 Shards that cannot be pinned are listed on stderr, never dropped silently:
   - the acting slot is empty (degraded): there is no OSD to pin the shard to;
@@ -106,9 +128,10 @@ Applying the output
 --import-mappings prints a JSON array for 'pgremapper import-mappings', one
 {pgid, mapping: {from, to}} entry per line (all other output goes to stderr):
 
-    stop-backfills-into-osd.py --import-mappings 682 > mappings.json
+    stop-backfills-into-osd.py --pin-blockers --import-mappings 682 > mappings.json
     # drop the entry into the OSD for each backfill you want to keep, but not
-    # its blockers (other entries of the same PG), e.g. keep 19.92e's 896->231:
+    # its blockers (other entries of the same PG, present with --pin-blockers),
+    # e.g. keep 19.92e's 896->231:
     jq 'map(select(.pgid != "19.92e" or .mapping.from != 896))' mappings.json \\
         > pruned.json
     pgremapper import-mappings pruned.json
@@ -216,24 +239,35 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Propose the upmaps needed to stop ALL backfills into an "
         "OSD. Each shard arriving on it is pinned to the OSD it is on now. "
-        "That can also mean pinning back shards heading for OTHER OSDs, so "
-        "the output lists every pin required, not only those into the given "
-        "OSD: a companion is a shard of the same PG that would otherwise share "
-        "a host with a pinned shard once that is pinned back, so the resulting "
-        "'up' set would break the host failure domain and Ceph would silently "
-        "drop the upmap (a shard still moving onto a host that holds another "
-        "shard of its PG is harmless in itself: a PG's 'acting' set switches "
-        "to 'up' only when all its backfills have finished), and a blocker is "
-        "a shard whose target OSD would reach backfillfull_ratio and so holds "
-        "the whole PG in backfill_toofull. The NOTE column says which is "
-        "which. Prints the proposals only; nothing is changed. Deciding what "
-        "to keep is up to you: delete the entries for the backfills you want "
-        "to let proceed, but keep the blockers of any shard you keep and drop "
-        "companions together with the entry they belong to.",
+        "That can also mean pinning back a shard heading for another OSD, a "
+        "companion: a shard of the same PG that would otherwise share a host "
+        "with a pinned shard once that is pinned back, so the resulting 'up' "
+        "set would break the host failure domain and Ceph would silently drop "
+        "the upmap (a shard still moving onto a host that holds another shard "
+        "of its PG is harmless in itself: a PG's 'acting' set switches to "
+        "'up' only when all its backfills have finished). Prints the "
+        "proposals only; nothing is changed. Deciding what to keep is up to "
+        "you: delete the entries for the backfills you want to let proceed, "
+        "and drop companions together with the entry they belong to. "
+        "--pin-blockers additionally pins back any other shard of the same PG "
+        "whose own target OSD would reach backfillfull_ratio and so hold the "
+        "whole PG in backfill_toofull: without it, a backfill you decide to "
+        "keep can still never run, for a reason this tool would not "
+        "otherwise mention. The NOTE column says which pin is which.",
         epilog="See the docstring at the top of this script for companions, "
         "blockers, what cannot be pinned and how to apply the output.",
     )
     parser.add_argument("osd", type=parse_osd, help="OSD id, e.g. 682 or osd.682")
+    parser.add_argument(
+        "--pin-blockers",
+        action="store_true",
+        help="Also pin back any other shard of a PG whose target OSD would "
+        "reach backfillfull_ratio and so hold the whole PG in "
+        "backfill_toofull, marked 'blocks shard N' in the NOTE column. Off "
+        "by default: finding blockers changes which PGs the output touches, "
+        "not just how it explains them. Keep a blocker's entry when you keep "
+        "the shard it blocks; that pin is what lets it start.",
+    )
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument(
         "--import-mappings",
@@ -494,7 +528,8 @@ class Cancellation(NamedTuple):
     progress_pct: float | None  # of the whole PG's movement, not this shard's
     companion_of: "int | str | None" = None  # the requested shard this one is
     # pinned along with (see _close_pins, find_blockers), None if requested
-    blocker_util: float | None = None  # set when this shard's target OSD would
+    blocker_util: float | None = None  # set (only with --pin-blockers, see
+    # plan_cancellations' blockers_enabled) when this shard's target OSD would
     # reach backfillfull_ratio (percent it would be at), i.e. it is a blocker
 
 
@@ -515,18 +550,23 @@ def plan_cancellations(
     crush_rules: dict[int, dict],
     osd_df: dict[int, dict] | None = None,
     backfillfull_pct: float | None = None,
+    pin_blockers: bool = False,
 ) -> tuple[list[Cancellation], list[Skipped]]:
     """Return (cancellations, skipped) for all backfills into osd, in PG order.
 
     Every shard arriving on osd yields a cancellation, plus cancellations for
     the other shards of its PG that go with it: companions that must be pinned
-    back to keep the mapping valid (_close_pins), and, when osd_df and
-    backfillfull_pct are given, blockers whose target OSD would reach
-    backfillfull_pct and hold the whole PG in backfill_toofull (find_blockers).
-    A blocker that cannot be pinned is skipped and reported; the requested
-    shard's own pin is kept. Exits with an error if such a PG's pool does not
-    fail over at host, since the clash check assumes it.
+    back to keep the mapping valid (_close_pins, always), and, when
+    pin_blockers is true and osd_df/backfillfull_pct are given, blockers whose
+    target OSD would reach backfillfull_pct and hold the whole PG in
+    backfill_toofull (find_blockers). A blocker that cannot be pinned is
+    skipped and reported; the requested shard's own pin is kept. Exits with an
+    error if such a PG's pool does not fail over at host, since the clash
+    check assumes it.
     """
+    blockers_enabled = (
+        pin_blockers and osd_df is not None and backfillfull_pct is not None
+    )
     cancellations, skipped = [], []
     for pg in pg_stats:
         up, acting = pg["up"], pg["acting"]
@@ -559,7 +599,7 @@ def plan_cancellations(
         for shard, acting_osd in pins:
             if is_ec:
                 resolved, why = pin_with_companions(up, acting, shard, osd_host)
-                if why is None and osd_df is not None and backfillfull_pct is not None:
+                if why is None and blockers_enabled:
                     for blocker in find_blockers(
                         up, acting, resolved, osd_df, backfillfull_pct, size
                     ):
@@ -587,7 +627,7 @@ def plan_cancellations(
                 continue
             for s, from_osd, to_osd in moves:
                 projected = None
-                if s != shard and osd_df is not None and backfillfull_pct is not None:
+                if s != shard and blockers_enabled:
                     projected = projected_utilization(osd_df, from_osd, size)
                     if projected is not None and projected < backfillfull_pct:
                         projected = None
@@ -858,10 +898,11 @@ def main() -> None:
     if osd not in osd_df:
         sys.exit(f"ERROR: osd.{osd} not found in 'ceph osd df'.")
     backfillfull_pct = fetch_backfillfull_pct(store)
-    if backfillfull_pct is None:
+    if backfillfull_pct is None and args.pin_blockers:
         print(
             "NOTE: 'osd dump' has no backfillfull_ratio (an older --load-state "
-            "capture?), so shards blocking their PG are not looked for.",
+            "capture?), so --pin-blockers has nothing to work from and no "
+            "blockers are looked for.",
             file=sys.stderr,
         )
     cancellations, skipped = plan_cancellations(
@@ -873,6 +914,7 @@ def main() -> None:
         crush_rules,
         osd_df,
         backfillfull_pct,
+        args.pin_blockers,
     )
     if not cancellations and not skipped:
         print(f"No backfills into osd.{osd}.", file=sys.stderr)
@@ -900,6 +942,15 @@ def main() -> None:
         print_table(COLUMNS, [format_row(c, osd_df, osd_host) for c in cancellations])
     if chained:
         warn_chained_pgs(chained, left_out=machine_format)
+    if backfillfull_pct is not None and not args.pin_blockers:
+        print(
+            "NOTE: --pin-blockers was not given, so a shard of the same PG "
+            "whose own target OSD is over backfillfull_ratio was not pinned "
+            "back. If that leaves a PG in backfill_toofull, a backfill you "
+            "decide to keep from this output will never actually run. Rerun "
+            "with --pin-blockers to find and include those pins too.",
+            file=sys.stderr,
+        )
     print(
         "NOTE: cancelling a running backfill discards its progress. Consider "
         "'ceph balancer off' while these are pinned.",

@@ -35,14 +35,17 @@ as the acting OSD of the shard heading for 896. Pinning only the shard into
 896 would therefore leave two shards on one host, which Ceph rejects. E.g.
 19.7e9: shard 0 would go back to osd.627 (host32), but shard 9 is arriving on
 osd.149, also host32; pinning shard 9 back to osd.497 as well resolves it.
-Those second shards go to OSDs at 90-92% (osd.149 would reach 91.6% with its
-shard), so they are also what would hold the PG in backfill_toofull: the tool
-reports all of them as blockers ("blocks shard N"). 19.92e has none of the
-host problem, but its shard 6 (osd.99 -> osd.337, 92.5% used) is a blocker that
-keeps its shard 4 (osd.231 -> osd.896) from starting.
+These 5 companion pins are unconditional (see "Companion pins" in the module
+docstring): the tool needs no flag to find them. Those same second shards also
+happen to go to OSDs at 90-92% (osd.149 would reach 91.6% with its shard), so
+with --pin-blockers they are additionally reported as blockers ("blocks shard
+N") rather than plain companions. 19.92e has none of the host problem, so
+without --pin-blockers it gets only its one pin into 896; with the flag, its
+shard 6 (osd.99 -> osd.337, 92.5% used) is found as a pure blocker that keeps
+its shard 4 (osd.231 -> osd.896) from starting.
 
-Expected output for osd 896 (--pgremapper): 6 pins into osd.896 and 7 blockers
-(all of them NOTE "blocks shard N"):
+Expected output for osd 896 --pgremapper --pin-blockers: 6 pins into osd.896
+and 7 blockers (all of them NOTE "blocks shard N"):
 
   19.7e9 896 627
   19.7e9 149 497
@@ -59,14 +62,20 @@ Expected output for osd 896 (--pgremapper): 6 pins into osd.896 and 7 blockers
   19.1fed 12 207
 
 19.14cd shard 1 (314 -> 347, a move between two OSDs of the same host) does not
-clash with anything, but osd.314 is at 91.5% so it is a blocker too. 19.1b16 is
-the one PG here that is already backfilling (~81%); the others are at 0% in
-backfill_toofull.
+clash with anything, but osd.314 is at 91.5% so it is a blocker too (only found
+with --pin-blockers; without it, 19.14cd's output is just "232 337" and
+"896 614"). 19.1b16 is the one PG here that is already backfilling (~81%); the
+others are at 0% in backfill_toofull.
 
---import-mappings prints the same 13 pairs as a JSON array (one entry per pair,
-in this order). Applying them with separate 'pgremapper remap' runs is what
-fails on this cluster, so --pgremapper warns that all 6 PGs need more than one
-line.
+Without --pin-blockers (the default), the same command drops the 2 pure-blocker
+lines (19.92e's "337 99" and 19.14cd's "314 347"), leaving 11 lines for 5 PGs;
+19.92e then has just its one pin ("896 231") and no second line.
+
+--import-mappings prints the same 13 pairs (11 without --pin-blockers) as a
+JSON array (one entry per pair, in this order). Applying them with separate
+'pgremapper remap' runs is what fails on this cluster, so --pgremapper warns
+that 6 PGs need more than one line with --pin-blockers (5 without it, since
+19.92e then has only one line).
 
 Chained pairs ("Chained pairs" in the module docstring): 13 of the 688 remapped
 PGs have an OSD that CRUSH wants in one shard slot while it currently holds
@@ -84,7 +93,10 @@ none of the 13 is a ring.
 Other OSDs worth replaying:
   osd 74   2 pins, nothing else (19.16fc shard 6, 19.1eb3 shard 8)
   osd 682  1 pin (19.16fc shard 7 from osd.231) plus 19.16fc shard 6 (osd.74,
-           same host as osd.231, and at 91.6% with its shard) as its blocker
+           same host as osd.231) as its companion -- unconditional, so present
+           either way; with --pin-blockers it is also at 91.6% with its shard,
+           so it is labeled a blocker ("blocks shard 7") instead of a plain
+           companion, but it is pinned regardless of the flag
   osd 231  no backfills into it
 
 tests/pg-osd/test_stop_backfills_into_osd.py replays this snapshot with

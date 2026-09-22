@@ -141,17 +141,21 @@ other environments.
     cancel the other. (A shard moving onto a host that holds another shard of
     its PG is harmless by itself: a PG's backfills run together and `acting`
     switches to `up` only once all of them have finished.)
-  - a *blocker*: another shard of the PG whose target OSD would reach
-    `backfillfull_ratio`. `backfill_toofull` is a per-PG state, so it holds the
-    whole PG back, including the shard you want to keep (e.g. `99 -> 337`
-    blocking `231 -> 896`).
+  - a *blocker*, only with `--pin-blockers` (off by default): another shard of
+    the PG whose target OSD would reach `backfillfull_ratio`.
+    `backfill_toofull` is a per-PG state, so it holds the whole PG back,
+    including the shard you want to keep (e.g. `99 -> 337` blocking
+    `231 -> 896`). Without `--pin-blockers` the tool does exactly what its name
+    says and nothing more, so a backfill you decide to keep from its output
+    can still be stuck in `backfill_toofull` for a reason it never mentions; a
+    trailing NOTE says so and points at the option.
 
   It does not pick which backfills to keep: the table shows each shard's acting and
   up OSD (bare ids, with utilization and host, under a two-line header whose
   first line spans each of the `ACTING` and `UP` groups), size, PG progress and
   abbreviated state (cancelling a running backfill discards its progress). You drop the entries
-  for the ones to let proceed, but keep the blockers of any shard you keep,
-  and drop companions with the entry they belong to.
+  for the ones to let proceed; with `--pin-blockers`, keep the blockers of any
+  shard you keep, and always drop companions with the entry they belong to.
   `--import-mappings` prints a JSON array for `pgremapper import-mappings`
   (prune it with `jq`, then `pgremapper import-mappings file.json`), which
   takes all pairs in one run and, as dry runs showed, keeps a PG's existing
@@ -169,7 +173,7 @@ other environments.
   OSD/pool granularity. `--save-state DIR` writes the run's cluster state as
   JSON, anonymized so it can be shared, and `--load-state DIR` replays such a
   capture offline with no cluster access.
-  `pg-osd/stop-backfills-into-osd.py [--import-mappings | --pgremapper] [--save-state DIR | --load-state DIR] <osd>`
+  `pg-osd/stop-backfills-into-osd.py [--pin-blockers] [--import-mappings | --pgremapper] [--save-state DIR | --load-state DIR] <osd>`
 
 - **`pg-osd/scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /
@@ -306,10 +310,13 @@ invariants that matter — no target projected above `--max-target-util`
 
 The `pg-osd/stop-backfills-into-osd.py` tests do the same with two real-cluster
 snapshots in `tests/pg-osd/test-data/stop-backfills-into-osd-*/` (688 remapped PGs;
-one where stopping the backfills into an OSD needs companion and blocker pins
-for six PGs, and one where a single wanted backfill is held up by a blocker in
-its own PG). Besides the exact `--pgremapper` output documented in each
-`README.txt`, they check independently that applying the proposed pins leaves
+one where stopping the backfills into an OSD needs companion pins for 5 of 6
+arriving PGs, and `--pin-blockers` adds blocker pins for those same 5 plus the
+6th, whose own backfill would otherwise be held up by an unrelated shard in
+its PG; and one where `--pin-blockers` is the only thing standing between a
+single wanted backfill and the blocker in its own PG that is holding it up).
+Besides the exact `--pgremapper` output documented in each `README.txt`, they
+check independently that applying the proposed pins leaves
 every PG with no repeated host or OSD, and that `--save-state` output replays to
 the same result with no `ceph` available.
 

@@ -18,7 +18,7 @@ second shard moving, shard 6 from osd.99 to osd.337, and osd.337 is at 92.5%,
 over backfillfull_ratio, so it refuses the reservation and the whole PG waits,
 including shard 4 going to the nearly empty osd.896.
 
-Expected output for osd 896 (--pgremapper):
+Expected output for osd 896 (--pgremapper --pin-blockers):
 
   19.92e 896 231
   19.92e 337 99
@@ -30,5 +30,10 @@ proceed drops the FIRST line and keeps the second; the pin is valid on its own
 (osd.99 on host17, no other shard of the PG there), and with it 19.92e has only
 the wanted backfill left. In --import-mappings form the same is a
 two-entry array.
+
+Without --pin-blockers (the default), the second line is never found: the
+output is just "19.92e 896 231" and a NOTE that a shard of the PG blocking it
+may not have been pinned. That is the whole point of this fixture -- see
+"Blockers" in the module docstring.
 
 tests/pg-osd/test_stop_backfills_into_osd.py replays this snapshot with --load-state.

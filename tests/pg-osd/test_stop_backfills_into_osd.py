@@ -306,12 +306,13 @@ class FindBlockersTest(unittest.TestCase):
 
 
 class PlanBlockersTest(unittest.TestCase):
-    """plan_cancellations with the OSD utilizations and backfillfull_ratio given."""
+    """plan_cancellations with pin_blockers=True and the OSD utilizations and
+    backfillfull_ratio given: what --pin-blockers finds."""
 
-    def plan(self, pgs, df, osd_host=None, ratio=RATIO):
+    def plan(self, pgs, df, osd_host=None, ratio=RATIO, pin_blockers=True):
         pools = {19: EC_POOL, 7: REP_POOL}
         return cb.plan_cancellations(
-            pgs, pools, EC_PROFILES, OSD, osd_host or {}, RULES, df, ratio
+            pgs, pools, EC_PROFILES, OSD, osd_host or {}, RULES, df, ratio, pin_blockers
         )
 
     def test_blocker_is_pinned_and_marked_with_its_projected_utilization(self):
@@ -335,13 +336,24 @@ class PlanBlockersTest(unittest.TestCase):
         self.assertEqual(self.plan([p], {77: osd_df_node(77, 99.0)}), ([], []))
 
     def test_no_blockers_without_utilizations_or_ratio(self):
+        # even with pin_blockers=True, no osd_df or no backfillfull_pct means
+        # there is nothing to look blockers up in.
         p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
         pools = {19: EC_POOL}
         for df, ratio in ((None, RATIO), ({77: osd_df_node(77, 99.0)}, None)):
             cancellations, _ = cb.plan_cancellations(
-                [p], pools, EC_PROFILES, OSD, {}, RULES, df, ratio
+                [p], pools, EC_PROFILES, OSD, {}, RULES, df, ratio, True
             )
             self.assertEqual([c.shard for c in cancellations], [0])
+
+    def test_no_blockers_without_pin_blockers_even_with_utilization_and_ratio(self):
+        # pin_blockers defaults to False: osd.77 is over the ratio, but the
+        # blocker search never runs unless the flag says to.
+        p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
+        cancellations, _ = self.plan(
+            [p], {77: osd_df_node(77, 92.0)}, pin_blockers=False
+        )
+        self.assertEqual([c.shard for c in cancellations], [0])
 
     def test_a_blocker_that_cannot_be_pinned_is_reported_and_the_pin_is_kept(self):
         # pinning shard 3 back to osd.66 would share host H with shard 1
@@ -373,6 +385,21 @@ class PlanBlockersTest(unittest.TestCase):
         )
         self.assertEqual([c.shard for c in cancellations], [0, 1])
         self.assertAlmostEqual(cancellations[1].blocker_util, 92.0, places=2)
+
+    def test_without_pin_blockers_that_same_companion_is_not_labeled_a_blocker(self):
+        # the companion pin itself is unconditional (host clash), but with the
+        # flag off it must not be mislabeled "blocks shard N": that would
+        # contradict the run's own note that blockers were not looked for.
+        p = pg("19.5", [OSD, 149], [627, 497])
+        cancellations, _ = self.plan(
+            [p],
+            {149: osd_df_node(149, 92.0)},
+            osd_host={627: "H", 149: "H"},
+            pin_blockers=False,
+        )
+        self.assertEqual([c.shard for c in cancellations], [0, 1])
+        self.assertIsNone(cancellations[1].blocker_util)
+        self.assertEqual(cancellations[1].companion_of, 0)
 
     def test_several_blockers_come_in_shard_order(self):
         p = pg("19.5", [OSD, 77, 3, 88], [8, 66, 3, 99])
@@ -473,9 +500,17 @@ class PlanChainTest(unittest.TestCase):
         self.assertIn("cycle", skipped[0].reason)
 
 
-def run_plan_with_df(pgs, df, ratio=RATIO):
+def run_plan_with_df(pgs, df, ratio=RATIO, pin_blockers=True):
     return cb.plan_cancellations(
-        pgs, {19: EC_POOL, 7: REP_POOL}, EC_PROFILES, OSD, {}, RULES, df, ratio
+        pgs,
+        {19: EC_POOL, 7: REP_POOL},
+        EC_PROFILES,
+        OSD,
+        {},
+        RULES,
+        df,
+        ratio,
+        pin_blockers,
     )
 
 
@@ -915,20 +950,41 @@ class MainTest(unittest.TestCase):
         _, err = self.run_main("682")
         self.assertNotIn("WARNING", err)
 
-    def test_blocker_in_the_same_pg_is_proposed_and_explained(self):
+    def test_blockers_are_not_pinned_by_default(self):
         # osd.77 is at 92%, over the 91% backfillfull_ratio, so shard 3 (66->77)
-        # would hold 19.e in backfill_toofull and must be pinned back too.
+        # would hold 19.e in backfill_toofull, but without --pin-blockers the
+        # tool never looks for it: only the requested pin comes out, plus a
+        # note pointing at the flag.
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, err = self.run_main(
             "--pgremapper", "682", pgs=pgs, extra_osds=[osd_df_node(77, 92.0)]
         )
+        self.assertEqual(out, "19.e 682 8\n")
+        self.assertNotIn("more shard(s)", err)
+        self.assertIn("--pin-blockers was not given", err)
+
+    def test_blocker_in_the_same_pg_is_proposed_and_explained(self):
+        # osd.77 is at 92%, over the 91% backfillfull_ratio, so shard 3 (66->77)
+        # would hold 19.e in backfill_toofull and, with --pin-blockers, must be
+        # pinned back too.
+        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        out, err = self.run_main(
+            "--pin-blockers",
+            "--pgremapper",
+            "682",
+            pgs=pgs,
+            extra_osds=[osd_df_node(77, 92.0)],
+        )
         self.assertEqual(out, "19.e 682 8\n19.e 77 66\n")
         self.assertIn("1 more shard(s)", err)
         self.assertIn("1 because their target would be over backfillfull_ratio", err)
+        self.assertNotIn("--pin-blockers was not given", err)
 
     def test_table_says_which_shard_a_blocker_blocks(self):
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
-        out, _ = self.run_main("682", pgs=pgs, extra_osds=[osd_df_node(77, 92.0)])
+        out, _ = self.run_main(
+            "--pin-blockers", "682", pgs=pgs, extra_osds=[osd_df_node(77, 92.0)]
+        )
         rows = out.splitlines()
         self.assertEqual(len(rows), 4)  # two header lines + the 2 pins
         self.assertIn("blocks shard 0: target osd.77 would be at 92.0%", rows[3])
@@ -937,12 +993,32 @@ class MainTest(unittest.TestCase):
     def test_a_target_below_the_ratio_is_not_a_blocker(self):
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, err = self.run_main(
-            "--pgremapper", "682", pgs=pgs, extra_osds=[osd_df_node(77, 80.0)]
+            "--pin-blockers",
+            "--pgremapper",
+            "682",
+            pgs=pgs,
+            extra_osds=[osd_df_node(77, 80.0)],
         )
         self.assertEqual(out, "19.e 682 8\n")
         self.assertNotIn("more shard(s)", err)
 
-    def test_without_a_backfillfull_ratio_no_blockers_are_looked_for(self):
+    def test_without_a_backfillfull_ratio_pin_blockers_has_nothing_to_work_from(self):
+        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        out, err = self.run_main(
+            "--pin-blockers",
+            "--pgremapper",
+            "682",
+            pgs=pgs,
+            extra_osds=[osd_df_node(77, 92.0)],
+            drop=["backfillfull_ratio"],
+        )
+        self.assertEqual(out, "19.e 682 8\n")
+        self.assertIn("no backfillfull_ratio", err)
+        self.assertNotIn("--pin-blockers was not given", err)
+
+    def test_without_a_backfillfull_ratio_and_without_the_flag_only_one_note(self):
+        # nothing useful to say about a flag whose search would find nothing
+        # anyway: neither note is worth printing.
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, err = self.run_main(
             "--pgremapper",
@@ -952,7 +1028,8 @@ class MainTest(unittest.TestCase):
             drop=["backfillfull_ratio"],
         )
         self.assertEqual(out, "19.e 682 8\n")
-        self.assertIn("no backfillfull_ratio", err)
+        self.assertNotIn("no backfillfull_ratio", err)
+        self.assertNotIn("--pin-blockers was not given", err)
 
     def test_chained_pgs_are_left_out_of_the_machine_formats(self):
         chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
@@ -1273,8 +1350,9 @@ FIXTURE_BLOCKER = (
 )
 
 # Documented in the fixture's README.txt. The pins that are neither into 896 nor
-# needed for host validity alone are the blockers (targets over backfillfull).
-EXPECTED_896 = """\
+# needed for host validity alone are the blockers (targets over backfillfull),
+# only found with --pin-blockers.
+EXPECTED_896_WITH_BLOCKERS = """\
 19.7e9 896 627
 19.7e9 149 497
 19.92e 896 231
@@ -1282,6 +1360,23 @@ EXPECTED_896 = """\
 19.94c 896 522
 19.94c 716 266
 19.14cd 314 347
+19.14cd 232 337
+19.14cd 896 614
+19.1b16 896 591
+19.1b16 524 578
+19.1fed 896 5
+19.1fed 12 207
+"""
+
+# Without --pin-blockers: the two pure-blocker lines (19.92e's "337 99" and
+# 19.14cd's "314 347") are missing; everything else (the companion pins) is
+# unconditional and unchanged.
+EXPECTED_896_DEFAULT = """\
+19.7e9 896 627
+19.7e9 149 497
+19.92e 896 231
+19.94c 896 522
+19.94c 716 266
 19.14cd 232 337
 19.14cd 896 614
 19.1b16 896 591
@@ -1299,23 +1394,43 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
-    def test_osd_896_pgremapper_output(self):
-        self.assertEqual(self.replay(896, "--pgremapper").stdout, EXPECTED_896)
+    def test_osd_896_pgremapper_output_default(self):
+        # --pin-blockers not given: the two pure-blocker lines are missing.
+        self.assertEqual(self.replay(896, "--pgremapper").stdout, EXPECTED_896_DEFAULT)
+
+    def test_osd_896_pgremapper_output_with_pin_blockers(self):
+        self.assertEqual(
+            self.replay(896, "--pin-blockers", "--pgremapper").stdout,
+            EXPECTED_896_WITH_BLOCKERS,
+        )
 
     def test_osd_896_import_mappings_matches_the_pgremapper_lines(self):
-        result = self.replay(896, "--import-mappings")
-        entries = json.loads(result.stdout)
-        self.assertEqual(
-            [
-                f"{e['pgid']} {e['mapping']['from']} {e['mapping']['to']}"
-                for e in entries
-            ],
-            EXPECTED_896.splitlines(),
-        )
-        self.assertNotIn("WARNING", result.stderr)
+        for flags, expected in (
+            ((), EXPECTED_896_DEFAULT),
+            (("--pin-blockers",), EXPECTED_896_WITH_BLOCKERS),
+        ):
+            with self.subTest(flags=flags):
+                result = self.replay(896, *flags, "--import-mappings")
+                entries = json.loads(result.stdout)
+                self.assertEqual(
+                    [
+                        f"{e['pgid']} {e['mapping']['from']} {e['mapping']['to']}"
+                        for e in entries
+                    ],
+                    expected.splitlines(),
+                )
+                self.assertNotIn("WARNING", result.stderr)
 
     def test_osd_896_pgremapper_lines_carry_the_warning(self):
+        # 19.92e needs only one line without --pin-blockers (its second shard,
+        # a pure blocker, is not found), so it drops out of the warning.
         err = self.replay(896, "--pgremapper").stderr
+        self.assertIn("WARNING: 5 PG(s) need more than one remap", err)
+        for pgid in ("19.7e9", "19.94c", "19.14cd", "19.1b16", "19.1fed"):
+            self.assertIn(pgid, err)
+        self.assertNotIn("19.92e,", err)
+
+        err = self.replay(896, "--pin-blockers", "--pgremapper").stderr
         self.assertIn("WARNING: 6 PG(s) need more than one remap", err)
         for pgid in ("19.7e9", "19.92e", "19.94c", "19.14cd", "19.1b16", "19.1fed"):
             self.assertIn(pgid, err)
@@ -1323,8 +1438,19 @@ class FixtureReplayTest(unittest.TestCase):
     def test_osd_74_pgremapper_lines_need_no_warning(self):
         self.assertNotIn("WARNING", self.replay(74, "--pgremapper").stderr)
 
-    def test_osd_896_table_and_summary(self):
+    def test_osd_896_table_and_summary_default(self):
         result = self.replay(896)
+        rows = result.stdout.splitlines()
+        self.assertEqual(len(rows), 2 + 11)  # two header lines + the 11 pins
+        self.assertEqual(sum("blocks shard" in r for r in rows), 0)
+        self.assertIn("6 arriving shard(s)", result.stderr)
+        self.assertIn("5 more shard(s)", result.stderr)
+        self.assertNotIn("because their target would be over", result.stderr)
+        self.assertIn("0 cannot be pinned", result.stderr)
+        self.assertIn("--pin-blockers was not given", result.stderr)
+
+    def test_osd_896_table_and_summary_with_pin_blockers(self):
+        result = self.replay(896, "--pin-blockers")
         rows = result.stdout.splitlines()
         self.assertEqual(len(rows), 2 + 13)  # two header lines + the 13 pins
         self.assertEqual(sum("blocks shard" in r for r in rows), 7)
@@ -1332,6 +1458,7 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertIn("7 more shard(s)", result.stderr)
         self.assertIn("(7 because their target would be over", result.stderr)
         self.assertIn("0 cannot be pinned", result.stderr)
+        self.assertNotIn("--pin-blockers was not given", result.stderr)
 
     def test_osd_74_needs_no_companions(self):
         out = self.replay(74, "--pgremapper").stdout
@@ -1339,9 +1466,24 @@ class FixtureReplayTest(unittest.TestCase):
 
     def test_osd_682_pairs_its_shard_with_the_one_on_the_same_host(self):
         # osd.231 (the acting OSD of 19.16fc shard 7) shares a host with osd.74,
-        # where shard 6 of the same PG is arriving.
-        out = self.replay(682, "--pgremapper").stdout
-        self.assertEqual(out, "19.16fc 74 183\n19.16fc 682 231\n")
+        # where shard 6 of the same PG is arriving. This pin is unconditional
+        # (a companion, not a blocker), so it is there with or without
+        # --pin-blockers.
+        for flags in ((), ("--pin-blockers",)):
+            with self.subTest(flags=flags):
+                out = self.replay(682, *flags, "--pgremapper").stdout
+                self.assertEqual(out, "19.16fc 74 183\n19.16fc 682 231\n")
+
+    def test_osd_682_companion_note_becomes_a_blocker_note_with_the_flag(self):
+        # osd.74 (shard 6's target) also happens to be over backfillfull_ratio,
+        # so --pin-blockers changes only how the pin is explained, not whether
+        # it is there.
+        without_flag = self.replay(682).stdout
+        self.assertIn("companion of shard 7", without_flag)
+        self.assertNotIn("blocks", without_flag)
+        with_flag = self.replay(682, "--pin-blockers").stdout
+        self.assertIn("blocks shard 7: target osd.74 would be at 91.6%", with_flag)
+        self.assertNotIn("companion of shard 7", with_flag)
 
     def test_an_osd_with_no_backfills_prints_nothing(self):
         result = self.replay(231, "--pgremapper")
@@ -1360,20 +1502,29 @@ class FixtureReplayTest(unittest.TestCase):
         }
         pgs = {p["pgid"]: p for p in snap["pg_ls_remapped"]["pg_stats"]}
         for osd in (896, 74, 682):
-            pins: dict[str, list[tuple[int, int]]] = {}
-            for line in self.replay(osd, "--pgremapper").stdout.splitlines():
-                pgid, from_osd, to_osd = line.split()
-                pins.setdefault(pgid, []).append((int(from_osd), int(to_osd)))
-            for pgid, pairs in pins.items():
-                up = list(pgs[pgid]["up"])
-                for from_osd, to_osd in pairs:
-                    slot = up.index(from_osd)
-                    # a pin always sends the shard back to where it is now
-                    self.assertEqual(pgs[pgid]["acting"][slot], to_osd, (osd, pgid))
-                    up[slot] = to_osd
-                self.assertEqual(len(set(up)), len(up), (osd, pgid, "OSD twice"))
-                hosts = [host[o] for o in up]
-                self.assertEqual(len(set(hosts)), len(hosts), (osd, pgid, hosts))
+            for pin_blockers in (False, True):
+                flags = ("--pin-blockers",) if pin_blockers else ()
+                pins: dict[str, list[tuple[int, int]]] = {}
+                lines = self.replay(osd, *flags, "--pgremapper").stdout.splitlines()
+                for line in lines:
+                    pgid, from_osd, to_osd = line.split()
+                    pins.setdefault(pgid, []).append((int(from_osd), int(to_osd)))
+                for pgid, pairs in pins.items():
+                    up = list(pgs[pgid]["up"])
+                    for from_osd, to_osd in pairs:
+                        slot = up.index(from_osd)
+                        # a pin always sends the shard back to where it is now
+                        self.assertEqual(
+                            pgs[pgid]["acting"][slot], to_osd, (osd, pin_blockers, pgid)
+                        )
+                        up[slot] = to_osd
+                    self.assertEqual(
+                        len(set(up)), len(up), (osd, pin_blockers, pgid, "OSD twice")
+                    )
+                    hosts = [host[o] for o in up]
+                    self.assertEqual(
+                        len(set(hosts)), len(hosts), (osd, pin_blockers, pgid, hosts)
+                    )
 
     def test_fixtures_hold_no_real_hostnames_addresses_or_uuids(self):
         for fixture in (FIXTURE, FIXTURE_BLOCKER):
@@ -1431,7 +1582,7 @@ class ChainFixtureReplayTest(unittest.TestCase):
         chained = 0
         for osd in sorted(targets):
             cancellations, _ = cb.plan_cancellations(
-                pgs, pools, ecp, osd, osd_host, rules, osd_df, pct
+                pgs, pools, ecp, osd, osd_host, rules, osd_df, pct, True
             )
             by_pg = {}
             for c in cancellations:
@@ -1447,21 +1598,29 @@ class ChainFixtureReplayTest(unittest.TestCase):
 class BlockerFixtureReplayTest(unittest.TestCase):
     """The state that prompted blockers: osd.896 has ONE arriving shard
     (19.92e shard 4, from osd.231) yet its PG stays in backfill_toofull, because
-    shard 6 of the same PG is going to osd.337, which is over backfillfull."""
+    shard 6 of the same PG is going to osd.337, which is over backfillfull.
+    That second shard is a pure blocker (no host clash), so it is only found
+    with --pin-blockers -- this fixture is the reason the flag exists."""
 
     def replay(self, *flags):
         result = run_cli("--load-state", str(FIXTURE_BLOCKER), *flags, "896")
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
+    def test_without_pin_blockers_only_the_stuck_pin_comes_out(self):
+        result = self.replay("--pgremapper")
+        self.assertEqual(result.stdout, "19.92e 896 231\n")
+        self.assertIn("--pin-blockers was not given", result.stderr)
+
     def test_the_blocking_shard_is_proposed_next_to_the_requested_one(self):
         self.assertEqual(
-            self.replay("--pgremapper").stdout, "19.92e 896 231\n19.92e 337 99\n"
+            self.replay("--pin-blockers", "--pgremapper").stdout,
+            "19.92e 896 231\n19.92e 337 99\n",
         )
 
     def test_import_mappings_output(self):
         self.assertEqual(
-            json.loads(self.replay("--import-mappings").stdout),
+            json.loads(self.replay("--pin-blockers", "--import-mappings").stdout),
             [
                 {"pgid": "19.92e", "mapping": {"from": 896, "to": 231}},
                 {"pgid": "19.92e", "mapping": {"from": 337, "to": 99}},
@@ -1469,20 +1628,20 @@ class BlockerFixtureReplayTest(unittest.TestCase):
         )
 
     def test_the_table_explains_the_second_line(self):
-        rows = self.replay().stdout.splitlines()
+        rows = self.replay("--pin-blockers").stdout.splitlines()
         self.assertEqual(len(rows), 4)  # two header lines + the 2 pins
         self.assertIn("blocks shard 4: target osd.337 would be at 93.4%", rows[3])
         self.assertNotIn("blocks", rows[2])
 
     def test_summary_says_it_is_one_arriving_shard_plus_one_blocker(self):
-        err = self.replay().stderr
+        err = self.replay("--pin-blockers").stderr
         self.assertIn("1 arriving shard(s)", err)
         self.assertIn("1 more shard(s)", err)
         self.assertIn("1 because their target would be over backfillfull_ratio", err)
 
     def test_keeping_the_wanted_backfill_means_dropping_only_its_own_entry(self):
         # the user's case: keep 231->896, so drop that entry and keep the blocker
-        entries = json.loads(self.replay("--import-mappings").stdout)
+        entries = json.loads(self.replay("--pin-blockers", "--import-mappings").stdout)
         kept = [e for e in entries if e["mapping"]["from"] != 896]
         self.assertEqual(kept, [{"pgid": "19.92e", "mapping": {"from": 337, "to": 99}}])
 
