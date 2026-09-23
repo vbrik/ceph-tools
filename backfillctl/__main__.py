@@ -18,6 +18,7 @@ import argparse
 import cancel_backfill
 import cancel_uphill
 import divert_toofull
+import drain
 import save_state
 import show_backfill
 import show_pg_osds
@@ -29,6 +30,7 @@ _COMMAND_MODULES = (
     divert_toofull,
     cancel_backfill,
     cancel_uphill,
+    drain,
     save_state,
 )
 
@@ -37,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="backfillctl",
         description="Ceph PG/OSD backfill and upmap tools: show what's "
-        "moving, and propose upmaps to divert or cancel backfills.",
+        "moving, and propose upmaps to divert or cancel backfills and drain OSDs.",
     )
     add_load_state_arg(parser)
     subparsers = parser.add_subparsers(dest="command", required=True)

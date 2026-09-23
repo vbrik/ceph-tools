@@ -302,10 +302,24 @@ import sys
 from collections import Counter, deque
 from typing import NamedTuple
 
-import shared
+from placement import (
+    ArrivingShard,
+    FullRatios,
+    ProjectedUsage,
+    add_target_args,
+    build_candidate_osds,
+    check_host_failure_domain,
+    ec_pool_ids_from,
+    fetch_full_ratios,
+    find_arriving_shards,
+    osd_class,
+    pick_target,
+    raw_crush_osds,
+    resolve_max_target_util,
+    shard_size_bytes,
+    usage_and_capacity,
+)
 from shared import (
-    KIB,
-    POOL_TYPE_ERASURE,
     PgidFilter,
     SnapshotStore,
     fetch_crush_rules,
@@ -320,21 +334,7 @@ from shared import (
     pgid_pool_id,
     pgid_sort_key,
     print_table,
-    rule_failure_domain,
-    slot,
 )
-
-# Ceph's own defaults for these ratios (OSDMap::build_simple). Used only if
-# 'ceph osd dump' somehow omits them, so that --min-up-util and
-# --max-target-util still get a sane cluster-independent default rather than
-# silently falling back to "no threshold at all", which is the unsafe
-# direction for both of them.
-DEFAULT_NEARFULL_RATIO = 0.85
-DEFAULT_BACKFILLFULL_RATIO = 0.90
-
-# How many shards one OSD may be proposed as the target of (--max-target-uses).
-DEFAULT_MAX_TARGET_USES = 5
-
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces
 # it. Keys match the fixtures under tests/pg-osd/test-data/
@@ -382,14 +382,6 @@ def fetch_backfill_toofull_pg_stats(store: SnapshotStore) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def positive_int(text: str) -> int:
-    """argparse type: an integer of at least 1."""
-    value = int(text)
-    if value < 1:
-        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
-    return value
-
-
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "divert-toofull",
@@ -414,12 +406,15 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "are chosen, which shards get skipped and why, and the caveats that "
         "apply when applying these proposals with 'pgremapper import-mappings'.",
     )
-    parser.add_argument(
-        "--pgremapper-mappings",
-        action="store_true",
-        help="Print a JSON array for 'pgremapper import-mappings' instead of "
-        "the table, one {pgid, mapping} entry per line. This is the reliable "
-        "way to apply the proposals: all pairs of a PG go in together.",
+    add_target_args(
+        parser,
+        max_target_util_help="Never let a target's projected utilization "
+        "(its 'ceph osd df' usage plus the shards arriving on it and those "
+        "already proposed onto it, including the shard being placed) exceed "
+        "PERCENT. Defaults to the cluster's backfillfull_ratio - 1; a value "
+        "above backfillfull_ratio is an error, since Ceph refuses to backfill "
+        "past it. The number of shards left with no eligible target is "
+        "reported on stderr.",
     )
     parser.add_argument(
         "--min-up-util",
@@ -432,29 +427,6 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "utilization as a proxy. A shard is diverted only if its arriving "
         'OSD (the "UP OSD") is at or above the threshold. The default is '
         "the cluster's nearfull_ratio, usually 85%%.",
-    )
-    parser.add_argument(
-        "--max-target-util",
-        type=float,
-        metavar="PERCENT",
-        help="Never let a target's projected utilization (its 'ceph osd df' "
-        "usage plus the shards arriving on it and those already proposed "
-        "onto it, including the shard being placed) exceed PERCENT. Defaults "
-        "to the cluster's backfillfull_ratio - 1; a value above "
-        "backfillfull_ratio is an error, since Ceph refuses to backfill past "
-        "it. The number of shards left with no eligible target is reported "
-        "on stderr.",
-    )
-    parser.add_argument(
-        "--max-target-uses",
-        type=positive_int,
-        default=DEFAULT_MAX_TARGET_USES,
-        metavar="N",
-        help="Hard limit on how many shards may be redirected to one OSD "
-        "(default: %(default)s). Independently of this limit, an OSD stops "
-        "being used once receiving another shard would bring its projected "
-        "utilization above --max-target-util; 1 gives every OSD at most one "
-        "shard.",
     )
     parser.add_argument(
         "--pgs",
@@ -475,125 +447,9 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
 # ---------------------------------------------------------------------------
 
 
-class FullRatios(NamedTuple):
-    """The cluster's fullness thresholds, as percentages.
-
-    These are what --min-up-util and --max-target-util default to, so
-    the script's two safety margins track whatever the cluster itself
-    considers 'getting full' and 'too full to backfill onto' rather than
-    hard-coded numbers that would be wrong on a tuned cluster.
-    """
-
-    nearfull: float
-    backfillfull: float
-
-
-def fetch_full_ratios(store: SnapshotStore) -> FullRatios:
-    """Return the cluster's nearfull/backfillfull ratios from 'ceph osd dump'.
-
-    Reported by Ceph as fractions (0.85); returned here as the percentages
-    the CLI flags and 'ceph osd df' utilizations are expressed in.
-    """
-    data = store.json("osd_dump")
-    nearfull = data.get("nearfull_ratio") or DEFAULT_NEARFULL_RATIO
-    backfillfull = data.get("backfillfull_ratio") or DEFAULT_BACKFILLFULL_RATIO
-    return FullRatios(nearfull * 100, backfillfull * 100)
-
-
-def ec_pool_ids_from(pools: list[dict]) -> set[int]:
-    """Return the set of pool ids that are erasure-coded (type == 3)."""
-    return {p["pool_id"] for p in pools if p.get("type") == POOL_TYPE_ERASURE}
-
-
-# ---------------------------------------------------------------------------
-# Failure domain validation
-# ---------------------------------------------------------------------------
-
-
-def check_host_failure_domain(pools: list[dict], crush_rules: dict[int, dict]) -> None:
-    """Exit with an error unless every given pool's CRUSH rule fails over at host.
-
-    The diversion strategy this script implements (see module docstring)
-    only makes sense if a failed leaf is retried within the same host
-    bucket, since that is what concentrates the re-placed shards onto one
-    already-full host and makes moving them to a host outside the PG's up
-    set the fix. If a pool's rule fails over at some other bucket type,
-    excluding hosts is neither the constraint CRUSH enforces for it nor the
-    one that would unwedge it.
-    """
-    bad = []
-    for pool in pools:
-        rule = crush_rules.get(pool["crush_rule"])
-        domain = rule_failure_domain(rule) if rule else None
-        if domain != "host":
-            bad.append((pool["pool_name"], pool["crush_rule"], domain))
-    if bad:
-        lines = "\n".join(
-            f"  pool '{name}' uses crush rule {rule_id} (failure domain: "
-            f"{domain or 'unknown'})"
-            for name, rule_id, domain in bad
-        )
-        sys.exit(
-            "ERROR: this script assumes the CRUSH failure domain of every "
-            "pool with a stuck PG is 'host' (see module docstring), but the "
-            f"following pool(s) do not:\n{lines}"
-        )
-
-
 # ---------------------------------------------------------------------------
 # PG analysis
 # ---------------------------------------------------------------------------
-
-
-def raw_crush_osds(up: list, upmap_pairs: list[dict]) -> set[int]:
-    """Reconstruct the OSDs CRUSH itself chose, by undoing the PG's upmaps.
-
-    pg_upmap_items rewrites the CRUSH result: a pair {'from': X, 'to': Y}
-    means CRUSH picked X and Y is used instead. Substituting each active
-    pair's 'to' back to its 'from' recovers the raw mapping, whose members
-    must not be proposed as targets (see module docstring).
-    """
-    raw = [osd_id for osd_id in up]
-    for pair in upmap_pairs:
-        if pair["to"] in raw:
-            raw[raw.index(pair["to"])] = pair["from"]
-    return {osd_id for osd_id in raw if is_real_osd(osd_id)}
-
-
-def shard_size_bytes(pg: dict, pool: dict, ec_profiles: dict[str, dict]) -> int:
-    """Estimate the bytes one shard of a PG occupies on its OSD (see shared).
-
-    Exits with an error where shared.shard_size_bytes reports "unknown": every
-    diversion's utilization projection needs a size, and a silent 0 would
-    project no usage at all.
-    """
-    size = shared.shard_size_bytes(pg, pool, ec_profiles)
-    if size is None:
-        profile = pool.get("erasure_code_profile")
-        sys.exit(
-            f"ERROR: pool {pool['pool_id']} uses erasure code profile "
-            f"{profile!r}, which 'ceph osd dump' does not describe (or "
-            "describes without 'k'), so the size of its shards is unknown."
-        )
-    return size
-
-
-class ArrivingShard(NamedTuple):
-    """A shard newly arriving on a host that is too full to take it."""
-
-    pgid: str
-    shard: "int | str"  # EC shard index, or '-' for replicated pools
-    up_osd: int  # OSD the shard is arriving on: in 'up', not yet in
-    # 'acting'. This is the 'from' of the upmap that would
-    # divert it, and its host is the one being diverted away
-    # from. Despite that 'from', no data flows off it.
-    acting_osd: int | None  # OSD still holding the shard, i.e. the
-    # backfill's data source, or None when the slot reads as
-    # CRUSH_ITEM_NONE (the usual out-OSD case)
-    up_set: list  # the PG's full up set, for host exclusions and for
-    # reconstructing the raw CRUSH mapping
-    size_bytes: int = 0  # what the shard will occupy once backfilled, see
-    # shard_size_bytes; 0 means "not known", which projects no usage
 
 
 def filter_toofull_pgs(
@@ -607,49 +463,6 @@ def filter_toofull_pgs(
     matched = {pg["pgid"] for pg in pgs if pg["pgid"] in wanted}
     kept = [pg for pg in pgs if pg["pgid"] in wanted]
     return kept, matched
-
-
-def find_arriving_shards(
-    pg: dict, is_ec: bool, size_bytes: int = 0
-) -> list[ArrivingShard]:
-    """Return the shards of one PG that are newly arriving on their up OSD.
-
-    size_bytes is the size of each of them (all shards of a PG are the same
-    size), recorded on the result for the utilization projection.
-    """
-    pgid = pg["pgid"]
-    up = pg["up"]
-    acting = pg["acting"]
-    found = []
-
-    if is_ec:
-        # EC: shard identity is positional, so diff index by index. This is
-        # what lets the shard index be reported, and keeps two unrelated
-        # shard moves in one PG from being conflated.
-        for i in range(max(len(up), len(acting))):
-            up_osd = slot(up, i)
-            acting_osd = slot(acting, i)
-            if up_osd is None or up_osd == acting_osd:
-                continue
-            found.append(ArrivingShard(pgid, i, up_osd, acting_osd, up, size_bytes))
-    else:
-        # Replicated: replicas are interchangeable, so position means nothing
-        # and only the set difference is real movement.
-        up_members = {o for o in up if is_real_osd(o)}
-        acting_members = {o for o in acting if is_real_osd(o)}
-        departing = sorted(acting_members - up_members)
-        arriving = sorted(up_members - acting_members)
-        # A replicated PG can have several arriving/departing replicas at once
-        # with no way to pair them up; name the acting OSD only when exactly
-        # one replica is leaving and one arriving. With one leaving and
-        # several arriving, naming it on all of them would claim it holds
-        # several replicas (and would relieve it several times over).
-        pairing_is_clear = len(departing) == 1 and len(arriving) == 1
-        for up_osd in arriving:
-            acting_osd = departing[0] if pairing_is_clear else None
-            found.append(ArrivingShard(pgid, "-", up_osd, acting_osd, up, size_bytes))
-
-    return found
 
 
 def select_stuck_shards(
@@ -688,59 +501,6 @@ def select_stuck_shards(
 # ---------------------------------------------------------------------------
 
 
-def osd_class(osd_df: dict[int, dict], osd_id: int) -> str | None:
-    """Return an OSD's device class, or None if it is unknown."""
-    return osd_df.get(osd_id, {}).get("device_class")
-
-
-def build_candidate_osds(osd_df: dict[int, dict]) -> dict[str, list[int]]:
-    """Return usable target OSD ids per device class, least-utilized first.
-
-    Excludes OSDs that are down, out (reweight 0) or have no CRUSH weight.
-    That also covers the OSD whose failure caused the pile-up in the first
-    place: without it an out OSD would sort to the very front, since
-    'ceph osd df' reports one at 0% utilization. An OSD with no utilization
-    figure at all is excluded for the same reason — it cannot be ranked, and
-    treating a missing value as 0% would make it the first pick.
-
-    Keyed by device class because a shard may only be diverted to an OSD of
-    its own class (see module docstring); each class's OSDs fill up
-    independently.
-    """
-    usable = [
-        node
-        for node in osd_df.values()
-        if node.get("status") == "up"
-        and node.get("reweight", 0) > 0
-        and node.get("crush_weight", 0) > 0
-        and node.get("device_class")
-        and node.get("kb")  # capacity unknown: nothing can be projected onto it
-        and node.get("utilization") is not None
-    ]
-    # OSD id as secondary key: utilizations tie constantly on a uniformly
-    # full cluster, and the operator will re-run this.
-    usable.sort(key=lambda n: (n["utilization"], n["id"]))
-    by_class: dict[str, list[int]] = {}
-    for node in usable:
-        by_class.setdefault(node["device_class"], []).append(node["id"])
-    return by_class
-
-
-def usage_and_capacity(
-    osd_df: dict[int, dict],
-) -> tuple[dict[int, int], dict[int, int]]:
-    """Return ({osd: bytes used}, {osd: bytes of capacity}) from 'ceph osd df'.
-
-    OSDs with no capacity figure are left out of both: nothing can be
-    projected for them.
-    """
-    sized = {i: n for i, n in osd_df.items() if n.get("kb")}
-    return (
-        {i: n["kb_used"] * KIB for i, n in sized.items()},
-        {i: n["kb"] * KIB for i, n in sized.items()},
-    )
-
-
 class SourcePressure:
     """How full each shard's ACTING OSD is projected to be, for ordering shards.
 
@@ -776,45 +536,6 @@ class SourcePressure:
         """Record that shard is placed, so its acting OSD will lose it."""
         if shard.acting_osd in self._used:
             self._used[shard.acting_osd] -= shard.size_bytes
-
-
-class ProjectedUsage:
-    """What each OSD will hold once the backfills already in motion complete.
-
-    Starts from the usage 'ceph osd df' reports plus the size of every shard
-    still arriving on the OSD: those bytes are not in 'kb_used' yet, and it is
-    the emptiest OSDs, the ones most attractive as targets, that have the
-    most in flight. That includes the stuck shards this script is about to
-    divert: until one is actually diverted it is still headed for its OSD, so
-    a shard that ends up unplaceable keeps counting there. redirect() then
-    takes a diverted shard's size off the OSD it was headed for and puts it on
-    its target.
-
-    The counting is order-dependent: an OSD whose own stuck shard is diverted
-    only later in the run looks fuller to the shards placed before that.
-    That errs on the safe side, so the run leaves room for a re-run.
-
-    Not accounted for: data leaving an OSD (never credited) and backfills that
-    are not in backfill_toofull (unknown to this script), so the projection
-    can still be optimistic. Ceph itself refuses a backfill on the target's
-    projected usage rather than today's (see module docstring).
-    """
-
-    def __init__(self, osd_df: dict[int, dict], arriving: list[ArrivingShard]):
-        self._used, self._capacity = usage_and_capacity(osd_df)
-        for shard in arriving:
-            if shard.up_osd in self._used:
-                self._used[shard.up_osd] += shard.size_bytes
-
-    def utilization_after(self, osd_id: int, extra_bytes: int) -> float:
-        """Return the OSD's projected utilization (percent) with extra_bytes more."""
-        return (self._used[osd_id] + extra_bytes) / self._capacity[osd_id] * 100
-
-    def redirect(self, shard: ArrivingShard, target_osd: int) -> None:
-        """Record that shard goes to target_osd instead of its UP OSD."""
-        if shard.up_osd in self._used:
-            self._used[shard.up_osd] -= shard.size_bytes
-        self._used[target_osd] += shard.size_bytes
 
 
 class Proposal(NamedTuple):
@@ -904,28 +625,22 @@ def assign_targets(
         # A target must be strictly emptier than the OSD being diverted from,
         # or the redirect gains nothing. Unknown UP utilization cannot be
         # compared, so it imposes no limit (as in select_stuck_shards).
-        max_util = osd_df.get(shard.up_osd, {}).get("utilization")
-        legal = []
-        for candidate in pool:
-            # Pool is sorted by utilization, and a projection is never below
-            # the current figure: everything from here on is over the cap.
-            if osd_df[candidate]["utilization"] > max_target_util:
-                break
-            if osd_host.get(candidate) in forbidden_hosts:
-                continue
-            if candidate in forbidden_osds:
-                continue
-            if uses[candidate] >= max_uses:
-                continue
-            if max_util is not None and osd_df[candidate]["utilization"] >= max_util:
-                continue
-            projected = projection.utilization_after(candidate, shard.size_bytes)
-            if projected > max_target_util:
-                continue
-            legal.append((projected, candidate))
+        picked = pick_target(
+            pool,
+            shard.size_bytes,
+            forbidden_hosts=forbidden_hosts,
+            forbidden_osds=forbidden_osds,
+            osd_host=osd_host,
+            osd_df=osd_df,
+            projection=projection,
+            uses=uses,
+            max_uses=max_uses,
+            max_target_util=max_target_util,
+            below_util=osd_df.get(shard.up_osd, {}).get("utilization"),
+        )
 
-        if legal:
-            projected, target = min(legal)
+        if picked:
+            projected, target = picked
             projection.redirect(shard, target)
             pressure.relieve(shard)
             uses[target] += 1
@@ -1094,19 +809,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
     # Both thresholds track the cluster's own idea of full unless overridden.
     ratios = fetch_full_ratios(store)
     min_up_util = ratios.nearfull if args.min_up_util is None else args.min_up_util
-    max_target_util = (
-        ratios.backfillfull - 1
-        if args.max_target_util is None
-        else args.max_target_util
-    )
-    if not 0 < max_target_util <= ratios.backfillfull:
-        sys.exit(
-            f"ERROR: max target utilization {max_target_util:g}% (--max-target-util, "
-            "or its backfillfull_ratio - 1 default) must be above 0 and "
-            f"at most the cluster's backfillfull_ratio ({ratios.backfillfull:g}%): "
-            "Ceph refuses to backfill onto an OSD past that, so a higher cap "
-            "would let the script propose targets that re-wedge."
-        )
+    max_target_util = resolve_max_target_util(args.max_target_util, ratios)
 
     pgs_filter = None
     if args.pgs:
@@ -1131,7 +834,9 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
             "unknown, so their shards cannot be analyzed correctly."
         )
     check_host_failure_domain(
-        [pools_by_id[i] for i in sorted(toofull_pool_ids)], crush_rules
+        [pools_by_id[i] for i in sorted(toofull_pool_ids)],
+        crush_rules,
+        "with a stuck PG",
     )
 
     arriving = []

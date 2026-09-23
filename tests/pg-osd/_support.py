@@ -5,7 +5,7 @@ backfillctl/'s own directory is put on sys.path here too (the same thing
 backfillctl/__init__.py does when the package is imported, and what running
 it directly relies on), so a bare `import shared` below -- and the command
 modules' own `import shared` / `from shared import ...` -- resolve to the
-exact same module object. That identity matters: tests that
+exact same module object (and likewise `placement`). That identity matters: tests that
 mock.patch.object(shared, ...) need to be patching the module the code under
 test actually calls, not a separate `backfillctl.shared` copy. This is set up
 with an explicit sys.path.insert rather than an `import backfillctl` side
@@ -24,9 +24,17 @@ for path in (REPO_ROOT, BACKFILLCTL_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+import placement
 import shared
 
-__all__ = ["REPO_ROOT", "FakeStore", "parse_args", "plan_from_state", "shared"]
+__all__ = [
+    "REPO_ROOT",
+    "FakeStore",
+    "parse_args",
+    "placement",
+    "plan_from_state",
+    "shared",
+]
 
 
 def parse_args(

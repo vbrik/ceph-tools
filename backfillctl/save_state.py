@@ -30,7 +30,7 @@ Cost
 per-subcommand listings (pg ls remapped, pg ls backfill_toofull, pg <pgid>
 query) exist to avoid paying for on a live run. That cost is paid once here,
 at capture time, not on every analysis run: a live 'backfillctl
-show-backfill'/'cancel-backfill'/'divert-toofull' still
+show-backfill'/'cancel-backfill'/'divert-toofull'/'drain' still
 issues its own narrower command, and only pays the full 'pg dump pgs' cost
 when replaying a --load-state snapshot this command produced.
 """

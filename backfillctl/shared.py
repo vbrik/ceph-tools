@@ -745,12 +745,12 @@ def print_table(columns: Columns, rows: list[list[str]]) -> None:
 
     def emit(cells: list[str]) -> None:
         last = len(cells) - 1
-        print(
-            "".join(
-                sep + (cell.ljust(widths[i]) if i < last else cell)
-                for i, (sep, cell) in enumerate(zip(seps, cells))
-            )
+        line = "".join(
+            sep + (cell.ljust(widths[i]) if i < last else cell)
+            for i, (sep, cell) in enumerate(zip(seps, cells))
         )
+        # rstrip: an empty final cell (e.g. a blank NOTE) leaves its separator.
+        print(line.rstrip())
 
     emit([label for _, label in columns])
     for row in rows:

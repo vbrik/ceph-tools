@@ -38,7 +38,7 @@ import unittest
 from collections import Counter
 from typing import ClassVar
 
-from _support import REPO_ROOT, FakeStore, plan_from_state, shared
+from _support import REPO_ROOT, FakeStore, placement, plan_from_state, shared
 
 from backfillctl import divert_toofull as ut
 
@@ -81,11 +81,11 @@ OSD_DF = {
 # Every OSD in the unit tests below has this capacity, chosen so that a
 # percentage of it is a whole number of bytes: 1% is PCT bytes exactly.
 KB = 1_000_000
-PCT = KB * ut.KIB // 100
+PCT = KB * shared.KIB // 100
 
 
 def make_proposal(acting_osd=406):
-    shard = ut.ArrivingShard(
+    shard = placement.ArrivingShard(
         pgid="19.2",
         shard=0,
         up_osd=882,
@@ -215,49 +215,49 @@ class PrintTableTest(unittest.TestCase):
 class FindArrivingShardsTest(unittest.TestCase):
     def test_ec_pairs_up_and_acting_by_position(self):
         pg = {"pgid": "19.2", "up": [882, 111], "acting": [406, 111]}
-        (shard,) = ut.find_arriving_shards(pg, is_ec=True)
+        (shard,) = placement.find_arriving_shards(pg, is_ec=True)
         self.assertEqual((shard.shard, shard.up_osd, shard.acting_osd), (0, 882, 406))
 
     def test_ec_empty_acting_slot_yields_unknown_acting_osd(self):
         pg = {"pgid": "19.2", "up": [882, 111], "acting": [shared.CRUSH_ITEM_NONE, 111]}
-        (shard,) = ut.find_arriving_shards(pg, is_ec=True)
+        (shard,) = placement.find_arriving_shards(pg, is_ec=True)
         self.assertEqual(shard.up_osd, 882)
         self.assertIsNone(shard.acting_osd)
 
     def test_replicated_names_acting_osd_when_pairing_is_unambiguous(self):
         pg = {"pgid": "5.1", "up": [882, 111], "acting": [406, 111]}
-        (shard,) = ut.find_arriving_shards(pg, is_ec=False)
+        (shard,) = placement.find_arriving_shards(pg, is_ec=False)
         self.assertEqual((shard.shard, shard.up_osd, shard.acting_osd), ("-", 882, 406))
 
     def test_replicated_leaves_acting_osd_unknown_when_ambiguous(self):
         # Two replicas arriving and two leaving: no way to say which came
         # from which, so neither row claims an acting OSD.
         pg = {"pgid": "5.1", "up": [882, 883, 111], "acting": [406, 407, 111]}
-        shards = ut.find_arriving_shards(pg, is_ec=False)
+        shards = placement.find_arriving_shards(pg, is_ec=False)
         self.assertEqual([s.up_osd for s in shards], [882, 883])
         self.assertEqual([s.acting_osd for s in shards], [None, None])
 
     def test_every_shard_of_the_pg_carries_its_size(self):
         pg = {"pgid": "19.2", "up": [882, 883, 111], "acting": [406, 407, 111]}
-        shards = ut.find_arriving_shards(pg, is_ec=True, size_bytes=1234)
+        shards = placement.find_arriving_shards(pg, is_ec=True, size_bytes=1234)
         self.assertEqual([s.size_bytes for s in shards], [1234, 1234])
 
     def test_replicated_acting_osd_is_not_named_on_every_arriving_replica(self):
         # One replica leaving and two arriving: naming the departing OSD on
         # both would claim it holds two replicas.
         pg = {"pgid": "5.1", "up": [882, 883, 111], "acting": [406, 111]}
-        shards = ut.find_arriving_shards(pg, is_ec=False)
+        shards = placement.find_arriving_shards(pg, is_ec=False)
         self.assertEqual([s.up_osd for s in shards], [882, 883])
         self.assertEqual([s.acting_osd for s in shards], [None, None])
 
     def test_replicated_acting_osd_is_named_for_a_one_for_one_swap(self):
         pg = {"pgid": "5.1", "up": [882, 111], "acting": [406, 111]}
-        (shard,) = ut.find_arriving_shards(pg, is_ec=False)
+        (shard,) = placement.find_arriving_shards(pg, is_ec=False)
         self.assertEqual(shard.acting_osd, 406)
 
     def test_reordered_replicated_set_is_not_movement(self):
         pg = {"pgid": "5.1", "up": [111, 882], "acting": [882, 111]}
-        self.assertEqual(ut.find_arriving_shards(pg, is_ec=False), [])
+        self.assertEqual(placement.find_arriving_shards(pg, is_ec=False), [])
 
 
 class FilterToofullPgsTest(unittest.TestCase):
@@ -293,7 +293,7 @@ class FullRatiosTest(unittest.TestCase):
     """The thresholds both defaults derive from."""
 
     def _ratios(self, dump):
-        return ut.fetch_full_ratios(FakeStore({"osd_dump": dump}))
+        return placement.fetch_full_ratios(FakeStore({"osd_dump": dump}))
 
     def test_ratios_are_converted_to_percent(self):
         # Ceph reports fractions; the flags and 'ceph osd df' are in percent.
@@ -306,7 +306,10 @@ class FullRatiosTest(unittest.TestCase):
         r = self._ratios({})
         self.assertEqual(
             (r.nearfull, r.backfillfull),
-            (ut.DEFAULT_NEARFULL_RATIO * 100, ut.DEFAULT_BACKFILLFULL_RATIO * 100),
+            (
+                placement.DEFAULT_NEARFULL_RATIO * 100,
+                placement.DEFAULT_BACKFILLFULL_RATIO * 100,
+            ),
         )
 
 
@@ -325,7 +328,7 @@ class SelectStuckShardsTest(unittest.TestCase):
     """backfill_toofull is a PG property, so arriving shards get filtered."""
 
     def shard(self, up_osd):
-        return ut.ArrivingShard("19.1", "-", up_osd, None, [up_osd])
+        return placement.ArrivingShard("19.1", "-", up_osd, None, [up_osd])
 
     def test_shard_on_a_full_osd_is_kept(self):
         stuck, skipped = ut.select_stuck_shards([self.shard(1)], SOURCE_DF, 85.0)
@@ -373,12 +376,12 @@ class BuildCandidateOsdsTest(unittest.TestCase):
         return {1: node | overrides}
 
     def test_usable_osd_is_offered_under_its_class(self):
-        self.assertEqual(ut.build_candidate_osds(self.df()), {"hdd": [1]})
+        self.assertEqual(placement.build_candidate_osds(self.df()), {"hdd": [1]})
 
     def test_a_full_osd_is_still_a_candidate(self):
         # The cap applies to the projection, per shard, not to the shortlist.
         self.assertEqual(
-            ut.build_candidate_osds(self.df(utilization=99.0)), {"hdd": [1]}
+            placement.build_candidate_osds(self.df(utilization=99.0)), {"hdd": [1]}
         )
 
     def test_osd_without_a_utilization_figure_is_excluded(self):
@@ -386,20 +389,20 @@ class BuildCandidateOsdsTest(unittest.TestCase):
         # it sort ahead of every real candidate.
         df = self.df()
         del df[1]["utilization"]
-        self.assertEqual(ut.build_candidate_osds(df), {})
+        self.assertEqual(placement.build_candidate_osds(df), {})
 
     def test_osd_without_a_capacity_figure_is_excluded(self):
         # ProjectedUsage cannot track it, so offering it would crash the
         # run in assign_targets.
-        self.assertEqual(ut.build_candidate_osds(self.df(kb=0)), {})
+        self.assertEqual(placement.build_candidate_osds(self.df(kb=0)), {})
         df = self.df()
         del df[1]["kb"]
-        self.assertEqual(ut.build_candidate_osds(df), {})
+        self.assertEqual(placement.build_candidate_osds(df), {})
 
     def test_down_and_out_osds_are_excluded(self):
-        self.assertEqual(ut.build_candidate_osds(self.df(status="down")), {})
-        self.assertEqual(ut.build_candidate_osds(self.df(reweight=0)), {})
-        self.assertEqual(ut.build_candidate_osds(self.df(crush_weight=0)), {})
+        self.assertEqual(placement.build_candidate_osds(self.df(status="down")), {})
+        self.assertEqual(placement.build_candidate_osds(self.df(reweight=0)), {})
+        self.assertEqual(placement.build_candidate_osds(self.df(crush_weight=0)), {})
 
     def test_candidates_are_sorted_by_utilization_then_id(self):
         base = self.df()[1]
@@ -408,7 +411,7 @@ class BuildCandidateOsdsTest(unittest.TestCase):
             11: base | {"id": 11, "utilization": 50.0},
             12: base | {"id": 12, "utilization": 50.0},
         }
-        self.assertEqual(ut.build_candidate_osds(df), {"hdd": [11, 12, 10]})
+        self.assertEqual(placement.build_candidate_osds(df), {"hdd": [11, 12, 10]})
 
 
 class PrintTableEdgeCaseTest(unittest.TestCase):
@@ -516,7 +519,7 @@ class PrintUnplaceableTest(unittest.TestCase):
 
 def proposal(pgid, up_osd, target_osd, shard=0):
     """A Proposal with just enough fields set for the pgremapper-mappings tests."""
-    ds = ut.ArrivingShard(pgid, shard, up_osd, None, [up_osd])
+    ds = placement.ArrivingShard(pgid, shard, up_osd, None, [up_osd])
     return ut.Proposal(ds, target_osd, "h", 50.0, 55.0)
 
 
@@ -773,55 +776,55 @@ def osd_df_of(utils):
 
 def stuck(pgid, up_osd=1, up_set=None, size_pct=0, shard=0, acting=None):
     """A diverted shard arriving on up_osd whose size is size_pct percent of an OSD."""
-    return ut.ArrivingShard(
+    return placement.ArrivingShard(
         pgid, shard, up_osd, acting, up_set or [up_osd], size_pct * PCT
     )
 
 
 class ProjectedUsageTest(unittest.TestCase):
     def test_projection_starts_from_current_usage(self):
-        proj = ut.ProjectedUsage(osd_df_of({2: 50.0}), [])
+        proj = placement.ProjectedUsage(osd_df_of({2: 50.0}), [])
         self.assertEqual(proj.utilization_after(2, 0), 50.0)
 
     def test_extra_bytes_are_added_without_being_recorded(self):
-        proj = ut.ProjectedUsage(osd_df_of({2: 50.0}), [])
+        proj = placement.ProjectedUsage(osd_df_of({2: 50.0}), [])
         self.assertEqual(proj.utilization_after(2, 25 * PCT), 75.0)
         self.assertEqual(proj.utilization_after(2, 0), 50.0)
 
     def test_redirect_accumulates_on_the_target(self):
-        proj = ut.ProjectedUsage(osd_df_of({2: 50.0}), [])
+        proj = placement.ProjectedUsage(osd_df_of({2: 50.0}), [])
         proj.redirect(stuck("1.0", up_osd=1, size_pct=10), 2)
         proj.redirect(stuck("1.1", up_osd=1, size_pct=15), 2)
         self.assertEqual(proj.utilization_after(2, 0), 75.0)
 
     def test_redirect_takes_the_shard_off_the_osd_it_was_headed_for(self):
         shard = stuck("1.0", up_osd=1, size_pct=20)
-        proj = ut.ProjectedUsage(osd_df_of({1: 60.0, 2: 50.0}), [shard])
+        proj = placement.ProjectedUsage(osd_df_of({1: 60.0, 2: 50.0}), [shard])
         self.assertEqual(proj.utilization_after(1, 0), 80.0)
         proj.redirect(shard, 2)
         self.assertEqual(proj.utilization_after(1, 0), 60.0)
         self.assertEqual(proj.utilization_after(2, 0), 70.0)
 
     def test_redirecting_off_an_osd_missing_from_osd_df_still_credits_the_target(self):
-        proj = ut.ProjectedUsage(osd_df_of({2: 50.0}), [])
+        proj = placement.ProjectedUsage(osd_df_of({2: 50.0}), [])
         proj.redirect(stuck("1.0", up_osd=7, size_pct=10), 2)
         self.assertEqual(proj.utilization_after(2, 0), 60.0)
 
     def test_arriving_shards_count_towards_their_osd(self):
-        proj = ut.ProjectedUsage(
+        proj = placement.ProjectedUsage(
             osd_df_of({2: 50.0}), [stuck("9.9", up_osd=2, size_pct=25)]
         )
         self.assertEqual(proj.utilization_after(2, 0), 75.0)
 
     def test_arriving_shard_on_an_osd_missing_from_osd_df_is_ignored(self):
-        proj = ut.ProjectedUsage(
+        proj = placement.ProjectedUsage(
             osd_df_of({2: 50.0}), [stuck("9.9", up_osd=7, size_pct=25)]
         )
         self.assertEqual(proj.utilization_after(2, 0), 50.0)
 
     def test_osd_without_capacity_is_not_tracked(self):
         df = osd_df_of({2: 50.0}) | {3: {"id": 3, "kb": 0, "kb_used": 0}}
-        proj = ut.ProjectedUsage(df, [])
+        proj = placement.ProjectedUsage(df, [])
         with self.assertRaises(KeyError):
             proj.utilization_after(3, 0)
 
@@ -868,55 +871,61 @@ class ShardSizeTest(unittest.TestCase):
     def test_ec_shard_is_one_kth_of_the_pg(self):
         pool = {
             "pool_id": 1,
-            "type": ut.POOL_TYPE_ERASURE,
+            "type": shared.POOL_TYPE_ERASURE,
             "erasure_code_profile": "k8m2",
         }
-        self.assertEqual(ut.shard_size_bytes(self.pg(800), pool, self.PROFILES), 100)
+        self.assertEqual(
+            placement.shard_size_bytes(self.pg(800), pool, self.PROFILES), 100
+        )
 
     def test_ec_shard_size_rounds_up(self):
         pool = {
             "pool_id": 1,
-            "type": ut.POOL_TYPE_ERASURE,
+            "type": shared.POOL_TYPE_ERASURE,
             "erasure_code_profile": "k8m2",
         }
-        self.assertEqual(ut.shard_size_bytes(self.pg(17), pool, self.PROFILES), 3)
+        self.assertEqual(
+            placement.shard_size_bytes(self.pg(17), pool, self.PROFILES), 3
+        )
 
     def test_empty_ec_pg_has_empty_shards(self):
         pool = {
             "pool_id": 1,
-            "type": ut.POOL_TYPE_ERASURE,
+            "type": shared.POOL_TYPE_ERASURE,
             "erasure_code_profile": "k8m2",
         }
-        self.assertEqual(ut.shard_size_bytes(self.pg(0), pool, self.PROFILES), 0)
+        self.assertEqual(placement.shard_size_bytes(self.pg(0), pool, self.PROFILES), 0)
 
     def test_replica_is_the_whole_pg(self):
         pool = {"pool_id": 1, "type": 1, "erasure_code_profile": ""}
-        self.assertEqual(ut.shard_size_bytes(self.pg(800), pool, self.PROFILES), 800)
+        self.assertEqual(
+            placement.shard_size_bytes(self.pg(800), pool, self.PROFILES), 800
+        )
 
     def test_unknown_profile_is_refused_rather_than_guessed(self):
         pool = {
             "pool_id": 1,
-            "type": ut.POOL_TYPE_ERASURE,
+            "type": shared.POOL_TYPE_ERASURE,
             "erasure_code_profile": "gone",
         }
         with self.assertRaises(SystemExit) as cm:
-            ut.shard_size_bytes(self.pg(800), pool, self.PROFILES)
+            placement.shard_size_bytes(self.pg(800), pool, self.PROFILES)
         self.assertIn("'gone'", str(cm.exception))
 
 
 class PositiveIntTest(unittest.TestCase):
     def test_accepts_one_and_up(self):
-        self.assertEqual(ut.positive_int("1"), 1)
-        self.assertEqual(ut.positive_int("12"), 12)
+        self.assertEqual(placement.positive_int("1"), 1)
+        self.assertEqual(placement.positive_int("12"), 12)
 
     def test_rejects_zero_negative_and_non_numbers(self):
         import argparse
 
         for text in ("0", "-3"):
             with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
-                ut.positive_int(text)
+                placement.positive_int(text)
         with self.assertRaises(ValueError):
-            ut.positive_int("many")
+            placement.positive_int("many")
 
 
 class AssignTargetsTest(unittest.TestCase):
@@ -944,7 +953,7 @@ class AssignTargetsTest(unittest.TestCase):
             self.HOSTS,
             df,
             {},
-            projection=ut.ProjectedUsage(df, list(arriving)),
+            projection=placement.ProjectedUsage(df, list(arriving)),
             max_uses=max_uses,
             max_target_util=max_target_util,
         )
@@ -1089,7 +1098,7 @@ class AssignTargetsTest(unittest.TestCase):
             self.HOSTS,
             df,
             {},
-            projection=ut.ProjectedUsage(df, shards),
+            projection=placement.ProjectedUsage(df, shards),
             max_uses=5,
             max_target_util=91.0,
         )

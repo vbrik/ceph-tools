@@ -1,7 +1,7 @@
 # ceph-tools
 
 Command-line tools for Ceph and CephFS cluster administration, debugging,
-and troubleshooting: PG movement/remapping, upmap manipulation, cancelling and diverting backfills, scrub
+and troubleshooting: PG movement/remapping, upmap manipulation, cancelling and diverting backfills, draining OSDs, scrub
 scheduling, OSD/PG lookups, MDS ops inspection, CephFS client load and
 inode-to-path resolution, and finding large, wide, or fast-growing
 directories on a mounted CephFS. Most tools wrap `ceph` CLI / `rados`
@@ -13,7 +13,7 @@ aren't answered directly by a single `ceph` subcommand.
 
 Every script is standalone and can be copied out and run on its own, with
 one exception: `backfillctl` (see below) is a small package, not a single
-file, because its six subcommands share code and more subcommands are
+file, because its seven subcommands share code and more subcommands are
 coming; copy the whole `backfillctl/` directory (symlinks to it work), not
 individual files out of it. `backfillctl.py` at the top level is an optional
 executable shim to `backfillctl/`; copy it alongside `backfillctl/` if you
@@ -61,9 +61,9 @@ other environments.
 not a set of standalone scripts, because its subcommands share code and more
 are coming that will be variations on the existing ones. Run
 `python3 backfillctl <subcommand> --help` (or
-`python3 -m backfillctl <subcommand> --help`) for any of the six below.
-Five analyze a cluster; the sixth, `save-state`, captures one so the other
-five can replay it offline with the global `--load-state DIR` option, given
+`python3 -m backfillctl <subcommand> --help`) for any of the seven below.
+Six analyze a cluster; the seventh, `save-state`, captures one so the other
+six can replay it offline with the global `--load-state DIR` option, given
 before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`
 (`save-state` itself rejects it).
 
@@ -83,7 +83,7 @@ script.
   a full `ceph pg dump pgs`, covering every PG, not just the remapped or
   `backfill_toofull` ones the other subcommands ask for live. Each of them
   then reads `DIR` via `backfillctl --load-state DIR`, filtering `pg_dump_pgs.json`
-  itself for the PGs it cares about, so one capture serves all five.
+  itself for the PGs it cares about, so one capture serves all six.
   `backfillctl save-state DIR`
 
 - **`backfillctl show-pg-osds`** — Show one or more PGs' `acting` and `up` OSDs,
@@ -254,6 +254,37 @@ script.
   `backfillctl save-state` capture offline instead of querying the live
   cluster.
   `backfillctl [--load-state DIR] cancel-uphill [--min-delta PERCENT] [--exclude-pgs PGID [PGID ...]] [--pgremapper-mappings]`
+
+- **`backfillctl drain`** — Propose upmaps that move every PG shard
+  mapped to the given OSDs (`--osds`), or to every OSD of the given hosts
+  (`--hosts`, short or fully qualified names as in `ceph osd tree`) —
+  resident there or still backfilling onto it — to the least-utilized OSDs
+  cluster-wide, instead of letting CRUSH pile them
+  onto the same host's siblings as marking the OSD `out` would. Targets are
+  chosen as in `divert-toofull` (same device class, a host no other shard of
+  the PG uses, not in the PG's `up` set or raw CRUSH mapping, projected
+  utilization at or below `--max-target-util`, at most `--max-target-uses`
+  shards each), except that a drained OSD is never a target, the evacuee's own
+  host is allowed, the projection counts every remapped PG's arriving shards,
+  and the largest shards are placed first. Because `backfill_toofull` is a
+  per-PG state, an evacuee would wait on any other shard of its PG heading for
+  an OSD projected above `--max-target-util` — or, for a PG that is
+  `backfill_toofull` now, arriving on an OSD at or above `--min-up-util`
+  (default `nearfull_ratio`, the same guess `divert-toofull` makes about which
+  shard is refused); such a *blocker* is diverted too
+  if there is room, otherwise pinned back to its acting OSD (with companions,
+  as in `cancel-backfill`), otherwise the evacuee is proposed anyway with a
+  `NOTE` saying the PG will stay `backfill_toofull` and why. The table has
+  `ACTING`/`UP`/`TARGET` groups plus `NOTE`; `--pgremapper-mappings` prints the
+  JSON for `pgremapper import-mappings`. Evacuees with no room anywhere are
+  counted on stderr (apply, let drain, re-run); a PG that is
+  `backfill_toofull` now with no identifiable blocker is flagged in `NOTE`.
+  Keep the OSD up and `in` until it is empty: an upmap's `from` must be an
+  OSD CRUSH chose, so marking it out early voids these pairs (afterwards,
+  `external/upmap-remapped.py` pins what CRUSH remaps to where the data
+  already is). Assumes the pools' CRUSH failure domain is `host`. Prints
+  proposals only; changes nothing.
+  `backfillctl [--load-state DIR] drain (--osds OSD [OSD ...] | --hosts HOST [HOST ...]) [--min-up-util PERCENT] [--pgremapper-mappings] [--max-target-util PERCENT] [--max-target-uses N]`
 
 - **`pg-osd/scrub-all-pgs-that-need-it.py`** — Scrub and deep-scrub every PG that
   `ceph health detail` reports under `PG_NOT_SCRUBBED` /
