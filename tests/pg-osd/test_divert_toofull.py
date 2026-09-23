@@ -928,6 +928,18 @@ class PositiveIntTest(unittest.TestCase):
             placement.positive_int("many")
 
 
+class RecordingProjection(placement.ProjectedUsage):
+    """A ProjectedUsage that notes which shards were placed, in placement order."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.placed: list[str] = []
+
+    def redirect(self, shard, target_osd):
+        self.placed.append(shard.pgid)
+        super().redirect(shard, target_osd)
+
+
 class AssignTargetsTest(unittest.TestCase):
     """assign_targets: legality rules for a shard's target OSD."""
 
@@ -947,13 +959,15 @@ class AssignTargetsTest(unittest.TestCase):
         # By default the shards being placed are all there is arriving.
         arriving = shards if arriving is None else arriving
         df = osd_df_of(utils)
+        projection = RecordingProjection(df, list(arriving))
+        self.placed = projection.placed  # PG ids, in the order placed
         return ut.assign_targets(
             shards,
             {"hdd": candidates},
             self.HOSTS,
             df,
             {},
-            projection=placement.ProjectedUsage(df, list(arriving)),
+            projection=projection,
             max_uses=max_uses,
             max_target_util=max_target_util,
         )
@@ -1036,7 +1050,7 @@ class AssignTargetsTest(unittest.TestCase):
             {1: 99.0, 2: 40.0}, [2], shards, max_target_util=95.0
         )
         self.assertEqual(self.targets(proposals), [2, 2])
-        self.assertEqual([p.target_projected for p in proposals], [65.0, 90.0])
+        self.assertEqual([p.target_projected for p in proposals], [90.0, 90.0])
         self.assertEqual([s.pgid for s in unplaceable], ["1.2"])
 
     def test_the_proposal_reports_current_and_projected_utilization(self):
@@ -1045,6 +1059,31 @@ class AssignTargetsTest(unittest.TestCase):
         )
         self.assertEqual(proposal.target_utilization, 40.0)
         self.assertEqual(proposal.target_projected, 65.0)
+
+    def test_every_row_of_a_target_reports_its_projection_once_all_are_placed(self):
+        # 40% + 10% + 20% + 30% = 100%, the same in all three rows, though the
+        # first placed (1.1, 20%) saw only 60% when it was chosen.
+        shards = [
+            stuck("1.0", acting=6, size_pct=10),
+            stuck("1.1", acting=7, size_pct=20),
+            stuck("1.2", acting=8, size_pct=30),
+        ]
+        proposals, _ = self.assign(
+            {1: 99.0, 2: 40.0, 6: 80.0, 7: 90.0, 8: 85.0},
+            [2],
+            shards,
+            max_target_util=100.0,
+        )
+        self.assertEqual(self.placed, ["1.1", "1.2", "1.0"])
+        self.assertEqual([p.target_projected for p in proposals], [100.0] * 3)
+
+    def test_each_target_reports_its_own_projection(self):
+        shards = [stuck(f"1.{i}", size_pct=10) for i in range(3)]
+        proposals, _ = self.assign(
+            {1: 99.0, 2: 50.0, 3: 55.0}, [2, 3], shards, max_uses=2
+        )
+        self.assertEqual(self.targets(proposals), [2, 3, 2])
+        self.assertEqual([p.target_projected for p in proposals], [70.0, 65.0, 70.0])
 
     def test_projecting_exactly_to_the_cap_is_allowed_and_beyond_is_refused(self):
         # 50% + 25% is exactly 75%: "not exceed", so allowed at 75, refused
@@ -1077,7 +1116,7 @@ class AssignTargetsTest(unittest.TestCase):
     def test_shards_of_different_sizes_are_each_projected_by_their_own_size(self):
         shards = [stuck("1.0", size_pct=30), stuck("1.1", size_pct=10)]
         proposals, _ = self.assign({1: 99.0, 2: 40.0}, [2], shards)
-        self.assertEqual([p.target_projected for p in proposals], [70.0, 80.0])
+        self.assertEqual([p.target_projected for p in proposals], [80.0, 80.0])
 
     def test_the_least_projected_candidate_wins_and_load_spreads(self):
         # 2 and 3 alternate as each takes 10% and overtakes the other.
@@ -1126,18 +1165,15 @@ class AssignTargetsTest(unittest.TestCase):
     def test_priority_rotates_as_a_placed_shard_relieves_its_acting_osd(self):
         # osd.6 (90%) holds two shards, osd.7 (85%) one, each 10%. Placing one
         # of osd.6's drops it to 80%, below osd.7, so the order is 6, 7, 6 and
-        # not 6, 6, 7: each takes the next 10% on osd.2, so projections are
-        # 20, 30, 40 in placement order.
+        # not 6, 6, 7, all of it going to osd.2.
         shards = [
             stuck("1.0", acting=6, size_pct=10),
             stuck("1.1", acting=6, size_pct=10),
             stuck("1.2", acting=7, size_pct=10),
         ]
         proposals, _ = self.assign({1: 99.0, 2: 10.0, 6: 90.0, 7: 85.0}, [2], shards)
-        self.assertEqual(
-            {p.shard.pgid: p.target_projected for p in proposals},
-            {"1.0": 20.0, "1.2": 30.0, "1.1": 40.0},
-        )
+        self.assertEqual(self.placed, ["1.0", "1.2", "1.1"])
+        self.assertEqual(self.targets(proposals), [2, 2, 2])
 
     def test_a_shard_with_no_known_acting_osd_goes_last(self):
         shards = [stuck("1.0", size_pct=10), stuck("1.1", acting=6, size_pct=10)]
@@ -1174,7 +1210,8 @@ class AssignTargetsTest(unittest.TestCase):
         # must be the same as, each turn, taking the best of all shards: check
         # it against that naive definition on random input full of ties. All
         # shards fit on osd.2, which takes each one's size in turn, so the
-        # projection it reports for a shard is its position in placement order.
+        # order in which the projection sees them redirected is the placement
+        # order.
         rng = random.Random(20260920)
         for trial in range(200):
             n = rng.randint(1, 40)
@@ -1206,11 +1243,11 @@ class AssignTargetsTest(unittest.TestCase):
                 if shards[i].acting_osd is not None:
                     used[shards[i].acting_osd] -= shards[i].size_bytes / PCT
 
-            proposals, unplaceable = self.assign(
+            _, unplaceable = self.assign(
                 {1: 99.0, 2: 0.0, **acting_utils}, [2], shards, max_uses=n
             )
             self.assertEqual(unplaceable, [], trial)
-            actual = sorted(range(n), key=lambda i: proposals[i].target_projected)
+            actual = [int(pgid.split(".")[1]) for pgid in self.placed]
             self.assertEqual(actual, expected, trial)
 
     def test_placing_a_shard_does_not_free_room_on_its_acting_osd_as_a_target(self):
@@ -1294,7 +1331,7 @@ class AssignTargetsTest(unittest.TestCase):
         )
         self.assertEqual(
             [(p.shard.pgid, p.target_osd, p.target_projected) for p in proposals],
-            [("1.0", 4, 50.0), ("9.9", 4, 70.0)],
+            [("1.0", 4, 70.0), ("9.9", 4, 70.0)],
         )
 
 
@@ -1390,11 +1427,10 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         self.assertLess(len(targets), len(self.proposals))
         self.assertLessEqual(len(targets), CEPH2_CANDIDATES)
 
-    def test_projection_stays_within_the_cap_and_grows_with_each_use(self):
+    def test_projection_stays_within_the_cap_and_is_one_figure_per_target(self):
         # Proposals are in PG order, not the order shards were placed in, so
-        # an OSD's successive uses are compared as a set: each adds a shard,
-        # so its projections are all different and all above its current
-        # utilization.
+        # the rows of an OSD cannot show its projection growing: all of them
+        # show the final one, above its current utilization.
         projections = {}
         for p in self.proposals:
             self.assertGreater(p.target_projected, p.target_utilization)
@@ -1402,7 +1438,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
             projections.setdefault(p.target_osd, []).append(p.target_projected)
         for osd, values in projections.items():
             with self.subTest(osd=osd):
-                self.assertEqual(len(values), len(set(values)))
+                self.assertEqual(len(set(values)), 1)
 
     def test_proposals_are_in_pg_order_whatever_order_shards_were_placed_in(self):
         keys = [(ut.pgid_sort_key(p.shard.pgid), p.shard.shard) for p in self.proposals]

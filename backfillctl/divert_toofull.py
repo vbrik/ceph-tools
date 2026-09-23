@@ -157,12 +157,12 @@ picks up what that left over.
 
 A candidate whose projection is above --max-target-util is not eligible for
 that shard, so an OSD stops being used once the next shard would fill it
-that far. The projection is what the TARGET PROJ column shows for each row:
-the target's utilization after this shard and all the ones above it have
-completed. That column is why an OSD that appears in several rows is not
-mistaken for one that appears once. Candidates are ranked by that same figure,
-lowest first (OSD id breaks ties), so an OSD is reused only as the others
-fill up.
+that far. Candidates are ranked by that figure, lowest first (OSD id breaks
+ties), so an OSD is reused only as the others fill up. The TARGET PROJ column
+shows the target's projection once *all* the proposals have completed, so it
+is the same in every row of an OSD, however the shards were ordered when
+placed, and an OSD that appears in several rows is not mistaken for one that
+appears once. It is the figure to check against --max-target-util.
 
 A shard's size is not reported by Ceph. It is estimated from the PG's
 logical size ('num_bytes'): all of it for a replicated pool, 1/k of it for an
@@ -544,7 +544,7 @@ class Proposal(NamedTuple):
     target_osd: int
     target_host: str
     target_utilization: float  # current, from 'ceph osd df'
-    target_projected: float  # once this and all earlier proposals have completed
+    target_projected: float  # once all proposals have completed, in any row
 
 
 def assign_targets(
@@ -566,7 +566,9 @@ def assign_targets(
     below max_target_util (percent) once this shard has been added to what
     the projection says it will hold. Of the legal candidates the one with the
     lowest such projected utilization wins (OSD id breaks ties), so
-    reusing an OSD only happens as the others fill up.
+    reusing an OSD only happens as the others fill up. Each proposal reports
+    its target's projection once all the proposals have completed, so the rows
+    for one OSD agree whatever order they were placed in.
 
     The shards are not taken in the order given: each turn takes the one whose
     ACTING OSD is projected to be fullest (see SourcePressure), so the
@@ -582,7 +584,7 @@ def assign_targets(
     # as each of the PG's shards is placed, so a PG with two diverted shards
     # cannot be given two targets on one host.
     blocked_hosts: dict[str, set[str]] = {}
-    proposed: dict[int, Proposal] = {}
+    proposed: dict[int, int] = {}  # shard index -> target OSD
     unplaceable = set()
 
     # A shard's priority is its acting OSD's utilization, and placing a shard
@@ -641,18 +643,12 @@ def assign_targets(
         )
 
         if picked:
-            projected, target = picked
+            _, target = picked
             projection.redirect(shard, target)
             pressure.relieve(shard)
             uses[target] += 1
             forbidden_hosts.add(osd_host.get(target))
-            proposed[i] = Proposal(
-                shard,
-                target,
-                osd_host.get(target, "?"),
-                osd_df[target]["utilization"],
-                projected,
-            )
+            proposed[i] = target
         else:
             unplaceable.add(i)
 
@@ -662,8 +658,19 @@ def assign_targets(
                 heap, (-pressure.utilization(shards[queue[0]]), queue[0], acting)
             )
 
+    # Only now is a target's projection complete: reported earlier, it would
+    # leave out the shards placed on it after.
     return (
-        [proposed[i] for i in sorted(proposed)],
+        [
+            Proposal(
+                shards[i],
+                proposed[i],
+                osd_host.get(proposed[i], "?"),
+                osd_df[proposed[i]]["utilization"],
+                projection.utilization_after(proposed[i], 0),
+            )
+            for i in sorted(proposed)
+        ],
         [shards[i] for i in sorted(unplaceable)],
     )
 
@@ -676,8 +683,8 @@ def assign_targets(
 # (ACTING), where the stalled backfill is trying to put it (UP), and where
 # this script proposes it go instead (TARGET), with each OSD followed by its
 # utilization and host; TARGET also gets PROJ, the utilization it is projected
-# to reach once this and all earlier rows have completed (see ProjectedUsage),
-# which is what tells an OSD used by several rows apart from one used once.
+# to reach once every row has completed (see ProjectedUsage), the same in all
+# the rows of one OSD, which tells it apart from an OSD used by only one.
 # Each entry is (group, label); the header is printed
 # on two lines, the group name spanning its columns above their labels, and
 # an empty group means the column has no group line. print_table leaves the

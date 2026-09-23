@@ -156,7 +156,8 @@ script.
   there, stuck ones included until they are diverted — and an OSD stops being
   used once that projection would exceed `--max-target-util`, or after
   `--max-target-uses N` shards (default 5; 1 gives every OSD at most one). The
-  `TARGET PROJ` column shows that projection. Shards are placed
+  `TARGET PROJ` column shows the target's projection once *all* proposals have
+  completed, so every row of an OSD shows the same figure. Shards are placed
   fullest-`ACTING`-OSD first, re-ranked as each placement relieves its source,
   so the scarce room goes to the OSDs most urgent to relieve (shards with no
   known acting OSD go last, and rows are printed in PG order regardless). A

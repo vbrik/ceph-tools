@@ -27,6 +27,8 @@ host another shard of the PG is mapped to, not in the PG's up set or raw CRUSH
 mapping, not the target of --max-target-uses shards already, and at or below
 --max-target-util (default backfillfull_ratio - 1) once the shard is projected
 onto it. The one with the lowest such projection wins, OSD id breaking ties.
+The table's PROJ column is the target's projection once the whole plan has
+completed, so it is the same in every row of an OSD.
 
 The differences:
 
@@ -342,7 +344,7 @@ class Move(NamedTuple):
     acting_osd: int | None  # where the shard's data is now
     up_osd: int  # the 'from' of the pair
     target_osd: int  # the 'to' of the pair
-    projected: float | None  # target's projected utilization; None for pins
+    projected: float | None  # target's, once all moves are done; None for pins
     note: str
 
 
@@ -656,6 +658,21 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
     return diverted, pinned, verdict
 
 
+def with_final_projection(moves: list[Move], projection: ProjectedUsage) -> list[Move]:
+    """Return moves with each target's projection as it is once all are done.
+
+    The projection a move was given when it was placed leaves out whatever
+    was placed on its target later (or was pinned away from it), and placement
+    order is not row order, so rows of one OSD would disagree.
+    """
+    return [
+        m
+        if m.projected is None
+        else m._replace(projected=projection.utilization_after(m.target_osd, 0))
+        for m in moves
+    ]
+
+
 def host_osds(hosts: list[str], osd_host: dict[int, str]) -> set[int]:
     """Return every OSD of the given hosts (short or fully qualified names).
 
@@ -766,6 +783,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
         elif verdict == UNEXPLAINED:
             unexplained_pgs.append(pgid)
         moves.extend(state.moves)
+    moves = with_final_projection(moves, projection)
 
     return DrainResult(
         osds=sorted(drained),
@@ -793,8 +811,8 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
 # Along the shard's path, as in divert-toofull: where its data is now
 # (ACTING), where it is mapped today (UP, the upmap's 'from') and where it is
 # proposed to go (TARGET, the 'to'). PROJ is the target's projected
-# utilization once this and all earlier rows have completed; '-' for a pin,
-# which sends the shard back where its data already is.
+# utilization once every row has completed, the same in all the rows of one
+# OSD; '-' for a pin, which sends the shard back where its data already is.
 COLUMNS = [
     ("", "PGID"),
     ("", "SHARD"),

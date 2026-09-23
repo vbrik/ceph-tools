@@ -266,6 +266,17 @@ class CapacityTest(unittest.TestCase):
         self.assertEqual(pairs(result), [("1.1", 0, 0, 31)])
         self.assertEqual([e.pgid for e in result.unplaceable], ["1.0"])
 
+    def test_rows_of_a_target_all_show_its_projection_once_everything_is_placed(self):
+        # The 10% shard is placed first and sees 70% + 10% = 80%; the 5% shard
+        # placed after sees 85%. Both rows, in PG order, show the final 85%.
+        c = Cluster(default_util=95.0)
+        c.util[31] = 70.0
+        c.pg("1.0", [0, 10, 20], shard_pct=5)
+        c.pg("1.1", [0, 10, 20], shard_pct=10)
+        result = c.plan(0)
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 31), ("1.1", 0, 0, 31)])
+        self.assertEqual([m.projected for m in result.moves], [85.0, 85.0])
+
 
 class BlockerTest(unittest.TestCase):
     """A sibling arriving on an OSD over the cap holds the PG in toofull."""
