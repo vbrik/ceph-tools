@@ -65,11 +65,11 @@ of a backfill_toofull PG is the refused one (see its "How PGs are
 identified"). For each blocker, in order:
 
   1. Divert it: pick a target for it the same way as for an evacuee (NOTE
-     "diverted: unblocks osd.N"). Diverting uses the same room as evacuees,
-     which is why evacuees are placed first.
+     "diverted: ..."). Diverting uses the same room as evacuees, which is
+     why evacuees are placed first.
   2. Otherwise pin it back to its acting OSD, i.e. cancel its backfill, with
-     whatever companion pins that needs (shared.close_pins; NOTE "pinned:
-     unblocks osd.N" and "companion of shard N"). Refused, like a pin
+     whatever companion pins that needs (shared.close_pins; NOTE "pinned, no
+     room to divert: ..." and "companion of shard N"). Refused, like a pin
      cancel-backfill cannot make, if the shard has no acting OSD, if a
      replicated PG's pairing is ambiguous, or if the pins would clash with
      the PG's new up set; and also if a pin would send data back to a
@@ -78,7 +78,12 @@ identified"). For each blocker, in order:
      shared.warn_chained_pgs).
   3. Otherwise keep the evacuee's proposal regardless -- it still moves the
      shard off the OSD once the blocker clears -- and say so in its NOTE:
-     "PG stays toofull: shard N -> osd.X (now U%, projected P%; ...)".
+     "PG stays toofull: shard N -> osd.X (<why it blocks>; cannot pin: ...)".
+
+A diverted or pinned blocker's NOTE says which of the two tests it failed
+and which evacuees it would have held up, e.g. "pinned, no room to divert:
+osd.195 (now 90.5%, projected 91.4% > --max-target-util 90%) would stall the
+PG, holding up shard 9 leaving osd.231".
 
 A PG that is backfill_toofull right now but has no sibling passing either
 test gets a NOTE saying its blocker is unidentified (unless one of its
@@ -436,20 +441,29 @@ class Planner:
         state.retarget(shard.up_osd, target)
 
     def is_blocker(self, sibling: ArrivingShard, toofull_now: bool) -> str | None:
-        """Return why the sibling blocks its PG, e.g. 'now 86.0%, projected
-        87.1%', or None if it does not.
+        """Return why the sibling blocks its PG, or None if it does not.
 
         It blocks if its OSD is projected over the cap or, for a PG that is
         backfill_toofull now (toofull_now), is at or above min_up_util today.
+        The reason names the test that tripped (the cap's, if both did), e.g.
+        'now 90.5%, projected 91.4% > --max-target-util 90%'.
         """
         if not self.projection.knows(sibling.up_osd):
             return None
         projected = self.projection.utilization_after(sibling.up_osd, 0)
         now = self.osd_df[sibling.up_osd].get("utilization")
-        near_full = toofull_now and now is not None and now >= self.min_up_util
-        if projected <= self.max_target_util and not near_full:
-            return None
-        return f"now {now:.1f}%, projected {projected:.1f}%"
+        if projected > self.max_target_util:
+            now_text = "?" if now is None else f"{now:.1f}%"
+            return (
+                f"now {now_text}, projected {projected:.1f}% > "
+                f"--max-target-util {self.max_target_util:g}%"
+            )
+        if toofull_now and now is not None and now >= self.min_up_util:
+            return (
+                f"now {now:.1f}% >= --min-up-util {self.min_up_util:g}% "
+                f"and PG is backfill_toofull, projected {projected:.1f}%"
+            )
+        return None
 
     def try_pin(
         self, state: PgState, blocker: ArrivingShard
@@ -550,7 +564,20 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
     """
     toofull_now = "backfill_toofull" in state.pg["state"].split("+")
     evacuated = list(state.moves)
-    unblocks = "unblocks " + ", ".join(f"osd.{m.up_osd}" for m in evacuated)
+    # What a blocker would hold up, e.g. 'shard 9 leaving osd.231'.
+    held_up = " and ".join(
+        f"shard {m.shard} leaving osd.{m.up_osd}"
+        if state.is_ec
+        else f"the replica leaving osd.{m.up_osd}"
+        for m in evacuated
+    )
+
+    def blocker_note(action: str, sibling: ArrivingShard, blocking: str) -> str:
+        return (
+            f"{action}: osd.{sibling.up_osd} ({blocking}) would stall the PG, "
+            f"holding up {held_up}"
+        )
+
     siblings = [
         s
         for s in find_arriving_shards(state.pg, state.is_ec, state.size_bytes)
@@ -578,7 +605,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
                     sibling.up_osd,
                     target,
                     projected,
-                    f"diverted: {unblocks}",
+                    blocker_note("diverted", sibling, blocking),
                 )
             )
             diverted += 1
@@ -599,7 +626,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
             state.new_up[state.new_up.index(from_osd)] = to_osd
             state.changed.add(s if state.is_ec else from_osd)
             note = (
-                f"pinned: {unblocks}"
+                blocker_note("pinned, no room to divert", sibling, blocking)
                 if k == 0
                 else f"companion of shard {sibling.shard}"
             )

@@ -274,7 +274,9 @@ script.
   shard is refused); such a *blocker* is diverted too
   if there is room, otherwise pinned back to its acting OSD (with companions,
   as in `cancel-backfill`), otherwise the evacuee is proposed anyway with a
-  `NOTE` saying the PG will stay `backfill_toofull` and why. The table has
+  `NOTE` saying the PG will stay `backfill_toofull` and why. A diverted or
+  pinned blocker's `NOTE` gives the threshold it crossed and the evacuees
+  it would have held up. The table has
   `ACTING`/`UP`/`TARGET` groups plus `NOTE`; `--pgremapper-mappings` prints the
   JSON for `pgremapper import-mappings`. Evacuees with no room anywhere are
   counted on stderr (apply, let drain, re-run); a PG that is

@@ -277,7 +277,11 @@ class BlockerTest(unittest.TestCase):
         c.util[41] = 20.0
         result = c.pg("1.0", [0, 10, 20], [0, 11, 20]).plan(0)
         self.assertEqual(pairs(result), [("1.0", 0, 0, 31), ("1.0", 1, 10, 41)])
-        self.assertEqual(result.moves[1].note, "diverted: unblocks osd.0")
+        self.assertEqual(
+            result.moves[1].note,
+            "diverted: osd.10 (now 95.0%, projected 96.0% > --max-target-util "
+            "89%) would stall the PG, holding up shard 0 leaving osd.0",
+        )
         self.assertEqual(result.diverted_count, 1)
         self.assertEqual(result.stuck_pgs, [])
 
@@ -304,7 +308,12 @@ class BlockerTest(unittest.TestCase):
         result = c.pg("1.0", [0, 10, 20], [0, 11, 20]).plan(0)
         self.assertEqual(pairs(result), [("1.0", 0, 0, 1), ("1.0", 1, 10, 11)])
         pin = result.moves[1]
-        self.assertEqual(pin.note, "pinned: unblocks osd.0")
+        self.assertEqual(
+            pin.note,
+            "pinned, no room to divert: osd.10 (now 95.0%, projected 96.0% > "
+            "--max-target-util 89%) would stall the PG, holding up shard 0 "
+            "leaving osd.0",
+        )
         self.assertIsNone(pin.projected)
         self.assertEqual(result.pinned_count, 1)
 
@@ -328,6 +337,23 @@ class BlockerTest(unittest.TestCase):
         c.util[1] = 10.0
         result = c.pg("2.0", [0, 10, 20], [0, 11, 20]).plan(0)
         self.assertEqual(pairs(result), [("2.0", "-", 0, 1), ("2.0", "-", 10, 11)])
+        self.assertTrue(
+            result.moves[1].note.endswith("holding up the replica leaving osd.0")
+        )
+
+    def test_blocker_note_lists_every_evacuee_it_holds_up(self):
+        c = Cluster()
+        c.util[10] = 95.0
+        c.util[31] = 10.0
+        c.util[41] = 20.0
+        c.util[51] = 30.0
+        result = c.pg("1.0", [0, 10, 20], [0, 11, 20]).plan(0, 20)
+        self.assertTrue(
+            result.moves[-1].note.endswith(
+                "holding up shard 0 leaving osd.0 and shard 2 leaving osd.20"
+            ),
+            result.moves[-1].note,
+        )
 
     def test_unpinnable_blocker_keeps_the_evacuee_with_a_note(self):
         c = Cluster(default_util=95.0)
@@ -355,8 +381,21 @@ class BlockerTest(unittest.TestCase):
         c.pg("1.0", [0, 10, 20], [0, 11, 20], state="active+backfill_toofull")
         result = c.plan(0)
         self.assertEqual(pairs(result), [("1.0", 0, 0, 31), ("1.0", 1, 10, 41)])
-        self.assertEqual(result.moves[1].note, "diverted: unblocks osd.0")
+        self.assertEqual(
+            result.moves[1].note,
+            "diverted: osd.10 (now 86.0% >= --min-up-util 85% and PG is "
+            "backfill_toofull, projected 87.0%) would stall the PG, holding "
+            "up shard 0 leaving osd.0",
+        )
         self.assertEqual(result.min_up_util, 85.0)
+
+    def test_toofull_pg_blocker_over_both_thresholds_cites_the_cap(self):
+        c = Cluster()
+        c.util[10] = 95.0
+        c.util[31] = 10.0
+        c.util[41] = 20.0
+        c.pg("1.0", [0, 10, 20], [0, 11, 20], state="active+backfill_toofull")
+        self.assertIn("> --max-target-util 89%)", c.plan(0).moves[1].note)
 
     def test_nearfull_sibling_of_a_pg_not_toofull_is_left_alone(self):
         c = Cluster()
@@ -374,14 +413,18 @@ class BlockerTest(unittest.TestCase):
         result = c.plan(0, "--min-up-util", 87)
         self.assertEqual(result.diverted_count, 0)
 
-    def test_unpinnable_nearfull_blocker_note_shows_now_and_projected(self):
+    def test_unpinnable_nearfull_blocker_note_shows_why_it_blocks(self):
         c = Cluster(default_util=95.0)
         c.util[1] = 10.0
         c.util[10] = 86.0
         none = shared.CRUSH_ITEM_NONE
         c.pg("1.0", [0, 10, 20], [0, none, 20], state="active+backfill_toofull")
         note = c.plan(0).moves[0].note
-        self.assertIn("shard 1 -> osd.10 (now 86.0%, projected 87.0%;", note)
+        self.assertIn(
+            "shard 1 -> osd.10 (now 86.0% >= --min-up-util 85% and PG is "
+            "backfill_toofull, projected 87.0%; cannot pin: no acting OSD)",
+            note,
+        )
 
     def test_toofull_pg_with_no_identified_blocker_is_flagged(self):
         c = Cluster()
