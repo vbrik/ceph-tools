@@ -89,16 +89,16 @@ class FormatTest(unittest.TestCase):
         pairs = [{"from": 1, "to": 2}, {"from": 2, "to": 3}]
         self.assertEqual("1->2,2->3", op.format_upmaps(pairs, Row(0, 2, 2)))
 
-    def test_row_progress_only_for_remapped(self):
-        def progress(pct, row):
-            return op.format_row(row, PG, pct, {}, {}, [])[7]
+    def test_row_progress(self):
+        def progress(p):
+            return op.format_row(Row(0, 1, 2), PG, p, {}, {}, [])[7]
 
-        self.assertEqual("-", progress(41.0, Row(0, 1, 1)))
-        self.assertEqual("-", progress(41.0, Row(0, 1, None)))
-        self.assertEqual("-", progress(None, Row(0, 1, 2)))
-        self.assertEqual("41%", progress(41.9, Row(0, 1, 2)))
-        # Never displays 100% while still moving.
-        self.assertEqual("99%", progress(99.7, Row(0, 1, 2)))
+        self.assertEqual("-", progress(None))  # not remapped (see plan())
+        self.assertEqual("-", progress(shared.Progress(None, True)))
+        self.assertEqual("41%", progress(shared.Progress(41.9, True)))
+        self.assertEqual("~41%", progress(shared.Progress(41.9, False)))
+        # Only finished copying reads 100%.
+        self.assertEqual("99%", progress(shared.Progress(99.7, True)))
 
     def test_row_marks_each_side_s_own_primary(self):
         row = op.format_row(Row(0, 712, 59), PG, None, {}, {}, [])
@@ -130,8 +130,10 @@ class TableTest(unittest.TestCase):
         host = {712: "h4", 226: "h9", 59: "h12"}
         pairs = [{"from": 226, "to": 59}]
         rows = [
-            op.format_row(r, PG, 41.0, util, host, pairs)
-            for r in (Row(0, 712, 712), Row(3, 226, 59))
+            op.format_row(Row(0, 712, 712), PG, None, util, host, pairs),
+            op.format_row(
+                Row(3, 226, 59), PG, shared.Progress(41.0, True), util, host, pairs
+            ),
         ]
         lines = self.render(rows)
         self.assertEqual(4, len(lines))
@@ -181,8 +183,13 @@ class MainTest(unittest.TestCase):
                 "reported_epoch": 7,
             }
         },
-        # Fields the script never reads, and that may name hosts or addresses.
-        "peer_info": [{"peer": "1", "addr": "10.1.2.3:6800"}],
+        # Of peer_info, only the backfill target's (osd.4's) last_backfill is
+        # read: halfway through PG 5.3's key range (pg_num 8). The rest may
+        # name hosts or addresses and is never read.
+        "peer_info": [
+            {"peer": "1", "addr": "10.1.2.3:6800", "last_backfill": "MAX"},
+            {"peer": "4", "last_backfill": "5:d0000000:::obj:head"},
+        ],
         "recovery_state": [{"name": "Started/Primary/Active"}],
     }
 
@@ -227,7 +234,9 @@ class MainTest(unittest.TestCase):
             "pg_upmap_items": [{"pgid": "5.3", "mappings": [{"from": 2, "to": 4}]}],
             "blocklist": {"10.9.8.7:0/12345": 1700000000},
         },
-        "pool_ls_detail": [{"pool_id": 5, "pool_name": "rep", "type": 1, "size": 2}],
+        "pool_ls_detail": [
+            {"pool_id": 5, "pool_name": "rep", "type": 1, "size": 2, "pg_num": 8}
+        ],
     }
 
     # A second, clean PG of the same pool (in pg_dump_pgs.json's shape).
@@ -266,7 +275,9 @@ class MainTest(unittest.TestCase):
         self.assertEqual("active+remapped+backfilling", view.pg["state"])
         # osd.1 stays; osd.2's copy is headed for osd.4
         self.assertEqual([Row("-", 1, 1), Row("-", 2, 4)], view.rows)
-        self.assertEqual(50.0, view.progress_pct)
+        # Only the remapped row has progress: the counters' 50% (the
+        # directory has no backfill_positions.json).
+        self.assertEqual([None, shared.Progress(50.0, False)], view.progress)
         self.assertEqual([{"from": 2, "to": 4}], view.upmap_pairs)
         self.assertEqual("ceph1-2", result.osd_host[4])
 
@@ -280,20 +291,42 @@ class MainTest(unittest.TestCase):
         self.assertEqual(["-", "-"], [ln.split()[0] for ln in lines[4:6]])
         self.assertIn("2->4", lines[5])
 
-    def test_progress_100_note_absent_below_100(self):
+    def test_saved_backfill_position_wins_over_counters(self):
+        # The counters say 100%, the saved position 25%.
+        snaps = json.loads(json.dumps(self.SNAPSHOTS))  # deep copy
+        snaps["pg_dump_pgs"]["pg_stats"][0]["stat_sum"]["num_objects_misplaced"] = 0
+        snaps["backfill_positions"] = {"5.3": {"4": "c8000000"}}
         with tempfile.TemporaryDirectory() as tmp:
-            self.write_snapshots(tmp)
+            self.write_snapshots(tmp, snaps)
+            (view,) = plan_from_state(op, tmp, "5.3").pgs
             out = self.run_main("5.3", load_state=tmp)
-        self.assertNotIn("PROGRESS reads 100%", out)
+        self.assertEqual([None, shared.Progress(25.0, True)], view.progress)
+        self.assertIn(" 25% ", out)
+        self.assertNotIn("~", out)
 
-    def test_progress_100_note_appears_when_the_pg_reads_100(self):
+    def test_approx_note_appears_when_progress_comes_from_counters(self):
+        # A capture without backfill_positions.json.
         snaps = json.loads(json.dumps(self.SNAPSHOTS))  # deep copy
         snaps["pg_dump_pgs"]["pg_stats"][0]["stat_sum"]["num_objects_misplaced"] = 0
         with tempfile.TemporaryDirectory() as tmp:
             self.write_snapshots(tmp, snaps)
             out = self.run_main("5.3", load_state=tmp)
-        self.assertIn(" 100%", out)
-        self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", out)
+        self.assertIn(" ~100%", out)
+        self.assertIn("~ marks PROGRESS from Ceph's misplaced/degraded", out)
+
+    def test_live_progress_from_the_pg_query(self):
+        # The query run() makes anyway carries the position: 50% exact, and
+        # no separate position query.
+        with (
+            mock.patch.object(
+                shared.SnapshotStore, "json", lambda store, key: self.SNAPSHOTS[key]
+            ),
+            mock.patch.object(shared, "query_backfill_positions") as query,
+        ):
+            args = parse_args(op, ["5.3"])
+            (view,) = op.plan(args, shared.SnapshotStore(op.SNAPSHOT_COMMANDS)).pgs
+        query.assert_not_called()
+        self.assertEqual([None, shared.Progress(50.0, True)], view.progress)
 
     def test_load_state_reports_a_pgid_missing_from_the_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -309,7 +342,7 @@ class MainTest(unittest.TestCase):
             self.write_snapshots(tmp, snaps)
             (view,) = plan_from_state(op, tmp, "5.3").pgs
         self.assertEqual([Row("-", 1, 1), Row("-", 2, 4)], view.rows)
-        self.assertEqual(50.0, view.progress_pct)
+        self.assertEqual([None, shared.Progress(50.0, False)], view.progress)
 
     def test_several_pgs_print_a_block_each_and_footnotes_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -326,13 +359,13 @@ class MainTest(unittest.TestCase):
         # Blocks are separated by a blank line.
         self.assertIn("\n\nPG 5.3  state:", out)
         self.assertEqual(1, out.count("* primary"))
-        self.assertEqual(1, out.count("PROGRESS is per PG"))
+        self.assertEqual(1, out.count("~ marks PROGRESS"))
 
     def test_footnote_on_progress_only_when_some_pg_is_remapped(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.write_snapshots(tmp, self.two_pg_snapshots())
             out = self.run_main("5.4", load_state=tmp)
-        self.assertNotIn("PROGRESS is per PG", out)
+        self.assertNotIn("~ marks PROGRESS", out)
         self.assertIn("* primary", out)
 
     def test_duplicate_pgids_are_shown_once(self):

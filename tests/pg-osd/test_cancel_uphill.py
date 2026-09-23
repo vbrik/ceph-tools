@@ -23,6 +23,13 @@ from backfillctl import cancel_uphill as cu
 FIXTURE = (
     REPO_ROOT / "tests" / "pg-osd" / "test-data" / "ceph1-backfills-stuck-at-100-pct"
 )
+FIXTURE_RESUMED = (
+    REPO_ROOT
+    / "tests"
+    / "pg-osd"
+    / "test-data"
+    / "ceph1-resumed-backfills-exact-progress"
+)
 
 NONE = shared.CRUSH_ITEM_NONE
 EC_POOL = {
@@ -461,6 +468,33 @@ class FixtureReplayTest(unittest.TestCase):
         # Confirms shared.chained_pgs is actually reached against real data,
         # not just the small hand-built fixtures above.
         self.assertGreater(len(self.result.chained), 0)
+
+
+class ExactProgressTest(unittest.TestCase):
+    """Replay a capture with backfill positions (see its README.txt)."""
+
+    def test_every_proposal_gets_progress_from_positions(self):
+        cancellations = plan_from_state(cu, FIXTURE_RESUMED).cancellations
+        self.assertGreater(len(cancellations), 0)
+        self.assertTrue(all(c.progress_exact for c in cancellations))
+        # 18.1d's counters read 100%; its position 98%.
+        (pct,) = {c.progress_pct for c in cancellations if c.pgid == "18.1d"}
+        self.assertAlmostEqual(98.2, pct, 1)
+
+    def test_no_approx_note(self):
+        err = io.StringIO()
+        args = parse_args(cu, [], load_state=str(FIXTURE_RESUMED))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            cu.run(args)
+        self.assertNotIn("~ marks PROGRESS", err.getvalue())
+
+    def test_capture_without_positions_is_marked(self):
+        err, out = io.StringIO(), io.StringIO()
+        args = parse_args(cu, [], load_state=str(FIXTURE))
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cu.run(args)
+        self.assertIn("~", out.getvalue())
+        self.assertIn("~ marks PROGRESS", err.getvalue())
 
 
 class MainRegistrationTest(unittest.TestCase):

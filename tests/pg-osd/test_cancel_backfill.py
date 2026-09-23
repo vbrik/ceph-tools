@@ -38,6 +38,7 @@ EC_POOL = {
     "size": 6,
     "erasure_code_profile": "p",
     "crush_rule": 0,
+    "pg_num": 16,
 }
 REP_POOL = {"pool_id": 7, "type": 1, "size": 3, "crush_rule": 0}
 HOST_RULE = {
@@ -1016,24 +1017,26 @@ class MainTest(unittest.TestCase):
         self.assertRegex(lines[2], r"\s8\s+90\.5%\s+h2\s+682\s+88\.0%\s+h1")
         self.assertIn("companion of shard 0", lines[4])
 
-    def test_progress_100_note_appears_when_a_row_reads_100(self):
-        # pg()'s misplaced/degraded default to 0, so every PGS row here reads
-        # literal 100% by default.
-        _, err = self.run_main("--osd", "682")
-        self.assertIn("NOTE: PROGRESS reads 100% once Ceph's own misplaced", err)
+    def test_approx_note_appears_when_progress_comes_from_counters(self):
+        # No backfill positions (the tests' stubbed live query returns none),
+        # so every row's PROGRESS is from Ceph's counters.
+        out, err = self.run_main("--osd", "682")
+        self.assertIn("~100%", out)
+        self.assertIn("NOTE: ~ marks PROGRESS from Ceph's misplaced/degraded", err)
 
-    def test_progress_100_note_absent_when_nothing_reads_100(self):
+    def test_progress_from_backfill_positions(self):
+        # The counters say 100%; the target's position says it hasn't started.
         pgs = [
-            pg(
-                "19.9",
-                [OSD, 2, 3, 4],
-                [8, 2, 3, 4],
-                "active+remapped+backfilling",
-                misplaced=25,
-            ),
+            pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4], "active+remapped+backfilling"),
         ]
-        _, err = self.run_main("--osd", "682", pgs=pgs)
-        self.assertNotIn("PROGRESS reads 100%", err)
+        positions = mock.Mock(return_value={"19.9": {f"{OSD}(0)": "MIN"}})
+        with mock.patch.object(shared, "query_backfill_positions", positions):
+            out, err = self.run_main("--osd", "682", pgs=pgs)
+        positions.assert_called_once()
+        self.assertEqual({"19.9"}, set(positions.call_args.args[0]))
+        self.assertIn(" 0% ", out)
+        self.assertNotIn("~", out.split("\n\n")[0])
+        self.assertNotIn("~ marks PROGRESS", err)
 
     def test_pgremapper_mappings_is_json_with_every_pair_and_no_warning(self):
         out, err = self.run_main("--pgremapper-mappings", "--osd", "682")
@@ -1303,13 +1306,18 @@ class NoPgsTest(unittest.TestCase):
             self.fetch({"what": 1})
 
 
-def run_cli(*argv, load_state=None, path=None):
+def run_cli(*argv, load_state=None, path=None, no_rados=None):
     """Run the subcommand as a subprocess.
 
     load_state, when given, is passed as the global --load-state; path
-    replaces PATH when given.
+    replaces PATH when given; no_rados, a directory, becomes PYTHONPATH (see
+    LoadStateCliTest.setUp).
     """
-    env = {**os.environ, "PATH": path} if path is not None else None
+    env = None
+    if path is not None:
+        env = {**os.environ, "PATH": path}
+    if no_rados is not None:
+        env = {**(env or os.environ), "PYTHONPATH": str(no_rados)}
     global_argv = ["--load-state", load_state] if load_state is not None else []
     return subprocess.run(
         [
@@ -1346,12 +1354,23 @@ class LoadStateCliTest(unittest.TestCase):
             if key != "pg_dump_pgs"  # never requested live, see fetch_remapped_pg_stats
         }
         fake = self.bin / "ceph"
+        # 'pg <pgid> query' (the backfill positions) answers {}: no targets,
+        # so PROGRESS comes from the counters, the same as the replay's.
         fake.write_text(
             f"#!{sys.executable}\nimport json, sys\n"
-            f"print(json.dumps({table!r}[' '.join(sys.argv[1:])]))\n"
+            "cmd = ' '.join(sys.argv[1:])\n"
+            f"print(json.dumps({table!r}.get(cmd, {{}})))\n"
         )
         fake.chmod(0o755)
         self.with_ceph = f"{self.bin}{os.pathsep}{os.environ['PATH']}"
+        # Keep the live run from reaching a real cluster over librados
+        # (rados would be importable on a ceph admin host): a 'rados' module
+        # that fails to import sends it to the fake ceph CLI instead.
+        self.no_rados = self.root / "no-rados"
+        self.no_rados.mkdir()
+        (self.no_rados / "rados.py").write_text(
+            "raise ImportError('blocked in tests')\n"
+        )
 
         self.state = self.root / "state"
         self.state.mkdir()
@@ -1368,7 +1387,13 @@ class LoadStateCliTest(unittest.TestCase):
         )
 
     def test_load_state_reproduces_the_live_output(self):
-        live = run_cli("--pgremapper-mappings", "--osd", "682", path=self.with_ceph)
+        live = run_cli(
+            "--pgremapper-mappings",
+            "--osd",
+            "682",
+            path=self.with_ceph,
+            no_rados=self.no_rados,
+        )
         self.assertEqual(live.returncode, 0, live.stderr)
         self.assertEqual(
             json.loads(live.stdout),
@@ -1384,6 +1409,17 @@ class LoadStateCliTest(unittest.TestCase):
         )
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertEqual(replay.stdout, live.stdout)
+
+    def test_load_state_reproduces_the_live_table(self):
+        # The table shows PROGRESS, so the live run queries each proposed PG's
+        # backfill position through the fake ceph (see setUp).
+        live = run_cli("--osd", "682", path=self.with_ceph, no_rados=self.no_rados)
+        self.assertEqual(live.returncode, 0, live.stderr)
+        self.assertIn("~", live.stdout)
+        replay = run_cli("--osd", "682", load_state=str(self.state))
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(replay.stdout, live.stdout)
+        self.assertEqual(replay.stderr, live.stderr)
 
     def test_load_reports_a_missing_directory_and_a_missing_file(self):
         result = run_cli("--osd", "682", load_state=str(self.root / "nope"))

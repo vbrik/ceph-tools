@@ -77,7 +77,7 @@ from typing import NamedTuple
 from shared import (
     COLUMNS,
     POOL_TYPE_ERASURE,
-    PROGRESS_100_NOTE,
+    PROGRESS_APPROX_NOTE,
     Cancellation,
     PgidFilter,
     Skipped,
@@ -100,12 +100,12 @@ from shared import (
     pin_replica,
     print_pgremapper_mappings,
     print_table,
-    progress_reads_100,
     real_osd_set,
     rule_failure_domain,
     shard_size_bytes,
     stderr_para,
     warn_chained_pgs,
+    with_exact_progress,
     wrap_text,
 )
 
@@ -467,6 +467,8 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> UphillResult:
         exclude_pgs,
         args.min_delta,
     )
+    if not args.pgremapper_mappings:  # the JSON has no PROGRESS: spare the queries
+        cancellations = with_exact_progress(store, cancellations, pg_stats, pools)
     return UphillResult(
         cancellations=cancellations,
         skipped=skipped,
@@ -501,8 +503,10 @@ def render(result: UphillResult, args: argparse.Namespace) -> None:
             COLUMNS,
             [format_row(c, result.osd_df, result.osd_host) for c in cancellations],
         )
-        if any(progress_reads_100(c.progress_pct) for c in cancellations):
-            stderr_para(f"NOTE: {PROGRESS_100_NOTE}")
+        if any(
+            c.progress_pct is not None and not c.progress_exact for c in cancellations
+        ):
+            stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
     if chained:
         warn_chained_pgs(chained, left_out=machine_format)
     stderr_para(

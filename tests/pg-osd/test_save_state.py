@@ -134,7 +134,12 @@ class RunTest(unittest.TestCase):
     def canned(self):
         return {
             tuple(cmd): (
-                {"pg_stats": [pg("19.1", "active+remapped+backfill_wait")]}
+                {
+                    "pg_stats": [
+                        pg("19.1", "active+clean"),
+                        pg("19.2", "active+remapped+backfill_wait", up=[1, 3]),
+                    ]
+                }
                 if key == "pg_dump_pgs"
                 else {"nodes": [], "stray": []}
                 if key == "osd_tree"
@@ -145,11 +150,15 @@ class RunTest(unittest.TestCase):
             for key, cmd in ss.SNAPSHOT_COMMANDS.items()
         }
 
-    def test_writes_one_file_per_command_anonymized(self):
+    def run_capture(self, positions=None):
+        """Run save-state against canned output; return ({stem: JSON}, queried pgids)."""
         canned = self.canned()
+        query = mock.Mock(return_value=positions or {})
         with (
             tempfile.TemporaryDirectory() as tmp,
             mock.patch.object(shared, "ceph_json", lambda cmd: canned[tuple(cmd)]),
+            mock.patch.object(ss, "query_backfill_positions", query),
+            contextlib.redirect_stdout(io.StringIO()),
         ):
             args = parse_args(ss, [tmp + "/snap"])
             ss.run(args)
@@ -157,8 +166,24 @@ class RunTest(unittest.TestCase):
                 p.stem: json.loads(p.read_text())
                 for p in pathlib.Path(tmp, "snap").glob("*.json")
             }
-        self.assertEqual(set(saved), set(ss.SNAPSHOT_COMMANDS))
+        (call,) = query.call_args_list
+        return saved, list(call.args[0])
+
+    def test_writes_one_file_per_command_anonymized(self):
+        saved, _ = self.run_capture()
+        self.assertEqual(
+            set(saved),
+            set(ss.SNAPSHOT_COMMANDS)
+            | {pathlib.Path(shared.BACKFILL_POSITIONS_FILE).stem},
+        )
         self.assertNotIn("real-fsid", json.dumps(saved))
+
+    def test_backfill_positions_of_remapped_pgs_only(self):
+        positions = {"19.2": {"3": "8000abcd"}}
+        saved, queried = self.run_capture(positions)
+        # 19.1 has up == acting: nothing to query.
+        self.assertEqual(["19.2"], queried)
+        self.assertEqual(positions, saved["backfill_positions"])
 
     def test_refuses_a_non_empty_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

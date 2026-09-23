@@ -192,7 +192,7 @@ from shared import (
     COLUMNS,
     KIB,
     POOL_TYPE_ERASURE,
-    PROGRESS_100_NOTE,
+    PROGRESS_APPROX_NOTE,
     Cancellation,
     PgidFilter,
     Skipped,
@@ -217,7 +217,6 @@ from shared import (
     pin_with_companions,
     print_pgremapper_mappings,
     print_table,
-    progress_reads_100,
     real_osd_set,
     rule_failure_domain,
     same_place,
@@ -225,6 +224,7 @@ from shared import (
     slot,
     stderr_para,
     warn_chained_pgs,
+    with_exact_progress,
     wrap_text,
 )
 
@@ -736,6 +736,8 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
         args.pin_blockers,
         exclude_pgs,
     )
+    if not args.pgremapper_mappings:  # the JSON has no PROGRESS: spare the queries
+        cancellations = with_exact_progress(store, cancellations, pg_stats, pools)
     return StopResult(
         osd=osd,
         cancellations=cancellations,
@@ -791,8 +793,10 @@ def render(result: StopResult, args: argparse.Namespace) -> None:
             COLUMNS,
             [format_row(c, result.osd_df, result.osd_host) for c in cancellations],
         )
-        if any(progress_reads_100(c.progress_pct) for c in cancellations):
-            stderr_para(f"NOTE: {PROGRESS_100_NOTE}")
+        if any(
+            c.progress_pct is not None and not c.progress_exact for c in cancellations
+        ):
+            stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
     if chained:
         warn_chained_pgs(chained, left_out=machine_format)
     if (

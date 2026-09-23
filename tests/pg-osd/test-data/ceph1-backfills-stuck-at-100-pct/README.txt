@@ -1,5 +1,9 @@
 Fixture: real, live-cluster snapshot showing the false-100% PROGRESS case
-(see PROGRESS_100_NOTE / progress_reads_100 in shared.py).
+of Ceph's misplaced counters. It predates 'save-state' capturing backfill
+positions, so a replay shows counter-based PROGRESS, marked '~' (see
+PROGRESS_APPROX_NOTE in shared.py). See
+../ceph1-resumed-backfills-exact-progress for the cause, and a capture
+with positions.
 
 Captured: 2026-09-22, cluster ceph1, 17.2.5 (quincy), while host ceph1-28
 (host28 after anonymization, 26 OSDs) was being rebalanced off of: it was the
@@ -34,6 +38,6 @@ with the same two rows still at 100%: this can persist far longer than the
 "reads 100%, about to finish" case the heuristic was written for.
 
 tests/pg-osd/test_show_backfill.py replays this snapshot with --load-state and
-checks that PROGRESS_100_NOTE is printed and that 27.126's two rows still read
-literal 100%; tests/pg-osd/test_backfillctl.py uses it as a real --load-state
+checks that PROGRESS_APPROX_NOTE is printed and that 27.126's two rows read
+100% from the counters (not exact); tests/pg-osd/test_backfillctl.py uses it as a real --load-state
 directory for the dispatcher.

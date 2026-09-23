@@ -27,12 +27,20 @@ for path in (REPO_ROOT, BACKFILLCTL_DIR):
 import placement
 import shared
 
+# A live (non --load-state) run queries each shown PG's backfill position
+# with 'ceph pg query', over librados or the ceph CLI. No test may reach a real
+# cluster, so that is stubbed out for every test to "no positions" (progress
+# from Ceph's counters). Tests of the query itself use the saved original.
+real_query_backfill_positions = shared.query_backfill_positions
+shared.query_backfill_positions = lambda pgids: {}
+
 __all__ = [
     "REPO_ROOT",
     "FakeStore",
     "parse_args",
     "placement",
     "plan_from_state",
+    "real_query_backfill_positions",
     "shared",
 ]
 

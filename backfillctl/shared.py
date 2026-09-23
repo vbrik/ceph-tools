@@ -4,7 +4,8 @@
 Not a script itself: the others import it (`from shared import ...`), so it
 has to sit next to them. Five groups of things live here:
 
-* OSD-slot helpers and PG arithmetic (progress, copies in flight, shard size);
+* OSD-slot helpers and PG arithmetic (progress, copies in flight, shard size),
+  including reading a backfill's position out of 'ceph pg query';
 * reading cluster state, live or from a saved snapshot (`SnapshotStore`), the
   global `--load-state` flag built on it, and the anonymizer (used by the
   `save-state` subcommand) that makes a saved snapshot safe to share;
@@ -21,13 +22,15 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
 import sys
 import textwrap
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
@@ -203,10 +206,8 @@ def pg_progress_pct(pg: dict, n_copies: int) -> float | None:
     the work was done. An object-count approximation, not byte-exact: it
     assumes objects are of similar size. None if the PG has no objects.
 
-    Can read 100% while the PG is still listed as moving (up != acting):
-    these counters are Ceph's own estimate and can hit zero before the
-    backfill scan itself actually finishes, especially on a very large or
-    contended PG. See PROGRESS_100_NOTE.
+    Unreliable for backfills: see PROGRESS_APPROX_NOTE. pg_progress prefers
+    the backfill position (backfill_progress_pct) and falls back on this.
     """
     stat_sum = pg.get("stat_sum", {})
     total = stat_sum.get("num_objects", 0) * n_copies
@@ -220,28 +221,203 @@ def pg_progress_pct(pg: dict, n_copies: int) -> float | None:
     return max(0.0, min(100.0, 100.0 * (1 - remaining / total)))
 
 
-def progress_reads_100(pct: float | None) -> bool:
-    """True when pg_progress_pct's return value displays as '100%'.
+# Backfill position
+# -----------------
+# Backfill copies a PG's objects in hobject sort order, which starts with a
+# 32-bit key: the bit-reversed object-name hash. Each backfill target's
+# 'last_backfill' ('ceph pg <pgid> query' -> peer_info[]) is how far along
+# that order it is, printed as 'POOL:KEY:...' (MIN before it starts, MAX
+# once done). Hashes are uniform, so the share of the PG's key range behind
+# the position is the share of its objects already copied. Unlike the
+# misplaced counter it can't be thrown off by what the target reports about
+# itself after re-peering (see PROGRESS_APPROX_NOTE).
 
-    Centralized so every script that prints PROGRESS decides, the same way,
-    whether to print PROGRESS_100_NOTE.
+
+def pg_hash_bits(seed: int, pg_num: int) -> int:
+    """Return how many low bits of an object's hash are fixed for PG seed.
+
+    Mirrors ceph_stable_mod(hash, pg_num, mask), mask = 2^n - 1 with n the
+    bit length of pg_num - 1: a hash maps to (hash & mask) if that is below
+    pg_num, else to (hash & mask >> 1). With pg_num a power of two every PG
+    fixes all n bits. Otherwise a PG below 2^(n-1) whose sibling
+    seed + 2^(n-1) does not exist also takes that sibling's hashes, so it
+    fixes only n - 1 bits and covers twice the key range.
     """
-    return pct == 100.0
+    n = (pg_num - 1).bit_length()
+    half = 1 << (n - 1) if n else 0
+    if n and seed < half and seed + half >= pg_num:
+        return n - 1
+    return n
 
 
-# Printed once by a subcommand when any row's PROGRESS reads 100% (see
-# progress_reads_100). Kept in one place so the wording can't drift between
-# show-backfill, show-pg-osds and cancel-backfill. No leading
-# newline/hard-wrapping: each caller adds its own paragraph spacing and either
-# prints this as-is (fixed-width footnote style) or hands it to a wrapper that
-# reflows it (textwrap.fill treats the embedded newlines as plain whitespace).
-PROGRESS_100_NOTE = (
-    "PROGRESS reads 100% once Ceph's own misplaced/degraded object counters "
-    "hit zero\nfor the PG — not proof it has actually finished (it's still "
-    "listed here because\nup != acting). On a very large or heavily contended "
-    "PG those counters can read\ncomplete well before the backfill scan itself "
-    "finishes, so 100% can persist for a\nwhile; it does not by itself mean "
-    "anything is stuck."
+def normalize_last_backfill(last_backfill: str) -> str | None:
+    """Reduce a 'last_backfill' hobject to 'MIN', 'MAX' or its hex sort key.
+
+    The object name is dropped: the key is all backfill_fraction needs, and
+    it keeps object names out of 'save-state' captures. None if unparsable.
+    """
+    if last_backfill in ("MIN", "MAX"):
+        return last_backfill
+    parts = last_backfill.split(":")
+    if len(parts) < 2 or not re.fullmatch(r"[0-9A-Fa-f]{1,8}", parts[1]):
+        return None
+    return parts[1].lower()
+
+
+def backfill_fraction(position: str, seed: int, pg_num: int) -> float | None:
+    """Return the share (0..1) of PG seed's objects before a backfill position.
+
+    position is normalize_last_backfill's output. None when the key does not
+    belong to the PG (a pg_num change since, or a malformed value), so a
+    caller never shows a figure computed against the wrong range.
+    """
+    if position == "MIN":
+        return 0.0
+    if position == "MAX":
+        return 1.0
+    key = int(position, 16)
+    bits = pg_hash_bits(seed, pg_num)
+    # The key is the hash bit-reversed, so its top `bits` bits are the
+    # hash's fixed low bits, reversed; the rest is the position in the PG.
+    hash_low = int(f"{key >> (32 - bits):0{bits}b}"[::-1], 2) if bits else 0
+    if hash_low != seed & ((1 << bits) - 1):
+        return None
+    span = 1 << (32 - bits)
+    return (key & (span - 1)) / span
+
+
+def backfill_target_peers(up: list, acting: list, is_ec: bool) -> list[str]:
+    """Return the backfill targets of a PG as 'ceph pg query' names its peers.
+
+    'OSD(SHARD)' for each EC shard moving to a new OSD, plain 'OSD' for each
+    OSD a replicated PG is moving to.
+    """
+    if is_ec:
+        return [f"{dst}({i})" for i, _, dst in ec_shard_moves(up, acting)]
+    return [str(o) for o in sorted(real_osd_set(up) - real_osd_set(acting))]
+
+
+def extract_backfill_positions(query: dict) -> dict[str, str]:
+    """Return {peer: position} for the backfill targets in a 'ceph pg query'.
+
+    Peers are named as in backfill_target_peers, positions normalized (see
+    normalize_last_backfill). Only the query's own backfill targets are kept:
+    peer_info also lists stray OSDs from earlier mappings.
+    """
+    up, acting = query.get("up", []), query.get("acting", [])
+    positions = {}
+    for info in query.get("peer_info", []):
+        peer = str(info.get("peer", ""))
+        match = re.fullmatch(r"(\d+)(?:\((\d+)\))?", peer)
+        if match is None:
+            continue
+        osd = int(match[1])
+        if match[2] is not None:
+            shard = int(match[2])
+            is_target = slot(up, shard) == osd and slot(acting, shard) != osd
+        else:
+            is_target = osd in real_osd_set(up) - real_osd_set(acting)
+        position = normalize_last_backfill(info.get("last_backfill", ""))
+        if is_target and position is not None:
+            positions[peer] = position
+    return positions
+
+
+def target_peer(osd: int, shard: "int | str") -> str:
+    """Name a backfill target as 'ceph pg query' names the peer.
+
+    'OSD(SHARD)' for an EC shard (shard an int), plain 'OSD' for a replica
+    (shard '-', as rows of replicated pools have it).
+    """
+    return f"{osd}({shard})" if isinstance(shard, int) else str(osd)
+
+
+def target_progress_pct(
+    pgid: str, pool: dict | None, position: str | None
+) -> float | None:
+    """Return % of a PG's objects one backfill target has already been sent.
+
+    None if the position is missing or doesn't fit the PG (see
+    backfill_fraction), or the pool or its pg_num is unknown.
+    """
+    pg_num = pool.get("pg_num") if pool else None
+    if not pg_num or position is None:
+        return None
+    fraction = backfill_fraction(position, int(pgid.split(".")[1], 16), pg_num)
+    return None if fraction is None else 100.0 * fraction
+
+
+class Progress(NamedTuple):
+    """Movement progress, and where it came from."""
+
+    pct: float | None  # None: PG has no objects, or pool unknown
+    exact: bool  # from backfill positions; False: from Ceph's counters
+
+
+def counter_progress(pg: dict, pool: dict | None) -> Progress:
+    """Return the PG's progress by Ceph's misplaced/degraded counters.
+
+    A per-PG figure (all moving copies together): the counters have no
+    per-shard breakdown.
+    """
+    n_copies = copies_moving(
+        pg["up"], pg["acting"], is_erasure(pool), pool.get("size", 0) if pool else 0
+    )
+    return Progress(pg_progress_pct(pg, n_copies), False)
+
+
+def copy_progress(
+    pg: dict, pool: dict | None, positions: dict[str, str], peer: str
+) -> Progress:
+    """Return how far one moving copy (EC shard or replica) of a PG is.
+
+    peer is the copy's backfill target (see target_peer), positions the PG's
+    {peer: position} (see extract_backfill_positions), empty if unknown.
+    Without a usable position for peer, falls back on the PG's counters
+    (counter_progress), which are per PG, not per copy.
+    """
+    pct = target_progress_pct(pg["pgid"], pool, positions.get(peer))
+    return counter_progress(pg, pool) if pct is None else Progress(pct, True)
+
+
+def pg_progress(pg: dict, pool: dict | None, positions: dict[str, str]) -> Progress:
+    """Return how far a PG's movement is as a whole, from its backfill positions if possible.
+
+    The targets' progress (target_progress_pct) averaged, each counting equally:
+    the same copy units as pg_progress_pct's. Used when every moving copy is a
+    backfill target with a usable position. Otherwise, e.g. with an EC shard
+    that has no OSD to go to yet, a failed query or an old --load-state
+    capture, falls back on the counters (counter_progress).
+    """
+    is_ec = is_erasure(pool)
+    up, acting = pg["up"], pg["acting"]
+    n_copies = copies_moving(up, acting, is_ec, pool.get("size", 0) if pool else 0)
+    targets = backfill_target_peers(up, acting, is_ec)
+    if targets and len(targets) == n_copies:
+        pcts = [
+            target_progress_pct(pg["pgid"], pool, positions.get(t)) for t in targets
+        ]
+        if None not in pcts:
+            return Progress(sum(pcts) / len(pcts), True)
+    return counter_progress(pg, pool)
+
+
+# Printed once by a subcommand when any PROGRESS figure comes from Ceph's
+# counters (a Progress with exact False, shown with a '~' by format_progress).
+# Kept in one place so the wording can't drift between subcommands. No
+# leading newline/hard-wrapping: each caller adds its own paragraph spacing
+# and either prints this as-is (fixed-width footnote style) or hands it to a
+# wrapper that reflows it (textwrap.fill treats the embedded newlines as
+# plain whitespace).
+PROGRESS_APPROX_NOTE = (
+    "~ marks PROGRESS from Ceph's misplaced/degraded object counters, used "
+    "where a PG's\nbackfill positions could not be read ('ceph pg query' "
+    "failed, or a --load-state\ncapture without backfill_positions.json) or "
+    "do not cover all of its moving\ncopies (e.g. an EC shard with no OSD to "
+    "go to yet). Those counters miss most of\nthe work left on a backfill "
+    "that resumed after re-peering, so a ~ figure can\nread far too high, "
+    "even ~100% for a backfill that is only a third done. It\nis per PG: "
+    "every moving shard of the PG shows the same ~ figure."
 )
 
 
@@ -332,6 +508,130 @@ class SnapshotStore:
             (self.save_dir / f"{key}.json").write_text(
                 json.dumps(obj, separators=(",", ":"))
             )
+
+
+# Where 'save-state' writes, and --load-state reads, {pgid: {peer: position}}
+# (see extract_backfill_positions) for every remapped PG.
+BACKFILL_POSITIONS_FILE = "backfill_positions.json"
+
+# Per-PG 'pg query' timeout (seconds): an unresponsive primary must not hang
+# the run; that PG just falls back on the counters.
+PG_QUERY_TIMEOUT = 30
+
+# Concurrent 'pg query' requests over one librados connection. Each is a
+# round trip to the PG's primary, so this is about latency, not CPU.
+RADOS_QUERY_THREADS = 16
+
+
+def _positions_from_output(output: str | bytes) -> dict[str, str] | None:
+    """Parse one 'ceph pg query' output into positions; None if it isn't one."""
+    try:
+        query = json.loads(output)
+    except ValueError:  # JSONDecodeError, or undecodable bytes
+        return None
+    return extract_backfill_positions(query) if isinstance(query, dict) else None
+
+
+def _query_positions_rados(rados, pgids: list[str]) -> dict[str, dict[str, str] | None]:
+    """Query PGs over one librados connection, a few at a time.
+
+    rados is the 'rados' module. Returns {pgid: positions, or None if that
+    PG's query failed}. Raises rados.Error if the cluster can't be reached
+    this way, for the caller to fall back on the CLI.
+    """
+    cluster = rados.Rados(conffile="")  # "": ceph's default config search
+    cluster.conf_parse_env()  # honor CEPH_ARGS, like the ceph CLI
+    cluster.connect(timeout=PG_QUERY_TIMEOUT)
+    try:
+
+        def query(pgid: str) -> dict[str, str] | None:
+            cmd = json.dumps({"prefix": "query", "pgid": pgid, "format": "json"})
+            try:
+                ret, out, _ = cluster.pg_command(pgid, cmd, b"", PG_QUERY_TIMEOUT)
+            except rados.Error:
+                return None
+            return _positions_from_output(out) if ret == 0 else None
+
+        with ThreadPoolExecutor(RADOS_QUERY_THREADS) as pool:
+            return dict(zip(pgids, pool.map(query, pgids)))
+    finally:
+        cluster.shutdown()
+
+
+def _query_positions_cli(pgids: list[str]) -> dict[str, dict[str, str] | None]:
+    """Query PGs with one 'ceph pg <pgid> query' process each, run in parallel.
+
+    Slower and far more CPU-hungry than librados (each process pays the
+    ceph CLI's startup), but needs nothing beyond the ceph binary.
+    """
+
+    def query(pgid: str) -> dict[str, str] | None:
+        cmd = ["ceph", "pg", pgid, "query", "--format", "json"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=PG_QUERY_TIMEOUT,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+        if proc.returncode != 0:
+            return None
+        return _positions_from_output(proc.stdout)
+
+    with ThreadPoolExecutor(max(8, 2 * (os.cpu_count() or 1))) as pool:
+        return dict(zip(pgids, pool.map(query, pgids)))
+
+
+def query_backfill_positions(pgids: Iterable[str]) -> dict[str, dict[str, str]]:
+    """Return {pgid: {peer: position}} for pgids, queried from the live cluster.
+
+    Uses librados (the 'rados' Python module) when available, else parallel
+    ceph CLI calls. A PG whose query fails is left out, so its progress falls
+    back on the counters; how many failed is noted on stderr.
+    """
+    pgids = sorted(set(pgids), key=pgid_sort_key)
+    if not pgids:
+        return {}
+    try:
+        import rados  # optional: the CLI fallback needs nothing extra
+    except ImportError:
+        rados = None
+    results = None
+    if rados is not None:
+        try:
+            results = _query_positions_rados(rados, pgids)
+        except rados.Error:
+            pass  # e.g. no keyring readable by librados; try the CLI
+    if results is None:
+        results = _query_positions_cli(pgids)
+    failed = [pgid for pgid, positions in results.items() if positions is None]
+    if failed:
+        stderr_para(
+            f"NOTE: 'ceph pg query' failed for {len(failed)} of {len(pgids)} "
+            f"PG(s) ({', '.join(failed[:5])}{', ...' if len(failed) > 5 else ''}); "
+            "their PROGRESS comes from Ceph's counters (marked '~')."
+        )
+    return {pgid: p for pgid, p in results.items() if p is not None}
+
+
+def fetch_backfill_positions(
+    store: "SnapshotStore", pgids: Iterable[str]
+) -> dict[str, dict[str, str]]:
+    """Return {pgid: {peer: position}} for pgids, live or from a snapshot.
+
+    With --load-state, read from BACKFILL_POSITIONS_FILE; a capture made
+    before 'save-state' wrote it yields {} (every PG on the counters).
+    """
+    if store.load_dir is None:
+        return query_backfill_positions(pgids)
+    try:
+        saved = json.loads((Path(store.load_dir) / BACKFILL_POSITIONS_FILE).read_text())
+    except FileNotFoundError:
+        return {}
+    return {pgid: saved[pgid] for pgid in pgids if pgid in saved}
 
 
 def resolve_save_dir(path: str) -> Path:
@@ -612,9 +912,15 @@ def format_utilization(osd_df: dict[int, dict], osd_id: int | None) -> str:
     return f"{util:.1f}%" if util is not None else "?"
 
 
-def format_progress(pct: float | None) -> str:
-    """Format a progress percentage, floored so a PG still moving never reads '100%'."""
-    return NOT_APPLICABLE if pct is None else f"{math.floor(pct)}%"
+def format_progress(pct: float | None, exact: bool = True) -> str:
+    """Format a progress percentage, floored so only finished copying reads '100%'.
+
+    A figure from Ceph's counters (exact False, see Progress) gets a '~'
+    prefix, explained by PROGRESS_APPROX_NOTE.
+    """
+    if pct is None:
+        return NOT_APPLICABLE
+    return f"{'' if exact else '~'}{math.floor(pct)}%"
 
 
 # Short forms of PG state flags for table cells; unknown flags pass through.
@@ -793,12 +1099,44 @@ class Cancellation(NamedTuple):
     acting_osd: int  # where it is now: the 'to'
     size_bytes: int | None  # estimated, None if unknown
     state: str
-    progress_pct: float | None  # of the whole PG's movement, not this shard's
+    progress_pct: float | None  # of this shard's move (see copy_progress)
     companion_of: "int | str | None" = None  # the requested shard this one is
     # pinned along with (see close_pins), None if requested directly
     blocker_util: float | None = None  # cancel-backfill's --pin-blockers only:
     # set when this shard's target OSD would reach backfillfull_ratio (percent
     # it would be at), i.e. it is a blocker. Always None for cancel-uphill.
+    progress_exact: bool = False  # progress_pct is from backfill positions,
+    # not Ceph's counters (see with_exact_progress)
+
+
+def with_exact_progress(
+    store: SnapshotStore,
+    cancellations: list[Cancellation],
+    pg_stats: list[dict],
+    pools: dict[int, dict],
+) -> list[Cancellation]:
+    """Return cancellations with each shard's own progress where possible.
+
+    Planning fills progress_pct from Ceph's per-PG counters (pg_progress_pct),
+    which needs no queries; this then queries the backfill positions of only
+    the PGs actually proposed and replaces each shard's figure with its own
+    (copy_progress), keeping the counters where a position is missing.
+    """
+    pgids = {c.pgid for c in cancellations}
+    pgs = {pg["pgid"]: pg for pg in pg_stats if pg["pgid"] in pgids}
+    positions = fetch_backfill_positions(store, pgs)
+    result = []
+    for c in cancellations:
+        progress = copy_progress(
+            pgs[c.pgid],
+            pools.get(pgid_pool_id(c.pgid)),
+            positions.get(c.pgid, {}),
+            target_peer(c.up_osd, c.shard),
+        )
+        result.append(
+            c._replace(progress_pct=progress.pct, progress_exact=progress.exact)
+        )
+    return result
 
 
 class Skipped(NamedTuple):
@@ -1021,7 +1359,7 @@ def format_row(
         *osd_cells(osd_df, osd_host, c.acting_osd),
         *osd_cells(osd_df, osd_host, c.up_osd),
         format_bytes(c.size_bytes),
-        format_progress(c.progress_pct),
+        format_progress(c.progress_pct, c.progress_exact),
         abbreviate_state(c.state),
         format_note(c),
     ]

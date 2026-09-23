@@ -4,7 +4,9 @@ The risky parts: the progress denominator (num_objects_misplaced and
 num_objects_degraded are counted in copy units, so a PG moving k copies starts
 at k * num_objects; dividing by num_objects alone reads 0% until more than 1/k
 of the work is done, which looks like a plausible "hasn't started" rather than
-an obvious failure), the EC/replicated slot counting that feeds it, and the
+an obvious failure), the EC/replicated slot counting that feeds it, turning a
+backfill position into a share of the PG (checked against a model of Ceph's
+ceph_stable_mod, including for pg_num that is not a power of two), and the
 snapshot layer whose saved output must be safe to share and loadable again.
 """
 
@@ -13,12 +15,14 @@ import contextlib
 import io
 import json
 import pathlib
+import random
+import sys
 import tempfile
 import unittest
 from typing import ClassVar
 from unittest import mock
 
-from _support import FakeStore, shared
+from _support import FakeStore, real_query_backfill_positions, shared
 
 NONE = shared.CRUSH_ITEM_NONE
 
@@ -132,12 +136,399 @@ class ProgressTest(unittest.TestCase):
         self.assertIsNone(shared.pg_progress_pct({}, 1))
 
 
-class ProgressReads100Test(unittest.TestCase):
-    def test_only_exact_100_reads_as_100(self):
-        self.assertTrue(shared.progress_reads_100(100.0))
-        self.assertFalse(shared.progress_reads_100(99.9))
-        self.assertFalse(shared.progress_reads_100(0.0))
-        self.assertFalse(shared.progress_reads_100(None))
+def stable_mod(x: int, pg_num: int) -> int:
+    """Model of Ceph's ceph_stable_mod(x, pg_num, pg_num_mask): object hash -> PG seed."""
+    mask = (1 << (pg_num - 1).bit_length()) - 1
+    return x & mask if (x & mask) < pg_num else x & (mask >> 1)
+
+
+def sort_key(hash32: int) -> int:
+    """The hobject sort key a backfill position prints: the hash bit-reversed."""
+    return int(f"{hash32:032b}"[::-1], 2)
+
+
+# Power-of-two and not, including the degenerate 1 and 2.
+PG_NUMS = (1, 2, 3, 5, 8, 12, 13, 64, 100, 512, 1000)
+
+
+class PgHashBitsTest(unittest.TestCase):
+    def test_power_of_two_fixes_all_bits_for_every_pg(self):
+        self.assertEqual({9}, {shared.pg_hash_bits(s, 512) for s in range(512)})
+
+    def test_pg_without_a_sibling_fixes_one_bit_less(self):
+        # pg_num 12: seeds 4-7 have no seed + 8 sibling (12-15 don't exist),
+        # so each also takes those hashes and covers twice the key range.
+        bits = [shared.pg_hash_bits(s, 12) for s in range(12)]
+        self.assertEqual([4] * 4 + [3] * 4 + [4] * 4, bits)
+
+    def test_single_pg_fixes_nothing(self):
+        self.assertEqual(0, shared.pg_hash_bits(0, 1))
+
+    def test_matches_ceph_stable_mod(self):
+        # A PG gets exactly the hashes whose low pg_hash_bits bits are its seed's.
+        for pg_num in PG_NUMS:
+            n = (pg_num - 1).bit_length()
+            for seed in range(pg_num):
+                with self.subTest(pg_num=pg_num, seed=seed):
+                    bits = shared.pg_hash_bits(seed, pg_num)
+                    low = (1 << bits) - 1
+                    self.assertEqual(
+                        {h for h in range(1 << n) if stable_mod(h, pg_num) == seed},
+                        {h for h in range(1 << n) if h & low == seed & low},
+                    )
+
+
+class BackfillPositionTest(unittest.TestCase):
+    def test_normalize(self):
+        norm = shared.normalize_last_backfill
+        self.assertEqual("MIN", norm("MIN"))
+        self.assertEqual("MAX", norm("MAX"))
+        self.assertEqual("b87d166c", norm("18:b87d166c:::eceaf007.36421.651:head"))
+        self.assertEqual("b87d166c", norm("18:B87D166C:::x:head"))
+        self.assertIsNone(norm("18:zz:::x:head"))
+        self.assertIsNone(norm("garbage"))
+        self.assertIsNone(norm(""))
+
+    def test_min_and_max(self):
+        self.assertEqual(0.0, shared.backfill_fraction("MIN", 5, 12))
+        self.assertEqual(1.0, shared.backfill_fraction("MAX", 5, 12))
+
+    def test_real_positions(self):
+        # Read off ceph1 (pool 18: pg_num 512), where PG 18.0's misplaced
+        # counter agreed (2.9%) and 18.1d's read 0 (see the resumed-backfills
+        # fixture's README.txt).
+        self.assertAlmostEqual(0.0296, shared.backfill_fraction("0003c84c", 0, 512), 4)
+        self.assertAlmostEqual(
+            0.977, shared.backfill_fraction("b87d166c", 0x1D, 512), 3
+        )
+
+    def test_key_of_another_pg_is_rejected(self):
+        # 18.1d's position, read against a different seed or pg_num.
+        self.assertIsNone(shared.backfill_fraction("b87d166c", 0x1C, 512))
+        self.assertIsNone(shared.backfill_fraction("b87d166c", 0x1D, 1024))
+
+    def test_fraction_is_share_of_the_pgs_objects_before_the_position(self):
+        # Scatter objects over the hash space, and check that the share of a
+        # PG's objects whose sort key is below a position is what
+        # backfill_fraction says, for PGs with and without a sibling. Small
+        # pg_nums only, so every PG gets thousands of objects; the tolerance
+        # is 4 standard deviations of that sampling.
+        rng = random.Random(42)
+        hashes = [rng.getrandbits(32) for _ in range(40_000)]
+        for pg_num in (p for p in PG_NUMS if p <= 16):
+            for seed in range(pg_num):
+                keys = sorted(
+                    sort_key(h) for h in hashes if stable_mod(h, pg_num) == seed
+                )
+                delta = 4 * (0.25 / len(keys)) ** 0.5
+                with self.subTest(pg_num=pg_num, seed=seed):
+                    for i in (len(keys) // 10, len(keys) // 2, 9 * len(keys) // 10):
+                        frac = shared.backfill_fraction(f"{keys[i]:08x}", seed, pg_num)
+                        self.assertAlmostEqual(i / len(keys), frac, delta=delta)
+
+    def test_every_key_of_the_pg_fits_including_the_siblingless_half(self):
+        # pg_num 12, seed 5: hashes ending in 0101 or (sibling 13 missing) 1101.
+        for low4 in (0b0101, 0b1101):
+            key = sort_key(0xABCDE000 | low4)
+            self.assertIsNotNone(shared.backfill_fraction(f"{key:08x}", 5, 12))
+
+
+def query(up, acting, peers):
+    """A 'ceph pg query' with peer_info for (peer, last_backfill) pairs."""
+    return {
+        "up": up,
+        "acting": acting,
+        "peer_info": [{"peer": p, "last_backfill": lb} for p, lb in peers],
+    }
+
+
+class ExtractBackfillPositionsTest(unittest.TestCase):
+    def test_ec_keeps_only_the_targets(self):
+        q = query(
+            [1, 5, 3],
+            [1, 2, 3],
+            [
+                ("1(0)", "MAX"),  # acting, not moving
+                ("2(1)", "MAX"),  # source
+                ("5(1)", "18:8000abcd:::obj:head"),  # the target
+                ("9(1)", "18:1000abcd:::obj:head"),  # stray from an older mapping
+                ("3(2)", "MAX"),
+            ],
+        )
+        self.assertEqual({"5(1)": "8000abcd"}, shared.extract_backfill_positions(q))
+
+    def test_ec_same_osd_in_another_shard_is_not_a_target(self):
+        # OSD 5 is in up at shard 1, but this peer entry is its shard 2.
+        q = query([1, 5, 3], [1, 2, 3], [("5(2)", "MIN")])
+        self.assertEqual({}, shared.extract_backfill_positions(q))
+
+    def test_replicated(self):
+        q = query([1, 4], [1, 2], [("1", "MAX"), ("2", "MAX"), ("4", "MIN")])
+        self.assertEqual({"4": "MIN"}, shared.extract_backfill_positions(q))
+
+    def test_unparsable_entries_are_skipped(self):
+        q = query([1, 4], [1, 2], [("4", "garbage"), ("osd.4", "MIN")])
+        self.assertEqual({}, shared.extract_backfill_positions(q))
+        self.assertEqual({}, shared.extract_backfill_positions({}))
+
+    def test_target_peers_named_like_pg_query(self):
+        self.assertEqual(
+            ["5(1)", "7(3)"],
+            shared.backfill_target_peers([1, 5, 3, 7], [1, 2, 3, NONE], True),
+        )
+        self.assertEqual(
+            ["4", "6"], shared.backfill_target_peers([6, 1, 4], [1, 2], False)
+        )
+
+
+class PgProgressTest(unittest.TestCase):
+    EC = {"type": shared.POOL_TYPE_ERASURE, "size": 3, "pg_num": 16}  # noqa: RUF012
+    REP = {"type": 1, "size": 2, "pg_num": 16}  # noqa: RUF012
+
+    @staticmethod
+    def pg(up, acting, pgid="1.3", misplaced=0):
+        return {
+            "pgid": pgid,
+            "up": up,
+            "acting": acting,
+            "stat_sum": {"num_objects": 100, "num_objects_misplaced": misplaced},
+        }
+
+    @staticmethod
+    def key(seed, pg_num, frac):
+        """The position frac of the way through PG seed's key range."""
+        bits = shared.pg_hash_bits(seed, pg_num)
+        top = int(f"{seed & ((1 << bits) - 1):0{bits}b}"[::-1], 2) if bits else 0
+        span = 1 << (32 - bits)
+        return f"{(top << (32 - bits)) | int(frac * span):08x}"
+
+    def test_positions_average_over_targets(self):
+        # The counters say done; the positions say 25% and 75%.
+        pg = self.pg([4, 5, 3], [1, 2, 3])
+        positions = {"4(0)": self.key(3, 16, 0.25), "5(1)": self.key(3, 16, 0.75)}
+        progress = shared.pg_progress(pg, self.EC, positions)
+        self.assertTrue(progress.exact)
+        self.assertAlmostEqual(50.0, progress.pct, 3)
+
+    def test_finished_target_counts_as_done(self):
+        pg = self.pg([4, 5, 3], [1, 2, 3], misplaced=200)
+        progress = shared.pg_progress(pg, self.EC, {"4(0)": "MAX", "5(1)": "MIN"})
+        self.assertEqual(shared.Progress(50.0, True), progress)
+
+    def test_replicated(self):
+        pg = self.pg([1, 4], [1, 2])
+        progress = shared.pg_progress(pg, self.REP, {"4": self.key(3, 16, 0.5)})
+        self.assertTrue(progress.exact)
+        self.assertAlmostEqual(50.0, progress.pct, 3)
+
+    def test_falls_back_on_counters(self):
+        pg = self.pg([4, 5, 3], [1, 2, 3], misplaced=50)  # 75% by the counters
+        counters = shared.Progress(75.0, False)
+        cases = {
+            "no positions": (self.EC, {}),
+            "a target without one": (self.EC, {"4(0)": "MIN"}),
+            "a position of another PG": (
+                self.EC,
+                {"4(0)": "MIN", "5(1)": self.key(2, 16, 0.5)},
+            ),
+            "unknown pool": (None, {"4(0)": "MIN", "5(1)": "MIN"}),
+            "unknown pg_num": (
+                {"type": shared.POOL_TYPE_ERASURE, "size": 3},
+                {"4(0)": "MIN", "5(1)": "MIN"},
+            ),
+        }
+        for name, (pool, positions) in cases.items():
+            with self.subTest(name):
+                # With the pool unknown, EC shards are diffed as replicas: the
+                # counters then give a different, still counter-based, figure.
+                progress = shared.pg_progress(pg, pool, positions)
+                self.assertFalse(progress.exact)
+                if pool is not None:
+                    self.assertEqual(counters, progress)
+
+    def test_shard_with_no_osd_yet_falls_back_on_counters(self):
+        # Shard 2 has nowhere to go: its copies are work no position covers.
+        pg = self.pg([4, 1, NONE], [1, 2, NONE])
+        pg["up"], pg["acting"] = [4, 2, NONE], [1, 2, NONE]
+        progress = shared.pg_progress(pg, self.EC, {"4(0)": "MAX"})
+        self.assertFalse(progress.exact)
+
+
+class CopyProgressTest(unittest.TestCase):
+    """One moving copy's own progress (EC shard or replica)."""
+
+    EC = PgProgressTest.EC
+    REP = PgProgressTest.REP
+    key = staticmethod(PgProgressTest.key)
+
+    def test_target_peer(self):
+        self.assertEqual("5(1)", shared.target_peer(5, 1))
+        self.assertEqual("5(0)", shared.target_peer(5, 0))
+        self.assertEqual("5", shared.target_peer(5, "-"))
+
+    def test_each_shard_its_own(self):
+        pg = PgProgressTest.pg([4, 5, 3], [1, 2, 3])
+        positions = {"4(0)": self.key(3, 16, 0.9), "5(1)": self.key(3, 16, 0.1)}
+        pcts = [
+            shared.copy_progress(pg, self.EC, positions, peer).pct
+            for peer in ("4(0)", "5(1)")
+        ]
+        self.assertAlmostEqual(90.0, pcts[0], 3)
+        self.assertAlmostEqual(10.0, pcts[1], 3)
+
+    def test_replica(self):
+        pg = PgProgressTest.pg([1, 4], [1, 2])
+        progress = shared.copy_progress(pg, self.REP, {"4": "MAX"}, "4")
+        self.assertEqual(shared.Progress(100.0, True), progress)
+
+    def test_shard_beside_one_with_no_osd_yet(self):
+        # pg_progress can't cover shard 2 (nowhere to go), but shard 0 has a
+        # position of its own.
+        pg = PgProgressTest.pg([4, 2, NONE], [1, 2, NONE])
+        progress = shared.copy_progress(pg, self.EC, {"4(0)": "MIN"}, "4(0)")
+        self.assertEqual(shared.Progress(0.0, True), progress)
+        self.assertFalse(shared.pg_progress(pg, self.EC, {"4(0)": "MIN"}).exact)
+
+    def test_falls_back_on_the_pgs_counters(self):
+        pg = PgProgressTest.pg([4, 5, 3], [1, 2, 3], misplaced=50)  # 75% by them
+        counters = shared.Progress(75.0, False)
+        self.assertEqual(counters, shared.counter_progress(pg, self.EC))
+        cases = {
+            "no position": (self.EC, {"5(1)": "MIN"}),
+            "a position of another PG": (self.EC, {"4(0)": self.key(2, 16, 0.5)}),
+            "unknown pg_num": (
+                {"type": shared.POOL_TYPE_ERASURE, "size": 3},
+                {"4(0)": "MIN"},
+            ),
+        }
+        for name, (pool, positions) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(
+                    counters, shared.copy_progress(pg, pool, positions, "4(0)")
+                )
+
+
+class WithExactProgressTest(unittest.TestCase):
+    """cancel-backfill/cancel-uphill's per-shard PROGRESS."""
+
+    def cancellation(self, pgid, shard, up_osd, acting_osd):
+        return shared.Cancellation(pgid, shard, up_osd, acting_osd, 0, "s", 75.0)
+
+    def test_each_cancellation_gets_its_shards_progress(self):
+        ec = PgProgressTest.pg([4, 5, 3], [1, 2, 3], misplaced=50)
+        rep = PgProgressTest.pg([1, 6], [1, 2], pgid="2.3", misplaced=50)
+        pools = {1: PgProgressTest.EC, 2: PgProgressTest.REP}
+        cancellations = [
+            self.cancellation("1.3", 0, 4, 1),
+            self.cancellation("1.3", 1, 5, 2),
+            self.cancellation("2.3", "-", 6, 2),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            pathlib.Path(tmp, shared.BACKFILL_POSITIONS_FILE).write_text(
+                json.dumps({"1.3": {"4(0)": "MAX", "5(1)": "MIN"}})
+            )
+            store = FakeStore({}, load_dir=pathlib.Path(tmp))
+            result = shared.with_exact_progress(store, cancellations, [ec, rep], pools)
+        self.assertEqual(
+            [(100.0, True), (0.0, True), (50.0, False)],
+            [(c.progress_pct, c.progress_exact) for c in result],
+        )
+
+
+class PositionsFromOutputTest(unittest.TestCase):
+    """A bad 'ceph pg query' output fails only that PG (None), not the run."""
+
+    def test_valid(self):
+        q = query([1, 4], [1, 2], [("4", "MIN")])
+        self.assertEqual({"4": "MIN"}, shared._positions_from_output(json.dumps(q)))
+        self.assertEqual(
+            {"4": "MIN"}, shared._positions_from_output(json.dumps(q).encode())
+        )
+
+    def test_invalid(self):
+        for output in ("", "not json", "[1, 2]", "null", b"\xff\xfe"):
+            with self.subTest(output=output):
+                self.assertIsNone(shared._positions_from_output(output))
+
+
+class QueryBackfillPositionsTest(unittest.TestCase):
+    """The live query, with librados and the CLI both faked."""
+
+    def run_query(self, pgids, *, rados, rados_result=None, cli_result=None):
+        """Call the real query_backfill_positions; return (result, stderr, cli mock)."""
+        err = io.StringIO()
+        cli = mock.Mock(return_value=cli_result)
+        with (
+            mock.patch.dict(sys.modules, {"rados": rados}),
+            mock.patch.object(
+                shared, "_query_positions_rados", return_value=rados_result
+            ) as via_rados,
+            mock.patch.object(shared, "_query_positions_cli", cli),
+            contextlib.redirect_stderr(err),
+        ):
+            if isinstance(rados_result, Exception):
+                via_rados.side_effect = rados_result
+            result = real_query_backfill_positions(pgids)
+        return result, err.getvalue(), cli
+
+    def fake_rados(self):
+        return type("rados", (), {"Error": type("Error", (Exception,), {})})
+
+    def test_uses_librados_when_available(self):
+        result, err, cli = self.run_query(
+            ["1.2", "1.1"],
+            rados=self.fake_rados(),
+            rados_result={"1.1": {}, "1.2": {"4": "MIN"}},
+        )
+        self.assertEqual({"1.1": {}, "1.2": {"4": "MIN"}}, result)
+        cli.assert_not_called()
+        self.assertEqual("", err)
+
+    def test_falls_back_on_the_cli_without_librados(self):
+        # None in sys.modules makes 'import rados' raise ImportError.
+        result, _, cli = self.run_query(["1.1"], rados=None, cli_result={"1.1": {}})
+        self.assertEqual({"1.1": {}}, result)
+        cli.assert_called_once_with(["1.1"])
+
+    def test_falls_back_on_the_cli_when_librados_cannot_connect(self):
+        rados = self.fake_rados()
+        result, _, cli = self.run_query(
+            ["1.1"],
+            rados=rados,
+            rados_result=rados.Error("no keyring"),
+            cli_result={"1.1": {}},
+        )
+        self.assertEqual({"1.1": {}}, result)
+        cli.assert_called_once()
+
+    def test_failed_pgs_are_left_out_and_noted(self):
+        result, err, _ = self.run_query(
+            ["1.1", "1.2"], rados=None, cli_result={"1.1": None, "1.2": {"4": "MIN"}}
+        )
+        self.assertEqual({"1.2": {"4": "MIN"}}, result)
+        self.assertIn("'ceph pg query' failed for 1 of 2 PG(s) (1.1)", err)
+
+    def test_nothing_to_query(self):
+        result, _, cli = self.run_query([], rados=None)
+        self.assertEqual({}, result)
+        cli.assert_not_called()
+
+
+class FetchBackfillPositionsTest(unittest.TestCase):
+    def test_from_a_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp, shared.BACKFILL_POSITIONS_FILE)
+            path.write_text(json.dumps({"1.1": {"4": "MIN"}, "1.2": {"5": "MAX"}}))
+            store = FakeStore({}, load_dir=pathlib.Path(tmp))
+            self.assertEqual(
+                {"1.1": {"4": "MIN"}},
+                shared.fetch_backfill_positions(store, ["1.1", "1.3"]),
+            )
+
+    def test_older_capture_without_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FakeStore({}, load_dir=pathlib.Path(tmp))
+            self.assertEqual({}, shared.fetch_backfill_positions(store, ["1.1"]))
 
 
 class EcShardMovesTest(unittest.TestCase):
@@ -344,6 +735,11 @@ class CellTest(unittest.TestCase):
         self.assertEqual(shared.format_progress(99.7), "99%")
         self.assertEqual(shared.format_progress(0.0), "0%")
         self.assertEqual(shared.format_progress(None), "-")
+
+    def test_counter_progress_is_marked_approximate(self):
+        self.assertEqual(shared.format_progress(41.9, exact=False), "~41%")
+        self.assertEqual(shared.format_progress(100.0, exact=False), "~100%")
+        self.assertEqual(shared.format_progress(None, exact=False), "-")
 
     def test_osd_cells_are_bare_ids(self):
         host = {1: "h1"}

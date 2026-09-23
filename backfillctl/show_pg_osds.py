@@ -19,7 +19,7 @@ Columns (same two-line grouped header as the divert-toofull subcommand):
   ACTING     OSD holding the shard's data now, with its UTIL and HOST
   UP         OSD CRUSH (plus upmaps) wants it on, with its UTIL and HOST
   PROGRESS   for a remapped shard (UP OSD != ACTING OSD), % of the PG's data
-             already in its target location, else '-'
+             its UP OSD has already been sent, else '-'
   UPMAPS     pg_upmap_items pairs 'from->to' whose from or to is this row's
              ACTING or UP OSD ('from' is what CRUSH chose, 'to' what is used
              instead), else '-'
@@ -35,15 +35,16 @@ Rows are built as in the show-backfill subcommand:
     identity. OSDs in both sets share a row; OSDs only in acting are paired
     (in OSD id order) with OSDs only in up.
 
-PROGRESS is estimated from the PG's object counters exactly as in the
-show-backfill subcommand (both use shared.pg_progress_pct). It is a per-PG figure, so
-every remapped row shows the same value.
+PROGRESS is each remapped row's own, as in the show-backfill subcommand
+(shared.copy_progress): from its UP OSD's backfill position in 'ceph pg
+query', falling back on Ceph's misplaced/degraded counters (marked '~'),
+which are per PG, so every such row of the PG shows the same figure.
 
 'backfillctl save-state DIR' captures a cluster's state (anonymized, and
 covering every subcommand, not just this one) into DIR; 'backfillctl
 --load-state DIR show-pg-osds PGID...' then replays it here instead of
 calling 'ceph', reading the given PGs' rows out of the capture's
-pg_dump_pgs.json.
+pg_dump_pgs.json and backfill_positions.json.
 """
 
 import argparse
@@ -53,9 +54,12 @@ from typing import NamedTuple
 
 from shared import (
     NOT_APPLICABLE,
-    PROGRESS_100_NOTE,
+    PROGRESS_APPROX_NOTE,
+    Progress,
     SnapshotStore,
-    copies_moving,
+    copy_progress,
+    extract_backfill_positions,
+    fetch_backfill_positions,
     fetch_osd_df,
     fetch_osd_hosts,
     fetch_pg_stats,
@@ -64,12 +68,11 @@ from shared import (
     format_progress,
     is_erasure,
     osd_cells,
-    pg_progress_pct,
     pgid_pool_id,
     print_table,
-    progress_reads_100,
     real_osd_set,
     slot,
+    target_peer,
 )
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces
@@ -111,7 +114,9 @@ def pg_query_key(pgid: str) -> str:
 
 
 def fetch_pg_info(store: SnapshotStore, pgid: str) -> dict:
-    """Return the PG's up/acting sets, primaries, state and counters.
+    """Return the PG's up/acting sets, primaries, state, counters and
+    backfill positions ('backfill_positions', see
+    shared.extract_backfill_positions).
 
     Live, this reads pg_query_key(pgid) (see SNAPSHOT_COMMANDS: 'ceph pg
     <pgid> query', added by run() -- one PG, not the whole cluster). From a
@@ -124,12 +129,14 @@ def fetch_pg_info(store: SnapshotStore, pgid: str) -> dict:
         try:
             stats = data.get("info", {}).get("stats", {})
             return {
+                "pgid": pgid,
                 "up": data["up"],
                 "up_primary": stats["up_primary"],
                 "acting": data["acting"],
                 "acting_primary": stats["acting_primary"],
                 "state": data["state"],
                 "stat_sum": stats.get("stat_sum", {}),
+                "backfill_positions": extract_backfill_positions(data),
             }
         except KeyError as exc:
             sys.exit(
@@ -138,12 +145,16 @@ def fetch_pg_info(store: SnapshotStore, pgid: str) -> dict:
     for pg in fetch_pg_stats(store, "pg_dump_pgs"):
         if pg["pgid"] == pgid:
             return {
+                "pgid": pgid,
                 "up": pg["up"],
                 "up_primary": pg["up_primary"],
                 "acting": pg["acting"],
                 "acting_primary": pg["acting_primary"],
                 "state": pg["state"],
                 "stat_sum": pg.get("stat_sum", {}),
+                "backfill_positions": fetch_backfill_positions(store, [pgid]).get(
+                    pgid, {}
+                ),
             }
     sys.exit(f"ERROR: PG {pgid} not found in --load-state snapshot's pg_dump_pgs.json.")
 
@@ -188,7 +199,7 @@ class PgView(NamedTuple):
     pgid: str
     pg: dict  # see fetch_pg_info
     rows: list[ShardRow]
-    progress_pct: float | None  # of the whole PG's movement, see pg_progress_pct
+    progress: list[Progress | None]  # per row: None where not remapped
     upmap_pairs: list[dict]  # the PG's pg_upmap_items pairs
 
 
@@ -220,22 +231,17 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> ShowResult:
     views = []
     for pgid, pg in pgs.items():
         pool = pools.get(pgid_pool_id(pgid))
-        erasure = is_erasure(pool)
-        pct = pg_progress_pct(
-            pg,
-            copies_moving(
-                pg["up"], pg["acting"], erasure, pool.get("size", 0) if pool else 0
-            ),
-        )
-        views.append(
-            PgView(
-                pgid,
-                pg,
-                build_rows(pg["up"], pg["acting"], erasure),
-                pct,
-                upmap_items.get(pgid, []),
+        rows = build_rows(pg["up"], pg["acting"], is_erasure(pool))
+        # Only a remapped shard has progress of its own to show.
+        progress = [
+            copy_progress(
+                pg, pool, pg["backfill_positions"], target_peer(row.up, row.shard)
             )
-        )
+            if row.remapped
+            else None
+            for row in rows
+        ]
+        views.append(PgView(pgid, pg, rows, progress, upmap_items.get(pgid, [])))
     return ShowResult(views, osd_df, osd_host)
 
 
@@ -254,17 +260,17 @@ def format_upmaps(pairs: list[dict], row: ShardRow) -> str:
 def format_row(
     row: ShardRow,
     pg: dict,
-    pct: float | None,
+    progress: Progress | None,
     osd_df: dict[int, dict],
     osd_host: dict[int, str],
     pairs: list[dict],
 ) -> list[str]:
+    """Return one table row's cells; progress is None for a row not remapped."""
     return [
         str(row.shard),
         *osd_cells(osd_df, osd_host, row.acting, pg["acting_primary"]),
         *osd_cells(osd_df, osd_host, row.up, pg["up_primary"]),
-        # Only a remapped shard has progress of its own to show.
-        format_progress(pct if row.remapped else None),
+        format_progress(*progress) if progress else format_progress(None),
         format_upmaps(pairs, row),
     ]
 
@@ -281,7 +287,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
 
 def render(result: ShowResult) -> None:
     """Print a table per PG, then the footnotes that apply to any of them."""
-    any_remapped = any_reads_100 = False
+    any_approx = False
     for i, view in enumerate(result.pgs):
         if i:
             print()
@@ -290,28 +296,17 @@ def render(result: ShowResult) -> None:
             COLUMNS,
             [
                 format_row(
-                    r,
-                    view.pg,
-                    view.progress_pct,
-                    result.osd_df,
-                    result.osd_host,
-                    view.upmap_pairs,
+                    r, view.pg, p, result.osd_df, result.osd_host, view.upmap_pairs
                 )
-                for r in view.rows
+                for r, p in zip(view.rows, view.progress, strict=True)
             ],
         )
-
-        if any(r.remapped for r in view.rows):
-            any_remapped = True
-            any_reads_100 |= progress_reads_100(view.progress_pct)
-
-    if any_remapped:
-        print(
-            "\nPROGRESS is per PG (from its object counters), not per shard: "
-            "every remapped row of a PG shows the same %."
+        any_approx |= any(
+            p is not None and p.pct is not None and not p.exact for p in view.progress
         )
-    if any_reads_100:
-        print(f"\n{PROGRESS_100_NOTE}")
+
+    if any_approx:
+        print(f"\n{PROGRESS_APPROX_NOTE}")
     print("\n* primary")
 
 

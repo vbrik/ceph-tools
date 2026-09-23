@@ -10,6 +10,11 @@ ones some subcommands ask for live -- see "Cost" below). Each subcommand's
 --load-state then reads the files it needs out of DIR, filtering pg_dump_pgs
 itself for the PGs it cares about.
 
+DIR also gets backfill_positions.json: the backfill position of each
+remapped PG's backfill targets (from one 'ceph pg <pgid> query' per PG, see
+shared.pg_progress), so a replay shows the same PROGRESS a live run would.
+Only each position's hash key is kept, not the object name it came from.
+
 DIR is created if missing and must be empty, so a capture is never partially
 overwritten by an unrelated one. The global --load-state is rejected here:
 this command exists to capture a live cluster, not to copy a capture.
@@ -36,12 +41,15 @@ when replaying a --load-state snapshot this command produced.
 """
 
 import argparse
+import json
 import sys
 
 from shared import (
+    BACKFILL_POSITIONS_FILE,
     PROGRESS_COUNTERS,
     SnapshotStore,
     extract_pg_stats,
+    query_backfill_positions,
     resolve_save_dir,
 )
 from shared import anonymize_snapshots as anonymize_common
@@ -62,7 +70,8 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 # The parts of each pg_stat entry that some subcommand reads: identity and
 # movement (show-backfill, show-pg-osds), the flags cancel-backfill and
 # divert-toofull filter on (part of 'state'), and the progress/size
-# counters (shared.pg_progress_pct, shared.shard_size_bytes).
+# counters (shared.pg_progress_pct, the fallback when a PG has no backfill
+# position, and shared.shard_size_bytes).
 KEPT_PG_STAT_KEYS = ("pgid", "state", "up", "acting", "acting_primary", "up_primary")
 KEPT_STAT_SUM_KEYS = (*PROGRESS_COUNTERS, "num_bytes")
 
@@ -132,4 +141,15 @@ def run(args: argparse.Namespace) -> None:
         SNAPSHOT_COMMANDS, save_dir=save_dir, anonymize=anonymize_snapshots
     )
     store.save()
-    print(f"Saved {len(SNAPSHOT_COMMANDS)} snapshot(s) to {save_dir}")
+    # store.json() returns the cached, un-anonymized dump store.save() read.
+    pg_stats = extract_pg_stats(store.json("pg_dump_pgs"), "ceph pg dump pgs")
+    positions = query_backfill_positions(
+        pg["pgid"] for pg in pg_stats if pg["up"] != pg["acting"]
+    )
+    (save_dir / BACKFILL_POSITIONS_FILE).write_text(
+        json.dumps(positions, separators=(",", ":"))
+    )
+    print(
+        f"Saved {len(SNAPSHOT_COMMANDS)} snapshot(s) and the backfill positions "
+        f"of {len(positions)} remapped PG(s) to {save_dir}"
+    )

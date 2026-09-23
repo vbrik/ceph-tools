@@ -5,6 +5,12 @@ Show backfills: for each PG where 'up' != 'acting', print:
   - source OSD(s): OSD(s) losing data (see Note)
   - destination OSD(s): OSD(s) gaining data
   - movement type derived from PG state flags
+  - PROGRESS: how far the row's backfill target has got (one 'ceph pg
+    query' per shown PG): an EC row's own shard (shared.copy_progress), a
+    replicated row's destinations averaged (shared.pg_progress). Marked '~'
+    where that falls back on Ceph's misplaced/degraded counters, which are
+    per PG and can read ~100% for a backfill resumed after re-peering that is
+    far from done.
   - abbreviated PG state string
 
 'up'/'acting' are diffed differently depending on pool type:
@@ -63,12 +69,13 @@ import sys
 from typing import NamedTuple
 
 from shared import (
-    PROGRESS_100_NOTE,
+    PROGRESS_APPROX_NOTE,
     PgidFilter,
     SnapshotStore,
     abbreviate_state,
-    copies_moving,
+    copy_progress,
     ec_shard_moves,
+    fetch_backfill_positions,
     fetch_osd_df,
     fetch_osd_hosts,
     fetch_pg_stats,
@@ -77,11 +84,11 @@ from shared import (
     is_erasure,
     is_real_osd,
     parse_osd,
-    pg_progress_pct,
+    pg_progress,
     pgid_pool_id,
     pgid_sort_key,
-    progress_reads_100,
     real_osd_set,
+    target_peer,
 )
 
 # Maps each snapshot to the 'ceph ... --format json' command that produces it
@@ -186,10 +193,11 @@ class MovementRow(NamedTuple):
     # counterpart source anywhere in this row (see plan() for derivation).
     # Always False for EC rows, where each row is a single shard and can't
     # mix the two cases.
-    progress_pct: "float | None"  # % of the PG's objects already in their
-    # target location, or None if the PG reports zero objects. Computed
-    # per-PG (from pg_stat.stat_sum), not per-shard — see plan() for why
-    # that matters for EC rows.
+    progress_pct: "float | None" = None  # % of the row's movement done, or
+    # None if the PG reports zero objects: an EC row's own shard, a replicated
+    # row's whole PG. Filled in by plan() after filtering, so only shown PGs
+    # are queried (see with_progress).
+    progress_exact: bool = False  # from backfill positions, not counters
 
 
 def _row_pgid_key(row: MovementRow) -> tuple:
@@ -273,7 +281,6 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
             # A->B, shard 4 separately backfilled into a previously-missing
             # slot) from being merged into one misleading multi-dest row.
             moves = ec_shard_moves(up, acting)
-            progress = pg_progress_pct(pg, copies_moving(up, acting, True, 0))
             for i, source, destination in moves:
                 sources = frozenset() if source is None else frozenset({source})
                 rows.append(
@@ -286,7 +293,6 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
                         state,
                         primary,
                         False,
-                        progress,
                     )
                 )
         else:
@@ -317,10 +323,6 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
             # no counterpart source anywhere, since a pure swap always
             # keeps sources/destinations equal in size.
             needs_primary_marker = len(destinations) > len(sources)
-            progress = pg_progress_pct(
-                pg,
-                copies_moving(up, acting, False, pool.get("size", 0) if pool else 0),
-            )
 
             rows.append(
                 MovementRow(
@@ -332,15 +334,47 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
                     state,
                     primary,
                     needs_primary_marker,
-                    progress,
                 )
             )
 
     rows, pgs_filter = filter_rows(rows, set(args.osds), set(args.pgs))
+    rows = with_progress(store, rows, pg_stats, pools)
     rows.sort(key=_SORT_KEYS[args.sort_by])
     return MovementsResult(
         rows, pgs_filter, bool(args.osds or args.pgs), osd_df, osd_host
     )
+
+
+def with_progress(
+    store: SnapshotStore,
+    rows: list[MovementRow],
+    pg_stats: list[dict],
+    pools: dict[int, dict],
+) -> list[MovementRow]:
+    """Return rows with PROGRESS filled in, querying the backfill positions of their PGs.
+
+    An EC row is one shard moving to one OSD, so it gets that shard's own
+    progress; a replicated row stands for all of its PG's moving replicas,
+    so it gets the PG's.
+    """
+    shown = {r.pgid for r in rows}
+    pgs = {pg["pgid"]: pg for pg in pg_stats if pg["pgid"] in shown}
+    positions = fetch_backfill_positions(store, pgs)
+    result = []
+    for r in rows:
+        pg, pool = pgs[r.pgid], pools.get(pgid_pool_id(r.pgid))
+        pg_positions = positions.get(r.pgid, {})
+        if isinstance(r.shard, int):
+            (destination,) = r.destinations
+            progress = copy_progress(
+                pg, pool, pg_positions, target_peer(destination, r.shard)
+            )
+        else:
+            progress = pg_progress(pg, pool, pg_positions)
+        result.append(
+            r._replace(progress_pct=progress.pct, progress_exact=progress.exact)
+        )
+    return result
 
 
 def filter_rows(
@@ -459,7 +493,8 @@ def render(result: MovementsResult) -> None:
     col_to = max(len("TO_OSD"), max(len(fmt_osds(r.destinations)) for r in rows))
     col_type = max(len("TYPE"), max(len(r.move_type) for r in rows))
     col_progress = max(
-        len("PROGRESS"), max(len(format_progress(r.progress_pct)) for r in rows)
+        len("PROGRESS"),
+        max(len(format_progress(r.progress_pct, r.progress_exact)) for r in rows),
     )
 
     def format_row(row: MovementRow) -> str:
@@ -470,7 +505,7 @@ def render(result: MovementsResult) -> None:
             f"{SEP}"
             f"{fmt_osds(row.destinations):<{col_to}}  "
             f"{row.move_type:<{col_type}}  "
-            f"{format_progress(row.progress_pct):<{col_progress}}  "
+            f"{format_progress(row.progress_pct, row.progress_exact):<{col_progress}}  "
             f"{abbreviate_state(row.state)}"
         )
 
@@ -500,16 +535,8 @@ def render(result: MovementsResult) -> None:
             "elevated load."
         )
 
-    if any(isinstance(r.shard, int) for r in rows):
-        print(
-            "\nPROGRESS is computed per PG, not per shard: it comes from the whole PG's "
-            "object\ncounts ('ceph pg dump'), so if an EC PG has more than one shard moving "
-            "independently\n(see module docstring), every shard row for that PG shows the "
-            "same % — the PG's\noverall remaining work, not this shard's individually."
-        )
-
-    if any(progress_reads_100(r.progress_pct) for r in rows):
-        print(f"\n{PROGRESS_100_NOTE}")
+    if any(r.progress_pct is not None and not r.progress_exact for r in rows):
+        print(f"\n{PROGRESS_APPROX_NOTE}")
 
     num_pgs = len({r.pgid for r in rows})
     print(f"\n{len(rows)} shard movement(s) across {num_pgs} PG(s).")

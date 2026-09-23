@@ -43,6 +43,10 @@ everything else is at the top level too.
     when both `--ldap-server` and `--ldap-base` are given (see `--help`).
   - `external/upmap-remapped.py` uses the `rados` Python bindings if importable and
     otherwise falls back to shelling out to `ceph ... | jq`.
+  - `backfillctl` uses the `rados` Python bindings, if importable, to read
+    each moving PG's backfill position (one `ceph pg query` per PG) over a
+    single connection; without them it runs `ceph pg query` processes in
+    parallel, which is slower and much more CPU-hungry.
 - `jq` for the `.sh` scripts and for `external/upmap-remapped.py`'s fallback path.
 - A mounted CephFS (kernel client or ceph-fuse) for `cephfs/du`,
   `cephfs/find-growing-dirs.py`, `cephfs/find-recent-rctime.py` and
@@ -83,26 +87,35 @@ script.
   a full `ceph pg dump pgs`, covering every PG, not just the remapped or
   `backfill_toofull` ones the other subcommands ask for live. Each of them
   then reads `DIR` via `backfillctl --load-state DIR`, filtering `pg_dump_pgs.json`
-  itself for the PGs it cares about, so one capture serves all six.
+  itself for the PGs it cares about, so one capture serves all six. It also
+  writes `backfill_positions.json`, every remapped PG's backfill position (see
+  `show-backfill`; hash keys only, no object names), so a replay shows the
+  same PROGRESS a live run would.
   `backfillctl save-state DIR`
 
 - **`backfillctl show-pg-osds`** — Show one or more PGs' `acting` and `up` OSDs,
   a table per PG with one row per shard, with each OSD's utilization and
-  host, the PG's primaries marked `*`, remap PROGRESS for shards that are moving (same estimate as
-  `backfillctl show-backfill`, per PG), and the PG's `pg_upmap_items` pairs that touch
+  host, the PG's primaries marked `*`, remap PROGRESS for shards that are moving (each shard's
+  own, as in `backfillctl show-backfill`), and the PG's `pg_upmap_items` pairs that touch
   each row (UPMAPS). Same grouped ACTING/UP table style as
   `backfillctl divert-toofull`. `--load-state DIR` replays a
   `backfillctl save-state` capture instead of querying the live cluster.
   `backfillctl [--load-state DIR] show-pg-osds <pgid> [<pgid> ...]`
 
 - **`backfillctl show-backfill`** — Show backfills: for every PG where
-  `up` != `acting`, print source/destination OSDs, movement type, per-PG progress, and PG
-  state. Progress is derived from the misplaced/degraded object counters,
-  which count copies, so it is scaled by the number of shards/replicas
-  moving. Those counters can hit zero before the PG actually finishes
-  (a known gap, seen on large/contended PGs), so a run where any row reads
-  100% prints a note explaining that; `show-pg-osds` and
-  `cancel-backfill` do the same. Handles EC (per-shard) and
+  `up` != `acting`, print source/destination OSDs, movement type, progress, and PG
+  state. Progress is how far the row's backfill target has got through the
+  PG (its `last_backfill` in `ceph pg query`; backfill copies objects in
+  hash order, so the share of the PG's hash range behind it is the share of
+  objects copied): each EC shard's own, since shards of one PG can be far
+  apart (one at 98% beside one at 10%), and for a replicated PG's single row
+  its destinations averaged. Only the PGs shown are queried: about 2 s for
+  1500 PGs over librados. Ceph's own misplaced/degraded counters are only
+  the fallback (a failed query, an older `--load-state` capture), marked
+  `~` and per PG: after a PG re-peers they miss most of the work left on a
+  resumed backfill and can read ~100% for one that is a third done.
+  `show-pg-osds`, `cancel-backfill` and `cancel-uphill` show the same
+  per-shard figure. Handles EC (per-shard) and
   replicated (set-diff) pools differently; see
   `--help` for the full explanation of the diffing logic and edge cases.
   `--osds` narrows the output to rows involving any of the given OSDs (as
@@ -202,7 +215,7 @@ script.
 
   It does not pick which backfills to keep: the table shows each shard's acting and
   up OSD (bare ids, with utilization and host, under a two-line header whose
-  first line spans each of the `ACTING` and `UP` groups), size, PG progress and
+  first line spans each of the `ACTING` and `UP` groups), size, the shard's progress and
   abbreviated state (cancelling a running backfill discards its progress). You drop the entries
   for the ones to let proceed; with `--pin-blockers`, keep the blockers of any
   shard you keep, and always drop companions with the entry they belong to.
@@ -407,7 +420,8 @@ python3 -m unittest discover -s tests/cephfs
 The tests import `backfillctl`'s modules through `tests/pg-osd/_support.py`,
 which puts this repo's root on `sys.path` so `from backfillctl import ...`
 resolves. `tests/pg-osd/test_shared.py` covers `backfillctl/shared.py`: the progress
-arithmetic (EC and replicated copy counting), PG/pool helpers, the shared table
+arithmetic (EC and replicated copy counting, and backfill positions, checked
+against a model of Ceph's PG hashing for any `pg_num`), PG/pool helpers, the shared table
 printer and cell formatters, and the `--load-state` snapshot layer (its
 counterpart, `backfillctl save-state`, is covered in `test_save_state.py`,
 including the general anonymizer: idempotent, keeps two hosts distinct,
@@ -429,6 +443,15 @@ tests of the output format feed results to `render()` and its helpers, plus
 a few subprocess runs that check the two are wired together. A change of
 output format, like reordering columns, should therefore break only
 rendering tests.
+
+The `show-backfill` tests replay two real-cluster snapshots of backfills
+whose counters read 100%: `tests/pg-osd/test-data/ceph1-backfills-stuck-at-100-pct/`,
+captured before `save-state` wrote backfill positions (so PROGRESS falls
+back on the counters and is marked `~`), and
+`ceph1-resumed-backfills-exact-progress/`, where 711 such PGs show their
+real 6.6-99.8% from their positions, including shards of one PG far
+apart. No test reaches a live cluster:
+`_support.py` stubs out the live backfill-position query for all of them.
 
 The `backfillctl divert-toofull` tests replay the
 cluster-state snapshots under `tests/pg-osd/test-data/` via `--load-state` and check the

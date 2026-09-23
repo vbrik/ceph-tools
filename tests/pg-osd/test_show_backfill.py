@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import pathlib
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -92,8 +93,8 @@ SNAPSHOTS = {
         "nodes": [{"id": o, "utilization": u} for o, u in enumerate((10, 20, 70, 89))]
     },
     "pool_ls_detail": [
-        {"pool_id": 5, "type": 1, "size": 3},
-        {"pool_id": 27, "type": 3, "size": 4},
+        {"pool_id": 5, "type": 1, "size": 3, "pg_num": 32},
+        {"pool_id": 27, "type": 3, "size": 4, "pg_num": 16},
     ],
 }
 
@@ -133,7 +134,7 @@ class MainTest(unittest.TestCase):
         out = self.run_main()
         line = next(ln for ln in out.splitlines() if ln.startswith("27.10"))
         self.assertRegex(
-            line, r"^27\.10\s+1\s+3\(ceph2,89%\)\s+->\s+2\(ceph2,70%\)\s+backfill\s+0%"
+            line, r"^27\.10\s+1\s+3\(ceph2,89%\)\s+->\s+2\(ceph2,70%\)\s+backfill\s+~0%"
         )
 
     def test_progress_denominator_counts_unassigned_shards(self):
@@ -162,23 +163,48 @@ class MainTest(unittest.TestCase):
         self.assertIn("0(ceph1)*", line)
         self.assertIn("* this is the PG's primary OSD", out)
 
-    def test_progress_100_note_appears_when_a_row_reads_100(self):
+    def test_counter_progress_is_marked_and_explained(self):
+        # No backfill positions (the tests' stubbed live query returns none):
         # 5.1f has no misplaced/degraded objects in its stat_sum, so its lone
-        # moving copy reads 100% while still up != acting (see pg()/PGS above).
+        # moving copy reads ~100% while still up != acting (see pg()/PGS above).
         out = self.run_main()
         line = next(ln for ln in out.splitlines() if ln.startswith("5.1f"))
-        self.assertIn(" 100% ", line)
-        self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", out)
+        self.assertIn(" ~100% ", line)
+        self.assertIn("~ marks PROGRESS from Ceph's misplaced/degraded", out)
 
-    def test_progress_100_note_absent_when_nothing_reads_100(self):
-        snaps = {
-            **SNAPSHOTS,
-            "pg_dump_pgs": {
-                "pg_map": {"pg_stats": [p for p in PGS if p["pgid"] != "5.1f"]}
-            },
+    def test_shard_beside_one_with_no_osd_yet_gets_its_own_progress(self):
+        # 27.9's shard 3 is moving; its shard 4 has no OSD anywhere, which
+        # would keep a per-PG figure on the counters, but not shard 3's own.
+        query = mock.Mock(return_value={"27.9": {"1(3)": "MAX"}})
+        store = FakeStore(SNAPSHOTS, commands=pm.SNAPSHOT_COMMANDS, load_dir=None)
+        with mock.patch.object(shared, "query_backfill_positions", query):
+            rows = pm.plan(parse_args(pm, ["--pgs", "27.9"]), store).rows
+        (row,) = rows
+        self.assertEqual((100.0, True), (row.progress_pct, row.progress_exact))
+
+    def test_progress_from_backfill_positions(self):
+        # Every target at MIN: 0% however done the counters say it is. 27.9
+        # is left out: a shard with no OSD anywhere keeps it on the counters.
+        pools = {5: False, 27: True}
+        positions = {
+            p["pgid"]: dict.fromkeys(
+                shared.backfill_target_peers(
+                    p["up"], p["acting"], pools[shared.pgid_pool_id(p["pgid"])]
+                ),
+                "MIN",
+            )
+            for p in PGS
         }
-        out = self.run_main(snapshots=snaps)
-        self.assertNotIn("PROGRESS reads 100%", out)
+        query = mock.Mock(return_value=positions)
+        with mock.patch.object(shared, "query_backfill_positions", query):
+            out = self.run_main("--pgs", "5.3", "5.1f", "27.10")
+        # Only the PGs shown are queried.
+        self.assertEqual({"5.3", "5.1f", "27.10"}, set(query.call_args.args[0]))
+        rows = [ln for ln in out.splitlines() if re.match(r"\d+\.[0-9a-f]+ ", ln)]
+        self.assertEqual(3, len(rows))
+        for line in rows:
+            self.assertRegex(line, r" 0%\s")
+        self.assertNotIn("~", out)
 
     def test_stray_osd_hosts_and_utilization_resolve(self):
         snaps = {
@@ -303,28 +329,61 @@ class FilterTest(unittest.TestCase):
 FIXTURE_STUCK_AT_100 = (
     REPO_ROOT / "tests" / "pg-osd" / "test-data" / "ceph1-backfills-stuck-at-100-pct"
 )
+FIXTURE_RESUMED = (
+    REPO_ROOT
+    / "tests"
+    / "pg-osd"
+    / "test-data"
+    / "ceph1-resumed-backfills-exact-progress"
+)
 
 
 class FixtureReplayTest(unittest.TestCase):
     """Replay the real-cluster snapshot in tests/pg-osd/test-data (see its README.txt)."""
 
-    def test_the_real_stuck_pgs_read_100(self):
-        # 27.126 has two shards genuinely still backfilling despite reading
-        # 100% (see the fixture's README.txt).
+    def test_capture_without_positions_falls_back_on_counters(self):
+        # 27.126 has two shards genuinely still backfilling despite its
+        # counters reading 100% (see the fixture's README.txt). The capture
+        # predates backfill_positions.json, so that is all there is to show.
         rows = [
             r
             for r in plan_from_state(pm, FIXTURE_STUCK_AT_100).rows
             if r.pgid == "27.126"
         ]
-        self.assertEqual([100.0, 100.0], [r.progress_pct for r in rows])
+        self.assertEqual(
+            [(100.0, False)] * 2, [(r.progress_pct, r.progress_exact) for r in rows]
+        )
 
-    def test_progress_100_note_appears_for_the_real_stuck_pgs(self):
+    def test_approx_note_appears_for_the_capture_without_positions(self):
         out = io.StringIO()
         args = parse_args(pm, [], load_state=str(FIXTURE_STUCK_AT_100))
         with contextlib.redirect_stdout(out):
             pm.run(args)
-        value = out.getvalue()
-        self.assertIn("PROGRESS reads 100% once Ceph's own misplaced/degraded", value)
+        self.assertIn("~ marks PROGRESS from Ceph's misplaced/degraded", out.getvalue())
+
+    def test_resumed_backfills_show_their_real_progress(self):
+        # 27.500's counters read 100%, its backfill position 6.6% (see the
+        # fixture's README.txt); every PG of the capture has a position.
+        rows = plan_from_state(pm, FIXTURE_RESUMED).rows
+        self.assertTrue(all(r.progress_exact for r in rows))
+        (pct,) = {r.progress_pct for r in rows if r.pgid == "27.500"}
+        self.assertAlmostEqual(6.6, pct, 1)
+
+    def test_shards_of_one_pg_show_their_own_progress(self):
+        # 27.ae2: shard 9 almost done, shard 4 barely started (see the
+        # fixture's README.txt); a per-PG average would show both at 53.8%.
+        rows = [
+            r for r in plan_from_state(pm, FIXTURE_RESUMED).rows if r.pgid == "27.ae2"
+        ]
+        pcts = {r.shard: round(r.progress_pct, 1) for r in rows}
+        self.assertEqual({4: 9.9, 9: 97.7}, pcts)
+
+    def test_no_approx_note_when_every_position_is_known(self):
+        out = io.StringIO()
+        args = parse_args(pm, [], load_state=str(FIXTURE_RESUMED))
+        with contextlib.redirect_stdout(out):
+            pm.run(args)
+        self.assertNotIn("~ marks PROGRESS", out.getvalue())
 
 
 if __name__ == "__main__":
