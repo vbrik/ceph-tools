@@ -659,12 +659,10 @@ def osd_cells(
     osd_host: dict[int, str],
     osd_id: int | None,
     primary: int | None = None,
-    *,
-    bare_id: bool = False,
 ) -> list[str]:
     """Return the [OSD, UTIL, HOST] cells for one slot.
 
-    The OSD reads 'osd.N', or just 'N' with bare_id. An empty slot (osd_id
+    The OSD reads as its bare number ('N', not 'osd.N'). An empty slot (osd_id
     None) reads 'none', '-', '-'. The OSD that is the PG's `primary` gets a
     trailing '*'.
     """
@@ -672,7 +670,7 @@ def osd_cells(
         return ["none", NOT_APPLICABLE, NOT_APPLICABLE]
     star = "*" if osd_id == primary else ""
     return [
-        f"{osd_id if bare_id else f'osd.{osd_id}'}{star}",
+        f"{osd_id}{star}",
         format_utilization(osd_df, osd_id),
         osd_host.get(osd_id, "?"),
     ]
@@ -1020,8 +1018,8 @@ def format_row(
     return [
         c.pgid,
         str(c.shard),
-        *osd_cells(osd_df, osd_host, c.acting_osd, bare_id=True),
-        *osd_cells(osd_df, osd_host, c.up_osd, bare_id=True),
+        *osd_cells(osd_df, osd_host, c.acting_osd),
+        *osd_cells(osd_df, osd_host, c.up_osd),
         format_bytes(c.size_bytes),
         format_progress(c.progress_pct),
         abbreviate_state(c.state),

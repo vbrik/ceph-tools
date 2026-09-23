@@ -345,26 +345,14 @@ class CellTest(unittest.TestCase):
         self.assertEqual(shared.format_progress(0.0), "0%")
         self.assertEqual(shared.format_progress(None), "-")
 
-    def test_osd_cells(self):
+    def test_osd_cells_are_bare_ids(self):
         host = {1: "h1"}
-        self.assertEqual(shared.osd_cells(self.DF, host, 1), ["osd.1", "92.5%", "h1"])
-        self.assertEqual(shared.osd_cells(self.DF, host, 2), ["osd.2", "?", "?"])
+        self.assertEqual(shared.osd_cells(self.DF, host, 1), ["1", "92.5%", "h1"])
+        self.assertEqual(shared.osd_cells(self.DF, host, 2), ["2", "?", "?"])
 
     def test_osd_cells_primary_marker(self):
-        self.assertEqual(shared.osd_cells(self.DF, {}, 1, primary=1)[0], "osd.1*")
-        self.assertEqual(shared.osd_cells(self.DF, {}, 1, primary=2)[0], "osd.1")
-
-    def test_osd_cells_bare_id(self):
-        host = {1: "h1"}
-        self.assertEqual(
-            shared.osd_cells(self.DF, host, 1, bare_id=True), ["1", "92.5%", "h1"]
-        )
-        self.assertEqual(
-            shared.osd_cells(self.DF, {}, 1, primary=1, bare_id=True)[0], "1*"
-        )
-        self.assertEqual(
-            shared.osd_cells(self.DF, {}, None, bare_id=True), ["none", "-", "-"]
-        )
+        self.assertEqual(shared.osd_cells(self.DF, {}, 1, primary=1)[0], "1*")
+        self.assertEqual(shared.osd_cells(self.DF, {}, 1, primary=2)[0], "1")
 
     def test_abbreviate_state(self):
         self.assertEqual(

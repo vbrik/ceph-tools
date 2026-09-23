@@ -711,7 +711,7 @@ def format_row(
         # The UP host varies per row now that the whole cluster is scanned, so
         # unlike the single-host version it cannot live in the stderr header.
         *osd_cells(osd_df, osd_host, shard.up_osd),
-        f"osd.{proposal.target_osd}",
+        str(proposal.target_osd),
         f"{proposal.target_utilization:.1f}%",
         f"{proposal.target_projected:.1f}%",
         proposal.target_host,

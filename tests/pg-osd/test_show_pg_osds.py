@@ -102,9 +102,9 @@ class FormatTest(unittest.TestCase):
 
     def test_row_marks_each_side_s_own_primary(self):
         row = op.format_row(Row(0, 712, 59), PG, None, {}, {}, [])
-        self.assertEqual(("osd.712*", "osd.59*"), (row[1], row[4]))
+        self.assertEqual(("712*", "59*"), (row[1], row[4]))
         row = op.format_row(Row(0, 59, 712), PG, None, {}, {}, [])
-        self.assertEqual(("osd.59", "osd.712"), (row[1], row[4]))
+        self.assertEqual(("59", "712"), (row[1], row[4]))
 
     def test_row_empty_slot(self):
         row = op.format_row(Row(3, None, 9), PG, None, {}, {}, [])
@@ -139,15 +139,15 @@ class TableTest(unittest.TestCase):
         self.assertIn("-- ACTING --", group)
         self.assertIn("-- UP --", group)
         self.assertEqual(
-            "SHARD    OSD       UTIL   HOST    OSD      UTIL   HOST    PROGRESS  UPMAPS",
+            "SHARD    OSD   UTIL   HOST    OSD  UTIL   HOST    PROGRESS  UPMAPS",
             header,
         )
         self.assertEqual(
-            "0        osd.712*  88.1%  h4      osd.712  88.1%  h4      -         -",
+            "0        712*  88.1%  h4      712  88.1%  h4      -         -",
             first,
         )
         self.assertEqual(
-            "3        osd.226   92.5%  h9      osd.59*  85.0%  h12     41%       226->59",
+            "3        226   92.5%  h9      59*  85.0%  h12     41%       226->59",
             second,
         )
         # The group name sits over the first column of its group.

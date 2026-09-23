@@ -103,13 +103,13 @@ class FormatRowTest(unittest.TestCase):
             [
                 "19.2",
                 "0",
-                "osd.406",
+                "406",
                 "89.9%",
                 "host32",
-                "osd.882",
+                "882",
                 "69.1%",
                 "host50",
-                "osd.898",
+                "898",
                 "61.7%",
                 "62.9%",
                 "host51",
@@ -131,7 +131,7 @@ class FormatRowTest(unittest.TestCase):
         self.assertEqual(cells[("ACTING", "UTIL")], shared.NOT_APPLICABLE)
         self.assertEqual(cells[("ACTING", "HOST")], shared.NOT_APPLICABLE)
         # The up side is still fully known — that is the whole premise.
-        self.assertEqual(cells[("UP", "OSD")], "osd.882")
+        self.assertEqual(cells[("UP", "OSD")], "882")
         self.assertEqual(cells[("UP", "UTIL")], "69.1%")
 
 
@@ -178,11 +178,11 @@ class PrintTableTest(unittest.TestCase):
         _, _, data_line = table_lines([row])
         # Data cells fill their columns exactly, so the gaps read off directly:
         # 2 spaces within a group, 4 between groups (and after SHARD).
-        self.assertRegex(data_line, r"osd\.406 {2}89\.9% {2}host32")
-        self.assertRegex(data_line, r"host32 {4}osd\.882")
-        self.assertRegex(data_line, r"host50 {4}osd\.898")
+        self.assertRegex(data_line, r"406 {2}89\.9% {2}host32")
+        self.assertRegex(data_line, r"host32 {4}882")
+        self.assertRegex(data_line, r"host50 {4}898")
         # SHARD's cell '0' is padded to the 5-char label, then the 4-space gap.
-        self.assertRegex(data_line, r" 0 {8}osd\.406")
+        self.assertRegex(data_line, r" 0 {8}406")
 
     def test_no_trailing_whitespace(self):
         # Narrow cells (unknown acting OSD) and a blank final group cell
@@ -199,7 +199,7 @@ class PrintTableTest(unittest.TestCase):
         lines = table_lines(rows)
         # The widest PGID ('19.1ce0') pushes every line's SHARD column right.
         self.assertTrue(lines[1].startswith("PGID     SHARD"))
-        self.assertEqual({line.index("osd.406") for line in lines[2:]}, {18})
+        self.assertEqual({line.index("406") for line in lines[2:]}, {18})
 
     def test_column_and_row_widths_agree(self):
         # Every cell of the group line and label line must be a column of

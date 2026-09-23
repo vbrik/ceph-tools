@@ -510,8 +510,8 @@ class OutputTest(unittest.TestCase):
             self.assertEqual(len(row), len(ut.COLUMNS))
         row = ut.format_row(result.moves[0], result.osd_host, result.osd_df)
         self.assertEqual(row[:2], ["1.0", "0"])
-        self.assertEqual(row[5], "osd.0")  # UP OSD: the upmap's 'from'
-        self.assertEqual(row[8], "osd.31")  # TARGET OSD: its 'to'
+        self.assertEqual(row[5], "0")  # UP OSD: the upmap's 'from'
+        self.assertEqual(row[8], "31")  # TARGET OSD: its 'to'
 
     def test_pgremapper_mappings_is_valid_json_of_from_to_pairs(self):
         out = io.StringIO()
