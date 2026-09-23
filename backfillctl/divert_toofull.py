@@ -385,6 +385,7 @@ def fetch_backfill_toofull_pg_stats(store: SnapshotStore) -> list[dict]:
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "divert-toofull",
+        help="Divert backfill_toofull PGs to emptier OSDs.",
         description="Propose upmap re-targets that divert stuck "
         "backfill_toofull PGs to emptier OSDs. Every backfill_toofull PG in "
         "the cluster is examined, and each shard newly arriving on an OSD "

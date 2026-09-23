@@ -38,11 +38,16 @@ _COMMAND_MODULES = (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="backfillctl",
-        description="Ceph PG/OSD backfill and upmap tools: show what's "
-        "moving, and propose upmaps to divert or cancel backfills and drain OSDs.",
+        description="Ceph PG/OSD backfill and upmap tools: show what's moving, "
+        "and divert or cancel backfills and drain OSDs. Commands that remap "
+        "PGs emit upmap proposals.",
     )
     add_load_state_arg(parser)
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="COMMAND",
+    )
     for module in _COMMAND_MODULES:
         subparser = module.build_parser(subparsers)
         subparser.set_defaults(run=module.run)

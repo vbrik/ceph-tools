@@ -109,6 +109,7 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "show-backfill",
+        help="Show what is backfilling: per-PG source and target OSDs, and progress.",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

@@ -62,3 +62,26 @@ class GlobalLoadStateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TopLevelHelpTest(unittest.TestCase):
+    COMMANDS = (
+        "show-pg-osds",
+        "show-backfill",
+        "divert-toofull",
+        "cancel-backfill",
+        "cancel-uphill",
+        "drain",
+        "save-state",
+    )
+
+    def test_every_subcommand_is_described(self):
+        """Each subcommand is listed in --help followed by a description."""
+        help_lines = run_backfillctl("--help").stdout.splitlines()
+        for name in self.COMMANDS:
+            with self.subTest(command=name):
+                line = next(
+                    (ln.strip() for ln in help_lines if ln.strip().startswith(name)), ""
+                )
+                self.assertTrue(line, f"{name} not listed in --help")
+                self.assertTrue(line.removeprefix(name).strip(), f"{name}: no help")

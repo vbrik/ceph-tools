@@ -236,6 +236,7 @@ def fetch_drained_pg_stats(store: SnapshotStore, osds: set[int]) -> list[dict]:
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "drain",
+        help="Move all PG shards off given OSDs or hosts.",
         description="Propose upmaps that move every PG shard mapped to the "
         "given OSDs, or to every OSD of the given hosts, to the least-utilized OSDs of the same device class "
         "that the PG can legally use, never projecting a target above "

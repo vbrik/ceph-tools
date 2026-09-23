@@ -278,6 +278,7 @@ def format_row(
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "show-pg-osds",
+        help="Show acting/up OSDs of given PGs, per shard, with utilization and upmaps.",
         description="Show acting/up OSDs of Ceph PGs per shard, with "
         "utilization, host, remap progress and upmaps.",
     )

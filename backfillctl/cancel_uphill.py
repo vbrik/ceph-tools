@@ -132,6 +132,7 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "cancel-uphill",
+        help="Cancel backfills that move data to a fuller OSD.",
         description="Propose the upmaps needed to cancel backfills that move "
         "data from a less-utilized OSD to a more-utilized one ('uphill'): "
         "the opposite of what backfill is supposed to accomplish. Every "

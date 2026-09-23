@@ -119,6 +119,7 @@ def anonymize_snapshots(snapshots: dict[str, object]) -> None:
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "save-state",
+        help="Capture cluster state into a directory, for offline use with --load-state.",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

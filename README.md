@@ -65,7 +65,8 @@ other environments.
 not a set of standalone scripts, because its subcommands share code and more
 are coming that will be variations on the existing ones. Run
 `python3 backfillctl <subcommand> --help` (or
-`python3 -m backfillctl <subcommand> --help`) for any of the seven below.
+`python3 -m backfillctl <subcommand> --help`) for any of the seven below;
+`backfillctl --help` lists them with a one-line description of each.
 Six analyze a cluster; the seventh, `save-state`, captures one so the other
 six can replay it offline with the global `--load-state DIR` option, given
 before the subcommand name: `backfillctl --load-state DIR <subcommand> ...`

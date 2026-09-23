@@ -253,6 +253,7 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "cancel-backfill",
+        help="Cancel backfills (all, or into one OSD).",
         description="Propose the upmaps needed to cancel backfills: by "
         "default ALL backfills in the cluster, or with --osd all backfills "
         "into one OSD. Each moving shard is pinned to the OSD it is on now. "
