@@ -68,6 +68,7 @@ from shared import (
     add_pgremapper_mappings_arg,
     check_host_failure_domain,
     check_known_pools,
+    check_osds_exist,
     close_pins,
     fetch_crush_rules,
     fetch_ec_profiles,
@@ -520,7 +521,8 @@ def host_osds(hosts: list[str], osd_host: dict[int, str]) -> set[int]:
     missing = sorted(wanted - {osd_host[o] for o in osds})
     if missing:
         sys.exit(
-            f"ERROR: no OSDs under host(s) in 'ceph osd tree': {', '.join(missing)}"
+            f"ERROR: --hosts: no OSDs under these in 'ceph osd tree': "
+            f"{', '.join(missing)}"
         )
     return osds
 
@@ -536,12 +538,8 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
     if args.hosts:
         drained = host_osds(args.hosts, osd_host)
     else:
+        check_osds_exist("--osds", args.osds, osd_df)
         drained = set(args.osds)
-        unknown = sorted(drained - osd_df.keys())
-        if unknown:
-            sys.exit(
-                "ERROR: not in 'ceph osd df': " + ", ".join(f"osd.{o}" for o in unknown)
-            )
     store.commands.update(ls_by_osd_commands(drained))
     upmap_items = fetch_upmap_items(store)
     pools_by_id = fetch_pools(store)

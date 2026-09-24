@@ -76,6 +76,7 @@ from shared import (
     chain_link,
     check_host_failure_domain,
     check_known_pools,
+    check_osds_exist,
     fetch_crush_rules,
     fetch_ec_profiles,
     fetch_osd_df,
@@ -199,7 +200,7 @@ def select_sources(
         if bad:
             sys.exit(
                 "ERROR: --osds: not up and in OSDs of this device class, with "
-                "a utilization in 'ceph osd df': " + ", ".join(f"osd.{o}" for o in bad)
+                "a utilization: " + ", ".join(f"osd.{o}" for o in bad)
             )
         return fullest_first(set(osds)), len(set(osds))
     ranked = fullest_first(class_osds)
@@ -491,6 +492,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> BalanceResult:
     reservation = ProjectedUsage(osd_df, arriving)
     final = FinalUsage(osd_df, ((s.up_osd, s.size_bytes) for s in arriving), departing)
 
+    check_osds_exist("--osds", args.osds or [], osd_df)
     sources, qualified = select_sources(
         class_osds,
         final.utilization,

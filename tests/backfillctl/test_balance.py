@@ -134,6 +134,13 @@ class SourcesFromClusterTest(unittest.TestCase):
                     parse_args(ut, argv)
                 self.assertIn("not a ratio", err.getvalue())
 
+    def test_osds_unknown_to_ceph_are_named_as_elsewhere(self):
+        with self.assertRaises(SystemExit) as cm:
+            Cluster().plan("--osds", "0", "999")
+        self.assertEqual(
+            str(cm.exception), "ERROR: --osds: not in 'ceph osd df': osd.999"
+        )
+
     def test_unknown_class_names_the_classes_present(self):
         with self.assertRaises(SystemExit) as cm:
             Cluster().plan("--class", "ssd")

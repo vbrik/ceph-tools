@@ -402,7 +402,9 @@ class BlockerTest(unittest.TestCase):
     def test_unknown_osd_is_an_error(self):
         with self.assertRaises(SystemExit) as cm:
             Cluster().plan(99)
-        self.assertIn("osd.99", str(cm.exception))
+        self.assertEqual(
+            str(cm.exception), "ERROR: --osds: not in 'ceph osd df': osd.99"
+        )
 
     def test_non_host_failure_domain_is_an_error(self):
         c = Cluster()
@@ -435,6 +437,7 @@ class HostsTest(unittest.TestCase):
     def test_unknown_host_is_an_error_naming_it(self):
         with self.assertRaises(SystemExit) as cm:
             Cluster().plan("--hosts", "h1", "nosuch")
+        self.assertTrue(str(cm.exception).startswith("ERROR: --hosts: "))
         self.assertIn("nosuch", str(cm.exception))
         self.assertNotIn("h1", str(cm.exception).split(":")[-1])
 

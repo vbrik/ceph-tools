@@ -626,6 +626,16 @@ def parse_osd(text: str) -> int:
     return int(match[1])
 
 
+def check_osds_exist(option: str, osds: Iterable[int], osd_df: dict[int, dict]) -> None:
+    """Exit naming the OSDs given with option that 'ceph osd df' does not list."""
+    unknown = sorted(set(osds) - osd_df.keys())
+    if unknown:
+        sys.exit(
+            f"ERROR: {option}: not in 'ceph osd df': "
+            + ", ".join(f"osd.{o}" for o in unknown)
+        )
+
+
 def parse_pgid(text: str) -> str:
     """argparse type: a PG id like '19.2a1', normalized as Ceph prints it.
 

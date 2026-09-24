@@ -138,6 +138,13 @@ class MainTest(unittest.TestCase):
             r"^27\.10\s+1\s+3\(ceph2,89\.0%\)\s+->\s+2\(ceph2,70\.0%\)\s+backfill\s+~0%",
         )
 
+    def test_unknown_osds_are_an_error_not_an_empty_match(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.plan("--osds", "2", "99", "osd.98")
+        self.assertEqual(
+            str(cm.exception), "ERROR: --osds: not in 'ceph osd df': osd.98, osd.99"
+        )
+
     def test_table_matches_the_other_commands(self):
         # print_table's layout: the label line first (no groups, no rule),
         # and utilization to one decimal, so 88.6% never reads as 89%.

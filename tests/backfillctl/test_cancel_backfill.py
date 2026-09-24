@@ -1385,7 +1385,9 @@ class MainTest(unittest.TestCase):
     def test_unknown_osd_is_an_error(self):
         with self.assertRaises(SystemExit) as ctx:
             self.plan("--osd", "5000")
-        self.assertIn("5000", str(ctx.exception))
+        self.assertEqual(
+            str(ctx.exception), "ERROR: --osd: not in 'ceph osd df': osd.5000"
+        )
 
     def test_exclude_pgs_removes_the_named_pg_only(self):
         result = self.plan("--osd", "682", "--exclude-pgs", "19.9")

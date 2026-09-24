@@ -30,6 +30,7 @@ from shared import (
     SnapshotStore,
     abbreviate_state,
     add_load_state_arg,
+    check_osds_exist,
     copy_progress,
     ec_shard_moves,
     fetch_backfill_positions,
@@ -190,6 +191,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
     """Fetch the cluster state and find the PG movements, filtered by --osds/--pgs."""
     pg_stats = fetch_pg_stats(store, "pg_dump_pgs")
     osd_df = fetch_osd_df(store)
+    check_osds_exist("--osds", args.osds, osd_df)
     osd_host = fetch_osd_hosts(store)
     pools = fetch_pools(store)
 

@@ -64,6 +64,7 @@ from shared import (
     avoid_chains,
     check_host_failure_domain,
     check_known_pools,
+    check_osds_exist,
     close_pins,
     copies_moving,
     fetch_crush_rules,
@@ -492,8 +493,8 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
     ec_profiles = fetch_ec_profiles(store)
     crush_rules = fetch_crush_rules(store)
 
-    if osd is not None and osd not in osd_df:
-        sys.exit(f"ERROR: osd.{osd} not found in 'ceph osd df'.")
+    if osd is not None:
+        check_osds_exist("--osd", [osd], osd_df)
     backfillfull_pct = fetch_backfillfull_pct(store)
     if backfillfull_pct is None and args.pin_blockers:
         stderr_para(
