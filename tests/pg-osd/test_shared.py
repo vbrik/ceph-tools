@@ -884,6 +884,42 @@ class SnapshotStoreTest(unittest.TestCase):
             self.assertEqual((pathlib.Path(tmp) / "b.json").read_text(), '"redacted"')
 
 
+class HelpFormatterTest(unittest.TestCase):
+    TEXT = """
+    First paragraph, long enough that it has to be reflowed onto several
+    lines at this width.
+
+    - item one, which is also long enough to wrap onto a second line
+      here
+    - item two
+
+        indented example   kept   as written
+    """
+
+    def fill(self, width=40):
+        formatter = shared.HelpFormatter("prog", width=width)
+        return formatter._fill_text(self.TEXT, width, "")
+
+    def test_paragraphs_stay_separate(self):
+        self.assertEqual(3, len(self.fill().split("\n\n")))
+
+    def test_paragraph_is_reflowed_to_width(self):
+        first = self.fill().split("\n\n")[0].splitlines()
+        self.assertGreater(len(first), 1)
+        self.assertTrue(all(len(line) <= 40 for line in first))
+
+    def test_list_items_get_a_hanging_indent(self):
+        items = self.fill().split("\n\n")[1].splitlines()
+        self.assertTrue(items[0].startswith("- item one"))
+        self.assertTrue(items[1].startswith("  "))
+        self.assertTrue(items[-1].startswith("- item two"))
+
+    def test_indented_block_is_kept_verbatim(self):
+        self.assertEqual(
+            "    indented example   kept   as written", self.fill().split("\n\n")[2]
+        )
+
+
 class StateArgsTest(unittest.TestCase):
     def parse(self, *argv):
         parser = argparse.ArgumentParser()
@@ -896,7 +932,7 @@ class StateArgsTest(unittest.TestCase):
     def test_help_points_at_save_state(self):
         parser = argparse.ArgumentParser()
         shared.add_load_state_arg(parser)
-        self.assertIn("backfillctl", parser.format_help())
+        self.assertIn("save-state", parser.format_help())
 
     def test_from_args_requires_an_existing_load_directory(self):
         with self.assertRaises(SystemExit) as ctx:

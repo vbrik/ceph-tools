@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Dispatch to backfillctl's subcommands.
 
-Each subcommand's own options and behavior are unchanged from when it was
-its own script (see the module docstring of each file in this directory);
-this wires them together under one command. The one exception is
---load-state, which every subcommand used to define for itself: it is now a
-global option, given before the subcommand name
-('backfillctl --load-state DIR show-backfill').
-
-build_parser() is split out from main() so it can be imported without side
-effects, both by tests and by 'shtab backfillctl.__main__.build_parser' to
-generate shell completions (https://docs.iterative.ai/shtab/).
+build_parser() has no side effects, so tests and shtab can import it:
+'shtab --shell=bash backfillctl.__main__.build_parser'.
 """
 
 import argparse
@@ -22,7 +14,7 @@ import drain
 import save_state
 import show_backfill
 import show_pg_osds
-from shared import add_load_state_arg
+from shared import HelpFormatter, add_load_state_arg
 
 _COMMAND_MODULES = (
     show_pg_osds,
@@ -38,9 +30,10 @@ _COMMAND_MODULES = (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="backfillctl",
-        description="Ceph PG/OSD backfill and upmap tools: show what's moving, "
-        "and divert or cancel backfills and drain OSDs. Commands that remap "
-        "PGs emit upmap proposals.",
+        description="Ceph PG backfill and upmap tools: show what is moving, "
+        "divert or cancel backfills, drain OSDs. Commands that remap PGs only "
+        "print upmap proposals; they change nothing.",
+        formatter_class=HelpFormatter,
     )
     add_load_state_arg(parser)
     subparsers = parser.add_subparsers(

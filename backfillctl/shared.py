@@ -1,20 +1,14 @@
 # SPDX-License-Identifier: MIT
-"""Code shared by the scripts in this directory.
+"""Code shared by the subcommands.
 
-Not a script itself: the others import it (`from shared import ...`), so it
-has to sit next to them. Five groups of things live here:
-
-* OSD-slot helpers and PG arithmetic (progress, copies in flight, shard size),
-  including reading a backfill's position out of 'ceph pg query';
-* reading cluster state, live or from a saved snapshot (`SnapshotStore`), the
-  global `--load-state` flag built on it, and the anonymizer (used by the
-  `save-state` subcommand) that makes a saved snapshot safe to share;
-* `fetch_*` helpers that turn snapshot keys into lookup tables;
-* the two-line grouped table (`print_table`) and its cell formatters;
-* turning a chosen shard into a valid, orderable upmap proposal --
-  `close_pins` and friends, `Cancellation`/`Skipped`, chain detection and the
-  cancellation-proposal table/JSON output -- shared by `cancel-backfill` and
-  `cancel-uphill`, the two subcommands that pin moving shards back.
+* OSD-slot helpers and PG arithmetic: progress, copies in flight, shard size,
+  backfill positions.
+* Cluster state, live or from a capture (SnapshotStore, --load-state), and
+  the anonymizer used by save-state.
+* fetch_* helpers that turn snapshots into lookup tables.
+* CLI helpers, the grouped table (print_table) and its cell formatters.
+* Pinning moving shards back (close_pins and friends), shared by
+  cancel-backfill and cancel-uphill.
 """
 
 import argparse
@@ -47,9 +41,7 @@ KIB = 1024
 # The pg_stat.stat_sum counters pg_progress_pct reads.
 PROGRESS_COUNTERS = ("num_objects", "num_objects_misplaced", "num_objects_degraded")
 
-# Printed for a value that does not apply (an empty slot's UTIL/HOST, a PG
-# that is not moving). Distinct from '?', which means the thing exists but its
-# data is unavailable.
+# Cell for a value that does not apply. '?' means applicable but unknown.
 NOT_APPLICABLE = "-"
 
 # Between table columns of one group, and between columns of different groups.
@@ -108,11 +100,11 @@ def is_erasure(pool: dict | None) -> bool:
 
 
 def rule_failure_domain(rule: dict | None) -> str | None:
-    """Return the bucket type CRUSH spreads shards over for redundancy.
+    """Return the rule's failure domain: the type of its first choose* step.
 
-    The 'type' of the rule's first choose*/chooseleaf* step: for the common EC
-    shape ('choose indep 0 type host' then 'chooseleaf indep 1 type osd') that
-    is the outer step, the inner osd pick being only the leaf within it.
+    The first step, because in the common EC shape ('choose indep 0 type
+    host', then 'chooseleaf indep 1 type osd') the inner step only picks a
+    leaf within the host.
     """
     for step in (rule or {}).get("steps", []):
         if step.get("op", "").startswith("choose"):
@@ -123,10 +115,9 @@ def rule_failure_domain(rule: dict | None) -> str | None:
 def shard_size_bytes(pg: dict, pool: dict, ec_profiles: dict[str, dict]) -> int | None:
     """Estimate the bytes one shard of a PG occupies, or None if unknown.
 
-    A replica holds all of the PG's logical size ('num_bytes'), an EC shard
-    1/k of it (rounded up). Omap, metadata and stripe padding are not counted,
-    so this slightly underestimates. None when the pool's erasure code profile
-    is missing from ec_profiles or has no usable 'k'.
+    A replica holds the PG's num_bytes, an EC shard 1/k of it. Ignores omap,
+    metadata and stripe padding, so it runs slightly low. None if the pool's
+    EC profile or its 'k' is missing.
     """
     num_bytes = pg["stat_sum"]["num_bytes"]
     if not is_erasure(pool):
@@ -141,9 +132,8 @@ def shard_size_bytes(pg: dict, pool: dict, ec_profiles: dict[str, dict]) -> int 
 def ec_shard_moves(up: list, acting: list) -> list[tuple[int, int | None, int]]:
     """Return (shard, source, destination) for each EC shard being moved.
 
-    source is None when the acting slot is empty (degraded). Shards that
-    stay put (clean or in-place recovery) and shards whose up slot is empty
-    (cluster still waiting for an OSD) are omitted.
+    source is None for an empty acting slot. Shards that stay put or have an
+    empty up slot are omitted.
     """
     moves = []
     for i in range(max(len(up), len(acting))):
@@ -156,8 +146,8 @@ def ec_shard_moves(up: list, acting: list) -> list[tuple[int, int | None, int]]:
 def ec_unassigned_shards(up: list, acting: list) -> int:
     """Count EC shards with no OSD in either up or acting.
 
-    Nothing can move for these yet, but Ceph still counts their objects as
-    degraded, so they belong in the progress denominator.
+    Ceph counts their objects as degraded, so they belong in the progress
+    denominator.
     """
     return sum(
         1
@@ -170,10 +160,7 @@ def replicated_unassigned_copies(up_set: set, acting_set: set, size: int) -> int
     """Count replicas that are degraded but have no destination OSD yet.
 
     Ceph counts size - len(acting) copies per object as degraded. Each
-    destination (an up OSD outside acting) fills one of those, and any
-    remainder is waiting for an OSD to appear, so it is extra work that isn't
-    visible in up/acting. Replicated slots carry no identity, so this is a
-    count difference rather than the per-slot check used for EC.
+    destination fills one; the rest wait for an OSD to appear.
     """
     return max(0, size - len(acting_set) - len(up_set - acting_set))
 
@@ -181,11 +168,9 @@ def replicated_unassigned_copies(up_set: set, acting_set: set, size: int) -> int
 def copies_moving(up: list, acting: list, is_ec: bool, pool_size: int) -> int:
     """Count the shard/replica copies a PG has to place.
 
-    Ceph's misplaced/degraded object counters are in copy units, so this is
-    the multiplier of num_objects in the progress denominator: slots whose up
-    OSD differs from acting, plus slots with no OSD anywhere yet. Fixed until
-    the PG finishes (acting only switches to up at the end), so it is a stable
-    denominator. pool_size (replica count) is only used for replicated pools.
+    Ceph's misplaced/degraded counters are in copy units, so this multiplies
+    num_objects in the progress denominator. It stays fixed until the PG
+    finishes. pool_size is used only for replicated pools.
     """
     if is_ec:
         return len(ec_shard_moves(up, acting)) + ec_unassigned_shards(up, acting)
@@ -196,25 +181,20 @@ def copies_moving(up: list, acting: list, is_ec: bool, pool_size: int) -> int:
 
 
 def pg_progress_pct(pg: dict, n_copies: int) -> float | None:
-    """Estimate % of a PG's data already at its target location.
+    """Estimate % of a PG's data at its target, from Ceph's object counters.
 
-    num_objects_misplaced (backfill) and num_objects_degraded (recovery) both
-    count down to 0 as movement completes, unlike the lifetime counters
-    (num_objects_recovered, ...) that only ever increase. Both are in *copy*
-    units, so the PG's total work is num_objects * n_copies (see copies_moving);
-    dividing by num_objects alone would read 0% until more than 1/n_copies of
-    the work was done. An object-count approximation, not byte-exact: it
-    assumes objects are of similar size. None if the PG has no objects.
+    num_objects_misplaced and num_objects_degraded count down to 0, in copy
+    units, so the total is num_objects * n_copies (see copies_moving). Counts
+    objects, not bytes. None if the PG has no objects.
 
-    Unreliable for backfills: see PROGRESS_APPROX_NOTE. pg_progress prefers
-    the backfill position (backfill_progress_pct) and falls back on this.
+    Unreliable after re-peering (see PROGRESS_APPROX_NOTE); only the fallback
+    for backfill positions.
     """
     stat_sum = pg.get("stat_sum", {})
     total = stat_sum.get("num_objects", 0) * n_copies
     if total <= 0:
         return None
-    # Misplaced and degraded are not disjoint (a PG can be both at once), so
-    # an object counted in both could make remaining > total without the clamp.
+    # Clamped: an object can be both misplaced and degraded.
     remaining = stat_sum.get("num_objects_misplaced", 0) + stat_sum.get(
         "num_objects_degraded", 0
     )
@@ -223,25 +203,19 @@ def pg_progress_pct(pg: dict, n_copies: int) -> float | None:
 
 # Backfill position
 # -----------------
-# Backfill copies a PG's objects in hobject sort order, which starts with a
-# 32-bit key: the bit-reversed object-name hash. Each backfill target's
-# 'last_backfill' ('ceph pg <pgid> query' -> peer_info[]) is how far along
-# that order it is, printed as 'POOL:KEY:...' (MIN before it starts, MAX
-# once done). Hashes are uniform, so the share of the PG's key range behind
-# the position is the share of its objects already copied. Unlike the
-# misplaced counter it can't be thrown off by what the target reports about
-# itself after re-peering (see PROGRESS_APPROX_NOTE).
+# Backfill copies objects in hobject order, keyed by the bit-reversed 32-bit
+# name hash. A target's 'last_backfill' ('ceph pg query' peer_info) is its
+# position in that order: 'POOL:KEY:...', or MIN/MAX. Hashes are uniform, so
+# the share of the PG's key range behind the position is the share of objects
+# copied. Unlike the counters, it survives re-peering.
 
 
 def pg_hash_bits(seed: int, pg_num: int) -> int:
     """Return how many low bits of an object's hash are fixed for PG seed.
 
-    Mirrors ceph_stable_mod(hash, pg_num, mask), mask = 2^n - 1 with n the
-    bit length of pg_num - 1: a hash maps to (hash & mask) if that is below
-    pg_num, else to (hash & mask >> 1). With pg_num a power of two every PG
-    fixes all n bits. Otherwise a PG below 2^(n-1) whose sibling
-    seed + 2^(n-1) does not exist also takes that sibling's hashes, so it
-    fixes only n - 1 bits and covers twice the key range.
+    Mirrors ceph_stable_mod(). With n = bit length of pg_num - 1, a PG fixes
+    n bits, except a PG below 2^(n-1) whose sibling seed + 2^(n-1) does not
+    exist: it also takes the sibling's hashes, so it fixes n - 1.
     """
     n = (pg_num - 1).bit_length()
     half = 1 << (n - 1) if n else 0
@@ -253,8 +227,8 @@ def pg_hash_bits(seed: int, pg_num: int) -> int:
 def normalize_last_backfill(last_backfill: str) -> str | None:
     """Reduce a 'last_backfill' hobject to 'MIN', 'MAX' or its hex sort key.
 
-    The object name is dropped: the key is all backfill_fraction needs, and
-    it keeps object names out of 'save-state' captures. None if unparsable.
+    Drops the object name, which also keeps names out of save-state
+    captures. None if unparsable.
     """
     if last_backfill in ("MIN", "MAX"):
         return last_backfill
@@ -267,9 +241,8 @@ def normalize_last_backfill(last_backfill: str) -> str | None:
 def backfill_fraction(position: str, seed: int, pg_num: int) -> float | None:
     """Return the share (0..1) of PG seed's objects before a backfill position.
 
-    position is normalize_last_backfill's output. None when the key does not
-    belong to the PG (a pg_num change since, or a malformed value), so a
-    caller never shows a figure computed against the wrong range.
+    position is normalize_last_backfill's output. None if the key is not in
+    the PG's range (e.g. after a pg_num change).
     """
     if position == "MIN":
         return 0.0
@@ -277,8 +250,8 @@ def backfill_fraction(position: str, seed: int, pg_num: int) -> float | None:
         return 1.0
     key = int(position, 16)
     bits = pg_hash_bits(seed, pg_num)
-    # The key is the hash bit-reversed, so its top `bits` bits are the
-    # hash's fixed low bits, reversed; the rest is the position in the PG.
+    # The key's top `bits` bits are the hash's fixed low bits, reversed; the
+    # rest is the position within the PG.
     hash_low = int(f"{key >> (32 - bits):0{bits}b}"[::-1], 2) if bits else 0
     if hash_low != seed & ((1 << bits) - 1):
         return None
@@ -287,11 +260,7 @@ def backfill_fraction(position: str, seed: int, pg_num: int) -> float | None:
 
 
 def backfill_target_peers(up: list, acting: list, is_ec: bool) -> list[str]:
-    """Return the backfill targets of a PG as 'ceph pg query' names its peers.
-
-    'OSD(SHARD)' for each EC shard moving to a new OSD, plain 'OSD' for each
-    OSD a replicated PG is moving to.
-    """
+    """Return a PG's backfill targets, named as 'ceph pg query' peers (see target_peer)."""
     if is_ec:
         return [f"{dst}({i})" for i, _, dst in ec_shard_moves(up, acting)]
     return [str(o) for o in sorted(real_osd_set(up) - real_osd_set(acting))]
@@ -300,9 +269,8 @@ def backfill_target_peers(up: list, acting: list, is_ec: bool) -> list[str]:
 def extract_backfill_positions(query: dict) -> dict[str, str]:
     """Return {peer: position} for the backfill targets in a 'ceph pg query'.
 
-    Peers are named as in backfill_target_peers, positions normalized (see
-    normalize_last_backfill). Only the query's own backfill targets are kept:
-    peer_info also lists stray OSDs from earlier mappings.
+    Positions are normalized (normalize_last_backfill). Stray peers from
+    earlier mappings are dropped.
     """
     up, acting = query.get("up", []), query.get("acting", [])
     positions = {}
@@ -324,22 +292,14 @@ def extract_backfill_positions(query: dict) -> dict[str, str]:
 
 
 def target_peer(osd: int, shard: "int | str") -> str:
-    """Name a backfill target as 'ceph pg query' names the peer.
-
-    'OSD(SHARD)' for an EC shard (shard an int), plain 'OSD' for a replica
-    (shard '-', as rows of replicated pools have it).
-    """
+    """Name a backfill target as 'ceph pg query' does: 'OSD(SHARD)' for EC, 'OSD' for a replica."""
     return f"{osd}({shard})" if isinstance(shard, int) else str(osd)
 
 
 def target_progress_pct(
     pgid: str, pool: dict | None, position: str | None
 ) -> float | None:
-    """Return % of a PG's objects one backfill target has already been sent.
-
-    None if the position is missing or doesn't fit the PG (see
-    backfill_fraction), or the pool or its pg_num is unknown.
-    """
+    """Return % of a PG's objects one backfill target has received, or None if unknown."""
     pg_num = pool.get("pg_num") if pool else None
     if not pg_num or position is None:
         return None
@@ -355,11 +315,7 @@ class Progress(NamedTuple):
 
 
 def counter_progress(pg: dict, pool: dict | None) -> Progress:
-    """Return the PG's progress by Ceph's misplaced/degraded counters.
-
-    A per-PG figure (all moving copies together): the counters have no
-    per-shard breakdown.
-    """
+    """Return the PG's progress by Ceph's counters: per PG, not per shard."""
     n_copies = copies_moving(
         pg["up"], pg["acting"], is_erasure(pool), pool.get("size", 0) if pool else 0
     )
@@ -369,25 +325,20 @@ def counter_progress(pg: dict, pool: dict | None) -> Progress:
 def copy_progress(
     pg: dict, pool: dict | None, positions: dict[str, str], peer: str
 ) -> Progress:
-    """Return how far one moving copy (EC shard or replica) of a PG is.
+    """Return the progress of one moving copy (EC shard or replica).
 
-    peer is the copy's backfill target (see target_peer), positions the PG's
-    {peer: position} (see extract_backfill_positions), empty if unknown.
-    Without a usable position for peer, falls back on the PG's counters
-    (counter_progress), which are per PG, not per copy.
+    peer names the copy's target (target_peer); positions is the PG's
+    {peer: position}. Falls back on counter_progress.
     """
     pct = target_progress_pct(pg["pgid"], pool, positions.get(peer))
     return counter_progress(pg, pool) if pct is None else Progress(pct, True)
 
 
 def pg_progress(pg: dict, pool: dict | None, positions: dict[str, str]) -> Progress:
-    """Return how far a PG's movement is as a whole, from its backfill positions if possible.
+    """Return a PG's overall progress: its targets' positions averaged.
 
-    The targets' progress (target_progress_pct) averaged, each counting equally:
-    the same copy units as pg_progress_pct's. Used when every moving copy is a
-    backfill target with a usable position. Otherwise, e.g. with an EC shard
-    that has no OSD to go to yet, a failed query or an old --load-state
-    capture, falls back on the counters (counter_progress).
+    Falls back on counter_progress unless every moving copy has a usable
+    position.
     """
     is_ec = is_erasure(pool)
     up, acting = pg["up"], pg["acting"]
@@ -402,22 +353,12 @@ def pg_progress(pg: dict, pool: dict | None, positions: dict[str, str]) -> Progr
     return counter_progress(pg, pool)
 
 
-# Printed once by a subcommand when any PROGRESS figure comes from Ceph's
-# counters (a Progress with exact False, shown with a '~' by format_progress).
-# Kept in one place so the wording can't drift between subcommands. No
-# leading newline/hard-wrapping: each caller adds its own paragraph spacing
-# and either prints this as-is (fixed-width footnote style) or hands it to a
-# wrapper that reflows it (textwrap.fill treats the embedded newlines as
-# plain whitespace).
+# Footnote for PROGRESS figures marked '~'. Pre-wrapped for printing as-is;
+# stderr_para reflows it.
 PROGRESS_APPROX_NOTE = (
-    "~ marks PROGRESS from Ceph's misplaced/degraded object counters, used "
-    "where a PG's\nbackfill positions could not be read ('ceph pg query' "
-    "failed, or a --load-state\ncapture without backfill_positions.json) or "
-    "do not cover all of its moving\ncopies (e.g. an EC shard with no OSD to "
-    "go to yet). Those counters miss most of\nthe work left on a backfill "
-    "that resumed after re-peering, so a ~ figure can\nread far too high, "
-    "even ~100% for a backfill that is only a third done. It\nis per PG: "
-    "every moving shard of the PG shows the same ~ figure."
+    "~ marks PROGRESS from Ceph's misplaced/degraded counters, used where\n"
+    "backfill positions are unavailable. The counters are per PG and can read\n"
+    "far too high after re-peering, even ~100% for a backfill a third done."
 )
 
 
@@ -438,19 +379,14 @@ def ceph_json(cmd: list[str]) -> object:
 
 
 class SnapshotStore:
-    """Source of a script's cluster state: the live ceph CLI, or a saved copy.
+    """Cluster state from the live ceph CLI, or from a capture.
 
-    `commands` maps each snapshot key to the 'ceph ... --format json' command
-    that produces it; the key is also the '<key>.json' filename it is saved
-    as and loaded from. With load_dir set, `json(key)` reads that file and
-    never runs ceph. Either way each key is read at most once (the parsed
-    result is cached), even when several fetch_* helpers ask for it.
+    commands maps each key to its 'ceph ... --format json' command; the key
+    is also the capture's '<key>.json' filename. With load_dir, json() reads
+    the file instead of running ceph. Results are cached.
 
-    With save_dir set, `save()` writes an anonymized copy of every key in
-    `commands`, so the capture is complete by construction and a later
-    --load-state of it needs no ceph. `anonymize` is applied to a deep copy of
-    the full {key: parsed JSON} dict; the copy the run itself uses is left
-    alone, so --save-state never changes what a run reports.
+    With save_dir, save() writes every key, anonymized. Anonymization works on
+    a copy, so the run's own data is unaffected.
     """
 
     def __init__(
@@ -510,16 +446,13 @@ class SnapshotStore:
             )
 
 
-# Where 'save-state' writes, and --load-state reads, {pgid: {peer: position}}
-# (see extract_backfill_positions) for every remapped PG.
+# {pgid: {peer: position}} of every remapped PG, in a capture.
 BACKFILL_POSITIONS_FILE = "backfill_positions.json"
 
-# Per-PG 'pg query' timeout (seconds): an unresponsive primary must not hang
-# the run; that PG just falls back on the counters.
+# Seconds per 'pg query'; a PG that times out falls back on the counters.
 PG_QUERY_TIMEOUT = 30
 
-# Concurrent 'pg query' requests over one librados connection. Each is a
-# round trip to the PG's primary, so this is about latency, not CPU.
+# Concurrent 'pg query' requests over one librados connection (latency-bound).
 RADOS_QUERY_THREADS = 16
 
 
@@ -533,11 +466,10 @@ def _positions_from_output(output: str | bytes) -> dict[str, str] | None:
 
 
 def _query_positions_rados(rados, pgids: list[str]) -> dict[str, dict[str, str] | None]:
-    """Query PGs over one librados connection, a few at a time.
+    """Query PGs concurrently over one librados connection.
 
-    rados is the 'rados' module. Returns {pgid: positions, or None if that
-    PG's query failed}. Raises rados.Error if the cluster can't be reached
-    this way, for the caller to fall back on the CLI.
+    rados is the 'rados' module. Returns {pgid: positions, or None on
+    failure}. Raises rados.Error if the cluster can't be reached.
     """
     cluster = rados.Rados(conffile="")  # "": ceph's default config search
     cluster.conf_parse_env()  # honor CEPH_ARGS, like the ceph CLI
@@ -559,10 +491,9 @@ def _query_positions_rados(rados, pgids: list[str]) -> dict[str, dict[str, str] 
 
 
 def _query_positions_cli(pgids: list[str]) -> dict[str, dict[str, str] | None]:
-    """Query PGs with one 'ceph pg <pgid> query' process each, run in parallel.
+    """Query PGs with parallel 'ceph pg <pgid> query' processes.
 
-    Slower and far more CPU-hungry than librados (each process pays the
-    ceph CLI's startup), but needs nothing beyond the ceph binary.
+    Much slower and more CPU-hungry than librados, but needs only the CLI.
     """
 
     def query(pgid: str) -> dict[str, str] | None:
@@ -588,9 +519,8 @@ def _query_positions_cli(pgids: list[str]) -> dict[str, dict[str, str] | None]:
 def query_backfill_positions(pgids: Iterable[str]) -> dict[str, dict[str, str]]:
     """Return {pgid: {peer: position}} for pgids, queried from the live cluster.
 
-    Uses librados (the 'rados' Python module) when available, else parallel
-    ceph CLI calls. A PG whose query fails is left out, so its progress falls
-    back on the counters; how many failed is noted on stderr.
+    Uses librados if importable, else the CLI. PGs whose query fails are left
+    out (and counted on stderr).
     """
     pgids = sorted(set(pgids), key=pgid_sort_key)
     if not pgids:
@@ -622,8 +552,7 @@ def fetch_backfill_positions(
 ) -> dict[str, dict[str, str]]:
     """Return {pgid: {peer: position}} for pgids, live or from a snapshot.
 
-    With --load-state, read from BACKFILL_POSITIONS_FILE; a capture made
-    before 'save-state' wrote it yields {} (every PG on the counters).
+    A capture without BACKFILL_POSITIONS_FILE yields {}.
     """
     if store.load_dir is None:
         return query_backfill_positions(pgids)
@@ -635,11 +564,7 @@ def fetch_backfill_positions(
 
 
 def resolve_save_dir(path: str) -> Path:
-    """Validate and prepare a directory for 'backfillctl save-state' to write into.
-
-    Created if missing; must be empty (or not yet exist) so a capture is
-    never partially overwritten by an unrelated one.
-    """
+    """Create save-state's output directory, exiting unless it is empty."""
     save_dir = Path(path)
     save_dir.mkdir(parents=True, exist_ok=True)
     if any(save_dir.iterdir()):
@@ -657,33 +582,80 @@ def parse_osd(text: str) -> int:
     return int(match[1])
 
 
-def add_load_state_arg(parser: argparse.ArgumentParser):
-    """Add --load-state, to analyze a captured cluster state instead of a live one.
+class HelpFormatter(argparse.HelpFormatter):
+    """Reflow each paragraph of a description separately.
 
-    backfillctl adds it once, to its top-level parser, so it is global: it
-    goes before the subcommand name and reaches every subcommand's args.
+    Paragraphs are separated by blank lines. '- ' list items get a hanging
+    indent; indented blocks (examples) are kept as written.
     """
+
+    def __init__(self, prog: str, **kwargs):
+        kwargs.setdefault("width", min(100, shutil.get_terminal_size().columns - 2))
+        super().__init__(prog, **kwargs)
+
+    def _fill_text(self, text: str, width: int, indent: str) -> str:
+        def fill(item: str, hang: str = "") -> str:
+            return textwrap.fill(
+                " ".join(item.split()),
+                width,
+                initial_indent=indent,
+                subsequent_indent=indent + hang,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+
+        paragraphs = []
+        for para in textwrap.dedent(text).strip().split("\n\n"):
+            if para.startswith(" "):
+                paragraphs.append(textwrap.indent(para, indent))
+            elif para.startswith("- "):
+                items = re.split(r"\n(?=- )", para)
+                paragraphs.append("\n".join(fill(item, "  ") for item in items))
+            else:
+                paragraphs.append(fill(para))
+        return "\n\n".join(paragraphs)
+
+
+def add_load_state_arg(parser: argparse.ArgumentParser):
+    """Add the global --load-state option."""
     parser.add_argument(
         "--load-state",
         metavar="DIR",
-        help="Analyze a saved cluster state instead of a live cluster. DIR "
-        "must be a directory as produced by 'backfillctl save-state' (or "
-        "matching the layout of the fixtures under "
-        "tests/pg-osd/test-data/). No 'ceph' commands are run. Not "
-        "accepted by save-state.",
+        help="Read cluster state from a 'save-state' capture instead of the "
+        "live cluster.",
+    )
+
+
+def add_pgremapper_mappings_arg(parser: argparse.ArgumentParser):
+    """Add --pgremapper-mappings."""
+    parser.add_argument(
+        "--pgremapper-mappings",
+        action="store_true",
+        help="Print JSON for 'pgremapper import-mappings' instead of the table.",
+    )
+
+
+def add_exclude_pgs_arg(parser: argparse.ArgumentParser):
+    """Add --exclude-pgs."""
+    parser.add_argument(
+        "--exclude-pgs",
+        nargs="+",
+        default=[],
+        metavar="PGID",
+        help="Leave these PGs alone.",
     )
 
 
 def extract_pg_stats(raw, source: str) -> list[dict]:
-    """Pull the pg_stat list out of the several shapes ceph releases return.
+    """Extract the pg_stat list from any of the shapes ceph releases return.
 
-    source names the command in error messages, e.g. 'ceph pg ls remapped'.
+    source names the command in error messages.
     """
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
         if raw.get("pg_ready") is False:
-            # Reading this as "no PGs" would answer "nothing is moving" wrongly.
+            # Not "no PGs": that would wrongly report nothing moving.
             sys.exit(
                 f"ERROR: '{source}' reports the PG stats are not ready (the "
                 "mgr has just started or failed over?); retry in a moment."
@@ -702,8 +674,7 @@ def extract_pg_stats(raw, source: str) -> list[dict]:
                 and "pgid" in val[0]
             ):
                 return val
-        # With no matching PGs 'ceph pg ls' omits 'pg_stats' and returns just
-        # {"pg_ready": true}.
+        # 'ceph pg ls' with no matching PGs returns just {"pg_ready": true}.
         if "pg_ready" in raw:
             return []
     raise SystemExit(
@@ -740,11 +711,7 @@ def fetch_osd_hosts(store: SnapshotStore, key: str = "osd_tree") -> dict[int, st
 
 
 def fetch_osd_df(store: SnapshotStore, key: str = "osd_df") -> dict[int, dict]:
-    """Return {osd_id: node} from 'ceph osd df'.
-
-    Each node carries device_class, utilization, status, reweight and
-    crush_weight. Down OSDs may lack a utilization.
-    """
+    """Return {osd_id: node} from 'ceph osd df'. Down OSDs may lack utilization."""
     return {n["id"]: n for n in _osd_nodes(store.json(key))}
 
 
@@ -773,12 +740,10 @@ def fetch_upmap_items(
 
 
 # ---------------------------------------------------------------------------
-# Anonymization for --save-state
+# Anonymization for save-state
 # ---------------------------------------------------------------------------
 
-# A reserved-for-documentation range (RFC 5737 TEST-NET-2): guaranteed not
-# to be a real routable address, so a saved capture can't be mistaken for
-# one and can't leak the real network's layout.
+# RFC 5737 TEST-NET-2: documentation-only, never routable.
 _FAKE_IP_PREFIX = "198.51.100."
 _ADDR_IP_RE = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
 _TRAILING_NUM_RE = re.compile(r"(\d+)$")
@@ -788,12 +753,9 @@ FAKE_FSID = "00000000-0000-0000-0000-000000000000"
 
 
 def _fake_ip(real_ip: str) -> str:
-    """Map a real IP to a deterministic, non-routable stand-in.
+    """Map a real IP to a fake one with the same last octet.
 
-    Keyed off the real address's own last octet, so the same real IP always
-    anonymizes to the same fake one with no lookup table required. Distinct
-    real IPs sharing a last octet collide onto the same fake one; that is
-    harmless since no script parses these descriptive fields.
+    Collisions are harmless: nothing reads these fields.
     """
     last_octet = int(real_ip.rsplit(".", 1)[-1])
     return f"{_FAKE_IP_PREFIX}{max(1, min(254, last_octet))}"
@@ -810,12 +772,7 @@ def _fake_uuid(osd_id: int) -> str:
 
 
 def _fake_hostname(real_name: str) -> str:
-    """Map a real hostname to a deterministic stand-in.
-
-    Keyed off the hostname's trailing number (e.g. 'ceph2-11' -> 'host11'), or,
-    with none, a hash of the whole name, so the same real host always maps to
-    the same fake one with no shared state.
-    """
+    """Map a hostname to 'hostNN' by its trailing number, else to a hash of it."""
     if _FAKE_HASH_NAME_RE.fullmatch(real_name):
         return real_name  # already a stand-in: keep anonymization idempotent
     m = _TRAILING_NUM_RE.search(real_name)
@@ -825,12 +782,10 @@ def _fake_hostname(real_name: str) -> str:
 
 
 def _fake_hostnames(real_names: set[str]) -> dict[str, str]:
-    """Map every real hostname to a fake one, never two to the same.
+    """Map every hostname to a distinct fake one; idempotent.
 
-    The analysis depends on which OSDs share a host, so two hosts must not
-    become one (ceph1-5 and ceph2-5 would both be 'host05'). Names that collide
-    under _fake_hostname all take the hash form instead. Idempotent: the fake
-    names it produces map to themselves.
+    Names that would collide under _fake_hostname (ceph1-5, ceph2-5) take the
+    hash form instead: merging two hosts would change the analysis.
     """
     fakes = {name: _fake_hostname(name) for name in real_names}
     counts = Counter(fakes.values())
@@ -843,19 +798,12 @@ def _fake_hostnames(real_names: set[str]) -> dict[str, str]:
 
 
 def anonymize_snapshots(snapshots: dict[str, object]) -> None:
-    """Anonymize parsed snapshots in place, whichever of the known keys are present.
+    """Anonymize parsed snapshots in place.
 
-    Replaces the cluster fsid, OSD IP addresses, OSD uuids, hostnames and
-    pool/CRUSH-rule names with deterministic fake values: everything that could
-    fingerprint the real cluster or site. PG ids, OSD ids, utilizations,
-    weights, device classes and the topology are untouched, since the analysis
-    (and any --load-state replay) depends on them. Pool and rule names are
-    display-only in the scripts (lookups are by id), so renaming them to
-    'pool<id>'/'rule<id>' needs no cross-reference fixups.
-
-    Idempotent: every substitution is keyed off an id, or off the real value
-    itself, so a second pass changes nothing and independent passes over
-    related captures agree without sharing state.
+    Replaces the fsid, OSD addresses and uuids, hostnames, and pool and rule
+    names with deterministic fakes. Ids, utilizations, weights, device
+    classes and topology are kept. Idempotent, and consistent across
+    captures.
     """
     if "osd_tree" in snapshots:
         osd_tree = snapshots["osd_tree"]
@@ -867,8 +815,7 @@ def anonymize_snapshots(snapshots: dict[str, object]) -> None:
     if "osd_dump" in snapshots:
         osd_dump = snapshots["osd_dump"]
         osd_dump["fsid"] = FAKE_FSID
-        # 'ceph osd dump' embeds its own copy of each pool's name, keyed by
-        # 'pool' rather than 'pool_id'.
+        # 'osd dump' has its own copy of pool names, keyed by 'pool'.
         for pool in osd_dump.get("pools", []):
             pool["pool_name"] = f"pool{pool['pool']}"
         for osd in osd_dump.get("osds", []):
@@ -902,10 +849,7 @@ def anonymize_snapshots(snapshots: dict[str, object]) -> None:
 
 
 def format_utilization(osd_df: dict[int, dict], osd_id: int | None) -> str:
-    """Format an OSD's utilization as 'NN.N%'.
-
-    '-' for an empty slot (osd_id None), '?' if 'ceph osd df' has no figure.
-    """
+    """Format an OSD's utilization as 'NN.N%', '-' for no OSD, '?' if unknown."""
     if osd_id is None:
         return NOT_APPLICABLE
     util = osd_df.get(osd_id, {}).get("utilization")
@@ -913,10 +857,9 @@ def format_utilization(osd_df: dict[int, dict], osd_id: int | None) -> str:
 
 
 def format_progress(pct: float | None, exact: bool = True) -> str:
-    """Format a progress percentage, floored so only finished copying reads '100%'.
+    """Format a progress percentage, floored so only a finished copy reads 100%.
 
-    A figure from Ceph's counters (exact False, see Progress) gets a '~'
-    prefix, explained by PROGRESS_APPROX_NOTE.
+    Counter-based figures (not exact) get a '~' prefix.
     """
     if pct is None:
         return NOT_APPLICABLE
@@ -968,9 +911,7 @@ def osd_cells(
 ) -> list[str]:
     """Return the [OSD, UTIL, HOST] cells for one slot.
 
-    The OSD reads as its bare number ('N', not 'osd.N'). An empty slot (osd_id
-    None) reads 'none', '-', '-'. The OSD that is the PG's `primary` gets a
-    trailing '*'.
+    An empty slot reads 'none', '-', '-'; primary gets a trailing '*'.
     """
     if osd_id is None:
         return ["none", NOT_APPLICABLE, NOT_APPLICABLE]
@@ -983,13 +924,9 @@ def osd_cells(
 
 
 def wrap_text(text: str, indent: str = "") -> str:
-    """Wrap a stderr paragraph or list item to a readable width.
+    """Wrap a stderr paragraph to the terminal, 40 to 100 columns.
 
-    Capped at 100 columns (and no narrower than 40) so a long NOTE/WARNING/
-    ERROR stays readable on a wide terminal instead of stretching edge to
-    edge; 'indent' (e.g. "  " for a list item under a paragraph) is repeated
-    on wrapped lines plus two more spaces, so the continuation hangs under
-    the item's own text rather than the margin.
+    Continuation lines hang two spaces deeper than indent.
     """
     width = min(100, max(40, shutil.get_terminal_size().columns))
     return textwrap.fill(
@@ -1003,12 +940,7 @@ def wrap_text(text: str, indent: str = "") -> str:
 
 
 def stderr_para(text: str) -> None:
-    """Print a wrapped stderr paragraph, blank-line-separated from the last one.
-
-    Without the blank line, a run's several NOTE/WARNING messages read as one
-    undifferentiated block once each has wrapped across multiple terminal
-    lines; this makes each message its own visually distinct paragraph.
-    """
+    """Print a wrapped stderr paragraph, separated from the previous by a blank line."""
     if stderr_para.printed:
         print(file=sys.stderr)
     print(wrap_text(text), file=sys.stderr)
@@ -1019,16 +951,12 @@ stderr_para.printed = False
 
 
 def print_table(columns: Columns, rows: list[list[str]]) -> None:
-    """Print rows under a two-line header: group spans, then column labels.
+    """Print rows under a two-line header: group names, then column labels.
 
-    A group's name is centered in dashes across the full width of its
-    columns, so it visibly covers all of them. The span is always wider than
-    the name (the labels under it alone are wider), so no fitting is needed.
-    Columns of different groups are separated by the wider GROUP_SEP, on every
-    line, to set the groups visually apart. The final column is left unpadded.
+    Each group name is centered in dashes across its columns; groups are
+    separated by GROUP_SEP. The last column is unpadded.
     """
-    # A list, not max(a, *b): with no rows the star-args form degrades to
-    # max(int) and raises.
+    # A list: max(a, *b) raises when there are no rows.
     widths = [
         max([len(label), *(len(row[i]) for row in rows)])
         for i, (_, label) in enumerate(columns)
@@ -1064,22 +992,15 @@ def print_table(columns: Columns, rows: list[list[str]]) -> None:
 # ---------------------------------------------------------------------------
 # Cancelling backfills: pins, companions, chains, output
 #
-# Shared by cancel-backfill and cancel-uphill, both of which propose upmaps
-# that pin a moving shard back to its acting OSD. Picking *which* shard to
-# pin is each subcommand's own job (by target OSD for cancel-backfill, by
-# utilization direction for cancel-uphill); everything here is about turning
-# one or more chosen shards into a valid, orderable set of upmap pairs and
-# printing the result the same way in both.
+# Shared by cancel-backfill and cancel-uphill. Each picks which shards to pin
+# back; this turns them into a valid, ordered set of upmap pairs and prints it.
 # ---------------------------------------------------------------------------
 
 
 def fetch_remapped_pg_stats(store: SnapshotStore) -> list[dict]:
-    """Return the PGs with up != acting ('remapped' state flag), live or from a snapshot.
+    """Return the remapped PGs (up != acting).
 
-    Live reads 'pg_ls_remapped' (a small fraction of the full PG population on
-    a big cluster); --load-state instead filters the 'pg_dump_pgs' snapshot
-    client-side by the same state flag. Both keys must be present in the
-    caller's SNAPSHOT_COMMANDS.
+    Live: 'pg_ls_remapped'. From a capture: 'pg_dump_pgs', filtered.
     """
     if store.load_dir is None:
         return fetch_pg_stats(store, "pg_ls_remapped")
@@ -1100,13 +1021,11 @@ class Cancellation(NamedTuple):
     size_bytes: int | None  # estimated, None if unknown
     state: str
     progress_pct: float | None  # of this shard's move (see copy_progress)
-    companion_of: "int | str | None" = None  # the requested shard this one is
-    # pinned along with (see close_pins), None if requested directly
-    blocker_util: float | None = None  # cancel-backfill's --pin-blockers only:
-    # set when this shard's target OSD would reach backfillfull_ratio (percent
-    # it would be at), i.e. it is a blocker. Always None for cancel-uphill.
-    progress_exact: bool = False  # progress_pct is from backfill positions,
-    # not Ceph's counters (see with_exact_progress)
+    companion_of: "int | str | None" = None  # requested shard this one goes
+    # with (see close_pins); None if requested directly
+    blocker_util: float | None = None  # for a blocker (--pin-blockers): its
+    # target's projected utilization
+    progress_exact: bool = False  # from backfill positions, not counters
 
 
 def with_exact_progress(
@@ -1115,12 +1034,9 @@ def with_exact_progress(
     pg_stats: list[dict],
     pools: dict[int, dict],
 ) -> list[Cancellation]:
-    """Return cancellations with each shard's own progress where possible.
+    """Replace counter-based progress with each shard's own (copy_progress).
 
-    Planning fills progress_pct from Ceph's per-PG counters (pg_progress_pct),
-    which needs no queries; this then queries the backfill positions of only
-    the PGs actually proposed and replaces each shard's figure with its own
-    (copy_progress), keeping the counters where a position is missing.
+    Queries backfill positions only for the proposed PGs.
     """
     pgids = {c.pgid for c in cancellations}
     pgs = {pg["pgid"]: pg for pg in pg_stats if pg["pgid"] in pgids}
@@ -1156,19 +1072,19 @@ def same_place(a: int, b: int, osd_host: dict[int, str]) -> bool:
 def close_pins(
     up: list, acting: list, pins: dict[int, int], osd_host: dict[int, str]
 ) -> tuple[dict[int, int], str | None]:
-    """Extend pins ({shard: acting_osd}) until the resulting mapping is valid.
+    """Extend pins ({shard: acting_osd}) until the resulting up set is valid.
 
-    Pinning a shard back puts its acting OSD into the up set, and Ceph drops an
-    upmap whose result puts two shards on one host (the pool's failure domain)
-    or the same OSD twice. That happens whenever another shard of the PG is
-    moving too and its destination shares a host with the pinned shard's acting
-    OSD: CRUSH re-placed the two together. The way out is to pin that other
-    shard back as well ("companion"), which can in turn clash with a third, and
-    so on until the mapping is valid.
+    Ceph silently drops an upmap that puts two shards of a PG on one host or
+    OSD. Pinning a shard back to its acting OSD does that if another shard is
+    moving onto the same host, so that shard is pinned back too (a
+    "companion"), which may in turn need its own.
 
-    Returns (pins, None) with the given pins first, or ({}, reason) when a
-    clashing shard cannot be pinned back (it is not moving, or has no acting
-    OSD), so that nothing partial is proposed.
+    A shard merely moving onto a host that holds another shard of its PG is
+    fine: Ceph checks the up set, and acting switches to up only once all of
+    the PG's backfills finish.
+
+    Returns (pins, None), given pins first, or ({}, reason) if a clashing
+    shard cannot be pinned (not moving, or no acting OSD).
     """
     pins = dict(pins)
     while True:
@@ -1196,24 +1112,17 @@ def close_pins(
 def pin_with_companions(
     up: list, acting: list, slot: int, osd_host: dict[int, str]
 ) -> tuple[dict[int, int], str | None]:
-    """Pin EC shard 'slot' to its acting OSD, plus whatever that requires.
-
-    Returns ({shard: acting_osd}, None) with the requested shard first, or
-    ({}, reason); see close_pins.
-    """
+    """Pin EC shard 'slot' to its acting OSD, plus its companions (see close_pins)."""
     return close_pins(up, acting, {slot: acting[slot]}, osd_host)
 
 
 def pin_replica(
     up: list, osd: int, acting_osd: int, osd_host: dict[int, str]
 ) -> str | None:
-    """Return why a replicated PG's replica cannot be pinned, or None if it can.
+    """Return why replacing osd with acting_osd in up is invalid, or None.
 
-    The replica swaps osd for acting_osd; the same-host clash with the other
-    replicas is checked as for EC. Replicas have no identity, so a clashing
-    replica cannot be pinned too: a PG with a second replica moving is
-    already ambiguous to pair and is the caller's job to refuse before
-    calling this, so it is never seen here.
+    Only for a PG with a single replica moving (the caller's check), so a
+    clash cannot be resolved with a companion.
     """
     for other in up:
         if (
@@ -1233,12 +1142,9 @@ def order_moves(
 ) -> tuple[list[tuple[int, int, int]], str | None]:
     """Order (shard, from_osd, to_osd) moves so Ceph applies all of them.
 
-    Ceph applies the pairs of a pg_upmap_items entry in order and skips a pair
-    whose 'to' OSD is still in the mapping. So a pair may only come after the
-    pair that moves its 'to' OSD away (the one whose 'from' it is). Shard order
-    is kept wherever nothing depends on anything else. Pairs that depend on each
-    other in a ring (osd.A -> B and B -> A) cannot be expressed as upmaps at
-    all: returns ([], reason) for those.
+    Ceph applies an entry's pairs in order and skips one whose 'to' is still
+    in the mapping, so A->B must follow B->C. Otherwise shard order is kept.
+    A cycle (A->B, B->A) cannot be expressed: returns ([], reason).
     """
     remaining = sorted(moves, key=lambda move: move[0])
     ordered = []
@@ -1255,12 +1161,7 @@ def order_moves(
 
 
 def chained_pgs(cancellations: list[Cancellation]) -> dict[str, list[Cancellation]]:
-    """Return {pgid: its cancellations}, in PG order, for PGs whose pairs chain.
-
-    Pairs chain when one's target OSD is another's source (osd.A -> B and
-    B -> C), which order_moves puts in the order Ceph needs. pgremapper cannot
-    apply those, see warn_chained_pgs.
-    """
+    """Return {pgid: its cancellations} for PGs whose pairs chain (A->B, B->C)."""
     by_pg: dict[str, list[Cancellation]] = {}
     for c in cancellations:
         by_pg.setdefault(c.pgid, []).append(c)
@@ -1274,33 +1175,25 @@ def chained_pgs(cancellations: list[Cancellation]) -> dict[str, list[Cancellatio
 
 
 def warn_chained_pgs(chained: dict[str, list[Cancellation]], left_out: bool) -> None:
-    """Warn on stderr about PGs with chained pairs, with how to apply them.
+    """Warn on stderr about PGs with chained pairs, and print commands for them.
 
-    Ceph applies the pairs of an entry in order and skips a pair whose target is
-    still in the mapping, so a chain has to go in the order order_moves gives.
-    Dry runs of pgremapper (1.0.0) on a real chain showed it cannot: in that
-    order 'import-mappings' aborts with a panic ("conflicting mapping"), which
-    would take a whole batch down with it, and in the reverse order it silently
-    folds the chain into one different pair. So in the machine formats these
-    PGs are left out (left_out) and the pairs are given here as commands
-    instead.
+    Dry runs of pgremapper 1.0.0 showed import-mappings cannot apply a chain:
+    it panics ("conflicting mapping") on the order Ceph needs, and folds the
+    chain into a different pair in the other. So the JSON output leaves these
+    PGs out (left_out).
     """
     stderr_para(
-        f"WARNING: {len(chained)} PG(s) have chained pairs (one pair's target is "
-        f"another's source, e.g. osd.A->B and osd.B->C): {', '.join(chained)}. "
-        "Ceph applies an entry's pairs in order and skips one whose target is "
-        "still in the mapping, so they must be given in the order below. "
-        "pgremapper cannot apply them: import-mappings aborts with a panic on "
-        "this order, and in the other order rewrites the chain into a different "
-        "mapping (seen in dry runs)."
-        + (" They are therefore left out of this output." if left_out else "")
-        + " Apply each with 'ceph osd pg-upmap-items', which replaces the PG's "
-        "whole upmap entry, so add the PG's existing pairs from 'ceph osd dump' "
-        "first (this has not been tried on your cluster):"
+        f"WARNING: {len(chained)} PG(s) have chained pairs (A->B, B->C): "
+        f"{', '.join(chained)}. pgremapper cannot apply these (it panics)"
+        + ("; they are left out of this output" if left_out else "")
+        + ". Apply them with the (untested) commands below, pairs in the order "
+        "given. "
+        "'ceph osd pg-upmap-items' replaces the PG's whole upmap entry: first "
+        "add the PG's existing pairs from 'ceph osd dump'."
     )
     for pgid, cs in chained.items():
         pairs = " ".join(f"{c.up_osd} {c.acting_osd}" for c in cs)
-        # Not wrapped: these are meant to be copy-pasted as shell commands.
+        # Not wrapped: for copy-pasting.
         print(f"  ceph osd pg-upmap-items {pgid} {pairs}", file=sys.stderr)
 
 
@@ -1317,7 +1210,7 @@ def format_bytes(num: int | None) -> str:
 
 
 def format_note(c: Cancellation) -> str:
-    """Say why a shard is in the proposal, if not because it was chosen directly."""
+    """Return the NOTE cell: why a shard not chosen directly is pinned."""
     if c.blocker_util is not None:
         return (
             f"blocks shard {c.companion_of}: target osd.{c.up_osd} "
@@ -1328,12 +1221,8 @@ def format_note(c: Cancellation) -> str:
     return ""
 
 
-# Each entry is (group, label); the header is printed on two lines, the group
-# name spanning its columns above their labels, and an empty group means the
-# column has no group line. The ACTING group is where the shard's data is now
-# (the 'to' of the upmap pair), UP where CRUSH wants it (the 'from'). OSDs are
-# bare ids, as 'pgremapper' takes them. print_table leaves the final column
-# unpadded.
+# (group, label). ACTING is where the data is (the pair's 'to'), UP where
+# CRUSH wants it (the 'from').
 COLUMNS = [
     ("", "PGID"),
     ("", "SHARD"),
@@ -1368,12 +1257,7 @@ def format_row(
 def print_pgremapper_mappings(cancellations: list[Cancellation]) -> None:
     """Print the cancellations as JSON for 'pgremapper import-mappings'.
 
-    One {pgid, mapping: {from, to}} entry per pair, in a JSON array with one
-    entry per line, so it is easy to read and to prune with jq ("[]" when there
-    are none, so the output is always valid JSON). import-mappings
-    reads the cluster's upmaps once and applies all pairs of a PG together, so
-    unlike separate 'pgremapper remap' runs the pairs of a PG cannot overwrite
-    each other.
+    A JSON array, one {pgid, mapping: {from, to}} entry per line.
     """
     if not cancellations:
         print("[]")

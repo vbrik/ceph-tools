@@ -1080,9 +1080,7 @@ class MainTest(unittest.TestCase):
         self.assertIsNotNone(blocker.blocker_util)
         _, err = self.run_main("--pin-blockers", "--osd", "682", **kwargs)
         self.assertIn("1 more shard(s)", err)
-        self.assertIn(
-            "1 because their target would be over backfillfull_ratio", flat(err)
-        )
+        self.assertIn("(blockers: 1)", flat(err))
         self.assertNotIn("--pin-blockers was not given", err)
 
     def test_table_says_which_shard_a_blocker_blocks(self):
@@ -1546,12 +1544,12 @@ class FixtureReplayTest(unittest.TestCase):
         err = self.replay(896).stderr
         self.assertIn("6 arriving shard(s)", err)
         self.assertIn("5 more shard(s)", err)
-        self.assertNotIn("because their target would be over", err)
+        self.assertNotIn("blockers:", err)
         self.assertIn("0 cannot be pinned", err)
         self.assertIn("--pin-blockers was not given", err)
 
         err = self.replay(896, "--pin-blockers").stderr
-        self.assertIn("(7 because their target would be over", flat(err))
+        self.assertIn("(blockers: 7)", flat(err))
         self.assertNotIn("--pin-blockers was not given", err)
 
     def test_osd_74_needs_no_companions(self):
@@ -1740,9 +1738,7 @@ class BlockerFixtureReplayTest(unittest.TestCase):
         err = self.replay("--pin-blockers").stderr
         self.assertIn("1 arriving shard(s)", err)
         self.assertIn("1 more shard(s)", err)
-        self.assertIn(
-            "1 because their target would be over backfillfull_ratio", flat(err)
-        )
+        self.assertIn("(blockers: 1)", flat(err))
 
     def test_keeping_the_wanted_backfill_means_dropping_only_its_own_entry(self):
         # the user's case: keep 231->896, so drop that entry and keep the blocker

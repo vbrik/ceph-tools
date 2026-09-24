@@ -1,126 +1,36 @@
 # SPDX-License-Identifier: MIT
 """
-Propose upmaps that drain OSDs of every PG shard mapped to them.
+Propose upmaps that move every PG shard off the given OSDs, or off every OSD
+of the given hosts.
 
-What it does
-------------
-The OSDs to drain are given either directly (--osds) or as the hosts whose
-OSDs are all to be drained (--hosts, matched against the short host names in
-'ceph osd tree'; a fully qualified name is shortened the same way).
+Marking an OSD out lets a host-level CRUSH rule pile its shards onto the same
+host's other OSDs. This spreads them over the least-utilized OSDs
+cluster-wide instead. Shards still backfilling onto a drained OSD are
+redirected too.
 
-Every PG shard whose 'up' slot is one of those OSDs is an evacuee, whether
-its data is already there or is still backfilling onto it: either way, the
-upmap pair '<drained OSD> -> <target>' sends it elsewhere. A shard the OSD
-still holds but that is already moving away (in 'acting', not in 'up') needs
-nothing and is only counted on stderr.
+Targets are chosen as in divert-toofull, except that drained OSDs are never
+targets, the shard's own host is allowed, and the largest shards are placed
+first.
 
-It only prints proposals; it changes nothing. Unlike marking the OSD out,
-which leaves it to CRUSH to re-place its shards (for a host-level rule, onto
-the same host's other OSDs -- see divert_toofull's "The situation this
-solves"), this spreads them over the least-utilized OSDs cluster-wide.
+backfill_toofull holds back the whole PG, so a moved shard also waits on any
+other shard of its PG heading for an OSD projected over --max-target-util or,
+if the PG is backfill_toofull now, arriving on an OSD at or above
+--min-up-util. Such a blocker is diverted if there is room, otherwise pinned
+back to its acting OSD (with companions, as in cancel-backfill). If neither
+is possible, the NOTE column says the PG will stay stuck, and why.
 
-How targets are chosen
-----------------------
-As in divert-toofull (see placement.pick_target and divert_toofull's module
-docstring): an OSD of the evacuee's device class that is up and in, not on a
-host another shard of the PG is mapped to, not in the PG's up set or raw CRUSH
-mapping, not the target of --max-target-uses shards already, and at or below
---max-target-util (default backfillfull_ratio - 1) once the shard is projected
-onto it. The one with the lowest such projection wins, OSD id breaking ties.
-The table's PROJ column is the target's projection once the whole plan has
-completed, so it is the same in every row of an OSD.
+Keep the drained OSDs up and in until they are empty: marking one out voids
+these upmaps, since Ceph honors only a 'from' that CRUSH chose. Afterwards,
+external/upmap-remapped.py can pin CRUSH's new mapping to where the data is.
 
-The differences:
+Apply the output as with divert-toofull. Keep a blocker's entry with the
+shard it unblocks, and a companion's with its pin:
 
-  - None of the drained OSDs is ever a target.
-  - There is no "strictly emptier than the OSD it leaves" rule: the point is
-    to empty that OSD, whatever its utilization.
-  - The evacuee's own host is not excluded: moving a shard to another OSD of
-    the same host keeps the PG's failure domains as they were. (With
-    --hosts, all of that host's OSDs are drained, so this never applies.)
-  - The projection counts the shards arriving at every remapped PG in the
-    cluster, not just the backfill_toofull ones.
-  - The largest shards are placed first (PG id, then shard, breaking ties):
-    ordering by the ACTING OSD's fullness, as divert-toofull does, says
-    nothing here, where that is the drained OSD for most evacuees; and big
-    shards first packs the room that is left better.
+    backfillctl drain --hosts host07 --pgremapper-mappings > m.json
+    pgremapper import-mappings m.json
 
-An evacuee with no legal target is left unplaceable and counted on stderr
-rather than sent somewhere over the cap. The pools of the affected PGs must
-fail over at 'host' (the unit targets are kept apart by); the subcommand
-exits with an error otherwise.
-
-Blockers
---------
-backfill_toofull is a property of the PG: while any of its backfill targets
-refuses a reservation, the whole PG waits, evacuee included. So after every
-evacuee has been placed, each affected PG's other arriving shards
-("siblings") are checked. A sibling is a blocker if the OSD it is heading for
-is projected above --max-target-util. That test ignores the PG's state: even
-a PG already backfilling re-peers when its upmap changes and has to reserve
-again. A PG that is backfill_toofull right now is known to be refused by
-*some* target, and Ceph can refuse one below the cap (it judges the target's
-projected usage, which this run can only estimate), so for such a PG a
-sibling is also a blocker if its OSD is at or above --min-up-util -- the same
-test, and default (nearfull_ratio), divert-toofull uses to guess which shard
-of a backfill_toofull PG is the refused one (see its "How PGs are
-identified"). For each blocker, in order:
-
-  1. Divert it: pick a target for it the same way as for an evacuee (NOTE
-     "diverted: ..."). Diverting uses the same room as evacuees, which is
-     why evacuees are placed first.
-  2. Otherwise pin it back to its acting OSD, i.e. cancel its backfill, with
-     whatever companion pins that needs (shared.close_pins; NOTE "pinned, no
-     room to divert: ..." and "companion of shard N"). Refused, like a pin
-     cancel-backfill cannot make, if the shard has no acting OSD, if a
-     replicated PG's pairing is ambiguous, or if the pins would clash with
-     the PG's new up set; and also if a pin would send data back to a
-     drained OSD, would undo a move proposed in this run, or would chain
-     with another pair (which pgremapper cannot apply, see
-     shared.warn_chained_pgs).
-  3. Otherwise keep the evacuee's proposal regardless -- it still moves the
-     shard off the OSD once the blocker clears -- and say so in its NOTE:
-     "PG stays toofull: shard N -> osd.X (<why it blocks>; cannot pin: ...)".
-
-A diverted or pinned blocker's NOTE says which of the two tests it failed
-and which evacuees it would have held up, e.g. "pinned, no room to divert:
-osd.195 (now 90.5%, projected 91.4% > --max-target-util 90%) would stall the
-PG, holding up shard 9 leaving osd.231".
-
-A PG that is backfill_toofull right now but has no sibling passing either
-test gets a NOTE saying its blocker is unidentified (unless one of its
-evacuees was itself arriving on a drained OSD, whose redirect may be the
-fix), since the evacuee may well wait regardless.
-
-Keep the drained OSD in
------------------------
-Ceph only honors an upmap pair whose 'from' is an OSD CRUSH itself chose (see
-divert_toofull's "Why the raw CRUSH mapping matters"). These pairs therefore
-only hold while the drained OSD stays in CRUSH's mapping: marking it out (or
-removing it) before the data has moved voids them, and CRUSH re-places the
-shards onto the same host's other OSDs -- the pile-up this subcommand avoids.
-Leave it up and in until it is empty; once it is, marking it out and running
-external/upmap-remapped.py pins the resulting remaps to where the data
-already is.
-
-Testing against saved cluster state
-------------------------------------
-Live, the subcommand reads 'ceph pg ls-by-osd' for each drained OSD and 'ceph
-pg ls remapped' for the projection. 'backfillctl --load-state DIR drain
-...' instead filters the 'pg_dump_pgs' of a 'backfillctl save-state' capture
-for both.
-
-Applying the output
--------------------
-As for divert-toofull: --pgremapper-mappings prints a JSON array for
-'pgremapper import-mappings' (from is UP OSD, to is TARGET OSD), which
-applies all pairs of a PG together and keeps its existing upmap pairs. Keep a
-blocker's entry with the evacuee it unblocks, and a companion's with the pin
-it belongs to. The upmap balancer may undo manual upmaps; consider 'ceph
-balancer off' while the drain runs.
-
-    backfillctl drain --hosts host07 --pgremapper-mappings > mappings.json
-    pgremapper-v1.0.0-linux-amd64 import-mappings mappings.json
+Consider 'ceph balancer off' while the drain runs. Assumes the CRUSH failure
+domain is host.
 """
 
 import argparse
@@ -147,6 +57,7 @@ from placement import (
 )
 from shared import (
     NOT_APPLICABLE,
+    HelpFormatter,
     SnapshotStore,
     close_pins,
     fetch_crush_rules,
@@ -169,10 +80,8 @@ from shared import (
     stderr_para,
 )
 
-# Static snapshot keys. A live run adds one 'pg ls-by-osd' per drained OSD
-# once it knows them (see ls_by_osd_commands); --load-state filters pg_dump_pgs instead, both for
-# those and for pg_ls_remapped (see fetch_drained_pg_stats and
-# shared.fetch_remapped_pg_stats).
+# Live runs add a 'pg ls-by-osd' per drained OSD (ls_by_osd_commands);
+# --load-state filters pg_dump_pgs instead of those and pg_ls_remapped.
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
     "osd_df": ["ceph", "osd", "df", "--format", "json"],
@@ -192,8 +101,8 @@ def ls_by_osd_key(osd: int) -> str:
 def ls_by_osd_commands(osds: set[int]) -> dict[str, list[str]]:
     """Return a 'pg ls-by-osd' snapshot command per drained OSD.
 
-    Added to the store's commands once the drained OSDs are known, which with
-    --hosts is only after 'ceph osd tree' has been read.
+    Added to the store once the OSDs are known (with --hosts, after reading
+    'ceph osd tree').
     """
     return {
         ls_by_osd_key(osd): [
@@ -209,11 +118,7 @@ def ls_by_osd_commands(osds: set[int]) -> dict[str, list[str]]:
 
 
 def fetch_drained_pg_stats(store: SnapshotStore, osds: set[int]) -> list[dict]:
-    """Return the PGs with any of osds in 'up' or 'acting', in PG id order.
-
-    Live, the union of 'ceph pg ls-by-osd' for each OSD; with --load-state,
-    pg_dump_pgs filtered client-side the same way.
-    """
+    """Return the PGs with any of osds in 'up' or 'acting', in PG id order."""
     if store.load_dir is None:
         by_pgid = {
             pg["pgid"]: pg
@@ -239,17 +144,8 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     parser = subparsers.add_parser(
         "drain",
         help="Move all PG shards off given OSDs or hosts.",
-        description="Propose upmaps that move every PG shard mapped to the "
-        "given OSDs, or to every OSD of the given hosts, to the least-utilized OSDs of the same device class "
-        "that the PG can legally use, never projecting a target above "
-        "--max-target-util nor using one for more than --max-target-uses "
-        "shards. Largest shards are placed first. Where another shard of the "
-        "same PG is headed for an OSD over --max-target-util (and would hold "
-        "the PG in backfill_toofull), that shard is diverted too, or else "
-        "pinned back, or else the evacuee's row says the PG will stay stuck. "
-        "Only the proposals are printed; nothing is changed. Assumes the "
-        "affected pools' CRUSH failure domain is 'host'.",
-        epilog="See the docstring at the top of drain.py for the details.",
+        description=__doc__,
+        formatter_class=HelpFormatter,
     )
     which = parser.add_mutually_exclusive_group(required=True)
     which.add_argument(
@@ -257,33 +153,22 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         nargs="+",
         type=parse_osd,
         metavar="OSD",
-        help="OSD(s) to drain, e.g. --osds 12 osd.13.",
+        help="OSDs to drain.",
     )
     which.add_argument(
         "--hosts",
         nargs="+",
         metavar="HOST",
-        help="Drain every OSD of these host(s), as named in 'ceph osd tree' "
-        "(short or fully qualified), e.g. --hosts host07 host08.",
+        help="Drain every OSD of these hosts.",
     )
     parser.add_argument(
         "--min-up-util",
         type=float,
         metavar="PERCENT",
-        help="For a PG that is backfill_toofull now, also treat another "
-        "shard as blocking it if the OSD that shard is arriving on is at or "
-        "above PERCENT today (as divert-toofull does). Default: the "
-        "cluster's nearfull_ratio.",
+        help="Blocker threshold for PGs that are backfill_toofull now "
+        "(default: nearfull_ratio).",
     )
-    add_target_args(
-        parser,
-        max_target_util_help="Never let a target's projected utilization "
-        "(its 'ceph osd df' usage plus the shards arriving on it and those "
-        "already proposed onto it) exceed PERCENT; a sibling shard arriving "
-        "on an OSD projected above PERCENT counts as blocking its PG. "
-        "Defaults to the cluster's backfillfull_ratio - 1; a value above "
-        "backfillfull_ratio is an error.",
-    )
+    add_target_args(parser)
     return parser
 
 
@@ -307,9 +192,8 @@ def find_evacuees(
 ) -> tuple[list[Evacuee], int]:
     """Return (the PG's shards mapped to a drained OSD, count already leaving one).
 
-    A replica resident on the drained OSD names it as its acting OSD; one
-    arriving there names the departing replica only when the pairing is
-    unambiguous (see placement.find_arriving_shards).
+    An arriving replica's acting OSD is known only if the pairing is
+    unambiguous.
     """
     pgid, up, acting = pg["pgid"], pg["up"], pg["acting"]
     if is_ec:
@@ -349,12 +233,7 @@ class Move(NamedTuple):
 
 
 class DrainResult(NamedTuple):
-    """Everything a run decides, independent of how it is printed.
-
-    plan() computes it and render() prints it, so tests can assert on these
-    fields. osd_df and osd_host are carried along only because the table
-    shows them.
-    """
+    """What plan() decided, for render() to print."""
 
     osds: list[int]
     hosts: list[str]  # with --hosts, the (short) host names; else empty
@@ -374,7 +253,7 @@ class DrainResult(NamedTuple):
 
 
 class PgState:
-    """One affected PG, as this run's proposals change its up set."""
+    """One affected PG, tracking its up set as proposals change it."""
 
     def __init__(self, pg: dict, is_ec: bool, size_bytes: int, raw: set[int]):
         self.pg = pg
@@ -398,7 +277,7 @@ class PgState:
 
 
 class Planner:
-    """The shared state of one run's placements: room, uses and the PGs."""
+    """State shared by one run's placements: projection, uses, thresholds."""
 
     def __init__(
         self,
@@ -444,12 +323,11 @@ class Planner:
         state.retarget(shard.up_osd, target)
 
     def is_blocker(self, sibling: ArrivingShard, toofull_now: bool) -> str | None:
-        """Return why the sibling blocks its PG, or None if it does not.
+        """Return why the sibling blocks its PG, or None.
 
-        It blocks if its OSD is projected over the cap or, for a PG that is
-        backfill_toofull now (toofull_now), is at or above min_up_util today.
-        The reason names the test that tripped (the cap's, if both did), e.g.
-        'now 90.5%, projected 91.4% > --max-target-util 90%'.
+        It blocks if its OSD is projected over max_target_util or, with
+        toofull_now, is at or above min_up_util. The reason cites the cap
+        first, e.g. 'now 90.5%, projected 91.4% > --max-target-util 90%'.
         """
         if not self.projection.knows(sibling.up_osd):
             return None
@@ -473,7 +351,10 @@ class Planner:
     ) -> tuple[list[tuple["int | str", int, int]], str | None]:
         """Return the (shard, from, to) pins that cancel blocker, or ([], why not).
 
-        The first pin is the blocker's own; the rest are companions.
+        The blocker's own pin comes first, then companions. Refused, besides
+        the reasons close_pins gives, if a pin would land on a drained OSD,
+        undo a move proposed in this run, or chain (pgremapper cannot apply
+        chains).
         """
         pg = state.pg
         acting = pg["acting"]
@@ -555,15 +436,12 @@ UNEXPLAINED = "unexplained"
 def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | None]:
     """Divert or pin the PG's blockers; return (diverted, pinned, verdict).
 
-    Only called for a PG with at least one placed evacuee. verdict is None,
-    or, with a NOTE on each of the PG's evacuees saying why:
+    Called after evacuees are placed, since diverting uses the same room.
+    verdict, also noted on each evacuee, is None or:
 
-      - STUCK: a blocker could be neither diverted nor pinned;
-      - UNEXPLAINED: the PG is backfill_toofull now, yet no sibling is a
-        blocker (see Planner.is_blocker) and no evacuee was arriving on a drained OSD (whose
-        redirect might have been the fix), so the blocker is unidentified.
-        Ceph refuses on usage it projects itself, so this PG may well stay
-        stuck.
+    - STUCK: a blocker could be neither diverted nor pinned;
+    - UNEXPLAINED: the PG is backfill_toofull now, but no sibling is a
+      blocker and no evacuee was arriving on a drained OSD.
     """
     toofull_now = "backfill_toofull" in state.pg["state"].split("+")
     evacuated = list(state.moves)
@@ -589,7 +467,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
     diverted = pinned = 0
     stuck_reasons = []
     for sibling in siblings:
-        # Already pinned as an earlier blocker's companion: no longer arriving.
+        # Pinned as an earlier blocker's companion.
         if (sibling.shard if state.is_ec else sibling.up_osd) in state.changed:
             continue
         blocking = planner.is_blocker(sibling, toofull_now)
@@ -659,12 +537,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
 
 
 def with_final_projection(moves: list[Move], projection: ProjectedUsage) -> list[Move]:
-    """Return moves with each target's projection as it is once all are done.
-
-    The projection a move was given when it was placed leaves out whatever
-    was placed on its target later (or was pinned away from it), and placement
-    order is not row order, so rows of one OSD would disagree.
-    """
+    """Return moves with each target's final projection, so rows of one OSD agree."""
     return [
         m
         if m.projected is None
@@ -674,11 +547,7 @@ def with_final_projection(moves: list[Move], projection: ProjectedUsage) -> list
 
 
 def host_osds(hosts: list[str], osd_host: dict[int, str]) -> set[int]:
-    """Return every OSD of the given hosts (short or fully qualified names).
-
-    Exits with an error naming any host that has no OSDs in 'ceph osd tree'
-    (usually a typo), rather than draining the rest and silently not that one.
-    """
+    """Return every OSD of the given hosts, exiting if a host has none."""
     wanted = {h.split(".")[0] for h in hosts}
     osds = {o for o, h in osd_host.items() if h in wanted}
     missing = sorted(wanted - {osd_host[o] for o in osds})
@@ -690,10 +559,10 @@ def host_osds(hosts: list[str], osd_host: dict[int, str]) -> set[int]:
 
 
 def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
-    """Fetch the cluster state from store and work out where each shard goes.
+    """Fetch the cluster state and work out where each shard goes.
 
-    Exits with an error if a given OSD or host is unknown, --max-target-util is
-    out of range, or an affected pool cannot be analyzed safely.
+    Exits on an unknown OSD or host, an invalid --max-target-util, or a pool
+    it cannot analyze safely.
     """
     osd_host = fetch_osd_hosts(store)
     osd_df = fetch_osd_df(store)
@@ -739,7 +608,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
         size = shard_size_bytes(pg, pool, ec_profiles) if pool else 0
         return is_ec, size
 
-    # Every shard in motion counts towards its OSD, drained PGs' included.
+    # Every shard in motion counts towards its target.
     arriving = []
     for pg in {p["pgid"]: p for p in [*remapped_pgs, *drained_pgs]}.values():
         arriving.extend(find_arriving_shards(pg, *pg_info(pg)))
@@ -808,11 +677,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
 # Output
 # ---------------------------------------------------------------------------
 
-# Along the shard's path, as in divert-toofull: where its data is now
-# (ACTING), where it is mapped today (UP, the upmap's 'from') and where it is
-# proposed to go (TARGET, the 'to'). PROJ is the target's projected
-# utilization once every row has completed, the same in all the rows of one
-# OSD; '-' for a pin, which sends the shard back where its data already is.
+# As in divert-toofull. PROJ is '-' for a pin: the data stays where it is.
 COLUMNS = [
     ("", "PGID"),
     ("", "SHARD"),
@@ -846,11 +711,7 @@ def format_row(
 
 
 def print_pgremapper_mappings(moves: list[Move]) -> None:
-    """Print the moves as JSON for 'pgremapper import-mappings'.
-
-    One {pgid, mapping: {from, to}} entry per line in a JSON array ("[]" when
-    there are none, so the output is always valid JSON).
-    """
+    """Print the moves as JSON for 'pgremapper import-mappings', one per line."""
     if not moves:
         print("[]")
         return
@@ -871,10 +732,10 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
         f"({result.leaving_count} more already moving off). Targets: up to "
         f"--max-target-uses {args.max_target_uses} shard(s) each, projected "
         f"at or below --max-target-util {result.max_target_util:g}% "
-        f"(backfillfull_ratio {result.ratios.backfillfull:g}%). A shard of "
-        "the same PG heading for an OSD projected over that cap -- or, for a "
-        "PG backfill_toofull now, arriving on one at or above --min-up-util "
-        f"{result.min_up_util:g}% -- counts as blocking it."
+        f"(backfillfull_ratio {result.ratios.backfillfull:g}%). Blockers: "
+        "other shards of a PG heading over that cap or, if the PG is "
+        f"backfill_toofull now, onto an OSD at or above --min-up-util "
+        f"{result.min_up_util:g}%."
     )
     if args.pgremapper_mappings:
         print_pgremapper_mappings(result.moves)
@@ -888,21 +749,18 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
     stderr_para(
         f"Proposed {placed} evacuation(s), {len(result.unplaceable)} unplaceable; "
         f"{result.diverted_count} blocking shard(s) diverted, "
-        f"{result.pinned_count} pinned back; {len(result.stuck_pgs)} PG(s) "
-        "will stay backfill_toofull regardless and "
-        f"{len(result.unexplained_pgs)} are backfill_toofull for a reason "
-        "not identified (see NOTE)."
+        f"{result.pinned_count} pinned back. PGs that will stay "
+        f"backfill_toofull: {len(result.stuck_pgs)}; for an unidentified "
+        f"reason: {len(result.unexplained_pgs)} (see NOTE)."
     )
     if result.unplaceable:
         stderr_para(
-            "NOTE: the unplaceable shards found no OSD with room under "
-            "--max-target-util and --max-target-uses. This is a limitation "
-            "of the greedy heuristic, not proof that none exists; apply "
-            "these, let them drain, then re-run."
+            "NOTE: targets ran out of room (--max-target-util, "
+            "--max-target-uses). Apply these, let them finish, then re-run."
         )
 
 
 def run(args: argparse.Namespace) -> None:
-    # A copy: plan() adds the drained OSDs' commands to it.
+    # A copy: plan() adds to it.
     store = SnapshotStore.from_args(args, dict(SNAPSHOT_COMMANDS))
     render(plan(args, store), args)

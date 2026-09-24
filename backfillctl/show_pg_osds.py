@@ -1,50 +1,14 @@
 # SPDX-License-Identifier: MIT
 """
-Show the 'acting' and 'up' OSDs of the given Ceph PGs, one row per shard,
-with each OSD's utilization and host (CRUSH bucket of type 'host'), the
-progress of shards that are being remapped, and the PG's pg_upmap_items pairs
-that touch the row.
+Show the acting and up OSDs of the given PGs, one row per shard, with each
+OSD's utilization and host.
 
-Usage: backfillctl show-pg-osds <pgid> [<pgid> ...]
-  e.g. backfillctl show-pg-osds 3.1a2 3.1a3
+EC shards are paired by position. Replicated OSDs in both sets share a row;
+the rest are paired in id order. '*' marks each set's primary; 'none' an
+empty slot.
 
-Each PG gets its own block (a 'PG <pgid>  state: ...' line and a table), in
-the order given, with duplicates dropped; the footnotes follow once, after the
-last block. Every PG is looked up before anything is printed, so an unknown
-PGID fails the run without partial output.
-
-Columns (same two-line grouped header as the divert-toofull subcommand):
-
-  SHARD      EC shard index, '-' for replicated pools (see below)
-  ACTING     OSD holding the shard's data now, with its UTIL and HOST
-  UP         OSD CRUSH (plus upmaps) wants it on, with its UTIL and HOST
-  PROGRESS   for a remapped shard (UP OSD != ACTING OSD), % of the PG's data
-             its UP OSD has already been sent, else '-'
-  UPMAPS     pg_upmap_items pairs 'from->to' whose from or to is this row's
-             ACTING or UP OSD ('from' is what CRUSH chose, 'to' what is used
-             instead), else '-'
-
-An OSD that is the PG's primary in that set is marked with '*'. An empty slot
-is shown as 'none'.
-
-Rows are built as in the show-backfill subcommand:
-
-  - EC pools: index i is shard i, a fixed identity, so acting[i] is paired
-    with up[i].
-  - Replicated pools: replicas are interchangeable, so position carries no
-    identity. OSDs in both sets share a row; OSDs only in acting are paired
-    (in OSD id order) with OSDs only in up.
-
-PROGRESS is each remapped row's own, as in the show-backfill subcommand
-(shared.copy_progress): from its UP OSD's backfill position in 'ceph pg
-query', falling back on Ceph's misplaced/degraded counters (marked '~'),
-which are per PG, so every such row of the PG shows the same figure.
-
-'backfillctl save-state DIR' captures a cluster's state (anonymized, and
-covering every subcommand, not just this one) into DIR; 'backfillctl
---load-state DIR show-pg-osds PGID...' then replays it here instead of
-calling 'ceph', reading the given PGs' rows out of the capture's
-pg_dump_pgs.json and backfill_positions.json.
+PROGRESS is a remapped shard's backfill progress, as in show-backfill.
+UPMAPS lists the PG's pg_upmap_items pairs that involve the row's OSDs.
 """
 
 import argparse
@@ -55,6 +19,7 @@ from typing import NamedTuple
 from shared import (
     NOT_APPLICABLE,
     PROGRESS_APPROX_NOTE,
+    HelpFormatter,
     Progress,
     SnapshotStore,
     copy_progress,
@@ -75,11 +40,7 @@ from shared import (
     target_peer,
 )
 
-# Maps each snapshot to the 'ceph ... --format json' command that produces
-# it. run() adds one pg_query_key(pgid) entry per PGID given: live, those are
-# the per-PG commands actually issued (one PG each, not the whole cluster);
-# --load-state never looks them up, reading pg_dump_pgs.json instead (what
-# 'backfillctl save-state' captures, covering every PG -- see fetch_pg_info).
+# run() adds a 'pg query' per PG; --load-state reads pg_dump_pgs instead.
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
     "osd_df": ["ceph", "osd", "df", "--format", "json"],
@@ -89,7 +50,7 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 }
 
 
-# Two-line header: (group, label). An empty group has no group line.
+# (group, label)
 COLUMNS = [
     ("", "SHARD"),
     ("ACTING", "OSD"),
@@ -109,20 +70,14 @@ COLUMNS = [
 
 
 def pg_query_key(pgid: str) -> str:
-    """Return the SnapshotStore key of 'ceph pg <pgid> query' (see run())."""
+    """Return the snapshot key of 'ceph pg <pgid> query'."""
     return f"pg_query_{pgid}"
 
 
 def fetch_pg_info(store: SnapshotStore, pgid: str) -> dict:
-    """Return the PG's up/acting sets, primaries, state, counters and
-    backfill positions ('backfill_positions', see
-    shared.extract_backfill_positions).
+    """Return the PG's up/acting sets, primaries, state, counters and backfill positions.
 
-    Live, this reads pg_query_key(pgid) (see SNAPSHOT_COMMANDS: 'ceph pg
-    <pgid> query', added by run() -- one PG, not the whole cluster). From a
-    --load-state snapshot (pg_dump_pgs.json, covering every PG -- see the
-    save-state subcommand), the same values are read off that PG's own
-    pg_stat entry instead.
+    Live, from 'ceph pg <pgid> query'; from a capture, from pg_dump_pgs.
     """
     if store.load_dir is None:
         data = store.json(pg_query_key(pgid))
@@ -165,18 +120,20 @@ def fetch_pg_info(store: SnapshotStore, pgid: str) -> dict:
 
 
 class ShardRow(NamedTuple):
+    """One table row: a shard's acting and up OSD."""
+
     shard: int | str  # EC shard index, or '-' for replicated pools
     acting: int | None
     up: int | None
 
     @property
     def remapped(self) -> bool:
-        """True when the shard is headed for an OSD other than its current one."""
+        """True if the shard is headed for another OSD."""
         return self.up is not None and self.up != self.acting
 
 
 def build_rows(up: list[int], acting: list[int], erasure: bool) -> list[ShardRow]:
-    """Pair up the PG's acting and up OSDs into rows (see module docstring)."""
+    """Pair the PG's acting and up OSDs into rows (see module docstring)."""
     if erasure:
         return [
             ShardRow(i, slot(acting, i), slot(up, i))
@@ -199,27 +156,22 @@ class PgView(NamedTuple):
     pgid: str
     pg: dict  # see fetch_pg_info
     rows: list[ShardRow]
-    progress: list[Progress | None]  # per row: None where not remapped
-    upmap_pairs: list[dict]  # the PG's pg_upmap_items pairs
+    progress: list[Progress | None]  # per row; None if not remapped
+    upmap_pairs: list[dict]
 
 
 class ShowResult(NamedTuple):
-    """Everything a run looked up, independent of how it is printed.
+    """What plan() looked up, for render() to print."""
 
-    plan() computes it and render() prints it. osd_df and osd_host are
-    carried along only because the tables show them.
-    """
-
-    pgs: list[PgView]  # in the order given, without duplicates
+    pgs: list[PgView]  # in the order given, deduplicated
     osd_df: dict[int, dict]
     osd_host: dict[int, str]
 
 
 def plan(args: argparse.Namespace, store: SnapshotStore) -> ShowResult:
-    """Look up every PG in args.pgids and pair up its OSDs into rows.
+    """Look up every PG in args.pgids and pair its OSDs into rows.
 
-    Every PG is looked up before anything else, so an unknown one exits (see
-    fetch_pg_info) before render() prints any output.
+    An unknown PG exits before anything is printed.
     """
     pgids = list(dict.fromkeys(args.pgids))  # drop duplicates, keep order
     pgs = {pgid: fetch_pg_info(store, pgid) for pgid in pgids}
@@ -232,7 +184,6 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> ShowResult:
     for pgid, pg in pgs.items():
         pool = pools.get(pgid_pool_id(pgid))
         rows = build_rows(pg["up"], pg["acting"], is_erasure(pool))
-        # Only a remapped shard has progress of its own to show.
         progress = [
             copy_progress(
                 pg, pool, pg["backfill_positions"], target_peer(row.up, row.shard)
@@ -251,7 +202,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> ShowResult:
 
 
 def format_upmaps(pairs: list[dict], row: ShardRow) -> str:
-    """List 'from->to' of the pairs touching the row's acting or up OSD."""
+    """Return the 'from->to' pairs involving the row's acting or up OSD."""
     osds = {row.acting, row.up} - {None}
     touching = [f"{p['from']}->{p['to']}" for p in pairs if {p["from"], p["to"]} & osds]
     return ",".join(touching) or NOT_APPLICABLE
@@ -278,16 +229,16 @@ def format_row(
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "show-pg-osds",
-        help="Show acting/up OSDs of given PGs, per shard, with utilization and upmaps.",
-        description="Show acting/up OSDs of Ceph PGs per shard, with "
-        "utilization, host, remap progress and upmaps.",
+        help="Show the acting and up OSDs of PGs, per shard.",
+        description=__doc__,
+        formatter_class=HelpFormatter,
     )
-    parser.add_argument("pgids", nargs="+", metavar="pgid", help="PG id, e.g. 3.1a2")
+    parser.add_argument("pgids", nargs="+", metavar="PGID")
     return parser
 
 
 def render(result: ShowResult) -> None:
-    """Print a table per PG, then the footnotes that apply to any of them."""
+    """Print a table per PG, then the footnotes that apply."""
     any_approx = False
     for i, view in enumerate(result.pgs):
         if i:

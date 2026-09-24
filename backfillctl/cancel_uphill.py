@@ -1,73 +1,19 @@
 # SPDX-License-Identifier: MIT
 """
-Propose upmaps that cancel backfills moving data "uphill": from a
-less-utilized OSD to a more-utilized one.
+Propose upmaps that cancel "uphill" backfills: those moving data from a
+less-utilized OSD to a more-utilized one, often a side effect of a CRUSH or
+OSD change.
 
-Why
----
-Backfill exists to balance the cluster, so a backfill that moves data the
-other way -- onto an OSD that is already fuller than the one the data is
-leaving -- is working against that goal. This can happen after a manual
-CRUSH or OSD change (a reweight, an OSD added/removed, a rule edit) sends
-some shard from a lightly-used OSD to a heavily-used one as a side effect.
-Cancelling those specific backfills lets the ones that are actually
-improving balance proceed undisturbed.
+Each uphill shard is pinned to the OSD that holds it now, with any companions
+it needs (see cancel-backfill). A PG's uphill shards are pinned together or
+not at all.
 
-How
----
-Every remapped PG is checked shard by shard (EC by position, replicated by
-the single arriving/departing OSD, when unambiguous -- see "Selection"
-below). A shard whose acting (current) OSD is less utilized than its up
-(destination) OSD is pinned back to where it is now, the same way
-cancel-backfill does: an upmap pair '<destination> -> <acting OSD>' makes
-'up' equal 'acting' for that shard, so nothing moves. If more than one shard
-of a PG is uphill, all of them are pinned together in one pass, so their
-companions (below) and chain order are computed consistently rather than one
-shard at a time.
+A destination's utilization includes what the backfill has copied so far,
+while the source keeps its copy until the PG is clean, so a move can look
+uphill once partly done. --min-delta filters out such small differences.
 
-Selection
----------
-A replicated PG's replicas are interchangeable, so which departing OSD
-pairs with which arriving one is only unambiguous when exactly one of each
-is moving; with more, the PG's shard is reported as skipped ("ambiguous")
-rather than guessed at, the same refusal cancel-backfill's --osd mode makes
-in the same situation. A shard whose acting or up OSD has no utilization
-figure in 'ceph osd df' (e.g. a down OSD) is also skipped rather than
-guessed at. A shard that is moving but not uphill by at least --min-delta
-percentage points (default 1.0) is simply not selected; most shards of a
-remapped PG fall in this bucket, so it is not reported as skipped -- that
-list is only for shards this tool could otherwise identify as uphill but
-cannot pin or decide about. --min-delta exists because a destination's
-reported utilization already includes whatever this backfill has copied so
-far, while the source keeps its full copy until the PG goes clean, so a
-move that actually started downhill can read as uphill once it is partway
-done; see find_uphill_shards' docstring.
-
-Companion pins and chains
---------------------------
-Pinning a shard back can require pinning another shard of the same PG too,
-if the pinned shard's acting OSD would otherwise share a host with a shard
-still moving there (Ceph would silently drop the upmap): see
-cancel_backfill.py's "Companion pins" for why. The two subcommands share
-that logic (shared.close_pins and friends), so it behaves identically here;
-a companion that is not itself uphill is still pinned, and shown with a
-"companion of shard N" note (or "companion of shard N, M" when it was
-needed by more than one of the PG's own uphill shards). Chained pairs
-(shared.chained_pgs) are handled and reported the same way as in
-cancel-backfill too.
-
-Testing against saved cluster state
-------------------------------------
-Same as cancel-backfill: 'backfillctl --load-state DIR cancel-uphill' replays
-a 'backfillctl save-state' capture instead of calling 'ceph'.
-
-Applying the output
---------------------
-Same as cancel-backfill: --pgremapper-mappings prints a JSON array for
-'pgremapper import-mappings'; review it and keep only the pairs for the
-backfills you want cancelled. See cancel_backfill.py's "Applying the
-output" and "Chained pairs" for the details (import-mappings usage,
---pgremapper-mappings' care around chains).
+Apply the output as with cancel-backfill. Consider 'ceph balancer off' while
+the pins are in place. Assumes the CRUSH failure domain is host.
 """
 
 import argparse
@@ -79,9 +25,12 @@ from shared import (
     POOL_TYPE_ERASURE,
     PROGRESS_APPROX_NOTE,
     Cancellation,
+    HelpFormatter,
     PgidFilter,
     Skipped,
     SnapshotStore,
+    add_exclude_pgs_arg,
+    add_pgremapper_mappings_arg,
     chained_pgs,
     close_pins,
     copies_moving,
@@ -109,10 +58,7 @@ from shared import (
     wrap_text,
 )
 
-# Maps each snapshot to the 'ceph ... --format json' command that produces
-# it. Same shape as cancel_backfill.py's (see its SNAPSHOT_COMMANDS): a
-# --load-state capture from either subcommand, or from save-state, works
-# for both.
+# Same as cancel-backfill's.
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
     "osd_df": ["ceph", "osd", "df", "--format", "json"],
@@ -133,53 +79,19 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     parser = subparsers.add_parser(
         "cancel-uphill",
         help="Cancel backfills that move data to a fuller OSD.",
-        description="Propose the upmaps needed to cancel backfills that move "
-        "data from a less-utilized OSD to a more-utilized one ('uphill'): "
-        "the opposite of what backfill is supposed to accomplish. Every "
-        "moving shard of every remapped PG is checked (see the docstring at "
-        "the top of this script for exactly how); the uphill ones are "
-        "pinned to the OSD they are on now, the same way cancel-backfill "
-        "does, including any companion shard needed to keep the resulting "
-        "'up' set valid. When a PG has more than one uphill shard, they are "
-        "pinned together as one unit: if that combined pin is not valid, "
-        "none of the PG's uphill shards are proposed, not just the one that "
-        "clashed. Prints the proposals only; nothing is changed.",
-        epilog="See the docstring at the top of this script, and "
-        "cancel_backfill.py's, for companions, chains and how to apply the "
-        "output.",
-    )
-    parser.add_argument(
-        "--exclude-pgs",
-        nargs="+",
-        default=[],
-        metavar="PGID",
-        help="PG id(s) to leave alone: skip entirely (no pins, no "
-        "companions) even if they have an uphill backfill to cancel. "
-        "Space-separated, e.g. --exclude-pgs 19.92e 20.1a3. A given id that "
-        "does not match a remapped PG is reported on stderr, since that "
-        "usually means a typo.",
-    )
-    parser.add_argument(
-        "--pgremapper-mappings",
-        action="store_true",
-        help="Print a JSON array for 'pgremapper import-mappings' instead of "
-        "the table, one {pgid, mapping} entry per line. This is the reliable "
-        "way to apply the proposals: all pairs of a PG go in together.",
+        description=__doc__,
+        formatter_class=HelpFormatter,
     )
     parser.add_argument(
         "--min-delta",
         type=float,
         default=1.0,
         metavar="PERCENT",
-        help="Only treat a shard as uphill when its destination OSD is at "
-        "least this many percentage points more utilized than its source "
-        "(default: 1.0). A destination's reported utilization already "
-        "includes whatever this backfill has copied so far, while the "
-        "source still holds its full copy until the PG goes clean, so a "
-        "move that actually started downhill can read as uphill once it is "
-        "partway done; this filters out deltas small enough to plausibly be "
-        "that artifact rather than a real difference.",
+        help="Minimum utilization difference, in percentage points, for a "
+        "move to count as uphill (default: %(default)s).",
     )
+    add_exclude_pgs_arg(parser)
+    add_pgremapper_mappings_arg(parser)
     return parser
 
 
@@ -195,27 +107,12 @@ def find_uphill_shards(
     osd_df: dict[int, dict],
     min_delta: float = 1.0,
 ) -> tuple[list[tuple["int | str", int, int]], list[tuple["int | str", str]]]:
-    """Return (candidates, skipped) for the PG's uphill shards.
+    """Return (candidates, skipped) for a PG's uphill shards.
 
-    candidates holds (shard, acting_osd, up_osd): the EC shard index, or '-'
-    for replicated pools, plus the OSD it is on now (less utilized) and the
-    OSD it is headed for (more utilized), where up's utilization exceeds
-    acting's by at least min_delta percentage points. min_delta exists
-    because the destination's reported utilization already includes
-    whatever this backfill has copied so far while the source still holds
-    its full copy until the PG goes clean, so a move that actually started
-    downhill can read as uphill once it is partway done; the default (1.0)
-    filters out deltas small enough to plausibly be that artifact rather
-    than a real difference. skipped holds (shard, reason) for a shard this
-    cannot decide about: unknown utilization on either end, no acting OSD
-    (degraded), or -- replicated pools only -- more than one replica moving
-    at once, which makes the departing/arriving pairing ambiguous (the same
-    refusal cancel-backfill's --osd mode makes).
-
-    A shard that is moving but not uphill by at least min_delta is not
-    returned at all: most shards of a remapped PG fall in this bucket, and
-    reporting each as "skipped" would bury the ones this tool actually
-    cannot decide about.
+    candidates: (shard, acting_osd, up_osd) where up is at least min_delta
+    points more utilized. skipped: (shard, reason) where that cannot be
+    decided (unknown utilization, no acting OSD, ambiguous replica pairing).
+    Shards that are not uphill appear in neither.
     """
 
     def utilization(osd_id: int) -> float | None:
@@ -253,13 +150,11 @@ def find_uphill_shards(
         elif dest_util - source_util >= min_delta:
             candidates.append(("-", source, destination))
     elif not departing:
-        # Either nothing is moving (both empty) or replicas are only being
-        # added (missing replica, nothing to pin back to): neither is a move
-        # to report on, uphill or otherwise.
+        # Replicas only being added have nothing to pin back to.
         if arriving:
             skipped.append(("-", "no acting OSD to pin to (missing replica)"))
     elif not arriving:
-        pass  # replicas only being removed: nothing is backfilling in
+        pass  # replicas only being removed: nothing to cancel
     else:
         skipped.append(("-", "several replicas moving, pairing is ambiguous"))
     return candidates, skipped
@@ -277,20 +172,12 @@ def plan_cancellations(
 ) -> tuple[list[Cancellation], list[Skipped]]:
     """Return (cancellations, skipped) for every PG's uphill shards.
 
-    min_delta is passed through to find_uphill_shards (see its docstring).
+    A PG's uphill shards (find_uphill_shards) are pinned in one close_pins
+    pass, so companions and chain order stay consistent; if that fails, all
+    of them are skipped. PGs in exclude_pgs are ignored.
 
-    A PG's uphill shards (find_uphill_shards) are pinned together in one
-    close_pins/order_moves pass, exactly as cancel-backfill's cancel_whole_pg
-    pins every moving shard of a PG together: that keeps companions and
-    chain order consistent when a PG has more than one uphill shard, rather
-    than resolving each independently and risking inconsistent or duplicate
-    pins. If the combined set cannot be pinned validly, every one of the
-    PG's uphill shards is reported as skipped with the reason; none are
-    proposed. A PG whose id is in exclude_pgs is left alone entirely.
-
-    Exits with an error if a PG's pool is missing from 'pools', or its CRUSH
-    failure domain is not 'host' (this tool only checks for same-host
-    clashes), same as cancel-backfill.
+    Exits with an error if a pool is unknown or its failure domain is not
+    host.
     """
     cancellations, skipped = [], []
     for pg in pg_stats:
@@ -350,9 +237,7 @@ def plan_cancellations(
                 for s, from_osd, to_osd in moves
             )
         else:
-            # find_uphill_shards' replicated branch only ever appends a
-            # candidate inside its "exactly one arriving, one departing"
-            # case, so there can be at most one here.
+            # find_uphill_shards yields at most one replicated candidate.
             ((shard, source, destination),) = candidates
             why = pin_replica(up, destination, source, osd_host)
             if why is not None:
@@ -394,7 +279,7 @@ def print_exclude_filter(exclude_filter: PgidFilter) -> None:
 
 
 def print_summary(cancellations: list[Cancellation], skipped: list[Skipped]) -> None:
-    """Report on stderr what the proposal covers."""
+    """Summarize the proposal on stderr, and list what cannot be pinned."""
     direct = [c for c in cancellations if c.companion_of is None]
     others = len(cancellations) - len(direct)
     known = [c.size_bytes for c in direct if c.size_bytes is not None]
@@ -405,10 +290,10 @@ def print_summary(cancellations: list[Cancellation], skipped: list[Skipped]) -> 
         f"{len(direct)} uphill shard(s) in {pgs} PG(s) can be pinned back, "
         f"~{format_bytes(total)} of data"
         + (f" (+{unknown} of unknown size)" if unknown else "")
-        + f"; {len(skipped)} cannot be determined or pinned."
+        + f"; {len(skipped)} cannot be judged or pinned."
         + (
-            f" {others} more shard(s) of those PGs, moving to other OSDs, are "
-            "pinned back too, to keep the resulting upmap valid."
+            f" {others} more shard(s), moving to other OSDs, are pinned too "
+            "(companions)."
             if others
             else ""
         )
@@ -426,11 +311,7 @@ def print_summary(cancellations: list[Cancellation], skipped: list[Skipped]) -> 
 
 
 class UphillResult(NamedTuple):
-    """Everything a run decides, independent of how it is printed.
-
-    plan() computes it and render() prints it, so tests of the planning can
-    assert on these fields and survive changes to the output format.
-    """
+    """What plan() decided, for render() to print."""
 
     cancellations: list[Cancellation]  # in apply order, see plan_cancellations
     skipped: list[Skipped]
@@ -441,7 +322,7 @@ class UphillResult(NamedTuple):
 
 
 def plan(args: argparse.Namespace, store: SnapshotStore) -> UphillResult:
-    """Fetch the cluster state from store and work out which shards to pin back."""
+    """Fetch the cluster state and work out which shards to pin back."""
     exclude_pgs = set(args.exclude_pgs)
     osd_df = fetch_osd_df(store)
     osd_host = fetch_osd_hosts(store)
@@ -468,7 +349,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> UphillResult:
         exclude_pgs,
         args.min_delta,
     )
-    if not args.pgremapper_mappings:  # the JSON has no PROGRESS: spare the queries
+    if not args.pgremapper_mappings:  # JSON has no PROGRESS: skip the queries
         cancellations = with_exact_progress(store, cancellations, pg_stats, pools)
     return UphillResult(
         cancellations=cancellations,

@@ -1,5 +1,5 @@
 Fixture: real, live-cluster snapshot of the case blockers exist for (see
-"Blockers" in cancel-backfill's module docstring): osd.896 has just
+'cancel-backfill --help' and cancel_backfill.find_blockers): osd.896 has just
 ONE backfill arriving, the one the operator wants (19.92e shard 4, from osd.231),
 and it is still backfill_toofull although osd.896 is at 81.1%.
 
@@ -41,6 +41,6 @@ same is a two-entry JSON array.
 Without --pin-blockers (the default), the second line is never found: the
 output is just "19.92e 896 231" and a NOTE that a shard of the PG blocking it
 may not have been pinned. That is the whole point of this fixture -- see
-"Blockers" in the module docstring.
+cancel_backfill.find_blockers.
 
 tests/pg-osd/test_cancel_backfill.py replays this snapshot with --load-state.

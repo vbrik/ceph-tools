@@ -1,7 +1,7 @@
 Fixture: real, live-cluster instance of the "arriving OSD is itself the 'to'
 of an existing upmap pair" case that divert-toofull's
-raw-CRUSH-mapping handling exists for (see "Why the raw CRUSH mapping
-matters" in the script's module docstring).
+raw-CRUSH-mapping handling exists for (see placement.raw_crush_osds and
+divert_toofull.print_pgremapper_mappings).
 
 Captured: 2026-08-17 ~06:17 from a live cluster, via:
 

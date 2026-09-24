@@ -85,3 +85,15 @@ class TopLevelHelpTest(unittest.TestCase):
                 )
                 self.assertTrue(line, f"{name} not listed in --help")
                 self.assertTrue(line.removeprefix(name).strip(), f"{name}: no help")
+
+    def test_every_subcommand_help_renders(self):
+        """-h works (no stray '%' in help text) and keeps paragraphs apart."""
+        for name in self.COMMANDS:
+            with self.subTest(command=name):
+                result = run_backfillctl(name, "-h")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("\n\n", result.stdout.split("options:")[0].strip())
+
+    def test_cancel_backfill_usage_shows_pin_blockers_needs_osd(self):
+        usage = run_backfillctl("cancel-backfill", "-h").stdout
+        self.assertIn("[--osd OSD [--pin-blockers]]", usage)

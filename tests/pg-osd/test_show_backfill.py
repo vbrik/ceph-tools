@@ -161,7 +161,7 @@ class MainTest(unittest.TestCase):
         out = self.run_main()
         line = next(ln for ln in out.splitlines() if ln.startswith("5.1f"))
         self.assertIn("0(ceph1)*", line)
-        self.assertIn("* this is the PG's primary OSD", out)
+        self.assertIn("* the PG's primary", out)
 
     def test_counter_progress_is_marked_and_explained(self):
         # No backfill positions (the tests' stubbed live query returns none):

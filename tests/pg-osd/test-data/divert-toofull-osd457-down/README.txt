@@ -21,8 +21,8 @@ What's actually going on: osd.457 is down/out, on host27. PG 19.21f
 (EC pool 19) lost its acting OSD in shard slot 7, and CRUSH re-placed that
 slot within the same host bucket, landing it on osd.625 -- also on
 host27. That host is now too full, so the PG sits in backfill_toofull.
-This is the single-OSD-out / same-host-retry mechanism from the script's
-module docstring, just with only one PG affected so far (osd.457 had only
+This is the single-OSD-out / same-host-retry mechanism from
+'divert-toofull --help', just with only one PG affected so far (osd.457 had only
 just gone down at capture time).
 
 Verified against the live cluster: running the script (it needs no

@@ -1,6 +1,6 @@
 Fixture: real, live-cluster snapshot in which stopping the backfills into
-osd.896 needs pins beyond the shards arriving on it (see "Companion pins" and
-"Blockers" in cancel-backfill's module docstring): pinning a shard
+osd.896 needs pins beyond the shards arriving on it (see shared.close_pins
+and cancel_backfill.find_blockers): pinning a shard
 back to its acting OSD can put two shards of the PG on one host, which Ceph
 silently drops, and other shards of the same PG can be headed for OSDs over
 backfillfull_ratio, which keeps the whole PG in backfill_toofull.
@@ -40,8 +40,8 @@ as the acting OSD of the shard heading for 896. Pinning only the shard into
 896 would therefore leave two shards on one host, which Ceph rejects. E.g.
 19.7e9: shard 0 would go back to osd.627 (host32), but shard 9 is arriving on
 osd.149, also host32; pinning shard 9 back to osd.497 as well resolves it.
-These 5 companion pins are unconditional (see "Companion pins" in the module
-docstring): the tool needs no flag to find them. Those same second shards also
+These 5 companion pins are unconditional (see shared.close_pins): the tool
+needs no flag to find them. Those same second shards also
 happen to go to OSDs at 90-92% (osd.149 would reach 91.6% with its shard), so
 with --pin-blockers they are additionally reported as blockers ("blocks shard
 N") rather than plain companions. 19.92e has none of the host problem, so
@@ -83,7 +83,7 @@ them: applying them with separate 'pgremapper remap' runs one PG at a time is
 what fails on this cluster (6 PGs have more than one pair with
 --pin-blockers, 5 without it, since 19.92e then has only one).
 
-Chained pairs ("Chained pairs" in the module docstring): 13 of the 688 remapped
+Chained pairs (see shared.order_moves, warn_chained_pgs): 13 of the 688 remapped
 PGs have an OSD that CRUSH wants in one shard slot while it currently holds
 another shard of the PG, e.g. 19.1299: shard 1 is going to osd.579 while
 osd.579 still holds shard 8, which is going to osd.825. Pinning them gives the

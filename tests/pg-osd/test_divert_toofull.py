@@ -45,6 +45,11 @@ from backfillctl import divert_toofull as ut
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def flat(text: str) -> str:
+    """Collapse whitespace, so a substring check survives stderr's line wrapping."""
+    return " ".join(text.split())
+
+
 def cli(state_dir: str) -> list[str]:
     """Argv prefix that runs this subcommand as a subprocess on a saved state
     (directory-execution form, works from any cwd); subcommand args follow.
@@ -503,18 +508,22 @@ CEPH2_NO_MARGIN_PROPOSED = 199
 CEPH2_UNCAPPED_PROPOSED = 210
 
 
-class PrintUnplaceableTest(unittest.TestCase):
+class PrintOutcomeTest(unittest.TestCase):
     def capture(self, count):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            ut.print_unplaceable(count)
-        return err.getvalue().splitlines()
+            ut.print_outcome(5, count)
+        return flat(err.getvalue())
 
     def test_reports_only_the_count_under_a_heuristic_caveat(self):
-        lines = self.capture(3)
-        self.assertEqual(len(lines), 1)
-        self.assertIn("3 shard(s) could not be placed", lines[0])
-        self.assertIn("limitation of the heuristic", lines[0])
+        text = self.capture(3)
+        self.assertIn("Proposed 5 remap(s); 3 shard(s) could not be placed", text)
+        self.assertIn("greedy heuristic", text)
+
+    def test_no_caveat_when_everything_is_placed(self):
+        text = self.capture(0)
+        self.assertIn("0 shard(s) could not be placed.", text)
+        self.assertNotIn("heuristic", text)
 
 
 def proposal(pgid, up_osd, target_osd, shard=0):
@@ -661,7 +670,7 @@ class FixtureReplayTest(unittest.TestCase):
         )
 
     def test_default_thresholds_are_reported_on_stderr(self):
-        err = self.run_proc("divert-toofull-osd457-down").stderr
+        err = flat(self.run_proc("divert-toofull-osd457-down").stderr)
         self.assertIn("--min-up-util 85%", err)
         self.assertIn("--max-target-util 89%", err)
 
@@ -714,18 +723,18 @@ class PrintPgsFilterTest(unittest.TestCase):
         return err.getvalue()
 
     def test_all_matched(self):
-        self.assertEqual(
-            self.capture(shared.PgidFilter(1, 1, [])),
-            "--pgs: 1 of 1 given PG id(s) are currently backfill_toofull "
-            "and will be the only ones considered\n",
+        self.assertIn(
+            "--pgs: 1 of 1 given PG id(s) are backfill_toofull and will be "
+            "the only ones considered.",
+            flat(self.capture(shared.PgidFilter(1, 1, []))),
         )
 
     def test_unmatched_ids_are_named(self):
         self.assertIn(
-            "--pgs: 1 of 3 given PG id(s) are currently backfill_toofull "
-            "and will be the only ones considered; 2 matched nothing "
-            "(check for typos): 19.yyy, 19.zzz",
-            self.capture(shared.PgidFilter(3, 1, ["19.yyy", "19.zzz"])),
+            "--pgs: 1 of 3 given PG id(s) are backfill_toofull and will be "
+            "the only ones considered; 2 matched nothing (check for typos): "
+            "19.yyy, 19.zzz",
+            flat(self.capture(shared.PgidFilter(3, 1, ["19.yyy", "19.zzz"]))),
         )
 
     def test_printed_even_when_planning_then_exits(self):
@@ -1507,16 +1516,17 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
         cls.proposals = fixture_plan(CEPH2_FIXTURE).proposals
 
     def test_the_counts_are_reported_on_stderr(self):
+        err = flat(self.proc.stderr)
         self.assertIn(
-            f"proposed {CEPH2_PROPOSED} remap(s), {CEPH2_UNPLACEABLE} unplaceable",
-            self.proc.stderr,
+            f"Proposed {CEPH2_PROPOSED} remap(s); {CEPH2_UNPLACEABLE} shard(s) "
+            "could not be placed",
+            err,
         )
         self.assertIn(
-            f"{CEPH2_ARRIVING} arriving shard(s), of which {CEPH2_STUCK} on an OSD",
-            self.proc.stderr,
+            f"{CEPH2_ARRIVING} arriving shard(s), of which {CEPH2_STUCK} on an OSD", err
         )
         skipped = CEPH2_ARRIVING - CEPH2_STUCK
-        self.assertIn(f"({skipped} left alone as not the blocker)", self.proc.stderr)
+        self.assertIn(f"({skipped} left alone as not the blocker)", err)
 
     def test_the_table_has_a_row_per_proposal(self):
         group_and_label_lines = 2
@@ -1542,10 +1552,11 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
                 self.assertIn("--max-target-uses", proc.stderr)
 
     def test_the_limit_and_ratio_are_reported_on_stderr(self):
-        self.assertIn(f"--max-target-uses {CEPH2_MAX_USES}", self.proc.stderr)
+        err = flat(self.proc.stderr)
+        self.assertIn(f"--max-target-uses {CEPH2_MAX_USES}", err)
         self.assertIn(
             f"--max-target-util {CEPH2_MAX_TARGET_UTIL:g}% (backfillfull_ratio 91%)",
-            self.proc.stderr,
+            err,
         )
 
     def test_a_cap_above_backfillfull_is_an_error(self):
@@ -1594,20 +1605,21 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
         self.assertEqual(entries, expected)
 
     def test_unplaceable_shards_are_only_counted(self):
-        lines = self.proc.stderr.splitlines()
-        matching = [ln for ln in lines if "could not be placed" in ln]
-        self.assertEqual(len(matching), 1)
+        err = flat(self.proc.stderr)
+        self.assertEqual(err.count("could not be placed"), 1)
         self.assertIn(
-            f"{CEPH2_UNPLACEABLE} shard(s) could not be placed. This is a "
-            "limitation of the heuristic",
-            matching[0],
+            f"{CEPH2_UNPLACEABLE} shard(s) could not be placed: targets ran "
+            "out of room, or the greedy heuristic",
+            err,
         )
         # No per-shard '<pgid>:<shard>' list, however long the tail is.
         self.assertNotRegex(self.proc.stderr, r"\d+\.\w+:[\d-]+, ")
 
     def test_pgremapper_mappings_mode_reports_the_unplaceable_count_on_stderr(self):
         proc = run_ceph2("--pgremapper-mappings")
-        self.assertIn(f"{CEPH2_UNPLACEABLE} shard(s) could not be placed", proc.stderr)
+        self.assertIn(
+            f"{CEPH2_UNPLACEABLE} shard(s) could not be placed", flat(proc.stderr)
+        )
         self.assertNotRegex(proc.stderr, r"\d+\.\w+:[\d-]+, ")
         # Stdout stays parseable: only the JSON array.
         self.assertNotIn("could not be placed", proc.stdout)
