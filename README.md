@@ -64,7 +64,7 @@ backfills needs. The cancel commands leave such backfills running, and print
 | `balance [--class CLASS] [--osds OSD... \| --min-source-util PCT]` | Lower a device class's highest OSD utilization by moving shards off the fullest OSDs onto the emptiest, without filling any target past its source. Stops once the maximum can't go lower (not a full balancer); `--max-moves` limits the batch. Turn off the upmap balancer while the backfills run. |
 | `cancel-backfill [--osd OSD [--pin-blockers]]` | Cancel backfills by pinning shards to where their data is: all of them, or those into one full OSD to make room for others. |
 | `cancel-uphill` | Cancel backfills that move data to a more-utilized OSD. |
-| `save-state DIR` | Capture the cluster state the other commands read, anonymized, for replay with `backfillctl --load-state DIR <command>`. |
+| `save-state DIR` | Capture the cluster state the other commands read, anonymized, for replay with `--load-state DIR`, before or after the command. |
 
 PROGRESS is computed from each backfill target's position (`last_backfill` in
 `ceph pg query`), one query per PG shown. Ceph's misplaced/degraded counters

@@ -33,6 +33,7 @@ from shared import (
     Skipped,
     SnapshotStore,
     add_exclude_pgs_arg,
+    add_load_state_arg,
     add_pgremapper_mappings_arg,
     avoid_chains,
     close_pins,
@@ -98,6 +99,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     )
     add_exclude_pgs_arg(parser)
     add_pgremapper_mappings_arg(parser)
+    add_load_state_arg(parser, after_command=True)
     return parser
 
 

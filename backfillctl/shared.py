@@ -642,14 +642,43 @@ class HelpFormatter(argparse.HelpFormatter):
         return "\n\n".join(paragraphs)
 
 
-def add_load_state_arg(parser: argparse.ArgumentParser):
-    """Add the global --load-state option."""
+# Where a --load-state given after the subcommand is stored, until
+# resolve_load_state folds it into load_state.
+SUB_LOAD_STATE = "sub_load_state"
+
+
+def add_load_state_arg(
+    parser: argparse.ArgumentParser, *, after_command: bool = False
+) -> None:
+    """Add --load-state: the global one, or with after_command a subcommand's.
+
+    Both exist so the option works before or after the subcommand name.
+    """
     parser.add_argument(
         "--load-state",
         metavar="DIR",
+        dest=SUB_LOAD_STATE if after_command else "load_state",
         help="Read cluster state from a 'save-state' capture instead of the "
         "live cluster.",
     )
+
+
+def resolve_load_state(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Fold a --load-state given after the subcommand into args.load_state.
+
+    Exits through parser.error if the two places name different directories.
+    """
+    sub = vars(args).pop(SUB_LOAD_STATE, None)
+    if sub is None:
+        return
+    if args.load_state is not None and args.load_state != sub:
+        parser.error(
+            f"--load-state given twice, with different directories: "
+            f"{args.load_state} and {sub}"
+        )
+    args.load_state = sub
 
 
 def add_pgremapper_mappings_arg(parser: argparse.ArgumentParser):

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """
 Capture the cluster state the other subcommands read into DIR, for replay
-with 'backfillctl --load-state DIR'.
+with '--load-state DIR', before or after the subcommand.
 
 One capture serves every subcommand: it includes a full 'ceph pg dump pgs'
 and the backfill positions of remapped PGs. It is anonymized (fsid,

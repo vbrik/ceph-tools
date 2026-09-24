@@ -29,6 +29,7 @@ from shared import (
     PgidFilter,
     SnapshotStore,
     abbreviate_state,
+    add_load_state_arg,
     copy_progress,
     ec_shard_moves,
     fetch_backfill_positions,
@@ -87,6 +88,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         metavar="PGID",
         help="Show only rows of these PGs.",
     )
+    add_load_state_arg(parser, after_command=True)
     return parser
 
 

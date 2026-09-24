@@ -15,7 +15,7 @@ import drain
 import save_state
 import show_backfill
 import show_pg_osds
-from shared import HelpFormatter, add_load_state_arg
+from shared import HelpFormatter, add_load_state_arg, resolve_load_state
 
 _COMMAND_MODULES = (
     show_pg_osds,
@@ -52,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    resolve_load_state(parser, args)
     args.run(args)
 
 

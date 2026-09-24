@@ -22,6 +22,7 @@ from shared import (
     HelpFormatter,
     Progress,
     SnapshotStore,
+    add_load_state_arg,
     copy_progress,
     extract_backfill_positions,
     fetch_backfill_positions,
@@ -234,6 +235,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         formatter_class=HelpFormatter,
     )
     parser.add_argument("pgids", nargs="+", metavar="PGID")
+    add_load_state_arg(parser, after_command=True)
     return parser
 
 

@@ -59,6 +59,7 @@ from shared import (
     Skipped,
     SnapshotStore,
     add_exclude_pgs_arg,
+    add_load_state_arg,
     add_pgremapper_mappings_arg,
     avoid_chains,
     close_pins,
@@ -120,7 +121,9 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         # Hand-written: argparse cannot show that --pin-blockers needs --osd.
         usage="%(prog)s [-h] [--osd OSD [--pin-blockers]]\n"
         + " " * len("usage: backfillctl cancel-backfill ")
-        + "[--exclude-pgs PGID [PGID ...]] [--pgremapper-mappings]",
+        + "[--exclude-pgs PGID [PGID ...]] [--pgremapper-mappings]\n"
+        + " " * len("usage: backfillctl cancel-backfill ")
+        + "[--load-state DIR]",
     )
     parser.add_argument(
         "--osd",
@@ -134,6 +137,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     )
     add_exclude_pgs_arg(parser)
     add_pgremapper_mappings_arg(parser)
+    add_load_state_arg(parser, after_command=True)
     return parser
 
 
