@@ -366,7 +366,7 @@ def format_row(
 def print_outcome(proposed: int, unplaceable: list[ArrivingShard]) -> None:
     """Report on stderr how many shards were placed, and name those that were not."""
     stderr_para(
-        f"Proposed {proposed} remap(s); {len(unplaceable)} shard(s) could not be "
+        f"Proposed {proposed} move(s); {len(unplaceable)} shard(s) could not be "
         "placed"
         + (
             ": targets ran out of room, or the greedy heuristic missed some. "

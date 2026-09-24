@@ -528,7 +528,7 @@ class PrintOutcomeTest(unittest.TestCase):
             placement.ArrivingShard("7.2", "-", 40, None, [40]),
         ]
         text = self.capture(shards)
-        self.assertIn("Proposed 5 remap(s); 2 shard(s) could not be placed", flat(text))
+        self.assertIn("Proposed 5 move(s); 2 shard(s) could not be placed", flat(text))
         self.assertIn("greedy heuristic", flat(text))
         # One indented item per shard, after the summary (wrapping aside).
         items = flat(text).split(" cannot place ")[1:]
@@ -1545,7 +1545,7 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
     def test_the_counts_are_reported_on_stderr(self):
         err = flat(self.proc.stderr)
         self.assertIn(
-            f"Proposed {CEPH2_PROPOSED} remap(s); {CEPH2_UNPLACEABLE} shard(s) "
+            f"Proposed {CEPH2_PROPOSED} move(s); {CEPH2_UNPLACEABLE} shard(s) "
             "could not be placed",
             err,
         )

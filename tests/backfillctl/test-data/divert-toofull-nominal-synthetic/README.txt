@@ -19,10 +19,9 @@ same capture, copied verbatim from ../divert-toofull-osd457-down/ --
 cluster topology/weights are independent of which PGs are backfill_toofull,
 so reusing them here is faithful, not fabricated.
 
-Expected behavior with this fixture: the script should print "0
-backfill_toofull PG(s) cluster-wide, 0 with newly-arriving shard(s)... " and
-"proposed 0 remap(s), 0 unplaceable", with no warnings and no proposal
-table.
+Expected behavior with this fixture: divert-toofull prints "No
+backfill_toofull PGs." on stderr, with no warnings and no proposal table
+(an empty JSON array with --pgremapper-mappings).
 
 If a truly problem-free capture is wanted later (all six files genuinely
 captured at once with zero backfill_toofull PGs), recapture when

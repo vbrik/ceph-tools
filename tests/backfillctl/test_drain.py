@@ -512,6 +512,17 @@ class OutputTest(unittest.TestCase):
             "  cannot place 1.0 shard 0 off osd.0: no legal target", err.getvalue()
         )
 
+    def test_outcome_counts_moves_and_pins_in_the_shared_words(self):
+        c = Cluster(default_util=95.0)
+        c.util[1] = 10.0  # room for the evacuee only: the blocker is pinned
+        result = c.pg("1.0", [0, 10, 20], [0, 11, 20]).plan(0)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            ut.render(result, parse_args(ut, ["--osds", "0"]))
+        text = " ".join(err.getvalue().split())
+        self.assertIn("Proposed 1 move(s) off the drained OSDs, 0 unplaceable;", text)
+        self.assertIn("0 blocking shard(s) diverted, 1 pinned back.", text)
+
     def test_nothing_to_drain_says_so(self):
         for argv, out_text in ((["0"], ""), (["0", "--pgremapper-mappings"], "[]\n")):
             out, err = io.StringIO(), io.StringIO()

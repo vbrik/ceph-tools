@@ -712,7 +712,8 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
     placed = result.evacuee_count - len(result.unplaceable)
     stuck, unexplained = result.stuck_pgs, result.unexplained_pgs
     stderr_para(
-        f"Proposed {placed} evacuation(s), {len(result.unplaceable)} unplaceable; "
+        f"Proposed {placed} move(s) off the drained OSDs, "
+        f"{len(result.unplaceable)} unplaceable; "
         f"{result.diverted_count} blocking shard(s) diverted, "
         f"{result.pinned_count} pinned back. PGs that will stay "
         f"backfill_toofull: {pg_list(stuck)}; for an unidentified reason: "
