@@ -369,12 +369,11 @@ def render(result: UphillResult, args: argparse.Namespace) -> None:
     """Print result: pins on stdout in the format args asks for, notes on stderr."""
     cancellations = result.cancellations
     if not cancellations and not result.skipped:
-        print("No uphill backfills.", file=sys.stderr)
+        stderr_para("No uphill backfills.")
         if args.pgremapper_mappings:
             print_pgremapper_mappings([])
         return
 
-    print_summary(cancellations, result.skipped)
     if args.pgremapper_mappings:
         print_pgremapper_mappings(cancellations)
     elif cancellations:
@@ -382,10 +381,11 @@ def render(result: UphillResult, args: argparse.Namespace) -> None:
             COLUMNS,
             [format_row(c, result.osd_df, result.osd_host) for c in cancellations],
         )
-        if any(
-            c.progress_pct is not None and not c.progress_exact for c in cancellations
-        ):
-            stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
+    print_summary(cancellations, result.skipped)
+    if not args.pgremapper_mappings and any(
+        c.progress_pct is not None and not c.progress_exact for c in cancellations
+    ):
+        stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
     if result.chained:
         warn_chains(result.chained)
     stderr_para(

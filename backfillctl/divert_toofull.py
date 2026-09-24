@@ -518,6 +518,12 @@ def print_pgs_filter(pgs_filter: PgidFilter) -> None:
 def render(result: DivertResult, args: argparse.Namespace) -> None:
     """Print result: proposals on stdout in the format args asks for, notes on stderr."""
     # Notes go to stderr, keeping stdout parseable.
+    if not result.toofull_pg_count:
+        among = " among --pgs" if result.pgs_filter is not None else ""
+        stderr_para(f"No backfill_toofull PGs{among}.")
+        if args.pgremapper_mappings:
+            print_pgremapper_mappings([])
+        return
     osd_df = result.osd_df
     max_target_util = result.max_target_util
     by_class = ", ".join(

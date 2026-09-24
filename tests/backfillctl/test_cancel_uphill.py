@@ -421,6 +421,15 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertIn("No uphill backfills.", err)
 
+    def test_summary_follows_the_table(self):
+        # As in the other remapping commands: proposals first, then the outcome.
+        c = shared.Cancellation("19.1", 2, 20, 9, 1_000, "s", 50.0)
+        both = io.StringIO()
+        with contextlib.redirect_stdout(both), contextlib.redirect_stderr(both):
+            cu.render(cu.UphillResult([c], [], {}, None, {}, {}), parse_args(cu, []))
+        text = both.getvalue()
+        self.assertLess(text.index("PGID"), text.index("can be pinned back"))
+
     def test_pgremapper_mappings_with_nothing_prints_empty_array(self):
         out, _ = self.render("--pgremapper-mappings")
         self.assertEqual(out.strip(), "[]")

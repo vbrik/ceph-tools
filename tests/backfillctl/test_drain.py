@@ -495,6 +495,16 @@ class OutputTest(unittest.TestCase):
         )
         self.assertTrue(moves[1].note.startswith("diverted:"))
 
+    def test_nothing_to_drain_says_so(self):
+        for argv, out_text in ((["0"], ""), (["0", "--pgremapper-mappings"], "[]\n")):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                ut.render(Cluster().plan(0), parse_args(ut, ["--osds", *argv]))
+            self.assertEqual(out.getvalue(), out_text)
+            self.assertEqual(
+                err.getvalue().strip(), "Nothing to drain: no shard is mapped to osd.0."
+            )
+
     def test_summary_without_stuck_pgs_points_nowhere(self):
         err = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):

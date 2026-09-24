@@ -684,6 +684,15 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
     osds = ", ".join(f"osd.{o}" for o in result.osds)
     if result.hosts:
         osds = f"host(s) {', '.join(result.hosts)} ({osds})"
+    if not result.evacuee_count:
+        leaving = result.leaving_count
+        stderr_para(
+            f"Nothing to drain: no shard is mapped to {osds}"
+            + (f"; {leaving} already moving off." if leaving else ".")
+        )
+        if args.pgremapper_mappings:
+            print_pgremapper_mappings([])
+        return
     stderr_para(
         f"Draining {osds}: {result.evacuee_count} shard(s) mapped to them "
         f"({result.leaving_count} more already moving off). Targets: up to "

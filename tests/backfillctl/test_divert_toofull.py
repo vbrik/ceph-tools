@@ -722,6 +722,27 @@ class PgsFlagTest(unittest.TestCase):
         self.assertIsNone(result.pgs_filter)
 
 
+class NothingToDivertTest(unittest.TestCase):
+    def test_no_toofull_pg_among_pgs_says_so_and_prints_no_table(self):
+        for extra, out_text in (([], ""), (["--pgremapper-mappings"], "[]\n")):
+            with self.subTest(extra=extra):
+                proc = subprocess.run(
+                    [
+                        *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
+                        "--pgs",
+                        "1.0",
+                        *extra,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, out_text)
+                self.assertIn("No backfill_toofull PGs among --pgs.", proc.stderr)
+                self.assertNotIn("Targets:", proc.stderr)
+
+
 class PrintPgsFilterTest(unittest.TestCase):
     def capture(self, pgs_filter):
         err = io.StringIO()
