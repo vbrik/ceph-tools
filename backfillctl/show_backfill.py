@@ -48,6 +48,12 @@ from shared import (
     target_peer,
 )
 
+# Footnote for the '*' after a FROM_OSD primary (see fmt_from in render).
+PRIMARY_NOTE = (
+    "* marks the PG's primary where no OSD loses a copy: it keeps its copy, "
+    "but drives the recovery."
+)
+
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
     "osd_df": ["ceph", "osd", "df", "--format", "json"],
@@ -412,7 +418,7 @@ def render(result: MovementsResult) -> None:
         print(line)
 
     if used_primary_marker:
-        print("\n* the PG's primary: it keeps its copy, but drives the recovery.")
+        print(f"\n{PRIMARY_NOTE}")
 
     if any(r.progress_pct is not None and not r.progress_exact for r in rows):
         print(f"\n{PROGRESS_APPROX_NOTE}")

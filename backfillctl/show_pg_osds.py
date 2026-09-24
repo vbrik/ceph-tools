@@ -239,9 +239,15 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     return parser
 
 
+# Footnote for the '*' after an OSD id.
+PRIMARY_NOTE = (
+    "* marks the primary of each set: acting's now, up's once the PG is clean."
+)
+
+
 def render(result: ShowResult) -> None:
     """Print a table per PG, then the footnotes that apply."""
-    any_approx = False
+    any_approx = any_primary = False
     for i, view in enumerate(result.pgs):
         if i:
             print()
@@ -258,10 +264,16 @@ def render(result: ShowResult) -> None:
         any_approx |= any(
             p is not None and p.pct is not None and not p.exact for p in view.progress
         )
+        any_primary |= any(
+            r.acting == view.pg["acting_primary"] or r.up == view.pg["up_primary"]
+            for r in view.rows
+            if r.acting is not None or r.up is not None
+        )
 
+    if any_primary:
+        print(f"\n{PRIMARY_NOTE}")
     if any_approx:
         print(f"\n{PROGRESS_APPROX_NOTE}")
-    print("\n* primary")
 
 
 def run(args: argparse.Namespace) -> None:

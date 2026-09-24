@@ -160,6 +160,28 @@ class TableTest(unittest.TestCase):
         self.assertEqual(2, len(lines))
 
 
+class RenderFootnoteTest(unittest.TestCase):
+    """render()'s footnotes, on results built by hand."""
+
+    def render(self, acting_primary, up_primary):
+        pg = {"state": "s", "acting_primary": acting_primary, "up_primary": up_primary}
+        rows = [op.ShardRow(0, 1, 1), op.ShardRow(1, 2, 3)]
+        view = op.PgView("1.0", pg, rows, [None, None], [])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            op.render(op.ShowResult([view], {}, {}))
+        return out.getvalue()
+
+    def test_primary_note_when_a_primary_is_shown(self):
+        self.assertIn("1*", self.render(1, 1))
+        self.assertIn(op.PRIMARY_NOTE, self.render(1, 1))
+
+    def test_no_primary_note_when_no_primary_is_shown(self):
+        # e.g. an incomplete PG whose primary is none of the rows' OSDs
+        out = self.render(-1, 99)
+        self.assertNotIn("*", out)
+
+
 class MainTest(unittest.TestCase):
     """plan() and run() end to end: a live run (mocked SnapshotStore.json) and
     --load-state (a pg_dump_pgs.json-based directory, what 'backfillctl
@@ -358,15 +380,17 @@ class MainTest(unittest.TestCase):
         )
         # Blocks are separated by a blank line.
         self.assertIn("\n\nPG 5.3  state:", out)
-        self.assertEqual(1, out.count("* primary"))
+        self.assertEqual(1, out.count("* marks the primary"))
         self.assertEqual(1, out.count("~ marks PROGRESS"))
+        # Both footnotes start with the mark they explain, '*' first.
+        self.assertLess(out.index("* marks"), out.index("~ marks"))
 
     def test_footnote_on_progress_only_when_some_pg_is_remapped(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.write_snapshots(tmp, self.two_pg_snapshots())
             out = self.run_main("5.4", load_state=tmp)
         self.assertNotIn("~ marks PROGRESS", out)
-        self.assertIn("* primary", out)
+        self.assertIn("* marks the primary", out)
 
     def test_duplicate_pgids_are_shown_once(self):
         with tempfile.TemporaryDirectory() as tmp:
