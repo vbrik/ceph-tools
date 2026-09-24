@@ -1055,6 +1055,45 @@ class ParseOsdTest(unittest.TestCase):
                 shared.parse_osd(text)
 
 
+class PoolChecksTest(unittest.TestCase):
+    """check_known_pools and check_host_failure_domain."""
+
+    HOST: ClassVar = {"steps": [{"op": "chooseleaf_indep", "type": "host"}]}
+    RACK: ClassVar = {"steps": [{"op": "chooseleaf_indep", "type": "rack"}]}
+    POOLS: ClassVar = {
+        1: {"pool_id": 1, "pool_name": "a", "crush_rule": 0},
+        2: {"pool_id": 2, "pool_name": "b", "crush_rule": 1},
+        3: {"pool_id": 3, "pool_name": "c", "crush_rule": 9},
+    }
+
+    def test_known_pools_pass(self):
+        shared.check_known_pools(["1.0", "2.a"], self.POOLS, "PGs")
+
+    def test_unknown_pools_are_all_named(self):
+        with self.assertRaises(SystemExit) as cm:
+            shared.check_known_pools(["1.0", "7.1", "5.2", "7.3"], self.POOLS, "PGs")
+        self.assertIn("PGs belong to pool id(s) 5, 7,", str(cm.exception))
+
+    def test_host_pools_pass(self):
+        shared.check_host_failure_domain(["1.0"], self.POOLS, {0: self.HOST}, "PGs")
+
+    def test_every_other_failure_domain_is_listed(self):
+        rules = {0: self.HOST, 1: self.RACK}  # rule 9 is missing
+        with self.assertRaises(SystemExit) as cm:
+            shared.check_host_failure_domain(
+                ["1.0", "3.1", "2.0"], self.POOLS, rules, "stuck PGs"
+            )
+        lines = str(cm.exception).splitlines()
+        self.assertIn("pools of these stuck PGs use another", lines[0])
+        self.assertEqual(
+            lines[1:],
+            [
+                "  pool 2 (b): crush rule 1, failure domain rack",
+                "  pool 3 (c): crush rule 9, failure domain unknown",
+            ],
+        )
+
+
 class PercentTypesTest(unittest.TestCase):
     """percentage_points and utilization_pct: argparse types of the PERCENT options."""
 

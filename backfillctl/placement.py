@@ -4,8 +4,7 @@
 A target is the legal OSD of the shard's device class with the lowest
 projected utilization (pick_target, ProjectedUsage; balance ranks its own).
 Also: finding shards in motion or on given OSDs, tracking a PG's up set as
-moves are proposed (PgPlacement), the cluster's full ratios and the host
-failure-domain check.
+moves are proposed (PgPlacement), and the cluster's full ratios.
 """
 
 import argparse
@@ -101,32 +100,6 @@ def resolve_max_target_util(given: float | None, ratios: FullRatios) -> float:
 def ec_pool_ids_from(pools: list[dict]) -> set[int]:
     """Return the set of pool ids that are erasure-coded (type == 3)."""
     return {p["pool_id"] for p in pools if p.get("type") == POOL_TYPE_ERASURE}
-
-
-def check_host_failure_domain(
-    pools: list[dict], crush_rules: dict[int, dict], which: str
-) -> None:
-    """Exit with an error unless every pool's failure domain is host.
-
-    pick_target keeps a PG's shards on distinct hosts, which is only right
-    for host. which describes the pools in the message, e.g. 'with a stuck PG'.
-    """
-    bad = []
-    for pool in pools:
-        rule = crush_rules.get(pool["crush_rule"])
-        domain = shared.rule_failure_domain(rule) if rule else None
-        if domain != "host":
-            bad.append((pool["pool_name"], pool["crush_rule"], domain))
-    if bad:
-        lines = "\n".join(
-            f"  pool '{name}' uses crush rule {rule_id} (failure domain: "
-            f"{domain or 'unknown'})"
-            for name, rule_id, domain in bad
-        )
-        sys.exit(
-            "ERROR: this subcommand requires CRUSH failure domain 'host' for "
-            f"every pool {which}; these differ:\n{lines}"
-        )
 
 
 def shard_size_bytes(pg: dict, pool: dict, ec_profiles: dict[str, dict]) -> int:

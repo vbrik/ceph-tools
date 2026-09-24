@@ -62,6 +62,8 @@ from shared import (
     add_load_state_arg,
     add_pgremapper_mappings_arg,
     avoid_chains,
+    check_host_failure_domain,
+    check_known_pools,
     close_pins,
     copies_moving,
     fetch_crush_rules,
@@ -77,13 +79,13 @@ from shared import (
     order_moves,
     parse_osd,
     pg_progress_pct,
+    pgid_pool_id,
     pgid_sort_key,
     pin_replica,
     pin_with_companions,
     print_pgremapper_mappings,
     print_table,
     real_osd_set,
-    rule_failure_domain,
     same_place,
     shard_size_bytes,
     skipped_sort_key,
@@ -306,28 +308,21 @@ def plan_cancellations(
     blockers_enabled = (
         pin_blockers and osd_df is not None and backfillfull_pct is not None
     )
+    pg_stats = [
+        pg
+        for pg in pg_stats
+        if (osd is None or osd in pg["up"]) and pg["pgid"] not in exclude_pgs
+    ]
+    pgids = [pg["pgid"] for pg in pg_stats]
+    which = "remapped PGs" if osd is None else f"PGs with a backfill into osd.{osd}"
+    check_known_pools(pgids, pools, which)
+    check_host_failure_domain(pgids, pools, crush_rules, which)
+
     cancellations, skipped = [], []
     for pg in pg_stats:
         up, acting = pg["up"], pg["acting"]
-        if osd is not None and osd not in up:
-            continue
         pgid = pg["pgid"]
-        if pgid in exclude_pgs:
-            continue
-        pool = pools.get(int(pgid.split(".")[0]))
-        if pool is None:
-            # Guessing the pool type would diff EC shards as replicas.
-            sys.exit(
-                f"ERROR: PG {pgid} belongs to a pool that 'ceph osd pool ls "
-                "detail' does not list, so its shards cannot be analyzed."
-            )
-        domain = rule_failure_domain(crush_rules.get(pool.get("crush_rule")))
-        if domain != "host":
-            sys.exit(
-                f"ERROR: pool {pool['pool_id']} (PG {pgid}) has CRUSH failure "
-                f"domain {domain or 'unknown'}; this script only checks for "
-                "same-host clashes, so it cannot tell which pins are valid."
-            )
+        pool = pools[pgid_pool_id(pgid)]
         is_ec = pool.get("type") == POOL_TYPE_ERASURE
         size = shard_size_bytes(pg, pool, ec_profiles)
         progress = pg_progress_pct(

@@ -58,7 +58,6 @@ from placement import (
     ProjectedUsage,
     add_target_args,
     build_candidate_osds,
-    check_host_failure_domain,
     ec_pool_ids_from,
     fetch_full_ratios,
     find_arriving_shards,
@@ -75,6 +74,8 @@ from shared import (
     add_load_state_arg,
     add_pgremapper_mappings_arg,
     chain_link,
+    check_host_failure_domain,
+    check_known_pools,
     fetch_crush_rules,
     fetch_ec_profiles,
     fetch_osd_df,
@@ -470,14 +471,8 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> BalanceResult:
             f"classes present: {', '.join(sorted(candidates)) or 'none'}."
         )
     pgs = fetch_pg_stats(store, "pg_dump_pgs")
-    pool_ids = {pgid_pool_id(pg["pgid"]) for pg in pgs}
-    unknown_pools = sorted(pool_ids - pools_by_id.keys())
-    if unknown_pools:
-        sys.exit(
-            f"ERROR: PGs belong to pool id(s) {', '.join(map(str, unknown_pools))}, "
-            "which 'ceph osd pool ls detail' does not list, so their shards "
-            "cannot be analyzed."
-        )
+    # All of them: shards in motion anywhere count in the projections.
+    check_known_pools((pg["pgid"] for pg in pgs), pools_by_id, "PGs")
 
     def pg_info(pg: dict) -> tuple[bool, int]:
         pool_id = pgid_pool_id(pg["pgid"])
@@ -516,9 +511,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> BalanceResult:
     chained = [pg for pg in settled if pairs_chain(pg)]
     settled = [pg for pg in settled if not pairs_chain(pg)]
     check_host_failure_domain(
-        [pools_by_id[i] for i in sorted({pgid_pool_id(pg["pgid"]) for pg in settled})],
-        crush_rules,
-        "with a PG to move",
+        (pg["pgid"] for pg in settled), pools_by_id, crush_rules, "PGs to move"
     )
 
     states: dict[str, PgPlacement] = {}

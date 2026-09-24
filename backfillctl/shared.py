@@ -112,6 +112,50 @@ def rule_failure_domain(rule: dict | None) -> str | None:
     return None
 
 
+def check_known_pools(pgids: Iterable[str], pools: dict[int, dict], which: str) -> None:
+    """Exit unless 'ceph osd pool ls detail' lists the pool of every PG in pgids.
+
+    which names the PGs in the message, e.g. 'backfill_toofull PGs'. An
+    unknown pool's EC shards would be diffed as replicas: plausible but
+    wrong output.
+    """
+    unknown = sorted({pgid_pool_id(p) for p in pgids} - pools.keys())
+    if unknown:
+        sys.exit(
+            f"ERROR: {which} belong to pool id(s) {', '.join(map(str, unknown))}, "
+            "which 'ceph osd pool ls detail' does not list, so their shards "
+            "cannot be analyzed."
+        )
+
+
+def check_host_failure_domain(
+    pgids: Iterable[str],
+    pools: dict[int, dict],
+    crush_rules: dict[int, dict],
+    which: str,
+) -> None:
+    """Exit unless the pool of every PG in pgids has CRUSH failure domain host.
+
+    The pools must be known (check_known_pools). which names the PGs, as
+    there. Every offending pool is listed. The remapping subcommands keep a
+    PG's shards on distinct hosts, which is only right for host.
+    """
+    bad = []
+    for pool_id in sorted({pgid_pool_id(p) for p in pgids}):
+        pool = pools[pool_id]
+        domain = rule_failure_domain(crush_rules.get(pool.get("crush_rule")))
+        if domain != "host":
+            bad.append(
+                f"  pool {pool_id} ({pool.get('pool_name', '?')}): crush rule "
+                f"{pool.get('crush_rule')}, failure domain {domain or 'unknown'}"
+            )
+    if bad:
+        sys.exit(
+            "ERROR: this subcommand assumes CRUSH failure domain 'host', but the "
+            f"pools of these {which} use another:\n" + "\n".join(bad)
+        )
+
+
 def shard_size_bytes(pg: dict, pool: dict, ec_profiles: dict[str, dict]) -> int | None:
     """Estimate the bytes one shard of a PG occupies, or None if unknown.
 

@@ -39,7 +39,6 @@ domain is host.
 import argparse
 import heapq
 import math
-import sys
 from collections import Counter, deque
 from typing import NamedTuple
 
@@ -49,7 +48,6 @@ from placement import (
     ProjectedUsage,
     add_target_args,
     build_candidate_osds,
-    check_host_failure_domain,
     ec_pool_ids_from,
     fetch_full_ratios,
     find_arriving_shards,
@@ -66,6 +64,8 @@ from shared import (
     SnapshotStore,
     add_load_state_arg,
     add_pgremapper_mappings_arg,
+    check_host_failure_domain,
+    check_known_pools,
     fetch_crush_rules,
     fetch_ec_profiles,
     fetch_osd_df,
@@ -445,20 +445,10 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
         )
         print_pgs_filter(pgs_filter)
 
-    toofull_pool_ids = {pgid_pool_id(pg["pgid"]) for pg in toofull_pgs}
-    # An unknown pool would skip the failure-domain check and have its EC
-    # shards diffed as replicas: plausible but wrong rows.
-    unknown_pools = sorted(toofull_pool_ids - pools_by_id.keys())
-    if unknown_pools:
-        sys.exit(
-            "ERROR: backfill_toofull PGs belong to pool id(s) "
-            f"{', '.join(map(str, unknown_pools))}, which 'ceph osd pool ls "
-            "detail' does not list."
-        )
+    toofull_pgids = [pg["pgid"] for pg in toofull_pgs]
+    check_known_pools(toofull_pgids, pools_by_id, "backfill_toofull PGs")
     check_host_failure_domain(
-        [pools_by_id[i] for i in sorted(toofull_pool_ids)],
-        crush_rules,
-        "with a stuck PG",
+        toofull_pgids, pools_by_id, crush_rules, "backfill_toofull PGs"
     )
 
     arriving = []

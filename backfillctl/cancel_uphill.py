@@ -36,6 +36,8 @@ from shared import (
     add_load_state_arg,
     add_pgremapper_mappings_arg,
     avoid_chains,
+    check_host_failure_domain,
+    check_known_pools,
     close_pins,
     copies_moving,
     ec_shard_moves,
@@ -51,12 +53,12 @@ from shared import (
     order_moves,
     percentage_points,
     pg_progress_pct,
+    pgid_pool_id,
     pgid_sort_key,
     pin_replica,
     print_pgremapper_mappings,
     print_table,
     real_osd_set,
-    rule_failure_domain,
     shard_size_bytes,
     skipped_sort_key,
     stderr_para,
@@ -187,25 +189,16 @@ def plan_cancellations(
     Exits with an error if a pool is unknown or its failure domain is not
     host.
     """
+    pg_stats = [pg for pg in pg_stats if pg["pgid"] not in exclude_pgs]
+    pgids = [pg["pgid"] for pg in pg_stats]
+    check_known_pools(pgids, pools, "remapped PGs")
+    check_host_failure_domain(pgids, pools, crush_rules, "remapped PGs")
+
     cancellations, skipped = [], []
     for pg in pg_stats:
         up, acting = pg["up"], pg["acting"]
         pgid = pg["pgid"]
-        if pgid in exclude_pgs:
-            continue
-        pool = pools.get(int(pgid.split(".")[0]))
-        if pool is None:
-            sys.exit(
-                f"ERROR: PG {pgid} belongs to a pool that 'ceph osd pool ls "
-                "detail' does not list, so its shards cannot be analyzed."
-            )
-        domain = rule_failure_domain(crush_rules.get(pool.get("crush_rule")))
-        if domain != "host":
-            sys.exit(
-                f"ERROR: pool {pool['pool_id']} (PG {pgid}) has CRUSH failure "
-                f"domain {domain or 'unknown'}; this script only checks for "
-                "same-host clashes, so it cannot tell which pins are valid."
-            )
+        pool = pools[pgid_pool_id(pgid)]
         is_ec = pool.get("type") == POOL_TYPE_ERASURE
         size = shard_size_bytes(pg, pool, ec_profiles)
         progress = pg_progress_pct(

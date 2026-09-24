@@ -48,7 +48,6 @@ from placement import (
     ProjectedUsage,
     add_target_args,
     build_candidate_osds,
-    check_host_failure_domain,
     ec_pool_ids_from,
     fetch_full_ratios,
     find_arriving_shards,
@@ -67,6 +66,8 @@ from shared import (
     SnapshotStore,
     add_load_state_arg,
     add_pgremapper_mappings_arg,
+    check_host_failure_domain,
+    check_known_pools,
     close_pins,
     fetch_crush_rules,
     fetch_ec_profiles,
@@ -553,19 +554,10 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
 
     drained_pgs = fetch_drained_pg_stats(store, drained)
     remapped_pgs = fetch_remapped_pg_stats(store)
-    affected_pool_ids = {pgid_pool_id(pg["pgid"]) for pg in drained_pgs}
-    unknown_pools = sorted(affected_pool_ids - pools_by_id.keys())
-    if unknown_pools:
-        sys.exit(
-            "ERROR: PGs on the drained OSD(s) belong to pool id(s) "
-            f"{', '.join(map(str, unknown_pools))}, which 'ceph osd pool ls "
-            "detail' does not list, so their shards cannot be analyzed."
-        )
-    check_host_failure_domain(
-        [pools_by_id[i] for i in sorted(affected_pool_ids)],
-        crush_rules,
-        "with a PG on a drained OSD",
-    )
+    drained_pgids = [pg["pgid"] for pg in drained_pgs]
+    which = "PGs on the drained OSDs"
+    check_known_pools(drained_pgids, pools_by_id, which)
+    check_host_failure_domain(drained_pgids, pools_by_id, crush_rules, which)
 
     def pg_info(pg: dict) -> tuple[bool, int]:
         pool_id = pgid_pool_id(pg["pgid"])

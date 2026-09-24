@@ -797,7 +797,8 @@ class PlanCompanionsTest(unittest.TestCase):
         }
         with self.assertRaises(SystemExit) as ctx:
             self.plan([pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])], rules=rack)
-        self.assertIn("rack", str(ctx.exception))
+        self.assertIn("failure domain rack", str(ctx.exception))
+        self.assertIn("PGs with a backfill into osd.682", str(ctx.exception))
 
     def test_missing_crush_rule_is_an_error(self):
         with self.assertRaises(SystemExit):
