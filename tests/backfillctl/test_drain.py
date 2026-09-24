@@ -495,6 +495,17 @@ class OutputTest(unittest.TestCase):
         )
         self.assertTrue(moves[1].note.startswith("diverted:"))
 
+    def test_unplaceable_shards_are_named(self):
+        c = Cluster(default_util=95.0)  # no OSD has room
+        result = c.pg("1.0", [0, 10, 20]).plan(0)
+        self.assertEqual([e.pgid for e in result.unplaceable], ["1.0"])
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            ut.render(result, parse_args(ut, ["--osds", "0"]))
+        self.assertIn(
+            "  cannot place 1.0 shard 0 off osd.0: no legal target", err.getvalue()
+        )
+
     def test_nothing_to_drain_says_so(self):
         for argv, out_text in ((["0"], ""), (["0", "--pgremapper-mappings"], "[]\n")):
             out, err = io.StringIO(), io.StringIO()

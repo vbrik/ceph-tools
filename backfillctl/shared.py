@@ -1070,6 +1070,16 @@ def stderr_para(text: str) -> None:
 stderr_para.printed = False
 
 
+def stderr_items(items: Iterable[str]) -> None:
+    """Print items on stderr, one indented, wrapped line each.
+
+    For the details under a stderr_para summary, e.g. each shard that could
+    not be pinned or placed.
+    """
+    for item in items:
+        print(wrap_text(item, indent="  "), file=sys.stderr)
+
+
 def print_table(columns: Columns, rows: list[list[str]]) -> None:
     """Print rows under a two-line header: group names, then column labels.
 

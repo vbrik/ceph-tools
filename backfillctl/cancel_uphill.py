@@ -19,7 +19,6 @@ the pins are in place. Assumes the CRUSH failure domain is host.
 """
 
 import argparse
-import sys
 from typing import NamedTuple
 
 from shared import (
@@ -61,10 +60,10 @@ from shared import (
     real_osd_set,
     shard_size_bytes,
     skipped_sort_key,
+    stderr_items,
     stderr_para,
     warn_chains,
     with_exact_progress,
-    wrap_text,
 )
 
 # Same as cancel-backfill's.
@@ -296,11 +295,7 @@ def print_summary(cancellations: list[Cancellation], skipped: list[Skipped]) -> 
             else ""
         )
     )
-    for s in skipped:
-        print(
-            wrap_text(f"cannot pin {s.pgid} shard {s.shard}: {s.reason}", indent="  "),
-            file=sys.stderr,
-        )
+    stderr_items(f"cannot pin {s.pgid} shard {s.shard}: {s.reason}" for s in skipped)
 
 
 # ---------------------------------------------------------------------------

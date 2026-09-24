@@ -79,6 +79,7 @@ from shared import (
     pgid_sort_key,
     print_table,
     print_upmap_pairs,
+    stderr_items,
     stderr_para,
     utilization_pct,
 )
@@ -366,16 +367,22 @@ def format_row(
     ]
 
 
-def print_outcome(proposed: int, unplaceable: int) -> None:
-    """Report on stderr how many shards were placed and how many were not."""
+def print_outcome(proposed: int, unplaceable: list[ArrivingShard]) -> None:
+    """Report on stderr how many shards were placed, and name those that were not."""
     stderr_para(
-        f"Proposed {proposed} remap(s); {unplaceable} shard(s) could not be placed"
+        f"Proposed {proposed} remap(s); {len(unplaceable)} shard(s) could not be "
+        "placed"
         + (
             ": targets ran out of room, or the greedy heuristic missed some. "
             "Apply these, let them finish, then re-run."
             if unplaceable
             else "."
         )
+    )
+    stderr_items(
+        f"cannot place {s.pgid} shard {s.shard} (headed for osd.{s.up_osd}): "
+        "no legal target"
+        for s in unplaceable
     )
 
 
@@ -555,7 +562,7 @@ def render(result: DivertResult, args: argparse.Namespace) -> None:
             [format_row(p, result.osd_host, osd_df) for p in proposals],
         )
 
-    print_outcome(len(proposals), len(unplaceable))
+    print_outcome(len(proposals), unplaceable)
 
 
 def run(args: argparse.Namespace) -> None:

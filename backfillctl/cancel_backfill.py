@@ -91,10 +91,10 @@ from shared import (
     shard_size_bytes,
     skipped_sort_key,
     slot,
+    stderr_items,
     stderr_para,
     warn_chains,
     with_exact_progress,
-    wrap_text,
 )
 
 # Live runs read pg_ls_remapped; --load-state filters pg_dump_pgs instead
@@ -449,11 +449,7 @@ def print_summary(
             else ""
         )
     )
-    for s in skipped:
-        print(
-            wrap_text(f"cannot pin {s.pgid} shard {s.shard}: {s.reason}", indent="  "),
-            file=sys.stderr,
-        )
+    stderr_items(f"cannot pin {s.pgid} shard {s.shard}: {s.reason}" for s in skipped)
 
 
 # ---------------------------------------------------------------------------

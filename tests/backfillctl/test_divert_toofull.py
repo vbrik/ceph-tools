@@ -516,21 +516,33 @@ CEPH2_UNCAPPED_PROPOSED = 210
 
 
 class PrintOutcomeTest(unittest.TestCase):
-    def capture(self, count):
+    def capture(self, unplaceable):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            ut.print_outcome(5, count)
-        return flat(err.getvalue())
+            ut.print_outcome(5, unplaceable)
+        return err.getvalue()
 
-    def test_reports_only_the_count_under_a_heuristic_caveat(self):
-        text = self.capture(3)
-        self.assertIn("Proposed 5 remap(s); 3 shard(s) could not be placed", text)
-        self.assertIn("greedy heuristic", text)
+    def test_names_each_unplaceable_shard_under_a_heuristic_caveat(self):
+        shards = [
+            placement.ArrivingShard("19.1", 3, 31, 7, [31]),
+            placement.ArrivingShard("7.2", "-", 40, None, [40]),
+        ]
+        text = self.capture(shards)
+        self.assertIn("Proposed 5 remap(s); 2 shard(s) could not be placed", flat(text))
+        self.assertIn("greedy heuristic", flat(text))
+        self.assertEqual(
+            text.splitlines()[-2:],
+            [
+                "  cannot place 19.1 shard 3 (headed for osd.31): no legal target",
+                "  cannot place 7.2 shard - (headed for osd.40): no legal target",
+            ],
+        )
 
-    def test_no_caveat_when_everything_is_placed(self):
-        text = self.capture(0)
-        self.assertIn("0 shard(s) could not be placed.", text)
+    def test_no_caveat_or_list_when_everything_is_placed(self):
+        text = self.capture([])
+        self.assertIn("0 shard(s) could not be placed.", flat(text))
         self.assertNotIn("heuristic", text)
+        self.assertNotIn("cannot place", text)
 
 
 def proposal(pgid, up_osd, target_osd, shard=0):

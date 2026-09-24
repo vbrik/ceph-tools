@@ -86,6 +86,7 @@ from shared import (
     print_table,
     print_upmap_entries,
     real_osd_set,
+    stderr_items,
     stderr_para,
     upmap_entry,
     utilization_pct,
@@ -723,6 +724,10 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
         f"backfill_toofull: {pg_list(stuck)}; for an unidentified reason: "
         f"{pg_list(unexplained)}"
         + (". Their NOTE (JSON: 'note') says why." if stuck or unexplained else ".")
+    )
+    stderr_items(
+        f"cannot place {e.pgid} shard {e.shard} off osd.{e.up_osd}: no legal target"
+        for e in result.unplaceable
     )
     if result.unplaceable:
         stderr_para(
