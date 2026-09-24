@@ -330,8 +330,9 @@ class FilterTest(unittest.TestCase):
     def test_pgs_names_ids_with_no_movement_on_stderr(self):
         # 27.a is clean, 99.1 does not exist: both matched nothing.
         out, err = self.run_main("--pgs", "5.3", "27.a", "99.1")
-        self.assertIn("--pgs: 1 of 3 given PG id(s) have movement", err)
-        self.assertIn("2 matched nothing (not moving, or a typo): 27.a, 99.1", err)
+        err = " ".join(err.split())
+        self.assertIn("NOTE: --pgs: 1 of 3 given PG id(s) have movement", err)
+        self.assertIn("2 matched nothing (not moving, or a typo): 27.a, 99.1.", err)
         self.assertTrue(out.startswith("PGID"))
 
     def test_pgs_unmatched_is_judged_before_osds(self):

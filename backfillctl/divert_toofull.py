@@ -77,6 +77,7 @@ from shared import (
     osd_cells,
     pgid_pool_id,
     pgid_sort_key,
+    print_pgid_filter,
     print_table,
     print_upmap_pairs,
     stderr_items,
@@ -445,12 +446,15 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
 
     pgs_filter = None
     if args.pgs:
-        wanted_pgs = set(args.pgs)
-        toofull_pgs, matched_pgs = filter_toofull_pgs(toofull_pgs, wanted_pgs)
-        pgs_filter = PgidFilter(
-            len(wanted_pgs), len(matched_pgs), sorted(wanted_pgs - matched_pgs)
+        wanted = set(args.pgs)
+        toofull_pgs, matched = filter_toofull_pgs(toofull_pgs, wanted)
+        pgs_filter = PgidFilter.of(wanted, matched)
+        print_pgid_filter(
+            "--pgs",
+            pgs_filter,
+            "are backfill_toofull and will be the only ones considered",
+            "not backfill_toofull",
         )
-        print_pgs_filter(pgs_filter)
 
     toofull_pgids = [pg["pgid"] for pg in toofull_pgs]
     check_known_pools(toofull_pgids, pools_by_id, "backfill_toofull PGs")
@@ -504,21 +508,6 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
         pgs_filter=pgs_filter,
         osd_df=osd_df,
         osd_host=osd_host,
-    )
-
-
-def print_pgs_filter(pgs_filter: PgidFilter) -> None:
-    """Report on stderr what --pgs matched, naming ids that matched nothing."""
-    stderr_para(
-        f"NOTE: --pgs: {pgs_filter.matched} of {pgs_filter.given} given PG id(s) "
-        "are backfill_toofull and will be the only ones considered"
-        + (
-            f"; {len(pgs_filter.unmatched)} matched nothing (check for typos): "
-            + ", ".join(pgs_filter.unmatched)
-            if pgs_filter.unmatched
-            else ""
-        )
-        + "."
     )
 
 

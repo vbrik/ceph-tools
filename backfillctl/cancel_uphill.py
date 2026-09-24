@@ -55,6 +55,7 @@ from shared import (
     pgid_pool_id,
     pgid_sort_key,
     pin_replica,
+    print_pgid_filter,
     print_pgremapper_mappings,
     print_table,
     real_osd_set,
@@ -260,21 +261,6 @@ def plan_cancellations(
 # ---------------------------------------------------------------------------
 
 
-def print_exclude_filter(exclude_filter: PgidFilter) -> None:
-    """Report on stderr what --exclude-pgs matched, naming the ids that matched nothing."""
-    unmatched = exclude_filter.unmatched
-    stderr_para(
-        f"NOTE: --exclude-pgs: {exclude_filter.matched} of {exclude_filter.given} "
-        "given PG id(s) matched a remapped PG and were left alone"
-        + (
-            f"; {len(unmatched)} matched nothing (check for typos): "
-            f"{', '.join(unmatched)}."
-            if unmatched
-            else "."
-        )
-    )
-
-
 def print_summary(cancellations: list[Cancellation], skipped: list[Skipped]) -> None:
     """Summarize the proposal on stderr, and list what cannot be pinned."""
     direct = [c for c in cancellations if c.companion_of is None]
@@ -326,11 +312,13 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> UphillResult:
 
     exclude_filter = None
     if exclude_pgs:
-        matched = {pg["pgid"] for pg in pg_stats if pg["pgid"] in exclude_pgs}
-        exclude_filter = PgidFilter(
-            len(exclude_pgs), len(matched), sorted(exclude_pgs - matched)
+        exclude_filter = PgidFilter.of(exclude_pgs, (pg["pgid"] for pg in pg_stats))
+        print_pgid_filter(
+            "--exclude-pgs",
+            exclude_filter,
+            "matched a remapped PG and were left alone",
+            "not remapped",
         )
-        print_exclude_filter(exclude_filter)
 
     cancellations, skipped = plan_cancellations(
         pg_stats,

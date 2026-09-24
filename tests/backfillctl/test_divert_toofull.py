@@ -530,11 +530,13 @@ class PrintOutcomeTest(unittest.TestCase):
         text = self.capture(shards)
         self.assertIn("Proposed 5 remap(s); 2 shard(s) could not be placed", flat(text))
         self.assertIn("greedy heuristic", flat(text))
+        # One indented item per shard, after the summary (wrapping aside).
+        items = flat(text).split(" cannot place ")[1:]
         self.assertEqual(
-            text.splitlines()[-2:],
+            items,
             [
-                "  cannot place 19.1 shard 3 (headed for osd.31): no legal target",
-                "  cannot place 7.2 shard - (headed for osd.40): no legal target",
+                "19.1 shard 3 (headed for osd.31): no legal target",
+                "7.2 shard - (headed for osd.40): no legal target",
             ],
         )
 
@@ -756,26 +758,7 @@ class NothingToDivertTest(unittest.TestCase):
 
 
 class PrintPgsFilterTest(unittest.TestCase):
-    def capture(self, pgs_filter):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            ut.print_pgs_filter(pgs_filter)
-        return err.getvalue()
-
-    def test_all_matched(self):
-        self.assertIn(
-            "--pgs: 1 of 1 given PG id(s) are backfill_toofull and will be "
-            "the only ones considered.",
-            flat(self.capture(shared.PgidFilter(1, 1, []))),
-        )
-
-    def test_unmatched_ids_are_named(self):
-        self.assertIn(
-            "--pgs: 1 of 3 given PG id(s) are backfill_toofull and will be "
-            "the only ones considered; 2 matched nothing (check for typos): "
-            "19.yyy, 19.zzz",
-            flat(self.capture(shared.PgidFilter(3, 1, ["19.yyy", "19.zzz"]))),
-        )
+    """divert-toofull's --pgs note (the shared print_pgid_filter)."""
 
     def test_printed_even_when_planning_then_exits(self):
         # A typo in --pgs can be what trips a later error, so the note naming
@@ -793,7 +776,11 @@ class PrintPgsFilterTest(unittest.TestCase):
             with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
                 plan_from_state(ut, dst, "--pgs", "19.21f", "19.zzz")
         self.assertIn("pool id(s) 19", str(ctx.exception))
-        self.assertIn("1 matched nothing (check for typos): 19.zzz", err.getvalue())
+        self.assertIn(
+            "are backfill_toofull and will be the only ones considered; 1 matched "
+            "nothing (not backfill_toofull, or a typo): 19.zzz.",
+            flat(err.getvalue()),
+        )
 
     def test_printed_only_with_pgs(self):
         # The note goes to stderr, ahead of the summary, only under --pgs.

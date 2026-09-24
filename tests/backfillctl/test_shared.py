@@ -1055,6 +1055,35 @@ class ParseOsdTest(unittest.TestCase):
                 shared.parse_osd(text)
 
 
+class PgidFilterTest(unittest.TestCase):
+    """PgidFilter.of and print_pgid_filter: the --pgs/--exclude-pgs note."""
+
+    def capture(self, f):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            shared.print_pgid_filter("--pgs", f, "have movement", "not moving")
+        return " ".join(err.getvalue().split())
+
+    def test_of_counts_distinct_ids_and_sorts_the_unmatched(self):
+        self.assertEqual(
+            shared.PgidFilter.of(["19.zzz", "1.a", "1.a", "19.yyy"], ["1.a", "2.b"]),
+            shared.PgidFilter(3, 1, ["19.yyy", "19.zzz"]),
+        )
+
+    def test_all_matched(self):
+        self.assertEqual(
+            self.capture(shared.PgidFilter(1, 1, [])),
+            "NOTE: --pgs: 1 of 1 given PG id(s) have movement.",
+        )
+
+    def test_unmatched_ids_are_named_with_what_else_they_may_be(self):
+        self.assertEqual(
+            self.capture(shared.PgidFilter(3, 1, ["19.yyy", "19.zzz"])),
+            "NOTE: --pgs: 1 of 3 given PG id(s) have movement; 2 matched nothing "
+            "(not moving, or a typo): 19.yyy, 19.zzz.",
+        )
+
+
 class PoolChecksTest(unittest.TestCase):
     """check_known_pools and check_host_failure_domain."""
 

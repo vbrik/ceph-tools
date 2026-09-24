@@ -84,6 +84,7 @@ from shared import (
     pgid_sort_key,
     pin_replica,
     pin_with_companions,
+    print_pgid_filter,
     print_pgremapper_mappings,
     print_table,
     real_osd_set,
@@ -500,16 +501,18 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
     exclude_filter = None
     if exclude_pgs:
         # Matched: remapped and, with --osd, osd in 'up'. Not necessarily a
-        # backfill into osd, so print_exclude_filter claims no more.
-        matched = {
-            pg["pgid"]
-            for pg in pg_stats
-            if (osd is None or osd in pg["up"]) and pg["pgid"] in exclude_pgs
-        }
-        exclude_filter = PgidFilter(
-            len(exclude_pgs), len(matched), sorted(exclude_pgs - matched)
+        # backfill into osd, so the note claims no more.
+        exclude_filter = PgidFilter.of(
+            exclude_pgs,
+            (pg["pgid"] for pg in pg_stats if osd is None or osd in pg["up"]),
         )
-        print_exclude_filter(osd, exclude_filter)
+        involving = "" if osd is None else f" involving osd.{osd}"
+        print_pgid_filter(
+            "--exclude-pgs",
+            exclude_filter,
+            f"matched a remapped PG{involving} and were left alone",
+            "not remapped" + ("" if osd is None else f", not involving osd.{osd}"),
+        )
     cancellations, skipped = plan_cancellations(
         pg_stats,
         pools,
@@ -540,22 +543,6 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
         exclude_filter=exclude_filter,
         osd_df=osd_df,
         osd_host=osd_host,
-    )
-
-
-def print_exclude_filter(osd: int | None, exclude_filter: PgidFilter) -> None:
-    """Report on stderr what --exclude-pgs matched, naming the ids that matched nothing."""
-    unmatched = exclude_filter.unmatched
-    involving = "" if osd is None else f" involving osd.{osd}"
-    stderr_para(
-        f"NOTE: --exclude-pgs: {exclude_filter.matched} of {exclude_filter.given} "
-        f"given PG id(s) matched a remapped PG{involving} and were left alone"
-        + (
-            f"; {len(unmatched)} matched nothing (check for typos): "
-            f"{', '.join(unmatched)}."
-            if unmatched
-            else "."
-        )
     )
 
 

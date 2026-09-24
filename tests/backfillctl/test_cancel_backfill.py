@@ -921,7 +921,11 @@ class RenderTest(unittest.TestCase):
             cb.plan(parse_args(cb, argv), store)
         paras = flat(err.getvalue())
         self.assertIn("no backfillfull_ratio", paras)
-        self.assertIn("1 matched nothing (check for typos): 19.zzz", paras)
+        self.assertIn(
+            "1 matched nothing (not remapped, not involving osd.682, or a typo): "
+            "19.zzz",
+            paras,
+        )
         self.assertLess(
             paras.index("no backfillfull_ratio"), paras.index("--exclude-pgs:")
         )
@@ -1400,8 +1404,12 @@ class MainTest(unittest.TestCase):
         self.assertEqual(pins(result.cancellations), ["19.d 682 8", "19.d 9 4"])
         self.assertEqual(result.exclude_filter, shared.PgidFilter(2, 1, ["19.zzz"]))
         _, err = self.run_main("--osd", "682", "--exclude-pgs", "19.9", "19.zzz")
-        self.assertIn("1 of 2 given PG id(s) matched", err)
-        self.assertIn("1 matched nothing (check for typos): 19.zzz", err)
+        self.assertIn("1 of 2 given PG id(s) matched", flat(err))
+        self.assertIn(
+            "1 matched nothing (not remapped, not involving osd.682, or a typo): "
+            "19.zzz",
+            flat(err),
+        )
 
     def test_exclude_pgs_all_entries_matched_nothing(self):
         # none of PGS involves osd.5000 at all: matched must read as zero,
@@ -1742,7 +1750,7 @@ class FixtureReplayTest(unittest.TestCase):
         )
 
     def test_osd_896_summary_on_stderr(self):
-        err = self.replay(896).stderr
+        err = flat(self.replay(896).stderr)
         self.assertIn("6 arriving shard(s)", err)
         self.assertIn("5 more shard(s)", err)
         self.assertNotIn("blockers:", err)
@@ -2164,7 +2172,7 @@ class MainAllTest(unittest.TestCase):
         _, err = self.run_main("--exclude-pgs", "19.9", "19.zzz")
         err = flat(err)
         self.assertIn("1 of 2 given PG id(s) matched a remapped PG and", err)
-        self.assertIn("matched nothing (check for typos): 19.zzz", err)
+        self.assertIn("matched nothing (not remapped, or a typo): 19.zzz", err)
 
     def test_nothing_to_pin_says_so(self):
         out, err = self.run_main("--pgremapper-mappings", pgs=[])

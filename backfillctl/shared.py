@@ -91,7 +91,32 @@ class PgidFilter(NamedTuple):
 
     given: int
     matched: int
-    unmatched: list[str]  # sorted; usually typos
+    unmatched: list[str]  # sorted; often typos
+
+    @classmethod
+    def of(cls, given: Iterable[str], present: Iterable[str]) -> "PgidFilter":
+        """Return what the given ids matched among the present ones."""
+        given = set(given)
+        matched = given & set(present)
+        return cls(len(given), len(matched), sorted(given - matched))
+
+
+def print_pgid_filter(option: str, f: PgidFilter, matched: str, unmatched: str) -> None:
+    """Report on stderr what option's PG ids matched, naming those that did not.
+
+    matched says what a match means ('have movement'); unmatched, what else
+    than a typo a non-match may be ('not moving').
+    """
+    stderr_para(
+        f"NOTE: {option}: {f.matched} of {f.given} given PG id(s) {matched}"
+        + (
+            f"; {len(f.unmatched)} matched nothing ({unmatched}, or a typo): "
+            + ", ".join(f.unmatched)
+            if f.unmatched
+            else ""
+        )
+        + "."
+    )
 
 
 def is_erasure(pool: dict | None) -> bool:

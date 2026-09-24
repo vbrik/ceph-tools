@@ -20,7 +20,6 @@ per-PG counters, which can read far too high.
 """
 
 import argparse
-import sys
 from typing import NamedTuple
 
 from shared import (
@@ -46,6 +45,7 @@ from shared import (
     pg_progress,
     pgid_pool_id,
     pgid_sort_key,
+    print_pgid_filter,
     print_table,
     real_osd_set,
     target_peer,
@@ -304,27 +304,11 @@ def filter_rows(
     """
     pgs_filter = None
     if pgids:
-        matched = pgids & {r.pgid for r in rows}
-        pgs_filter = PgidFilter(len(pgids), len(matched), sorted(pgids - matched))
+        pgs_filter = PgidFilter.of(pgids, (r.pgid for r in rows))
         rows = [r for r in rows if r.pgid in pgids]
     if osds:
         rows = [r for r in rows if osds & (from_osds(r) | r.destinations)]
     return rows, pgs_filter
-
-
-def print_pgs_filter(pgs_filter: PgidFilter) -> None:
-    """Report on stderr what --pgs matched, naming ids that matched nothing."""
-    print(
-        f"--pgs: {pgs_filter.matched} of {pgs_filter.given} given PG id(s) "
-        "have movement"
-        + (
-            f"; {len(pgs_filter.unmatched)} matched nothing (not moving, or "
-            "a typo): " + ", ".join(pgs_filter.unmatched)
-            if pgs_filter.unmatched
-            else ""
-        ),
-        file=sys.stderr,
-    )
 
 
 # (group, label). The unlabeled column holds the '->' from FROM to TO.
@@ -392,7 +376,7 @@ def render(result: MovementsResult) -> None:
     """Print the rows as a table, then the footnotes that apply."""
     rows, pgs_filter, filtered, osd_df, osd_host = result
     if pgs_filter is not None:
-        print_pgs_filter(pgs_filter)
+        print_pgid_filter("--pgs", pgs_filter, "have movement", "not moving")
     if not rows:
         print(
             "No PG movements match --osds/--pgs."
