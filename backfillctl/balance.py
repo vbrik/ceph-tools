@@ -90,6 +90,7 @@ from shared import (
     real_osd_set,
     slot,
     stderr_para,
+    utilization_pct,
 )
 
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
@@ -150,7 +151,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     )
     sources.add_argument(
         "--min-source-util",
-        type=float,
+        type=utilization_pct,
         metavar="PERCENT",
         help="Move data off OSDs projected at least this full, at most half "
         "of the class (default: the fuller half).",

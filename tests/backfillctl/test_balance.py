@@ -126,6 +126,14 @@ class SourcesFromClusterTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parse_args(ut, ["--osds", "1", "--min-source-util", "80"])
 
+    def test_percent_options_refuse_a_ratio(self):
+        for argv in (["--min-source-util", "0.8"], ["--max-target-util", "0.9"]):
+            with self.subTest(argv=argv):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                    parse_args(ut, argv)
+                self.assertIn("not a ratio", err.getvalue())
+
     def test_unknown_class_names_the_classes_present(self):
         with self.assertRaises(SystemExit) as cm:
             Cluster().plan("--class", "ssd")

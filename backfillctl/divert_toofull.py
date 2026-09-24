@@ -78,6 +78,7 @@ from shared import (
     print_table,
     print_upmap_pairs,
     stderr_para,
+    utilization_pct,
 )
 
 # Live runs read pg_ls_backfill_toofull; --load-state filters pg_dump_pgs
@@ -125,7 +126,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     )
     parser.add_argument(
         "--toofull-util",
-        type=float,
+        type=utilization_pct,
         metavar="PERCENT",
         help="Divert only shards arriving on an OSD at least this full "
         "(default: nearfull_ratio).",

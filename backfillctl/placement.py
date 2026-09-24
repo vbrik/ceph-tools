@@ -48,7 +48,7 @@ def add_target_args(parser: argparse.ArgumentParser):
     """Add --max-target-util, --max-target-uses and --pgremapper-mappings."""
     parser.add_argument(
         "--max-target-util",
-        type=float,
+        type=shared.utilization_pct,
         metavar="PERCENT",
         help="Cap on a target's projected utilization (default: "
         "backfillfull_ratio - 1; at most backfillfull_ratio).",

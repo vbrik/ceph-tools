@@ -390,6 +390,13 @@ class BuildParserTest(unittest.TestCase):
         args = parse_args(cu, ["--min-delta", "5"])
         self.assertEqual(args.min_delta, 5.0)
 
+    def test_min_delta_takes_fractions_of_a_point_but_not_negatives(self):
+        self.assertEqual(parse_args(cu, ["--min-delta", "0.5"]).min_delta, 0.5)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            parse_args(cu, ["--min-delta", "-1"])
+        self.assertIn("must be from 0 to 100", err.getvalue())
+
 
 class RenderTest(unittest.TestCase):
     def render(self, *argv, **fields):

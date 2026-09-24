@@ -84,6 +84,7 @@ from shared import (
     real_osd_set,
     stderr_para,
     upmap_entry,
+    utilization_pct,
 )
 
 # Live runs add a 'pg ls-by-osd' per drained OSD (ls_by_osd_commands);
@@ -169,7 +170,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     )
     parser.add_argument(
         "--toofull-util",
-        type=float,
+        type=utilization_pct,
         metavar="PERCENT",
         help="Blocker threshold for PGs that are backfill_toofull now "
         "(default: nearfull_ratio).",

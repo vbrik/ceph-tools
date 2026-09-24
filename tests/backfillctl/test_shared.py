@@ -1055,5 +1055,36 @@ class ParseOsdTest(unittest.TestCase):
                 shared.parse_osd(text)
 
 
+class PercentTypesTest(unittest.TestCase):
+    """percentage_points and utilization_pct: argparse types of the PERCENT options."""
+
+    def test_percentage_points_accepts_0_to_100(self):
+        for text, value in (("0", 0.0), ("0.5", 0.5), ("1", 1.0), ("100", 100.0)):
+            with self.subTest(text=text):
+                self.assertEqual(shared.percentage_points(text), value)
+
+    def test_percentage_points_rejects_out_of_range_and_garbage(self):
+        for text in ("-0.1", "100.1", "nan", "inf", "", "85%", "x"):
+            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
+                shared.percentage_points(text)
+
+    def test_utilization_accepts_0_and_1_to_100(self):
+        for text, value in (("0", 0.0), ("1.01", 1.01), ("85", 85.0), ("100", 100.0)):
+            with self.subTest(text=text):
+                self.assertEqual(shared.utilization_pct(text), value)
+
+    def test_utilization_rejects_what_looks_like_a_ratio(self):
+        for text in ("0.01", "0.85", "0.9", "1", "1.0"):
+            with self.subTest(text=text):
+                with self.assertRaises(argparse.ArgumentTypeError) as cm:
+                    shared.utilization_pct(text)
+                self.assertIn("not a ratio like 0.85", str(cm.exception))
+
+    def test_utilization_rejects_out_of_range(self):
+        for text in ("-5", "101", "nan"):
+            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
+                shared.utilization_pct(text)
+
+
 if __name__ == "__main__":
     unittest.main()

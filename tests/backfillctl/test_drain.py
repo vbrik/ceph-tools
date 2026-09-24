@@ -352,6 +352,12 @@ class BlockerTest(unittest.TestCase):
         result = c.plan(0)
         self.assertEqual(pairs(result), [("1.0", 0, 0, 31)])
 
+    def test_toofull_util_refuses_a_ratio(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            parse_args(ut, ["--osds", "0", "--toofull-util", "0.85"])
+        self.assertIn("not a ratio", err.getvalue())
+
     def test_toofull_util_overrides_nearfull(self):
         c = Cluster()
         c.util[10] = 86.0

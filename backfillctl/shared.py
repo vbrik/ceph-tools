@@ -582,6 +582,32 @@ def parse_osd(text: str) -> int:
     return int(match[1])
 
 
+def percentage_points(text: str) -> float:
+    """argparse type: a number from 0 to 100, e.g. a utilization difference."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {text!r}") from None
+    if not 0 <= value <= 100:  # also rejects nan
+        raise argparse.ArgumentTypeError(f"must be from 0 to 100, got {text}")
+    return value
+
+
+def utilization_pct(text: str) -> float:
+    """argparse type: a utilization threshold in percent, 0 or from 1 to 100.
+
+    Rejects 0 < value <= 1: almost surely a ratio (0.85, as in Ceph's
+    *_ratio settings) typed for a percentage. Taken as a percentage it
+    would select everything or nothing, and the output would look plausible.
+    """
+    value = percentage_points(text)
+    if 0 < value <= 1:
+        raise argparse.ArgumentTypeError(
+            f"expected a percentage like 85, not a ratio like 0.85, got {text}"
+        )
+    return value
+
+
 class HelpFormatter(argparse.HelpFormatter):
     """Reflow each paragraph of a description separately.
 

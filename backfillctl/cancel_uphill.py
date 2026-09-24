@@ -48,6 +48,7 @@ from shared import (
     format_bytes,
     format_row,
     order_moves,
+    percentage_points,
     pg_progress_pct,
     pgid_sort_key,
     pin_replica,
@@ -89,7 +90,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     )
     parser.add_argument(
         "--min-delta",
-        type=float,
+        type=percentage_points,
         default=1.0,
         metavar="PERCENT",
         help="Minimum utilization difference, in percentage points, for a "

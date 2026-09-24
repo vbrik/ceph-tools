@@ -38,7 +38,14 @@ import unittest
 from collections import Counter
 from typing import ClassVar
 
-from _support import REPO_ROOT, FakeStore, placement, plan_from_state, shared
+from _support import (
+    REPO_ROOT,
+    FakeStore,
+    parse_args,
+    placement,
+    plan_from_state,
+    shared,
+)
 
 from backfillctl import divert_toofull as ut
 
@@ -1579,7 +1586,13 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
                 self.assertIn("backfillfull_ratio (91%)", proc.stderr)
 
     def test_a_non_positive_cap_is_an_error(self):
-        for value in ("0", "-5"):
+        # 0 parses, then fails the range check against backfillfull_ratio;
+        # a negative value, a ratio or garbage is refused by argparse.
+        for value, message in (
+            ("0", "ERROR: max target utilization"),
+            ("-5", "must be from 0 to 100, got -5"),
+            ("0.89", "not a ratio like 0.85, got 0.89"),
+        ):
             with self.subTest(value=value):
                 proc = subprocess.run(
                     [
@@ -1589,9 +1602,19 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     check=False,
+                    env=os.environ | {"PYTHON_COLORS": "0"},
                 )
                 self.assertNotEqual(proc.returncode, 0)
-                self.assertIn("ERROR: max target utilization", proc.stderr)
+                self.assertEqual(proc.stdout, "")
+                self.assertIn(message, " ".join(proc.stderr.split()))
+
+    def test_every_percent_option_refuses_a_ratio(self):
+        for argv in (["--toofull-util", "0.85"], ["--max-target-util", "0.9"]):
+            with self.subTest(argv=argv):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                    parse_args(ut, argv)
+                self.assertIn("not a ratio", err.getvalue())
 
     def test_pgremapper_mappings_mode_prints_the_planned_proposals(self):
         entries = json.loads(run_ceph2("--pgremapper-mappings").stdout)
