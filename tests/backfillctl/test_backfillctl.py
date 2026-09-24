@@ -14,7 +14,11 @@ from pathlib import Path
 from _support import REPO_ROOT
 
 FIXTURE = (
-    REPO_ROOT / "tests" / "pg-osd" / "test-data" / "ceph1-backfills-stuck-at-100-pct"
+    REPO_ROOT
+    / "tests"
+    / "backfillctl"
+    / "test-data"
+    / "ceph1-backfills-stuck-at-100-pct"
 )
 
 

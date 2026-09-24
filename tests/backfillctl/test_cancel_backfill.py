@@ -1433,7 +1433,7 @@ class LoadStateCliTest(unittest.TestCase):
 FIXTURE = (
     REPO_ROOT
     / "tests"
-    / "pg-osd"
+    / "backfillctl"
     / "test-data"
     / "cancel-backfill-ceph2-osd896-host-clash-companions"
 )
@@ -1483,7 +1483,7 @@ def fixture_plan(fixture, osd, *flags):
 
 
 class FixtureReplayTest(unittest.TestCase):
-    """Replay the real-cluster snapshot in tests/pg-osd/test-data (see its README.txt)."""
+    """Replay the real-cluster snapshot in tests/backfillctl/test-data (see its README.txt)."""
 
     def replay(self, osd, *flags):
         result = run_cli(*flags, "--osd", str(osd), load_state=str(FIXTURE))

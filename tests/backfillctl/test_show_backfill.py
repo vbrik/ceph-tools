@@ -327,19 +327,23 @@ class FilterTest(unittest.TestCase):
 
 
 FIXTURE_STUCK_AT_100 = (
-    REPO_ROOT / "tests" / "pg-osd" / "test-data" / "ceph1-backfills-stuck-at-100-pct"
+    REPO_ROOT
+    / "tests"
+    / "backfillctl"
+    / "test-data"
+    / "ceph1-backfills-stuck-at-100-pct"
 )
 FIXTURE_RESUMED = (
     REPO_ROOT
     / "tests"
-    / "pg-osd"
+    / "backfillctl"
     / "test-data"
     / "ceph1-resumed-backfills-exact-progress"
 )
 
 
 class FixtureReplayTest(unittest.TestCase):
-    """Replay the real-cluster snapshot in tests/pg-osd/test-data (see its README.txt)."""
+    """Replay the real-cluster snapshot in tests/backfillctl/test-data (see its README.txt)."""
 
     def test_capture_without_positions_falls_back_on_counters(self):
         # 27.126 has two shards genuinely still backfilling despite its

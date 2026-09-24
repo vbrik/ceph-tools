@@ -1,4 +1,4 @@
-"""Unit tests for shared.py, the code the pg-osd scripts have in common.
+"""Unit tests for shared.py, the code the backfillctl scripts have in common.
 
 The risky parts: the progress denominator (num_objects_misplaced and
 num_objects_degraded are counted in copy units, so a PG moving k copies starts
