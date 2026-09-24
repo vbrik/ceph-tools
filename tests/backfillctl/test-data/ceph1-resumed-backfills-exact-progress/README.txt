@@ -33,7 +33,7 @@ Shards of one PG are not necessarily at the same position: in 52 PGs they
 differ, e.g. 27.ae2's shard 9 (to osd.646) at 97.7% and its shard 4 (to
 osd.663) at 9.9%, which a per-PG average would show as 53.8% for both.
 
-tests/pg-osd/test_show_backfill.py replays it (FixtureReplayTest): every row
+tests/backfillctl/test_show_backfill.py replays it (FixtureReplayTest): every row
 is exact, 27.500 reads 6.6%, 27.ae2's shards read 97.7% and 9.9%, and no '~'
-note is printed. tests/pg-osd/test_cancel_uphill.py replays it too
+note is printed. tests/backfillctl/test_cancel_uphill.py replays it too
 (ExactProgressTest).

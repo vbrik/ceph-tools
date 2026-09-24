@@ -43,4 +43,4 @@ output is just "19.92e 896 231" and a NOTE that a shard of the PG blocking it
 may not have been pinned. That is the whole point of this fixture -- see
 cancel_backfill.find_blockers.
 
-tests/pg-osd/test_cancel_backfill.py replays this snapshot with --load-state.
+tests/backfillctl/test_cancel_backfill.py replays this snapshot with --load-state.

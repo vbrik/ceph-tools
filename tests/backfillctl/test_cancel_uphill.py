@@ -21,12 +21,16 @@ from _support import REPO_ROOT, parse_args, plan_from_state, shared
 from backfillctl import cancel_uphill as cu
 
 FIXTURE = (
-    REPO_ROOT / "tests" / "pg-osd" / "test-data" / "ceph1-backfills-stuck-at-100-pct"
+    REPO_ROOT
+    / "tests"
+    / "backfillctl"
+    / "test-data"
+    / "ceph1-backfills-stuck-at-100-pct"
 )
 FIXTURE_RESUMED = (
     REPO_ROOT
     / "tests"
-    / "pg-osd"
+    / "backfillctl"
     / "test-data"
     / "ceph1-resumed-backfills-exact-progress"
 )

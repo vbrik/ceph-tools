@@ -29,7 +29,11 @@ from backfillctl import drain as ut
 KB = 1_000_000  # every synthetic OSD's capacity, in KiB
 PCT = KB * shared.KIB // 100  # bytes in 1% of an OSD
 FIXTURE = (
-    REPO_ROOT / "tests" / "pg-osd" / "test-data" / "ceph1-backfills-stuck-at-100-pct"
+    REPO_ROOT
+    / "tests"
+    / "backfillctl"
+    / "test-data"
+    / "ceph1-backfills-stuck-at-100-pct"
 )
 
 EC_POOL, REP_POOL = 1, 2

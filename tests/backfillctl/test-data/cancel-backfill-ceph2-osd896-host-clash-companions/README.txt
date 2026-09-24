@@ -105,6 +105,6 @@ Other OSDs worth replaying:
            companion, but it is pinned regardless of the flag
   osd 231  no backfills into it
 
-tests/pg-osd/test_cancel_backfill.py replays this snapshot with
+tests/backfillctl/test_cancel_backfill.py replays this snapshot with
 --load-state, so its assertions do not depend on the live cluster. See also
 cancel-backfill-ceph2-osd896-blocker-in-same-pg/, a later capture.

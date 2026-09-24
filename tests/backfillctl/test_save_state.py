@@ -5,7 +5,7 @@ reads (see save_state.py's module docstring); shared.anonymize_snapshots'
 own general scrub (hostnames, fsid, ...) is tested in test_shared.py.
 
 CrossSubcommandFixtureTest is the one that matters most: it replays a real,
-already-committed fixture (tests/pg-osd/test-data/
+already-committed fixture (tests/backfillctl/test-data/
 cancel-backfill-ceph2-osd896-host-clash-companions/) that happens to
 contain a genuine mix of PG states (688 remapped, of which 585 are also
 backfill_toofull -- see its README.txt), so filtering pg_dump_pgs.json for
@@ -31,7 +31,7 @@ from backfillctl import save_state as ss
 FIXTURE = (
     REPO_ROOT
     / "tests"
-    / "pg-osd"
+    / "backfillctl"
     / "test-data"
     / "cancel-backfill-ceph2-osd896-host-clash-companions"
 )
