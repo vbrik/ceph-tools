@@ -165,6 +165,25 @@ class TopLevelHelpTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("\n\n", result.stdout.split("options:")[0].strip())
 
+    def test_shared_options_have_one_help_text(self):
+        def option_help(command, option):
+            """The help text of option in command's option list."""
+            lines = run_backfillctl(command, "--help").stdout.splitlines()
+            lines = lines[lines.index("options:") :]
+            i = next(i for i, ln in enumerate(lines) if ln.startswith(f"  {option} "))
+            block = [lines[i]]
+            for line in lines[i + 1 :]:
+                if not line.startswith(" " * 20):  # the next option, or the end
+                    break
+                block.append(line)
+            return " ".join(" ".join(block).split()[2:])
+
+        for option in ("--toofull-util", "--max-target-util", "--max-target-uses"):
+            with self.subTest(option=option):
+                self.assertEqual(
+                    option_help("divert-toofull", option), option_help("drain", option)
+                )
+
     def test_cancel_backfill_usage_shows_pin_blockers_needs_osd(self):
         usage = run_backfillctl("cancel-backfill", "-h").stdout
         self.assertIn("[--osd OSD [--pin-blockers]]", usage)

@@ -47,6 +47,7 @@ from placement import (
     FullRatios,
     ProjectedUsage,
     add_target_args,
+    add_toofull_util_arg,
     build_candidate_osds,
     ec_pool_ids_from,
     fetch_full_ratios,
@@ -55,6 +56,7 @@ from placement import (
     pick_target,
     raw_crush_osds,
     resolve_max_target_util,
+    resolve_toofull_util,
     shard_size_bytes,
     usage_and_capacity,
 )
@@ -82,7 +84,6 @@ from shared import (
     print_upmap_pairs,
     stderr_items,
     stderr_para,
-    utilization_pct,
 )
 
 # Live runs read pg_ls_backfill_toofull; --load-state filters pg_dump_pgs
@@ -128,13 +129,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         description=__doc__,
         formatter_class=HelpFormatter,
     )
-    parser.add_argument(
-        "--toofull-util",
-        type=utilization_pct,
-        metavar="PERCENT",
-        help="Divert only shards arriving on an OSD at least this full "
-        "(default: nearfull_ratio).",
-    )
+    add_toofull_util_arg(parser)
     add_target_args(parser)
     parser.add_argument(
         "--pgs",
@@ -441,7 +436,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
     ec_profiles = fetch_ec_profiles(store)
 
     ratios = fetch_full_ratios(store)
-    toofull_util = ratios.nearfull if args.toofull_util is None else args.toofull_util
+    toofull_util = resolve_toofull_util(args.toofull_util, ratios)
     max_target_util = resolve_max_target_util(args.max_target_util, ratios)
 
     pgs_filter = None

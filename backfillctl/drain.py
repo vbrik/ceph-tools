@@ -48,6 +48,7 @@ from placement import (
     PgPlacement,
     ProjectedUsage,
     add_target_args,
+    add_toofull_util_arg,
     build_candidate_osds,
     ec_pool_ids_from,
     fetch_full_ratios,
@@ -57,6 +58,7 @@ from placement import (
     pick_target,
     raw_crush_osds,
     resolve_max_target_util,
+    resolve_toofull_util,
     shard_size_bytes,
 )
 from shared import (
@@ -91,7 +93,6 @@ from shared import (
     stderr_items,
     stderr_para,
     upmap_entry,
-    utilization_pct,
 )
 
 # Live runs add a 'pg ls-by-osd' per drained OSD (ls_by_osd_commands);
@@ -175,13 +176,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         metavar="HOST",
         help="Drain every OSD of these hosts.",
     )
-    parser.add_argument(
-        "--toofull-util",
-        type=utilization_pct,
-        metavar="PERCENT",
-        help="Blocker threshold for PGs that are backfill_toofull now "
-        "(default: nearfull_ratio).",
-    )
+    add_toofull_util_arg(parser)
     add_target_args(parser)
     add_pgremapper_mappings_arg(parser)
     add_load_state_arg(parser, after_command=True)
@@ -547,7 +542,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
     ec_profiles = fetch_ec_profiles(store)
     ratios = fetch_full_ratios(store)
     max_target_util = resolve_max_target_util(args.max_target_util, ratios)
-    toofull_util = ratios.nearfull if args.toofull_util is None else args.toofull_util
+    toofull_util = resolve_toofull_util(args.toofull_util, ratios)
 
     drained_pgs = fetch_drained_pg_stats(store, drained)
     remapped_pgs = fetch_remapped_pg_stats(store)

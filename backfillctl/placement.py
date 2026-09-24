@@ -43,6 +43,27 @@ def positive_int(text: str) -> int:
     return value
 
 
+def add_toofull_util_arg(parser: argparse.ArgumentParser):
+    """Add --toofull-util, shared by divert-toofull and drain.
+
+    Ceph reports backfill_toofull per PG, not per shard, so both guess
+    which shard was refused the same way; each says in its help what it
+    then does with that shard.
+    """
+    parser.add_argument(
+        "--toofull-util",
+        type=shared.utilization_pct,
+        metavar="PERCENT",
+        help="In a backfill_toofull PG, take shards arriving on an OSD at least "
+        "this full to be the refused ones (default: nearfull_ratio).",
+    )
+
+
+def resolve_toofull_util(given: float | None, ratios: "FullRatios") -> float:
+    """Return --toofull-util, defaulting to the cluster's nearfull_ratio."""
+    return ratios.nearfull if given is None else given
+
+
 def add_target_args(parser: argparse.ArgumentParser):
     """Add --max-target-util and --max-target-uses."""
     parser.add_argument(
