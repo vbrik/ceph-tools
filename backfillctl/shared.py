@@ -1009,7 +1009,8 @@ def print_table(columns: Columns, rows: list[list[str]]) -> None:
     """Print rows under a two-line header: group names, then column labels.
 
     Each group name is centered in dashes across its columns; groups are
-    separated by GROUP_SEP. The last column is unpadded.
+    separated by GROUP_SEP. Without any group, the header is the label line
+    alone. The last column is unpadded.
     """
     # A list: max(a, *b) raises when there are no rows.
     widths = [
@@ -1028,7 +1029,8 @@ def print_table(columns: Columns, rows: list[list[str]]) -> None:
         span = sum(widths[i] for i in cols) + sum(len(seps[i]) for i in cols[1:])
         group_line += seps[cols[0]]
         group_line += f" {group} ".center(span, "-") if group else " " * span
-    print(group_line.rstrip())
+    if group_line.strip():  # no groups: no group line
+        print(group_line.rstrip())
 
     def emit(cells: list[str]) -> None:
         last = len(cells) - 1

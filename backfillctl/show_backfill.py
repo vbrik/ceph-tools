@@ -38,12 +38,14 @@ from shared import (
     fetch_pg_stats,
     fetch_pools,
     format_progress,
+    format_utilization,
     is_erasure,
     is_real_osd,
     parse_osd,
     pg_progress,
     pgid_pool_id,
     pgid_sort_key,
+    print_table,
     real_osd_set,
     target_peer,
 )
@@ -323,6 +325,67 @@ def print_pgs_filter(pgs_filter: PgidFilter) -> None:
     )
 
 
+# (group, label). The unlabeled column holds the '->' from FROM to TO.
+COLUMNS = [
+    ("", "PGID"),
+    ("", "SHARD"),
+    ("", "FROM_OSD"),
+    ("", ""),
+    ("", "TO_OSD"),
+    ("", "TYPE"),
+    ("", "PROGRESS"),
+    ("", "STATE"),
+]
+
+
+def osd_label(
+    osd_id: int, osd_df: dict[int, dict], osd_host: dict[int, str], util: bool = True
+) -> str:
+    """Format an OSD as 'ID(host,NN.N%)', or 'ID(host)' without util."""
+    host = osd_host.get(osd_id, "?")
+    if not util:
+        return f"{osd_id}({host})"
+    return f"{osd_id}({host},{format_utilization(osd_df, osd_id)})"
+
+
+def shows_primary(row: MovementRow) -> bool:
+    """True if the row's FROM_OSD cell shows the primary, marked '*'.
+
+    It does when the primary rebuilds a missing copy (no source, or
+    needs_primary_marker) and is not a source itself.
+    """
+    return (
+        (not row.sources or row.needs_primary_marker)
+        and row.primary is not None
+        and row.primary not in row.sources
+    )
+
+
+def format_row(
+    row: MovementRow, osd_df: dict[int, dict], osd_host: dict[int, str]
+) -> list[str]:
+    """Return one table row's cells.
+
+    FROM_OSD lists the sources, plus the primary marked '*' (shows_primary),
+    without utilization: it loses no data.
+    """
+    sources = [osd_label(o, osd_df, osd_host) for o in sorted(row.sources)]
+    if shows_primary(row):
+        sources.append(osd_label(row.primary, osd_df, osd_host, util=False) + "*")
+    elif (not row.sources or row.needs_primary_marker) and row.primary is None:
+        sources.append("unknown")  # a copy is rebuilt, but by no known primary
+    return [
+        row.pgid,
+        str(row.shard),
+        ",".join(sources),
+        "->",
+        ",".join(osd_label(o, osd_df, osd_host) for o in sorted(row.destinations)),
+        row.move_type,
+        format_progress(row.progress_pct, row.progress_exact),
+        abbreviate_state(row.state),
+    ]
+
+
 def render(result: MovementsResult) -> None:
     """Print the rows as a table, then the footnotes that apply."""
     rows, pgs_filter, filtered, osd_df, osd_host = result
@@ -336,88 +399,9 @@ def render(result: MovementsResult) -> None:
         )
         return
 
-    SEP = "  ->  "  # between FROM and TO
-    SEP_HDR = " " * len(SEP)
+    print_table(COLUMNS, [format_row(r, osd_df, osd_host) for r in rows])
 
-    def fmt_osd(o: int, show_util: bool = True) -> str:
-        host = osd_host.get(o, "?")
-        if not show_util:
-            return f"{o}({host})"
-        util_pct = osd_df.get(o, {}).get("utilization")
-        util = f"{util_pct:.0f}%" if util_pct is not None else "?%"
-        return f"{o}({host},{util})"
-
-    def fmt_osds(osd_ids: frozenset) -> str:
-        """Format OSDs as 'ID(host,util%),...'."""
-        return ",".join(fmt_osd(o) for o in sorted(osd_ids))
-
-    used_primary_marker = False
-
-    def fmt_from(
-        sources: frozenset, primary, needs_primary_marker: bool = False
-    ) -> str:
-        """Return the FROM_OSD cell: the sources, plus the primary marked '*'.
-
-        The primary is shown when it rebuilds a missing copy (no source, or
-        needs_primary_marker), without utilization: it loses no data.
-        """
-        nonlocal used_primary_marker
-        parts = []
-        if sources:
-            parts.append(fmt_osds(sources))
-        if not sources or needs_primary_marker:
-            if primary is None:
-                parts.append("unknown")
-            elif primary not in sources:
-                used_primary_marker = True
-                parts.append(f"{fmt_osd(primary, show_util=False)}*")
-        return ",".join(parts)
-
-    col_pg = max(len("PGID"), max(len(r.pgid) for r in rows))
-    col_shard = max(len("SHARD"), max(len(str(r.shard)) for r in rows))
-    col_from = max(
-        len("FROM_OSD"),
-        max(len(fmt_from(r.sources, r.primary, r.needs_primary_marker)) for r in rows),
-    )
-    col_to = max(len("TO_OSD"), max(len(fmt_osds(r.destinations)) for r in rows))
-    col_type = max(len("TYPE"), max(len(r.move_type) for r in rows))
-    col_progress = max(
-        len("PROGRESS"),
-        max(len(format_progress(r.progress_pct, r.progress_exact)) for r in rows),
-    )
-
-    def format_row(row: MovementRow) -> str:
-        return (
-            f"{row.pgid:<{col_pg}}  "
-            f"{row.shard!s:<{col_shard}}  "
-            f"{fmt_from(row.sources, row.primary, row.needs_primary_marker):<{col_from}}"
-            f"{SEP}"
-            f"{fmt_osds(row.destinations):<{col_to}}  "
-            f"{row.move_type:<{col_type}}  "
-            f"{format_progress(row.progress_pct, row.progress_exact):<{col_progress}}  "
-            f"{abbreviate_state(row.state)}"
-        )
-
-    header = (
-        f"{'PGID':<{col_pg}}  "
-        f"{'SHARD':<{col_shard}}  "
-        f"{'FROM_OSD':<{col_from}}"
-        f"{SEP_HDR}"
-        f"{'TO_OSD':<{col_to}}  "
-        f"{'TYPE':<{col_type}}  "
-        f"{'PROGRESS':<{col_progress}}  "
-        f"STATE"
-    )
-
-    data_lines = [format_row(r) for r in rows]
-    separator = "─" * max(len(header), max(len(l) for l in data_lines))
-
-    print(header)
-    print(separator)
-    for line in data_lines:
-        print(line)
-
-    if used_primary_marker:
+    if any(shows_primary(r) for r in rows):
         print(f"\n{PRIMARY_NOTE}")
 
     if any(r.progress_pct is not None and not r.progress_exact for r in rows):

@@ -134,8 +134,21 @@ class MainTest(unittest.TestCase):
         out = self.run_main()
         line = next(ln for ln in out.splitlines() if ln.startswith("27.10"))
         self.assertRegex(
-            line, r"^27\.10\s+1\s+3\(ceph2,89%\)\s+->\s+2\(ceph2,70%\)\s+backfill\s+~0%"
+            line,
+            r"^27\.10\s+1\s+3\(ceph2,89\.0%\)\s+->\s+2\(ceph2,70\.0%\)\s+backfill\s+~0%",
         )
+
+    def test_table_matches_the_other_commands(self):
+        # print_table's layout: the label line first (no groups, no rule),
+        # and utilization to one decimal, so 88.6% never reads as 89%.
+        row = pm.MovementRow(
+            "1.0", 0, frozenset({3}), frozenset({2}), "backfill", "s", 3, False
+        )
+        cells = pm.format_row(row, {3: {"utilization": 88.6}, 2: {}}, {3: "a", 2: "b"})
+        self.assertEqual(cells[2:5], ["3(a,88.6%)", "->", "2(b,?)"])
+        out = self.run_main()
+        self.assertTrue(out.startswith("PGID "))
+        self.assertNotIn("─", out)
 
     def test_progress_denominator_counts_unassigned_shards(self):
         # 27.9: one shard moving plus one with no OSD anywhere = 2 copies to
@@ -227,8 +240,8 @@ class MainTest(unittest.TestCase):
         self.assertEqual(33.0, result.osd_df[4]["utilization"])
         self.assertNotIn(3, result.osd_df)
         out = self.run_main(snapshots=snaps)
-        self.assertIn("4(h2,33%)", out)
-        self.assertIn("3(h2,?%)", out)
+        self.assertIn("4(h2,33.0%)", out)
+        self.assertIn("3(h2,?)", out)
 
     def test_no_movement(self):
         snaps = {**SNAPSHOTS, "pg_dump_pgs": [PGS[2]]}
