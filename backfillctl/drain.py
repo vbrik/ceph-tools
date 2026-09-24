@@ -13,7 +13,8 @@ targets, the shard's own host is allowed, and the largest shards are placed
 first.
 
 backfill_toofull holds back the whole PG, so a moved shard also waits on any
-other shard of its PG heading for an OSD projected over --max-target-util or,
+other shard of its PG heading for an OSD projected at or over
+backfillfull_ratio (counting every shard arriving there, as Ceph does) or,
 if the PG is backfill_toofull now, arriving on an OSD at or above
 --toofull-util. Such a blocker is diverted if there is room, otherwise pinned
 back to its acting OSD (with companions, as in cancel-backfill). If neither
@@ -66,6 +67,7 @@ from shared import (
     SnapshotStore,
     add_load_state_arg,
     add_pgremapper_mappings_arg,
+    blocking_reason,
     check_host_failure_domain,
     check_known_pools,
     check_osds_exist,
@@ -247,6 +249,7 @@ class Planner:
         *,
         max_uses: int,
         max_target_util: float,
+        backfillfull: float,
         toofull_util: float,
         drained: set[int],
     ):
@@ -256,6 +259,7 @@ class Planner:
         self.projection = projection
         self.max_uses = max_uses
         self.max_target_util = max_target_util
+        self.backfillfull = backfillfull  # percent
         self.toofull_util = toofull_util
         self.drained = drained
         self.uses: Counter[int] = Counter()
@@ -282,26 +286,24 @@ class Planner:
         state.retarget(shard.up_osd, target)
 
     def is_blocker(self, sibling: ArrivingShard, toofull_now: bool) -> str | None:
-        """Return why the sibling blocks its PG, or None.
+        """Return why the sibling blocks its PG, naming its OSD, or None.
 
-        It blocks if its OSD is projected over max_target_util or, with
-        toofull_now, is at or above toofull_util. The reason cites the cap
-        first, e.g. 'now 90.5%, projected 91.4% > --max-target-util 90%'.
+        It blocks if its OSD is projected at or over backfillfull_ratio
+        (shared.blocking_reason, as in cancel-backfill) or, with toofull_now,
+        is at or above toofull_util now: Ceph may count more than the
+        projection sees.
         """
-        if not self.projection.knows(sibling.up_osd):
+        osd_id = sibling.up_osd
+        if not self.projection.knows(osd_id):
             return None
-        projected = self.projection.utilization_after(sibling.up_osd, 0)
-        now = self.osd_df[sibling.up_osd].get("utilization")
-        if projected > self.max_target_util:
-            now_text = "?" if now is None else f"{now:.1f}%"
-            return (
-                f"now {now_text}, projected {projected:.1f}% > "
-                f"--max-target-util {self.max_target_util:g}%"
-            )
+        projected = self.projection.utilization_after(osd_id, 0)
+        now = self.osd_df[osd_id].get("utilization")
+        if projected >= self.backfillfull:
+            return blocking_reason(osd_id, projected)
         if toofull_now and now is not None and now >= self.toofull_util:
             return (
-                f"now {now:.1f}% >= --toofull-util {self.toofull_util:g}% "
-                f"and PG is backfill_toofull, projected {projected:.1f}%"
+                f"osd.{osd_id} now {now:.1f}% >= --toofull-util "
+                f"{self.toofull_util:g}% and PG is backfill_toofull"
             )
         return None
 
@@ -413,10 +415,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
     )
 
     def blocker_note(action: str, sibling: ArrivingShard, blocking: str) -> str:
-        return (
-            f"{action}: osd.{sibling.up_osd} ({blocking}) would stall the PG, "
-            f"holding up {held_up}"
-        )
+        return f"{action}: {blocking}, which would stall the PG, holding up {held_up}"
 
     siblings = [
         s
@@ -454,8 +453,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
         pins, why = planner.try_pin(state, sibling)
         if not pins:
             stuck_reasons.append(
-                f"shard {sibling.shard} -> osd.{sibling.up_osd} "
-                f"({blocking}; cannot pin: {why})"
+                f"shard {sibling.shard} -> {blocking} (cannot pin: {why})"
             )
             continue
         for k, (s, from_osd, to_osd) in enumerate(pins):
@@ -496,8 +494,8 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
         verdict = UNEXPLAINED
         note = (
             "PG is backfill_toofull now, but no other shard is arriving on "
-            "an OSD at or above --toofull-util or projected over "
-            "--max-target-util: blocker unidentified"
+            "an OSD at or above --toofull-util or projected at or over "
+            "backfillfull_ratio: blocker unidentified"
         )
     else:
         return diverted, pinned, None
@@ -590,6 +588,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
         projection,
         max_uses=args.max_target_uses,
         max_target_util=max_target_util,
+        backfillfull=ratios.backfillfull,
         toofull_util=toofull_util,
         drained=drained,
     )
@@ -700,9 +699,9 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
         f"--max-target-uses {args.max_target_uses} shard(s) each, projected "
         f"at or below --max-target-util {result.max_target_util:g}% "
         f"(backfillfull_ratio {result.ratios.backfillfull:g}%). Blockers: "
-        "other shards of a PG heading over that cap or, if the PG is "
-        f"backfill_toofull now, onto an OSD at or above --toofull-util "
-        f"{result.toofull_util:g}%."
+        "other shards of a PG heading for an OSD projected at or over "
+        "backfillfull_ratio or, if the PG is backfill_toofull now, onto an "
+        f"OSD at or above --toofull-util {result.toofull_util:g}%."
     )
     if args.pgremapper_mappings:
         print_pgremapper_mappings(result.moves)

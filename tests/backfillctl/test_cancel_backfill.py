@@ -24,6 +24,7 @@ from _support import (
     REPO_ROOT,
     FakeStore,
     parse_args,
+    placement,
     plan_from_state,
     shared,
     upmap_pairs,
@@ -271,24 +272,43 @@ class PlanTest(unittest.TestCase):
 RATIO = 91.0
 
 
-class ProjectedUtilizationTest(unittest.TestCase):
-    def test_adds_the_shard_to_current_usage(self):
-        df = {5: osd_df_node(5, 90.0, kb=1000)}  # 1000 KiB, 900 KiB used
-        self.assertAlmostEqual(cb.projected_utilization(df, 5, 0), 90.0)
-        self.assertAlmostEqual(cb.projected_utilization(df, 5, 10 * 1024), 91.0)
+class ArrivalProjectionTest(unittest.TestCase):
+    """arrival_projection and blocker_projection: Ceph's backfillfull check."""
 
-    def test_unknown_size_counts_as_nothing(self):
-        df = {5: osd_df_node(5, 90.0)}
-        self.assertAlmostEqual(cb.projected_utilization(df, 5, None), 90.0)
+    # 1000 KiB OSDs; a 40 KiB EC 4+2 PG has 10 KiB (1%) shards.
+    def setUp(self):
+        self.df = {77: osd_df_node(77, 89.0, kb=1000), 5: osd_df_node(5, 50.0, kb=1000)}
 
-    def test_unknown_osd_or_capacity_gives_none(self):
-        self.assertIsNone(cb.projected_utilization({}, 5, 1))
-        self.assertIsNone(cb.projected_utilization({5: {"kb": 0, "kb_used": 0}}, 5, 1))
+    def projection(self, pgs, pools=None):
+        return cb.arrival_projection(pgs, pools or {19: EC_POOL}, EC_PROFILES, self.df)
+
+    def test_every_shard_arriving_counts(self):
+        # Two PGs send a shard to osd.77: 89% + 1% + 1%.
+        pgs = [
+            pg("19.1", [77, 2], [8, 2], num_bytes=40 * 1024),
+            pg("19.2", [3, 77], [3, 9], num_bytes=40 * 1024),
+        ]
+        self.assertAlmostEqual(self.projection(pgs).utilization_after(77, 0), 91.0)
+
+    def test_pgs_of_unknown_pools_add_nothing(self):
+        pgs = [pg("42.1", [77, 2], [8, 2], num_bytes=40 * 1024)]
+        self.assertAlmostEqual(self.projection(pgs).utilization_after(77, 0), 89.0)
+
+    def test_blocks_at_or_over_the_ratio_only(self):
+        pgs = [pg(f"19.{i}", [77, 2], [8, 2], num_bytes=40 * 1024) for i in (1, 2)]
+        at_ratio = self.projection(pgs)  # 91%
+        self.assertAlmostEqual(cb.blocker_projection(at_ratio, 77, RATIO), 91.0)
+        self.assertIsNone(cb.blocker_projection(self.projection(pgs[:1]), 77, RATIO))
+        self.assertIsNone(cb.blocker_projection(at_ratio, 5, RATIO))
+
+    def test_unknown_capacity_never_blocks(self):
+        self.assertIsNone(cb.blocker_projection(self.projection([]), 1234, RATIO))
 
 
 class FindBlockersTest(unittest.TestCase):
-    def find(self, up, acting, df, pinned=None):
-        return cb.find_blockers(up, acting, pinned or {0: acting[0]}, df, RATIO, 1_000)
+    def find(self, up, acting, df, pinned=None, arriving=()):
+        projection = placement.ProjectedUsage(df, arriving)
+        return cb.find_blockers(up, acting, pinned or {0: acting[0]}, projection, RATIO)
 
     def test_lists_moving_shards_whose_target_reaches_the_ratio(self):
         up, acting = [OSD, 2, 77, 88], [8, 2, 66, 99]
@@ -314,13 +334,13 @@ class FindBlockersTest(unittest.TestCase):
     def test_an_osd_missing_from_osd_df_is_not_a_blocker(self):
         self.assertEqual(self.find([OSD, 77], [8, 66], {}), [])
 
-    def test_the_size_of_the_shard_can_tip_it_over(self):
-        # 90.9% used is under the ratio, but a 0.2% shard takes it to 91.1%.
+    def test_shards_arriving_from_other_pgs_can_tip_it_over(self):
+        # 90.9% used is under the ratio; a 0.2% shard arriving from another
+        # PG takes it to 91.1%, which Ceph counts too.
         df = {77: osd_df_node(77, 90.9)}
-        up, acting = [OSD, 77], [8, 66]
-        small = cb.find_blockers(up, acting, {0: 8}, df, RATIO, 1_000)
-        big = cb.find_blockers(up, acting, {0: 8}, df, RATIO, 3 * 1024 * 1024)
-        self.assertEqual((small, big), ([], [1]))
+        other = placement.ArrivingShard("19.f", 0, 77, 1, [77], 2 * 1024 * 1024)
+        self.assertEqual(self.find([OSD, 77], [8, 66], df), [])
+        self.assertEqual(self.find([OSD, 77], [8, 66], df, arriving=[other]), [1])
 
 
 class PlanBlockersTest(unittest.TestCase):
@@ -742,7 +762,8 @@ class NoteTest(unittest.TestCase):
     def test_blocker_names_the_shard_it_blocks_and_the_projection(self):
         self.assertEqual(
             self.note(companion_of=0, blocker_util=92.04),
-            "blocks shard 0: target osd.77 would be at 92.0%, over backfillfull",
+            "blocks shard 0: target osd.77 projected at 92.0%, at or over "
+            "backfillfull_ratio",
         )
 
 
@@ -1288,7 +1309,7 @@ class MainTest(unittest.TestCase):
         )
         rows = out.splitlines()
         self.assertEqual(len(rows), 4)  # two header lines + the 2 pins
-        self.assertIn("blocks shard 0: target osd.77 would be at 92.0%", rows[3])
+        self.assertIn("blocks shard 0: target osd.77 projected at 92.0%", rows[3])
         self.assertNotIn("blocks", rows[2])
 
     def test_a_target_below_the_ratio_is_not_a_blocker(self):
@@ -1770,25 +1791,30 @@ class FixtureReplayTest(unittest.TestCase):
     def test_osd_682_pairs_its_shard_with_the_one_on_the_same_host(self):
         # osd.231 (the acting OSD of 19.16fc shard 7) shares a host with osd.74,
         # where shard 6 of the same PG is arriving. This pin is unconditional
-        # (a companion, not a blocker), so it is there with or without
-        # --pin-blockers.
-        for flags in ((), ("--pin-blockers",)):
-            with self.subTest(flags=flags):
-                self.assertEqual(
-                    pins(self.plan(682, *flags).cancellations),
-                    ["19.16fc 74 183", "19.16fc 682 231"],
-                )
+        # (a companion), so it is there with or without --pin-blockers. The
+        # flag adds shards 4 and 5: osd.898 and osd.885 are only 66.5% and 78%
+        # full, but the shards queued for them project 91.8% and 99.5%.
+        self.assertEqual(
+            pins(self.plan(682).cancellations),
+            ["19.16fc 74 183", "19.16fc 682 231"],
+        )
+        self.assertEqual(
+            pins(self.plan(682, "--pin-blockers").cancellations),
+            ["19.16fc 898 334", "19.16fc 885 260", "19.16fc 74 183", "19.16fc 682 231"],
+        )
 
     def test_osd_682_companion_becomes_a_blocker_with_the_flag(self):
-        # osd.74 (shard 6's target) also happens to be over backfillfull_ratio,
-        # so --pin-blockers changes only how the pin is explained, not whether
+        # osd.74 (shard 6's target) is also projected over backfillfull_ratio,
+        # so --pin-blockers changes only how that pin is explained, not whether
         # it is there.
         companion = self.plan(682).cancellations[0]
         self.assertEqual((companion.shard, companion.companion_of), (6, 7))
         self.assertIsNone(companion.blocker_util)
-        blocker = self.plan(682, "--pin-blockers").cancellations[0]
-        self.assertEqual((blocker.shard, blocker.companion_of), (6, 7))
-        self.assertAlmostEqual(blocker.blocker_util, 91.6, places=1)
+        (blocker,) = [
+            c for c in self.plan(682, "--pin-blockers").cancellations if c.shard == 6
+        ]
+        self.assertEqual(blocker.companion_of, 7)
+        self.assertAlmostEqual(blocker.blocker_util, 92.5, places=1)
 
     def test_an_osd_with_no_backfills_prints_nothing(self):
         result = self.replay(231)
@@ -2002,7 +2028,11 @@ class BlockerFixtureReplayTest(unittest.TestCase):
 
     def test_the_table_explains_the_second_line(self):
         rows = self.replay("--pin-blockers").stdout.splitlines()
-        self.assertIn("blocks shard 4: target osd.337 would be at 93.4%", rows[-1])
+        self.assertIn(
+            "blocks shard 4: target osd.337 projected at 93.4%, at or over "
+            "backfillfull_ratio",
+            rows[-1],
+        )
 
     def test_summary_says_it_is_one_arriving_shard_plus_one_blocker(self):
         err = self.replay("--pin-blockers").stderr

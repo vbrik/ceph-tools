@@ -98,12 +98,16 @@ pg-upmap-items 19.1299 579 825 891 579' on stderr; without --osd it keeps
 none of the 13 is a ring.
 
 Other OSDs worth replaying:
-  osd 74   2 pins, nothing else (19.16fc shard 6, 19.1eb3 shard 8)
+  osd 74   2 pins (19.16fc shard 6, 19.1eb3 shard 8); with --pin-blockers
+           also 3 blockers whose targets are projected, with every shard
+           arriving there, at or over backfillfull_ratio (19.16fc shards 4
+           and 5, 19.1eb3 shard 4)
   osd 682  1 pin (19.16fc shard 7 from osd.231) plus 19.16fc shard 6 (osd.74,
            same host as osd.231) as its companion -- unconditional, so present
-           either way; with --pin-blockers it is also at 91.6% with its shard,
-           so it is labeled a blocker ("blocks shard 7") instead of a plain
-           companion, but it is pinned regardless of the flag
+           either way; with --pin-blockers it is labeled a blocker ("blocks
+           shard 7", osd.74 projected at 92.5%) instead of a plain companion,
+           and shards 4 and 5 are added as blockers: osd.898 and osd.885 are
+           66.5% and 78% full, but projected at 91.8% and 99.5%
   osd 231  no backfills into it
 
 tests/backfillctl/test_cancel_backfill.py replays this snapshot with

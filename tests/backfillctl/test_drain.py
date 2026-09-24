@@ -200,7 +200,8 @@ class CapacityTest(unittest.TestCase):
 
 
 class BlockerTest(unittest.TestCase):
-    """A sibling arriving on an OSD over the cap holds the PG in toofull."""
+    """A sibling arriving on an OSD projected at or over backfillfull_ratio
+    (90% here) holds the PG in toofull."""
 
     def test_blocker_is_diverted(self):
         c = Cluster()
@@ -211,22 +212,24 @@ class BlockerTest(unittest.TestCase):
         self.assertEqual(pairs(result), [("1.0", 0, 0, 31), ("1.0", 1, 10, 41)])
         self.assertEqual(
             result.moves[1].note,
-            "diverted: osd.10 (now 95.0%, projected 96.0% > --max-target-util "
-            "89%) would stall the PG, holding up shard 0 leaving osd.0",
+            "diverted: osd.10 projected at 96.0%, at or over backfillfull_ratio, "
+            "which would stall the PG, holding up shard 0 leaving osd.0",
         )
         self.assertEqual(result.diverted_count, 1)
         self.assertEqual(result.stuck_pgs, [])
 
-    def test_blocker_threshold_is_max_target_util_not_backfillfull(self):
+    def test_blocker_threshold_is_backfillfull_not_max_target_util(self):
+        # Ceph's rule, as in cancel-backfill: --max-target-util caps targets,
+        # it does not decide what Ceph refuses.
         c = Cluster()
-        c.util[10] = 89.5  # under backfillfull (90%), over the 89% cap
         c.util[31] = 10.0
         c.util[41] = 20.0
-        result = c.pg("1.0", [0, 10, 20], [0, 11, 20], shard_pct=0.1).plan(0)
-        self.assertEqual(result.diverted_count, 1)
-        # With a looser cap, the same sibling is no longer a blocker.
-        result = c.plan(0, "--max-target-util", 90)
-        self.assertEqual(result.diverted_count, 0)
+        c.util[10] = 89.5  # + 0.1% shard: 89.6%, over the 89% cap, under 90%
+        c.pg("1.0", [0, 10, 20], [0, 11, 20], shard_pct=0.1)
+        self.assertEqual(c.plan(0).diverted_count, 0)
+        c.util[10] = 89.9  # + 0.1% shard: 90.0%, at backfillfull
+        self.assertEqual(c.plan(0).diverted_count, 1)
+        self.assertEqual(c.plan(0, "--max-target-util", 80).diverted_count, 1)
 
     def test_sibling_under_the_cap_is_left_alone(self):
         c = Cluster()
@@ -242,8 +245,8 @@ class BlockerTest(unittest.TestCase):
         pin = result.moves[1]
         self.assertEqual(
             pin.note,
-            "pinned, no room to divert: osd.10 (now 95.0%, projected 96.0% > "
-            "--max-target-util 89%) would stall the PG, holding up shard 0 "
+            "pinned, no room to divert: osd.10 projected at 96.0%, at or over "
+            "backfillfull_ratio, which would stall the PG, holding up shard 0 "
             "leaving osd.0",
         )
         self.assertIsNone(pin.projected)
@@ -322,7 +325,7 @@ class BlockerTest(unittest.TestCase):
 
     def test_toofull_pg_blocker_at_nearfull_is_diverted(self):
         c = Cluster()
-        c.util[10] = 86.0  # under the cap, but at nearfull (85%)
+        c.util[10] = 86.0  # under backfillfull, but at nearfull (85%)
         c.util[31] = 10.0
         c.util[41] = 20.0
         c.pg("1.0", [0, 10, 20], [0, 11, 20], state="active+backfill_toofull")
@@ -330,19 +333,22 @@ class BlockerTest(unittest.TestCase):
         self.assertEqual(pairs(result), [("1.0", 0, 0, 31), ("1.0", 1, 10, 41)])
         self.assertEqual(
             result.moves[1].note,
-            "diverted: osd.10 (now 86.0% >= --toofull-util 85% and PG is "
-            "backfill_toofull, projected 87.0%) would stall the PG, holding "
-            "up shard 0 leaving osd.0",
+            "diverted: osd.10 now 86.0% >= --toofull-util 85% and PG is "
+            "backfill_toofull, which would stall the PG, holding up shard 0 "
+            "leaving osd.0",
         )
         self.assertEqual(result.toofull_util, 85.0)
 
-    def test_toofull_pg_blocker_over_both_thresholds_cites_the_cap(self):
+    def test_toofull_pg_blocker_over_both_thresholds_cites_backfillfull(self):
         c = Cluster()
         c.util[10] = 95.0
         c.util[31] = 10.0
         c.util[41] = 20.0
         c.pg("1.0", [0, 10, 20], [0, 11, 20], state="active+backfill_toofull")
-        self.assertIn("> --max-target-util 89%)", c.plan(0).moves[1].note)
+        self.assertIn(
+            "osd.10 projected at 96.0%, at or over backfillfull_ratio,",
+            c.plan(0).moves[1].note,
+        )
 
     def test_nearfull_sibling_of_a_pg_not_toofull_is_left_alone(self):
         c = Cluster()
@@ -374,8 +380,8 @@ class BlockerTest(unittest.TestCase):
         c.pg("1.0", [0, 10, 20], [0, none, 20], state="active+backfill_toofull")
         note = c.plan(0).moves[0].note
         self.assertIn(
-            "shard 1 -> osd.10 (now 86.0% >= --toofull-util 85% and PG is "
-            "backfill_toofull, projected 87.0%; cannot pin: no acting OSD)",
+            "shard 1 -> osd.10 now 86.0% >= --toofull-util 85% and PG is "
+            "backfill_toofull (cannot pin: no acting OSD)",
             note,
         )
 

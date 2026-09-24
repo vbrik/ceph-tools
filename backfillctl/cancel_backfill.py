@@ -25,8 +25,9 @@ the JSON, each entry has its NOTE as 'note', plus 'shard' and 'role'
 - companion: another shard of the PG moving onto the host of a pinned
   shard. Ceph drops an upmap that would put two shards of a PG on one host,
   so the two can only be cancelled together. Keep or remove them together.
-- blocker (--pin-blockers): another shard of the PG whose target would reach
-  backfillfull_ratio, and the blocker's own companions. backfill_toofull
+- blocker (--pin-blockers): another shard of the PG whose target is projected
+  at or over backfillfull_ratio, counting every shard arriving there, and the
+  blocker's own companions. backfill_toofull
   holds back the whole PG, including a backfill you keep. Keep a PG's
   blocker entries when you keep its backfill into --osd.
 
@@ -47,6 +48,7 @@ import argparse
 import sys
 from typing import NamedTuple
 
+from placement import ProjectedUsage, find_arriving_shards
 from shared import (
     COLUMNS,
     KIB,
@@ -76,6 +78,7 @@ from shared import (
     fetch_upmap_items,
     format_bytes,
     format_row,
+    is_erasure,
     is_real_osd,
     order_moves,
     parse_osd,
@@ -198,42 +201,61 @@ def find_arrivals(
     return pins, skipped
 
 
-def projected_utilization(
-    osd_df: dict[int, dict], osd_id: int, size_bytes: int | None
+def blocker_projection(
+    projection: ProjectedUsage, osd_id: int, backfillfull_pct: float
 ) -> float | None:
-    """Return an OSD's utilization (percent) once one more shard has landed.
+    """Return the OSD's projected utilization if a shard headed there blocks, else None.
 
-    A lower bound of what Ceph projects: other shards arriving on the OSD are
-    not counted. None if the OSD's capacity is unknown.
+    See shared.blocking_reason. None also if the OSD's capacity is unknown.
     """
-    node = osd_df.get(osd_id)
-    if not node or not node.get("kb"):
+    if not projection.knows(osd_id):
         return None
-    return (node["kb_used"] * KIB + (size_bytes or 0)) / (node["kb"] * KIB) * 100
+    projected = projection.utilization_after(osd_id, 0)
+    return projected if projected >= backfillfull_pct else None
 
 
 def find_blockers(
     up: list,
     acting: list,
     pinned: dict[int, int],
-    osd_df: dict[int, dict],
+    projection: ProjectedUsage,
     backfillfull_pct: float,
-    size_bytes: int | None,
 ) -> list[int]:
     """Return the EC shards, in order, that would hold the PG in backfill_toofull.
 
     One refused reservation holds back the whole PG. A blocker is an
-    unpinned, moving shard with an acting OSD whose target would reach
-    backfillfull_pct.
+    unpinned, moving shard with an acting OSD whose target blocks
+    (blocker_projection).
     """
-    blockers = []
-    for j, target in enumerate(up):
-        if j in pinned or not is_real_osd(target) or slot(acting, j) in (None, target):
+    return [
+        j
+        for j, target in enumerate(up)
+        if j not in pinned
+        and is_real_osd(target)
+        and slot(acting, j) not in (None, target)
+        and blocker_projection(projection, target, backfillfull_pct) is not None
+    ]
+
+
+def arrival_projection(
+    pg_stats: list[dict],
+    pools: dict[int, dict],
+    ec_profiles: dict[str, dict],
+    osd_df: dict[int, dict],
+) -> ProjectedUsage:
+    """Project every OSD with all shards arriving on it, as Ceph does for backfillfull.
+
+    pg_stats: every remapped PG, not only those being pinned. PGs of
+    unknown pools, or of unknown shard size, add nothing.
+    """
+    arriving = []
+    for pg in pg_stats:
+        pool = pools.get(pgid_pool_id(pg["pgid"]))
+        if pool is None:
             continue
-        projected = projected_utilization(osd_df, target, size_bytes)
-        if projected is not None and projected >= backfillfull_pct:
-            blockers.append(j)
-    return blockers
+        size = shard_size_bytes(pg, pool, ec_profiles) or 0
+        arriving.extend(find_arriving_shards(pg, is_erasure(pool), size))
+    return ProjectedUsage(osd_df, arriving)
 
 
 def cancel_whole_pg(
@@ -310,6 +332,12 @@ def plan_cancellations(
     blockers_enabled = (
         pin_blockers and osd_df is not None and backfillfull_pct is not None
     )
+    # From all remapped PGs, before filtering: Ceph counts every queued backfill.
+    projection = (
+        arrival_projection(pg_stats, pools, ec_profiles, osd_df)
+        if blockers_enabled
+        else None
+    )
     pg_stats = [
         pg
         for pg in pg_stats
@@ -347,7 +375,7 @@ def plan_cancellations(
                 resolved, why = pin_with_companions(up, acting, shard, osd_host)
                 if why is None and blockers_enabled:
                     for blocker in find_blockers(
-                        up, acting, resolved, osd_df, backfillfull_pct, size
+                        up, acting, resolved, projection, backfillfull_pct
                     ):
                         if blocker in resolved:  # already pulled in as a companion
                             continue
@@ -376,9 +404,9 @@ def plan_cancellations(
             for s, from_osd, to_osd in moves:
                 projected = None
                 if s != shard and blockers_enabled:
-                    projected = projected_utilization(osd_df, from_osd, size)
-                    if projected is not None and projected < backfillfull_pct:
-                        projected = None
+                    projected = blocker_projection(
+                        projection, from_osd, backfillfull_pct
+                    )
                 # A companion over the ratio blocks the requested shard itself.
                 of_blocker = projected is None and s in blocker_of
                 companion_of = (

@@ -1525,12 +1525,22 @@ def format_bytes(num: int | None) -> str:
     raise AssertionError("unreachable")
 
 
+def blocking_reason(osd_id: int, projected: float) -> str:
+    """Say why a shard headed for osd_id is a blocker, in the words every command uses.
+
+    A blocker's target is projected, counting every shard arriving on it,
+    at or over backfillfull_ratio: Ceph refuses that backfill, and
+    backfill_toofull then holds back the whole PG.
+    """
+    return f"osd.{osd_id} projected at {projected:.1f}%, at or over backfillfull_ratio"
+
+
 def format_note(c: Cancellation) -> str:
     """Return the NOTE cell: why a shard not chosen directly is pinned."""
     if c.blocker_util is not None:
         return (
-            f"blocks shard {c.companion_of}: target osd.{c.up_osd} "
-            f"would be at {c.blocker_util:.1f}%, over backfillfull"
+            f"blocks shard {c.companion_of}: target "
+            f"{blocking_reason(c.up_osd, c.blocker_util)}"
         )
     if c.companion_of is None:
         return ""
