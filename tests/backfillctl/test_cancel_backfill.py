@@ -20,7 +20,14 @@ import unittest
 from typing import ClassVar
 from unittest import mock
 
-from _support import REPO_ROOT, FakeStore, parse_args, plan_from_state, shared
+from _support import (
+    REPO_ROOT,
+    FakeStore,
+    parse_args,
+    plan_from_state,
+    shared,
+    upmap_pairs,
+)
 
 from backfillctl import cancel_backfill as cb
 
@@ -379,7 +386,8 @@ class PlanBlockersTest(unittest.TestCase):
 
     def test_pinning_a_blocker_can_pull_in_a_companion(self):
         # shard 2 (77) is the blocker; its acting osd.66 shares a host with
-        # shard 3's target osd.88, so shard 3 comes along as a plain companion.
+        # shard 3's target osd.88, so shard 3 comes along as the blocker's
+        # companion: it goes with the blocker, not with requested shard 0.
         p = pg("19.5", [OSD, 2, 77, 88], [8, 2, 66, 99])
         df = {77: osd_df_node(77, 92.0), 88: osd_df_node(88, 50.0)}
         cancellations, skipped = self.plan([p], df, osd_host={66: "H", 88: "H"})
@@ -387,7 +395,25 @@ class PlanBlockersTest(unittest.TestCase):
         self.assertEqual([c.shard for c in cancellations], [0, 2, 3])
         self.assertIsNotNone(cancellations[1].blocker_util)
         self.assertIsNone(cancellations[2].blocker_util)  # companion, not blocker
-        self.assertEqual(cancellations[2].companion_of, 0)
+        self.assertEqual(cancellations[2].companion_of, 2)
+        self.assertEqual(
+            [c.role for c in cancellations],
+            [shared.ROLE_REQUESTED, shared.ROLE_BLOCKER, shared.ROLE_BLOCKER],
+        )
+        self.assertEqual(
+            shared.format_note(cancellations[2]), "companion of blocker shard 2"
+        )
+
+    def test_a_requested_pins_companion_is_not_a_blocker(self):
+        # shard 1's target shares a host with shard 0's acting osd.8.
+        p = pg("19.5", [OSD, 88], [8, 99])
+        cancellations, _ = self.plan(
+            [p], {88: osd_df_node(88, 50.0)}, osd_host={8: "H", 88: "H"}
+        )
+        self.assertEqual(
+            [(c.shard, c.role, c.companion_of) for c in cancellations],
+            [(0, shared.ROLE_REQUESTED, None), (1, shared.ROLE_COMPANION, 0)],
+        )
 
     def test_a_companion_whose_target_is_over_the_ratio_counts_as_a_blocker(self):
         p = pg("19.5", [OSD, 149], [627, 497])
@@ -868,7 +894,7 @@ class RenderTest(unittest.TestCase):
     def test_both_formats_print_the_same_pins_and_the_chain_warning(self):
         out, err = self.render("--pgremapper-mappings")
         self.assertEqual(
-            json.loads(out), [{"pgid": "19.2", "mapping": {"from": 682, "to": 8}}]
+            upmap_pairs(out), [{"pgid": "19.2", "mapping": {"from": 682, "to": 8}}]
         )
         self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
         out, err = self.render()
@@ -970,7 +996,7 @@ class PgremapperMappingsOutputTest(unittest.TestCase):
 
     def test_is_a_json_array_of_pgid_and_mapping_entries(self):
         self.assertEqual(
-            json.loads(self.printed(self.cancellations())),
+            upmap_pairs(self.printed(self.cancellations())),
             [
                 {"pgid": "19.14cd", "mapping": {"from": 232, "to": 337}},
                 {"pgid": "19.14cd", "mapping": {"from": 896, "to": 614}},
@@ -986,9 +1012,20 @@ class PgremapperMappingsOutputTest(unittest.TestCase):
         self.assertTrue(lines[1].endswith(","))
         self.assertFalse(lines[-2].endswith(","))  # valid JSON: no trailing comma
 
+    def test_each_entry_carries_its_rows_shard_role_and_note(self):
+        entries = json.loads(self.printed(self.cancellations()))
+        self.assertEqual(
+            [(e["shard"], e["role"], e["note"]) for e in entries],
+            [
+                (5, shared.ROLE_COMPANION, "companion of shard 8"),
+                (8, shared.ROLE_REQUESTED, ""),
+                ("-", shared.ROLE_REQUESTED, ""),
+            ],
+        )
+
     def test_a_single_entry_has_no_comma(self):
         self.assertEqual(
-            json.loads(self.printed(self.cancellations()[:1])),
+            upmap_pairs(self.printed(self.cancellations()[:1])),
             [{"pgid": "19.14cd", "mapping": {"from": 232, "to": 337}}],
         )
 
@@ -1193,7 +1230,7 @@ class MainTest(unittest.TestCase):
     def test_pgremapper_mappings_is_json_with_every_pair_and_no_warning(self):
         out, err = self.run_main("--pgremapper-mappings", "--osd", "682")
         self.assertEqual(
-            json.loads(out),
+            upmap_pairs(out),
             [
                 {"pgid": "19.9", "mapping": {"from": 682, "to": 8}},
                 {"pgid": "19.d", "mapping": {"from": 682, "to": 8}},
@@ -1287,7 +1324,7 @@ class MainTest(unittest.TestCase):
             drop=["backfillfull_ratio"],
         )
         self.assertEqual(
-            json.loads(out), [{"pgid": "19.e", "mapping": {"from": 682, "to": 8}}]
+            upmap_pairs(out), [{"pgid": "19.e", "mapping": {"from": 682, "to": 8}}]
         )
         self.assertNotIn("no backfillfull_ratio", err)
         self.assertNotIn("--pin-blockers was not given", err)
@@ -1555,7 +1592,7 @@ class LoadStateCliTest(unittest.TestCase):
         )
         self.assertEqual(live.returncode, 0, live.stderr)
         self.assertEqual(
-            json.loads(live.stdout),
+            upmap_pairs(live.stdout),
             [
                 {"pgid": "19.9", "mapping": {"from": 682, "to": 8}},
                 {"pgid": "19.d", "mapping": {"from": 682, "to": 8}},
@@ -1939,7 +1976,7 @@ class BlockerFixtureReplayTest(unittest.TestCase):
 
     def test_pgremapper_mappings_output(self):
         self.assertEqual(
-            json.loads(self.replay("--pin-blockers", "--pgremapper-mappings").stdout),
+            upmap_pairs(self.replay("--pin-blockers", "--pgremapper-mappings").stdout),
             [
                 {"pgid": "19.92e", "mapping": {"from": 896, "to": 231}},
                 {"pgid": "19.92e", "mapping": {"from": 337, "to": 99}},
@@ -1962,13 +1999,17 @@ class BlockerFixtureReplayTest(unittest.TestCase):
         self.assertIn("1 more shard(s)", err)
         self.assertIn("(blockers: 1)", flat(err))
 
-    def test_keeping_the_wanted_backfill_means_dropping_only_its_own_entry(self):
-        # the user's case: keep 231->896, so drop that entry and keep the blocker
+    def test_the_help_recipe_keeps_the_wanted_backfill_and_its_blocker(self):
+        # the user's case: keep 231->896. The help's jq filter keeps a PG's
+        # entries only if they are blockers: select(.pgid != X or .role == "blocker").
         entries = json.loads(
             self.replay("--pin-blockers", "--pgremapper-mappings").stdout
         )
-        kept = [e for e in entries if e["mapping"]["from"] != 896]
-        self.assertEqual(kept, [{"pgid": "19.92e", "mapping": {"from": 337, "to": 99}}])
+        kept = [e for e in entries if e["pgid"] != "19.92e" or e["role"] == "blocker"]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["mapping"], {"from": 337, "to": 99})
+        self.assertEqual(kept[0]["shard"], 6)
+        self.assertIn("blocks shard 4: target osd.337", kept[0]["note"])
 
 
 class CancelWholePgTest(unittest.TestCase):

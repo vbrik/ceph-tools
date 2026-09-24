@@ -23,6 +23,7 @@ from _support import (
     SyntheticCluster,
     parse_args,
     shared,
+    upmap_pairs,
 )
 
 from backfillctl import drain as ut
@@ -259,8 +260,12 @@ class BlockerTest(unittest.TestCase):
             pairs(result),
             [("1.0", 0, 0, 1), ("1.0", 1, 10, 21), ("1.0", 2, 20, 11)],
         )
-        self.assertEqual(result.moves[2].note, "companion of shard 1")
+        self.assertEqual(result.moves[2].note, "companion of blocker shard 1")
         self.assertEqual(result.moves[0].note, "")
+        self.assertEqual(
+            [m.role for m in result.moves],
+            [shared.ROLE_REQUESTED, shared.ROLE_BLOCKER, shared.ROLE_BLOCKER],
+        )
         self.assertEqual((result.pinned_count, result.stuck_pgs), (1, []))
 
     def test_replicated_blocker_is_pinned(self):
@@ -295,6 +300,17 @@ class BlockerTest(unittest.TestCase):
         self.assertIn("PG stays toofull: shard 1 -> osd.10", result.moves[0].note)
         self.assertIn("no acting OSD", result.moves[0].note)
         self.assertEqual(result.stuck_pgs, ["1.0"])
+        # In both formats the summary names the PG and where to read why.
+        for argv in (["0"], ["0", "--pgremapper-mappings"]):
+            err = io.StringIO()
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(err),
+            ):
+                ut.render(result, parse_args(ut, ["--osds", *argv]))
+            text = " ".join(err.getvalue().split())
+            self.assertIn("stay backfill_toofull: 1 (1.0);", text)
+            self.assertIn("Their NOTE (JSON: 'note') says why.", text)
 
     def test_pin_back_onto_a_drained_osd_is_refused(self):
         c = Cluster(default_util=95.0)
@@ -449,12 +465,34 @@ class OutputTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             ut.print_pgremapper_mappings(self.result().moves)
         self.assertEqual(
-            json.loads(out.getvalue()),
+            upmap_pairs(out.getvalue()),
             [
                 {"pgid": "1.0", "mapping": {"from": 0, "to": 31}},
                 {"pgid": "1.0", "mapping": {"from": 10, "to": 1}},
             ],
         )
+
+    def test_pgremapper_mappings_carry_each_rows_shard_role_and_note(self):
+        moves = self.result().moves
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ut.print_pgremapper_mappings(moves)
+        self.assertEqual(
+            [(e["shard"], e["role"], e["note"]) for e in json.loads(out.getvalue())],
+            [(m.shard, m.role, m.note) for m in moves],
+        )
+        self.assertEqual(
+            [m.role for m in moves], [shared.ROLE_REQUESTED, shared.ROLE_BLOCKER]
+        )
+        self.assertTrue(moves[1].note.startswith("diverted:"))
+
+    def test_summary_without_stuck_pgs_points_nowhere(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            ut.render(self.result(), parse_args(ut, ["--osds", "0"]))
+        text = " ".join(err.getvalue().split())
+        self.assertIn("backfill_toofull: 0; for an unidentified reason: 0.", text)
+        self.assertNotIn("NOTE (JSON", text)
 
     def test_pgremapper_mappings_empty(self):
         out = io.StringIO()

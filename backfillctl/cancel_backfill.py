@@ -18,22 +18,23 @@ pin of a chain is kept and the backfills before it keep running; with
 --osd, a PG whose requested pin would chain is left out. Both are listed on
 stderr, with 'ceph osd pg-upmap-items' commands that pin everything.
 
-With --osd, the NOTE column marks pins of backfills into other OSDs:
+With --osd, the NOTE column marks pins of backfills into other OSDs. In
+the JSON, each entry has its NOTE as 'note', plus 'shard' and 'role'
+(requested, companion or blocker).
 
 - companion: another shard of the PG moving onto the host of a pinned
   shard. Ceph drops an upmap that would put two shards of a PG on one host,
   so the two can only be cancelled together. Keep or remove them together.
 - blocker (--pin-blockers): another shard of the PG whose target would reach
-  backfillfull_ratio. backfill_toofull holds back the whole PG, including a
-  backfill you keep. Keep a blocker's entry when you keep the shard it
-  blocks.
+  backfillfull_ratio, and the blocker's own companions. backfill_toofull
+  holds back the whole PG, including a backfill you keep. Keep a PG's
+  blocker entries when you keep its backfill into --osd.
 
 Apply the output with pgremapper, which adds to a PG's existing upmap pairs:
 
     backfillctl cancel-backfill --osd 682 --pin-blockers --pgremapper-mappings > m.json
-    # keep 19.92e's backfill into osd.682: drop its pin and any companions
-    # (see NOTE; add them to the filter), keep its blockers
-    jq 'map(select(.pgid != "19.92e" or .mapping.from != 682))' m.json > m2.json
+    # keep 19.92e's backfill into osd.682: drop its pin and companions, keep its blockers
+    jq 'map(select(.pgid != "19.92e" or .role == "blocker"))' m.json > m2.json
     pgremapper import-mappings m2.json
 
 Pass pgremapper a file, not stdin: it prompts for confirmation.
@@ -339,6 +340,8 @@ def plan_cancellations(
         pins, unpinnable = find_arrivals(up, acting, osd, is_ec)
         skipped.extend(Skipped(pgid, shard, why) for shard, why in unpinnable)
         for shard, acting_osd in pins:
+            # Companion shard -> the blocker whose pin pulled it in.
+            blocker_of: dict[int, int] = {}
             if is_ec:
                 resolved, why = pin_with_companions(up, acting, shard, osd_host)
                 if why is None and blockers_enabled:
@@ -354,6 +357,8 @@ def plan_cancellations(
                                 [(s, up[s], a) for s, a in closed.items()]
                             )
                         if blocker_why is None:
+                            for s in closed.keys() - resolved.keys() - {blocker}:
+                                blocker_of[s] = blocker
                             resolved = closed
                         else:
                             skipped.append(
@@ -373,6 +378,11 @@ def plan_cancellations(
                     projected = projected_utilization(osd_df, from_osd, size)
                     if projected is not None and projected < backfillfull_pct:
                         projected = None
+                # A companion over the ratio blocks the requested shard itself.
+                of_blocker = projected is None and s in blocker_of
+                companion_of = (
+                    None if s == shard else blocker_of[s] if of_blocker else shard
+                )
                 cancellations.append(
                     Cancellation(
                         pgid,
@@ -382,8 +392,9 @@ def plan_cancellations(
                         size,
                         pg["state"],
                         progress,
-                        None if s == shard else shard,
+                        companion_of,
                         projected,
+                        of_blocker=of_blocker,
                     )
                 )
 

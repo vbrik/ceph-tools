@@ -47,6 +47,9 @@ Apply the proposals with `--pgremapper-mappings` and
 [pgremapper](https://github.com/digitalocean/pgremapper)'s `import-mappings`,
 which adds to a PG's existing upmap pairs. `ceph osd pg-upmap-items` replaces
 them all. The remapping commands assume the CRUSH failure domain is `host`.
+Entries from the cancel commands and `drain` also carry the table's `shard`,
+`role` (requested, companion, blocker) and `note`, for pruning with `jq`;
+pgremapper ignores them.
 
 pgremapper cannot apply chained pairs (A->B, B->C), which cancelling some EC
 backfills needs. The cancel commands leave such backfills running, and print

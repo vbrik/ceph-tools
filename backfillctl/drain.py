@@ -23,8 +23,10 @@ Keep the drained OSDs up and in until they are empty: marking one out voids
 these upmaps, since Ceph honors only a 'from' that CRUSH chose. Afterwards,
 external/upmap-remapped.py can pin CRUSH's new mapping to where the data is.
 
-Apply the output as with divert-toofull. Keep a blocker's entry with the
-shard it unblocks, and a companion's with its pin:
+Apply the output as with divert-toofull. In the JSON, each entry has its
+NOTE as 'note', plus 'shard' and 'role': requested (an evacuee) or blocker
+(a blocker, or a pinned blocker's companion). Keep a PG's blocker entries
+with its evacuees:
 
     backfillctl drain --hosts host07 --pgremapper-mappings > m.json
     pgremapper import-mappings m.json
@@ -59,6 +61,8 @@ from placement import (
 )
 from shared import (
     NOT_APPLICABLE,
+    ROLE_BLOCKER,
+    ROLE_REQUESTED,
     HelpFormatter,
     SnapshotStore,
     close_pins,
@@ -76,9 +80,10 @@ from shared import (
     pgid_sort_key,
     pin_replica,
     print_table,
-    print_upmap_pairs,
+    print_upmap_entries,
     real_osd_set,
     stderr_para,
+    upmap_entry,
 )
 
 # Live runs add a 'pg ls-by-osd' per drained OSD (ls_by_osd_commands);
@@ -188,6 +193,9 @@ class Move(NamedTuple):
     target_osd: int  # the 'to' of the pair
     projected: float | None  # target's, once all moves are done; None for pins
     note: str
+    role: str = (
+        ROLE_REQUESTED  # an evacuee; blockers and their companions: ROLE_BLOCKER
+    )
 
 
 class DrainResult(NamedTuple):
@@ -430,6 +438,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
                     target,
                     projected,
                     blocker_note("diverted", sibling, blocking),
+                    ROLE_BLOCKER,
                 )
             )
             diverted += 1
@@ -452,10 +461,19 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
             note = (
                 blocker_note("pinned, no room to divert", sibling, blocking)
                 if k == 0
-                else f"companion of shard {sibling.shard}"
+                else f"companion of blocker shard {sibling.shard}"
             )
             state.moves.append(
-                Move(state.pg["pgid"], s, to_osd, from_osd, to_osd, None, note)
+                Move(
+                    state.pg["pgid"],
+                    s,
+                    to_osd,
+                    from_osd,
+                    to_osd,
+                    None,
+                    note,
+                    ROLE_BLOCKER,
+                )
             )
         pinned += 1
 
@@ -654,8 +672,16 @@ def format_row(
 
 
 def print_pgremapper_mappings(moves: list[Move]) -> None:
-    """Print the moves as JSON for 'pgremapper import-mappings', one per line."""
-    print_upmap_pairs((m.pgid, m.up_osd, m.target_osd) for m in moves)
+    """Print the moves as JSON for 'pgremapper import-mappings', one per line.
+
+    Each entry carries its table row's SHARD, role and NOTE.
+    """
+    print_upmap_entries(
+        upmap_entry(
+            m.pgid, m.up_osd, m.target_osd, shard=m.shard, role=m.role, note=m.note
+        )
+        for m in moves
+    )
 
 
 def render(result: DrainResult, args: argparse.Namespace) -> None:
@@ -681,13 +707,18 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
             [format_row(m, result.osd_host, result.osd_df) for m in result.moves],
         )
 
+    def pg_list(pgids: list[str]) -> str:
+        return f"{len(pgids)} ({', '.join(pgids)})" if pgids else "0"
+
     placed = result.evacuee_count - len(result.unplaceable)
+    stuck, unexplained = result.stuck_pgs, result.unexplained_pgs
     stderr_para(
         f"Proposed {placed} evacuation(s), {len(result.unplaceable)} unplaceable; "
         f"{result.diverted_count} blocking shard(s) diverted, "
         f"{result.pinned_count} pinned back. PGs that will stay "
-        f"backfill_toofull: {len(result.stuck_pgs)}; for an unidentified "
-        f"reason: {len(result.unexplained_pgs)} (see NOTE)."
+        f"backfill_toofull: {pg_list(stuck)}; for an unidentified reason: "
+        f"{pg_list(unexplained)}"
+        + (". Their NOTE (JSON: 'note') says why." if stuck or unexplained else ".")
     )
     if result.unplaceable:
         stderr_para(

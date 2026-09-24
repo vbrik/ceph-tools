@@ -14,6 +14,7 @@ effect, since an isort/ruff cleanup could otherwise reorder that import after
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -47,6 +48,7 @@ __all__ = [
     "plan_from_state",
     "real_query_backfill_positions",
     "shared",
+    "upmap_pairs",
 ]
 
 
@@ -67,6 +69,15 @@ def parse_args(
     (name,) = subparsers.choices
     global_argv = ["--load-state", load_state] if load_state is not None else []
     return parser.parse_args([*global_argv, name, *argv])
+
+
+def upmap_pairs(text: str) -> list[dict]:
+    """Parse --pgremapper-mappings output, keeping only what pgremapper reads.
+
+    For tests of which pairs are proposed; the extra keys (shard, role,
+    note) have tests of their own.
+    """
+    return [{"pgid": e["pgid"], "mapping": e["mapping"]} for e in json.loads(text)]
 
 
 def plan_from_state(module, state_dir: str | Path, *argv: str):

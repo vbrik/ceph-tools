@@ -1011,6 +1011,13 @@ def fetch_remapped_pg_stats(store: SnapshotStore) -> list[dict]:
     ]
 
 
+# Why a pin or move is proposed: the NOTE column's gist, and the 'role' key
+# of the JSON entries (upmap_entry), so a filter can keep units together.
+ROLE_REQUESTED = "requested"  # what the command was asked for
+ROLE_COMPANION = "companion"  # keeps a requested pin valid (close_pins)
+ROLE_BLOCKER = "blocker"  # unblocks the PG's requested ones; so do its companions
+
+
 class Cancellation(NamedTuple):
     """One shard pinned back from the OSD it was moving to onto its acting OSD."""
 
@@ -1021,11 +1028,20 @@ class Cancellation(NamedTuple):
     size_bytes: int | None  # estimated, None if unknown
     state: str
     progress_pct: float | None  # of this shard's move (see copy_progress)
-    companion_of: "int | str | None" = None  # requested shard this one goes
-    # with (see close_pins); None if requested directly
+    companion_of: "int | str | None" = None  # shard this one goes with: the
+    # requested one it keeps valid or blocks, or with of_blocker the blocker
+    # whose companion it is (see close_pins); None if requested directly
     blocker_util: float | None = None  # for a blocker (--pin-blockers): its
     # target's projected utilization
     progress_exact: bool = False  # from backfill positions, not counters
+    of_blocker: bool = False  # companion_of is a blocker, not a requested shard
+
+    @property
+    def role(self) -> str:
+        """Return why the shard is pinned: one of the ROLE_* constants."""
+        if self.blocker_util is not None or self.of_blocker:
+            return ROLE_BLOCKER
+        return ROLE_REQUESTED if self.companion_of is None else ROLE_COMPANION
 
 
 def with_exact_progress(
@@ -1353,9 +1369,11 @@ def format_note(c: Cancellation) -> str:
             f"blocks shard {c.companion_of}: target osd.{c.up_osd} "
             f"would be at {c.blocker_util:.1f}%, over backfillfull"
         )
-    if c.companion_of is not None:
-        return f"companion of shard {c.companion_of}"
-    return ""
+    if c.companion_of is None:
+        return ""
+    if c.of_blocker:
+        return f"companion of blocker shard {c.companion_of}"
+    return f"companion of shard {c.companion_of}"
 
 
 # (group, label). ACTING is where the data is (the pair's 'to'), UP where
@@ -1392,20 +1410,41 @@ def format_row(
 
 
 def print_pgremapper_mappings(cancellations: list[Cancellation]) -> None:
-    """Print the cancellations as JSON for 'pgremapper import-mappings'."""
-    print_upmap_pairs((c.pgid, c.up_osd, c.acting_osd) for c in cancellations)
+    """Print the cancellations as JSON for 'pgremapper import-mappings'.
+
+    Each entry carries its table row's SHARD, role and NOTE.
+    """
+    print_upmap_entries(
+        upmap_entry(
+            c.pgid,
+            c.up_osd,
+            c.acting_osd,
+            shard=c.shard,
+            role=c.role,
+            note=format_note(c),
+        )
+        for c in cancellations
+    )
+
+
+def upmap_entry(pgid: str, from_osd: int, to_osd: int, **extra) -> dict:
+    """Return one 'pgremapper import-mappings' entry, with extra keys after mapping.
+
+    pgremapper 1.0.0 ignores keys it does not know (checked by dry run), so
+    extra carries what a user filtering the file needs, e.g. role.
+    """
+    return {"pgid": pgid, "mapping": {"from": from_osd, "to": to_osd}, **extra}
 
 
 def print_upmap_pairs(pairs: Iterable[tuple[str, int, int]]) -> None:
-    """Print (pgid, from, to) pairs as JSON for 'pgremapper import-mappings'.
+    """Print (pgid, from, to) pairs as JSON for 'pgremapper import-mappings'."""
+    print_upmap_entries(upmap_entry(*pair) for pair in pairs)
 
-    A JSON array, one {pgid, mapping: {from, to}} entry per line.
-    """
-    entries = [
-        json.dumps({"pgid": pgid, "mapping": {"from": from_osd, "to": to_osd}})
-        for pgid, from_osd, to_osd in pairs
-    ]
-    if not entries:
+
+def print_upmap_entries(entries: Iterable[dict]) -> None:
+    """Print upmap_entry dicts as a JSON array, one entry per line."""
+    lines = [json.dumps(entry) for entry in entries]
+    if not lines:
         print("[]")
         return
-    print("[\n" + ",\n".join(f"  {e}" for e in entries) + "\n]")
+    print("[\n" + ",\n".join(f"  {line}" for line in lines) + "\n]")
