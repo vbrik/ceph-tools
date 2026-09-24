@@ -38,7 +38,6 @@ domain is host.
 
 import argparse
 import heapq
-import json
 import math
 import sys
 from collections import Counter, deque
@@ -77,6 +76,7 @@ from shared import (
     pgid_pool_id,
     pgid_sort_key,
     print_table,
+    print_upmap_pairs,
     stderr_para,
 )
 
@@ -384,17 +384,7 @@ def print_pgremapper_mappings(proposals: list[Proposal]) -> None:
     'to' of an existing pair, it rewrites that pair; a new pair from UP would
     be silently dropped, since Ceph only honors a 'from' CRUSH chose.
     """
-    if not proposals:
-        print("[]")
-        return
-    print("[")
-    for i, proposal in enumerate(proposals):
-        entry = {
-            "pgid": proposal.shard.pgid,
-            "mapping": {"from": proposal.shard.up_osd, "to": proposal.target_osd},
-        }
-        print(f"  {json.dumps(entry)}{',' if i < len(proposals) - 1 else ''}")
-    print("]")
+    print_upmap_pairs((p.shard.pgid, p.shard.up_osd, p.target_osd) for p in proposals)
 
 
 # ---------------------------------------------------------------------------

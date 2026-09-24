@@ -35,8 +35,13 @@ real_query_backfill_positions = shared.query_backfill_positions
 shared.query_backfill_positions = lambda pgids: {}
 
 __all__ = [
+    "EC_POOL",
+    "KB",
+    "PCT",
     "REPO_ROOT",
+    "REP_POOL",
     "FakeStore",
+    "SyntheticCluster",
     "parse_args",
     "placement",
     "plan_from_state",
@@ -97,3 +102,103 @@ class FakeStore:
 
     def json(self, key: str) -> object:
         return self.snapshots[key]
+
+
+KB = 1_000_000  # every synthetic OSD's capacity, in KiB
+PCT = KB * shared.KIB // 100  # bytes in 1% of an OSD
+
+EC_POOL, REP_POOL = 1, 2
+HOST_RULE = {
+    "rule_id": 0,
+    "steps": [{"op": "take"}, {"op": "chooseleaf_indep", "type": "host"}],
+}
+
+
+class SyntheticCluster:
+    """Builder for a small synthetic cluster's snapshots.
+
+    Six hosts h0..h5 with two hdd OSDs each, numbered host*10 + j (0, 1, 10,
+    11, ... 51), every OSD of KB KiB so that utilizations and shard sizes are
+    exact percentages. Pool 1 is EC k=2 m=1 (size 3), pool 2 replicated size
+    3, both with a host failure domain. backfillfull_ratio is 90%, so
+    --max-target-util defaults to 89%.
+    """
+
+    def __init__(self, default_util: float = 50.0):
+        self.util = {h * 10 + j: default_util for h in range(6) for j in range(2)}
+        self.pgs: list[dict] = []
+        self.upmaps: list[dict] = []
+        self.classes: dict[int, str] = {}  # device class, if not hdd
+        self.rule = HOST_RULE
+
+    def pg(self, pgid, up, acting=None, *, shard_pct=1.0, state="active+clean"):
+        """Add a PG whose shards are each shard_pct of an OSD."""
+        is_ec = pgid.startswith(f"{EC_POOL}.")
+        num_bytes = int(shard_pct * PCT) * (2 if is_ec else 1)
+        acting = up if acting is None else acting
+        if up != acting and "remapped" not in state:
+            state += "+remapped"
+        self.pgs.append(
+            {
+                "pgid": pgid,
+                "state": state,
+                "up": up,
+                "acting": acting,
+                "stat_sum": {"num_bytes": num_bytes},
+            }
+        )
+        return self
+
+    def snapshots(self) -> dict:
+        hosts = [
+            {
+                "id": -1 - h,
+                "type": "host",
+                "name": f"h{h}",
+                "children": [h * 10, h * 10 + 1],
+            }
+            for h in range(6)
+        ]
+        osds = [
+            {
+                "id": o,
+                "type": "osd",
+                "device_class": self.classes.get(o, "hdd"),
+                "utilization": u,
+                "kb": KB,
+                "kb_used": int(u * KB / 100),
+                "status": "up",
+                "reweight": 1.0,
+                "crush_weight": 1.0,
+            }
+            for o, u in self.util.items()
+        ]
+        return {
+            "osd_tree": {"nodes": hosts + osds},
+            "osd_df": {"nodes": osds},
+            "osd_dump": {
+                "nearfull_ratio": 0.85,
+                "backfillfull_ratio": 0.90,
+                "erasure_code_profiles": {"p": {"k": "2", "m": "1"}},
+                "pg_upmap_items": self.upmaps,
+            },
+            "pool_ls_detail": [
+                {
+                    "pool_id": EC_POOL,
+                    "pool_name": "ec",
+                    "type": 3,
+                    "crush_rule": 0,
+                    "erasure_code_profile": "p",
+                },
+                {"pool_id": REP_POOL, "pool_name": "rep", "type": 1, "crush_rule": 0},
+            ],
+            "crush_rule_dump": [self.rule],
+            "pg_dump_pgs": self.pgs,
+        }
+
+    def plan_with(self, module, *argv):
+        """Run module.plan() on this cluster; leading bare OSD ids go to --osds."""
+        argv = [str(a) for a in argv]
+        if argv and not argv[0].startswith("--"):
+            argv.insert(0, "--osds")
+        return module.plan(parse_args(module, argv), FakeStore(self.snapshots()))

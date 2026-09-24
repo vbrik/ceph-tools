@@ -2,9 +2,10 @@
 
 Command-line tools for Ceph and CephFS administration and troubleshooting:
 PG backfill and remapping, upmaps, cancelling and diverting backfills,
-draining OSDs, scrub scheduling, OSD/PG lookups, MDS ops inspection, CephFS
-client load, inode-to-path resolution, and finding large, wide or
-fast-growing directories on CephFS. Most tools turn `ceph` and `rados` JSON
+draining OSDs, relieving the fullest OSDs (utilization balancing), scrub
+scheduling, OSD/PG lookups, MDS ops inspection, CephFS client load,
+inode-to-path resolution, and finding large, wide or fast-growing
+directories on CephFS. Most tools turn `ceph` and `rados` JSON
 output into something more useful; the CephFS tree tools read recursive
 statistics (`ceph.dir.*` xattrs) off a mount.
 
@@ -57,6 +58,7 @@ backfills needs. The cancel commands leave such backfills running, and print
 | `show-pg-osds PGID...` | Acting and up OSDs of given PGs, per shard, with utilization, host, progress and upmap pairs. |
 | `divert-toofull` | Re-target shards stuck in `backfill_toofull` to the least-utilized legal OSDs, e.g. after an OSD failure piles its data onto its host's other OSDs. |
 | `drain --osds OSD... \| --hosts HOST...` | Move every shard off OSDs or hosts, spread across the cluster rather than onto the same host. Also diverts or pins back shards that would hold the moved ones in `backfill_toofull`. Keep the OSDs up and in until empty: marking them out voids the upmaps. |
+| `balance [--class CLASS] [--osds OSD... \| --min-up-util PCT]` | Lower a device class's highest OSD utilization by moving shards off the fullest OSDs onto the emptiest, without filling any target past its source. Stops once the maximum can't go lower (not a full balancer); `--max-moves` limits the batch. Turn off the upmap balancer while the backfills run. |
 | `cancel-backfill [--osd OSD [--pin-blockers]]` | Cancel backfills by pinning shards to where their data is: all of them, or those into one full OSD to make room for others. |
 | `cancel-uphill` | Cancel backfills that move data to a more-utilized OSD. |
 | `save-state DIR` | Capture the cluster state the other commands read, anonymized, for replay with `backfillctl --load-state DIR <command>`. |

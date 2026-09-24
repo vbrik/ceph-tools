@@ -1392,15 +1392,20 @@ def format_row(
 
 
 def print_pgremapper_mappings(cancellations: list[Cancellation]) -> None:
-    """Print the cancellations as JSON for 'pgremapper import-mappings'.
+    """Print the cancellations as JSON for 'pgremapper import-mappings'."""
+    print_upmap_pairs((c.pgid, c.up_osd, c.acting_osd) for c in cancellations)
+
+
+def print_upmap_pairs(pairs: Iterable[tuple[str, int, int]]) -> None:
+    """Print (pgid, from, to) pairs as JSON for 'pgremapper import-mappings'.
 
     A JSON array, one {pgid, mapping: {from, to}} entry per line.
     """
-    if not cancellations:
+    entries = [
+        json.dumps({"pgid": pgid, "mapping": {"from": from_osd, "to": to_osd}})
+        for pgid, from_osd, to_osd in pairs
+    ]
+    if not entries:
         print("[]")
         return
-    print("[")
-    for i, c in enumerate(cancellations):
-        entry = {"pgid": c.pgid, "mapping": {"from": c.up_osd, "to": c.acting_osd}}
-        print(f"  {json.dumps(entry)}{',' if i < len(cancellations) - 1 else ''}")
-    print("]")
+    print("[\n" + ",\n".join(f"  {e}" for e in entries) + "\n]")

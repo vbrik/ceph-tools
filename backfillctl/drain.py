@@ -34,7 +34,6 @@ domain is host.
 """
 
 import argparse
-import json
 import sys
 from collections import Counter
 from typing import NamedTuple
@@ -42,6 +41,8 @@ from typing import NamedTuple
 from placement import (
     ArrivingShard,
     FullRatios,
+    MappedShard,
+    PgPlacement,
     ProjectedUsage,
     add_target_args,
     build_candidate_osds,
@@ -49,6 +50,7 @@ from placement import (
     ec_pool_ids_from,
     fetch_full_ratios,
     find_arriving_shards,
+    find_mapped_shards,
     osd_class,
     pick_target,
     raw_crush_osds,
@@ -68,15 +70,14 @@ from shared import (
     fetch_pools,
     fetch_remapped_pg_stats,
     fetch_upmap_items,
-    is_real_osd,
     osd_cells,
     parse_osd,
     pgid_pool_id,
     pgid_sort_key,
     pin_replica,
     print_table,
+    print_upmap_pairs,
     real_osd_set,
-    slot,
     stderr_para,
 )
 
@@ -177,49 +178,6 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
 # ---------------------------------------------------------------------------
 
 
-class Evacuee(NamedTuple):
-    """A shard mapped to a drained OSD, to be moved off it."""
-
-    pgid: str
-    shard: "int | str"  # EC shard index, or '-' for replicated pools
-    up_osd: int  # the drained OSD: the 'from' of the upmap pair
-    acting_osd: int | None  # where its data is now, None if unknown
-    size_bytes: int
-
-
-def find_evacuees(
-    pg: dict, is_ec: bool, drained: set[int], size_bytes: int
-) -> tuple[list[Evacuee], int]:
-    """Return (the PG's shards mapped to a drained OSD, count already leaving one).
-
-    An arriving replica's acting OSD is known only if the pairing is
-    unambiguous.
-    """
-    pgid, up, acting = pg["pgid"], pg["up"], pg["acting"]
-    if is_ec:
-        evacuees = [
-            Evacuee(pgid, i, osd, slot(acting, i), size_bytes)
-            for i, osd in enumerate(up)
-            if osd in drained
-        ]
-        leaving = sum(
-            1 for i, osd in enumerate(acting) if osd in drained and slot(up, i) != osd
-        )
-        return evacuees, leaving
-
-    up_set, acting_set = real_osd_set(up), real_osd_set(acting)
-    departing = sorted(acting_set - up_set)
-    pairing_is_clear = len(departing) == 1 and len(up_set - acting_set) == 1
-    evacuees = []
-    for osd in sorted(up_set & drained):
-        if osd in acting_set:
-            acting_osd = osd
-        else:
-            acting_osd = departing[0] if pairing_is_clear else None
-        evacuees.append(Evacuee(pgid, "-", osd, acting_osd, size_bytes))
-    return evacuees, len((acting_set - up_set) & drained)
-
-
 class Move(NamedTuple):
     """One proposed upmap pair, and why it is proposed."""
 
@@ -238,7 +196,7 @@ class DrainResult(NamedTuple):
     osds: list[int]
     hosts: list[str]  # with --hosts, the (short) host names; else empty
     moves: list[Move]  # in PG order; within a PG, in the order proposed
-    unplaceable: list[Evacuee]
+    unplaceable: list[MappedShard]
     evacuee_count: int
     leaving_count: int  # shards already moving off a drained OSD
     diverted_count: int  # blockers diverted
@@ -252,28 +210,13 @@ class DrainResult(NamedTuple):
     osd_host: dict[int, str]
 
 
-class PgState:
-    """One affected PG, tracking its up set as proposals change it."""
+class PgState(PgPlacement):
+    """One affected PG, and the moves proposed for it."""
 
     def __init__(self, pg: dict, is_ec: bool, size_bytes: int, raw: set[int]):
-        self.pg = pg
-        self.is_ec = is_ec
-        self.size_bytes = size_bytes
-        self.new_up = list(pg["up"])  # 'up' once the proposals are applied
-        self.forbidden_osds = raw | real_osd_set(pg["up"])
+        super().__init__(pg, is_ec, size_bytes, raw)
         self.changed: set[int | str] = set()  # EC slots / replica OSDs moved
         self.moves: list[Move] = []
-
-    def forbidden_hosts(self, moving_osd: int, osd_host: dict[int, str]) -> set:
-        """Hosts a shard leaving moving_osd must not go to: the PG's other ones."""
-        return {
-            osd_host.get(o) for o in self.new_up if is_real_osd(o) and o != moving_osd
-        }
-
-    def retarget(self, from_osd: int, to_osd: int) -> None:
-        """Record that the shard on from_osd (in new_up) now goes to to_osd."""
-        self.new_up[self.new_up.index(from_osd)] = to_osd
-        self.forbidden_osds.add(to_osd)
 
 
 class Planner:
@@ -391,14 +334,14 @@ class Planner:
         return moves, None
 
 
-def shard_key(evacuee: Evacuee) -> int:
+def shard_key(evacuee: MappedShard) -> int:
     """Order a PG's evacuees: EC by shard index, replicated by drained OSD id."""
     return evacuee.shard if isinstance(evacuee.shard, int) else evacuee.up_osd
 
 
 def place_evacuees(
-    planner: Planner, states: dict[str, PgState], evacuees: list[Evacuee]
-) -> list[Evacuee]:
+    planner: Planner, states: dict[str, PgState], evacuees: list[MappedShard]
+) -> list[MappedShard]:
     """Place evacuees, largest first; return the unplaceable ones in PG order."""
     unplaceable = []
     order = sorted(
@@ -615,11 +558,11 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
     projection = ProjectedUsage(osd_df, arriving)
 
     states: dict[str, PgState] = {}
-    evacuees: list[Evacuee] = []
+    evacuees: list[MappedShard] = []
     leaving = 0
     for pg in drained_pgs:
         is_ec, size = pg_info(pg)
-        found, gone = find_evacuees(pg, is_ec, drained, size)
+        found, gone = find_mapped_shards(pg, is_ec, drained, size)
         leaving += gone
         if found:
             raw = raw_crush_osds(pg["up"], upmap_items.get(pg["pgid"], []))
@@ -712,14 +655,7 @@ def format_row(
 
 def print_pgremapper_mappings(moves: list[Move]) -> None:
     """Print the moves as JSON for 'pgremapper import-mappings', one per line."""
-    if not moves:
-        print("[]")
-        return
-    print("[")
-    for i, m in enumerate(moves):
-        entry = {"pgid": m.pgid, "mapping": {"from": m.up_osd, "to": m.target_osd}}
-        print(f"  {json.dumps(entry)}{',' if i < len(moves) - 1 else ''}")
-    print("]")
+    print_upmap_pairs((m.pgid, m.up_osd, m.target_osd) for m in moves)
 
 
 def render(result: DrainResult, args: argparse.Namespace) -> None:

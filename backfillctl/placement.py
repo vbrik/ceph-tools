@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""Choosing target OSDs for shards; shared by divert-toofull and drain.
+"""Choosing target OSDs for shards; shared by divert-toofull, drain and balance.
 
 A target is the legal OSD of the shard's device class with the lowest
-projected utilization (pick_target, ProjectedUsage). Also: the cluster's
-full ratios and the host failure-domain check.
+projected utilization (pick_target, ProjectedUsage; balance ranks its own).
+Also: finding shards in motion or on given OSDs, tracking a PG's up set as
+moves are proposed (PgPlacement), the cluster's full ratios and the host
+failure-domain check.
 """
 
 import argparse
@@ -13,7 +15,14 @@ from collections.abc import Iterable
 from typing import NamedTuple, Protocol
 
 import shared
-from shared import KIB, POOL_TYPE_ERASURE, SnapshotStore, is_real_osd, slot
+from shared import (
+    KIB,
+    POOL_TYPE_ERASURE,
+    SnapshotStore,
+    is_real_osd,
+    real_osd_set,
+    slot,
+)
 
 # Ceph's defaults (OSDMap::build_simple), for an 'osd dump' without them.
 DEFAULT_NEARFULL_RATIO = 0.85
@@ -201,6 +210,49 @@ def find_arriving_shards(
     return found
 
 
+class MappedShard(NamedTuple):
+    """A shard mapped to (in 'up' on) one of the OSDs of interest."""
+
+    pgid: str
+    shard: "int | str"  # EC shard index, or '-' for replicated pools
+    up_osd: int  # the OSD of interest: the 'from' of an upmap pair
+    acting_osd: int | None  # where its data is now, None if unknown
+    size_bytes: int
+
+
+def find_mapped_shards(
+    pg: dict, is_ec: bool, osds: set[int], size_bytes: int
+) -> tuple[list[MappedShard], int]:
+    """Return (the PG's shards mapped to one of osds, count already leaving one).
+
+    An arriving replica's acting OSD is known only if the pairing is
+    unambiguous.
+    """
+    pgid, up, acting = pg["pgid"], pg["up"], pg["acting"]
+    if is_ec:
+        mapped = [
+            MappedShard(pgid, i, osd, slot(acting, i), size_bytes)
+            for i, osd in enumerate(up)
+            if osd in osds
+        ]
+        leaving = sum(
+            1 for i, osd in enumerate(acting) if osd in osds and slot(up, i) != osd
+        )
+        return mapped, leaving
+
+    up_set, acting_set = real_osd_set(up), real_osd_set(acting)
+    departing = sorted(acting_set - up_set)
+    pairing_is_clear = len(departing) == 1 and len(up_set - acting_set) == 1
+    mapped = []
+    for osd in sorted(up_set & osds):
+        if osd in acting_set:
+            acting_osd = osd
+        else:
+            acting_osd = departing[0] if pairing_is_clear else None
+        mapped.append(MappedShard(pgid, "-", osd, acting_osd, size_bytes))
+    return mapped, len((acting_set - up_set) & osds)
+
+
 # ---------------------------------------------------------------------------
 # Candidates and projection
 # ---------------------------------------------------------------------------
@@ -289,12 +341,39 @@ class ProjectedUsage:
     def redirect(self, shard: Retargetable, target_osd: int) -> None:
         """Record that shard goes to target_osd instead of its up OSD."""
         self.cancel(shard)
-        self._used[target_osd] += shard.size_bytes
+        self.add(target_osd, shard.size_bytes)
+
+    def add(self, osd_id: int, size_bytes: int) -> None:
+        """Record that size_bytes more will arrive on the OSD."""
+        self._used[osd_id] += size_bytes
 
     def cancel(self, shard: Retargetable) -> None:
         """Record that shard no longer goes to its up OSD (e.g. pinned back)."""
         if shard.up_osd in self._used:
             self._used[shard.up_osd] -= shard.size_bytes
+
+
+class PgPlacement:
+    """One PG's up set as proposals change it, and the OSDs it must avoid."""
+
+    def __init__(self, pg: dict, is_ec: bool, size_bytes: int, raw: set[int]):
+        self.pg = pg
+        self.is_ec = is_ec
+        self.size_bytes = size_bytes
+        self.new_up = list(pg["up"])  # 'up' once the proposals are applied
+        # raw: see raw_crush_osds.
+        self.forbidden_osds = raw | real_osd_set(pg["up"])
+
+    def forbidden_hosts(self, moving_osd: int, osd_host: dict[int, str]) -> set:
+        """Hosts a shard leaving moving_osd must not go to: the PG's other ones."""
+        return {
+            osd_host.get(o) for o in self.new_up if is_real_osd(o) and o != moving_osd
+        }
+
+    def retarget(self, from_osd: int, to_osd: int) -> None:
+        """Record that the shard on from_osd (in new_up) now goes to to_osd."""
+        self.new_up[self.new_up.index(from_osd)] = to_osd
+        self.forbidden_osds.add(to_osd)
 
 
 def pick_target(

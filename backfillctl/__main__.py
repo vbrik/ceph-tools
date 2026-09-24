@@ -7,6 +7,7 @@ build_parser() has no side effects, so tests and shtab can import it:
 
 import argparse
 
+import balance
 import cancel_backfill
 import cancel_uphill
 import divert_toofull
@@ -23,6 +24,7 @@ _COMMAND_MODULES = (
     cancel_backfill,
     cancel_uphill,
     drain,
+    balance,
     save_state,
 )
 
@@ -31,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="backfillctl",
         description="Ceph PG backfill and upmap tools: show what is moving, "
-        "divert or cancel backfills, drain OSDs. Commands that remap PGs only "
+        "divert or cancel backfills, drain OSDs, move data off the fullest OSDs. Commands that remap PGs only "
         "print upmap proposals; they change nothing.",
         formatter_class=HelpFormatter,
     )
