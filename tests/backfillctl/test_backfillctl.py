@@ -184,6 +184,6 @@ class TopLevelHelpTest(unittest.TestCase):
                     option_help("divert-toofull", option), option_help("drain", option)
                 )
 
-    def test_cancel_backfill_usage_shows_pin_blockers_needs_osd(self):
+    def test_cancel_backfill_usage_shows_pin_blockers_needs_osds(self):
         usage = run_backfillctl("cancel-backfill", "-h").stdout
-        self.assertIn("[--osd OSD [--pin-blockers]]", usage)
+        self.assertIn("[--osds OSD [OSD ...] [--pin-blockers]]", usage)

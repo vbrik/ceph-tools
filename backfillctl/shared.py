@@ -1288,13 +1288,6 @@ def close_pins(
         pins.update(added)
 
 
-def pin_with_companions(
-    up: list, acting: list, slot: int, osd_host: dict[int, str]
-) -> tuple[dict[int, int], str | None]:
-    """Pin EC shard 'slot' to its acting OSD, plus its companions (see close_pins)."""
-    return close_pins(up, acting, {slot: acting[slot]}, osd_host)
-
-
 def pin_replica(
     up: list, osd: int, acting_osd: int, osd_host: dict[int, str]
 ) -> str | None:

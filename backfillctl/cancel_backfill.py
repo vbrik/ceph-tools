@@ -1,24 +1,24 @@
 # SPDX-License-Identifier: MIT
 """
-Propose upmaps that cancel backfills: all of them, or with --osd those into
-one OSD.
+Propose upmaps that cancel backfills: all of them, or with --osds those into
+the given OSDs.
 
 Each moving shard is pinned to the OSD that holds it now, so nothing moves.
 Ceph refuses a backfill whose target would be projected past
 backfillfull_ratio, counting every backfill queued for that OSD, so
 cancelling backfills into a full OSD makes room for the ones you want.
-Without --osd, this freezes all data movement so you can let backfills
+Without --osds, this freezes all data movement so you can let backfills
 through selectively.
 
 Remove the entries of backfills you want to keep, or pass their PGs to
 --exclude-pgs. Cancelling a running backfill discards its progress.
 
-pgremapper cannot apply chained pairs (A->B, B->C). Without --osd, the last
+pgremapper cannot apply chained pairs (A->B, B->C). Without --osds, the last
 pin of a chain is kept and the backfills before it keep running; with
---osd, a PG whose requested pin would chain is left out. Both are listed on
+--osds, a PG whose requested pin would chain is left out. Both are listed on
 stderr, with 'ceph osd pg-upmap-items' commands that pin everything.
 
-With --osd, the NOTE column marks pins of backfills into other OSDs. In
+With --osds, the NOTE column marks pins of backfills into other OSDs. In
 the JSON, each entry has its NOTE as 'note', plus 'shard' and 'role'
 (requested, companion or blocker).
 
@@ -27,13 +27,16 @@ the JSON, each entry has its NOTE as 'note', plus 'shard' and 'role'
   so the two can only be cancelled together. Keep or remove them together.
 - blocker (--pin-blockers): another shard of the PG whose target is projected
   at or over backfillfull_ratio, counting every shard arriving there, and the
-  blocker's own companions. backfill_toofull
-  holds back the whole PG, including a backfill you keep. Keep a PG's
-  blocker entries when you keep its backfill into --osd.
+  blocker's own companions. backfill_toofull holds back the whole PG,
+  including a backfill you keep. Keep a PG's blocker entries when you keep
+  its backfills into the --osds OSDs.
+
+A PG with shards arriving on several of the given OSDs is pinned as a
+whole, or not at all.
 
 Apply the output with pgremapper, which adds to a PG's existing upmap pairs:
 
-    backfillctl cancel-backfill --osd 682 --pin-blockers --pgremapper-mappings > m.json
+    backfillctl cancel-backfill --osds 682 --pin-blockers --pgremapper-mappings > m.json
     # keep 19.92e's backfill into osd.682: drop its pin and companions, keep its blockers
     jq 'map(select(.pgid != "19.92e" or .role == "blocker"))' m.json > m2.json
     pgremapper import-mappings m2.json
@@ -46,6 +49,7 @@ failure domain is host.
 
 import argparse
 import sys
+from collections.abc import Iterable
 from typing import NamedTuple
 
 from placement import ProjectedUsage, find_arriving_shards
@@ -78,6 +82,7 @@ from shared import (
     fetch_upmap_items,
     format_bytes,
     format_row,
+    format_utilization,
     is_erasure,
     is_real_osd,
     order_moves,
@@ -86,7 +91,6 @@ from shared import (
     pgid_pool_id,
     pgid_sort_key,
     pin_replica,
-    pin_with_companions,
     print_pgid_filter,
     print_pgremapper_mappings,
     print_table,
@@ -122,20 +126,23 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "cancel-backfill",
-        help="Cancel backfills (all, or into one OSD).",
+        help="Cancel backfills (all, or into given OSDs).",
         description=__doc__,
         formatter_class=HelpFormatter,
-        # Hand-written: argparse cannot show that --pin-blockers needs --osd.
-        usage="%(prog)s [-h] [--osd OSD [--pin-blockers]]\n"
+        # Hand-written: argparse cannot show that --pin-blockers needs --osds.
+        usage="%(prog)s [-h] [--osds OSD [OSD ...] [--pin-blockers]]\n"
         + " " * len("usage: backfillctl cancel-backfill ")
         + "[--exclude-pgs PGID [PGID ...]] [--pgremapper-mappings]\n"
         + " " * len("usage: backfillctl cancel-backfill ")
         + "[--load-state DIR]",
     )
     parser.add_argument(
-        "--osd",
+        "--osds",
+        nargs="+",
         type=parse_osd,
-        help="Cancel only backfills into OSD (and their companions).",
+        default=[],
+        metavar="OSD",
+        help="Cancel only backfills into these OSDs (and their companions).",
     )
     parser.add_argument(
         "--pin-blockers",
@@ -165,35 +172,37 @@ def fetch_backfillfull_pct(store: SnapshotStore) -> float | None:
 
 
 def find_arrivals(
-    up: list, acting: list, osd: int, is_ec: bool
-) -> tuple[list[tuple["int | str", int]], list[tuple["int | str", str]]]:
-    """Return the shards arriving on osd as (pins, skipped).
+    up: list, acting: list, osds: set[int], is_ec: bool
+) -> tuple[list[tuple["int | str", int, int]], list[tuple["int | str", str]]]:
+    """Return the shards arriving on any of osds as (pins, skipped).
 
-    pins: (shard, acting_osd) for shards with an OSD to pin back to (valid or
-    not, see pin_with_companions). skipped: (shard, reason) for the rest.
-    shard is the EC shard index, or '-' for replicated pools.
+    pins: (shard, up_osd, acting_osd) for shards with an OSD to pin back to
+    (valid or not, see close_pins); a replicated PG yields at most one.
+    skipped: (shard, reason) for the rest. shard is the EC shard index, or
+    '-' for replicated pools.
     """
     pins, skipped = [], []
     if is_ec:
         for i in range(len(up)):
-            if slot(up, i) != osd:
+            up_osd = slot(up, i)
+            if up_osd not in osds:
                 continue
             acting_osd = slot(acting, i)
-            if acting_osd == osd:
+            if acting_osd == up_osd:
                 continue
             if acting_osd is None:
                 skipped.append((i, "no acting OSD for this shard (degraded)"))
             else:
-                pins.append((i, acting_osd))
+                pins.append((i, up_osd, acting_osd))
         return pins, skipped
 
     up_set, acting_set = real_osd_set(up), real_osd_set(acting)
-    if osd not in up_set or osd in acting_set:
-        return pins, skipped
     arriving = up_set - acting_set
     departing = acting_set - up_set
+    if not arriving & osds:
+        return pins, skipped
     if len(arriving) == 1 and len(departing) == 1:
-        pins.append(("-", next(iter(departing))))
+        pins.append(("-", next(iter(arriving)), next(iter(departing))))
     elif not departing:
         skipped.append(("-", "no acting OSD to pin to (missing replica)"))
     else:
@@ -261,7 +270,7 @@ def arrival_projection(
 def cancel_whole_pg(
     up: list, acting: list, is_ec: bool, osd_host: dict[int, str]
 ) -> tuple[list[tuple["int | str", int, int]], list[tuple["int | str", str]]]:
-    """Pin every moving shard of a PG back to its acting OSD (no --osd).
+    """Pin every moving shard of a PG back to its acting OSD (no --osds).
 
     Returns (moves, skipped): moves are (shard, up_osd, acting_osd) in apply
     order (order_moves); skipped are (shard, reason). All-or-nothing per PG.
@@ -310,7 +319,7 @@ def plan_cancellations(
     pg_stats: list[dict],
     pools: dict[int, dict],
     ec_profiles: dict[str, dict],
-    osd: int | None,
+    osds: set[int],
     osd_host: dict[int, str],
     crush_rules: dict[int, dict],
     osd_df: dict[int, dict] | None = None,
@@ -318,13 +327,13 @@ def plan_cancellations(
     pin_blockers: bool = False,
     exclude_pgs: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[list[Cancellation], list[Skipped]]:
-    """Return (cancellations, skipped) for the backfills into osd, in PG order.
+    """Return (cancellations, skipped) for the backfills into osds, in PG order.
 
-    With osd None, cancels every backfill (cancel_whole_pg). Otherwise each
-    shard arriving on osd is pinned with its companions (close_pins) and,
-    with pin_blockers, its blockers (find_blockers). A blocker that cannot be
-    pinned is skipped; the requested pin stays. PGs in exclude_pgs are
-    ignored.
+    With osds empty, cancels every backfill (cancel_whole_pg). Otherwise a
+    PG's shards arriving on osds are pinned together with their companions
+    (close_pins), all or none, and, with pin_blockers, its blockers
+    (find_blockers). A blocker that cannot be pinned is skipped; the
+    requested pins stay. PGs in exclude_pgs are ignored.
 
     Exits with an error if a pool is unknown or its failure domain is not
     host.
@@ -341,10 +350,10 @@ def plan_cancellations(
     pg_stats = [
         pg
         for pg in pg_stats
-        if (osd is None or osd in pg["up"]) and pg["pgid"] not in exclude_pgs
+        if (not osds or osds & set(pg["up"])) and pg["pgid"] not in exclude_pgs
     ]
     pgids = [pg["pgid"] for pg in pg_stats]
-    which = "remapped PGs" if osd is None else f"PGs with a backfill into osd.{osd}"
+    which = f"PGs with a backfill into {osd_list(osds)}" if osds else "remapped PGs"
     check_known_pools(pgids, pools, which)
     check_host_failure_domain(pgids, pools, crush_rules, which)
 
@@ -358,7 +367,7 @@ def plan_cancellations(
         progress = pg_progress_pct(
             pg, copies_moving(up, acting, is_ec, pool.get("size", 0))
         )
-        if osd is None:
+        if not osds:
             moves, unpinnable = cancel_whole_pg(up, acting, is_ec, osd_host)
             skipped.extend(Skipped(pgid, shard, why) for shard, why in unpinnable)
             cancellations.extend(
@@ -366,66 +375,70 @@ def plan_cancellations(
                 for s, from_osd, to_osd in moves
             )
             continue
-        pins, unpinnable = find_arrivals(up, acting, osd, is_ec)
+        pins, unpinnable = find_arrivals(up, acting, osds, is_ec)
         skipped.extend(Skipped(pgid, shard, why) for shard, why in unpinnable)
-        for shard, acting_osd in pins:
-            # Companion shard -> the blocker whose pin pulled it in.
-            blocker_of: dict[int, int] = {}
-            if is_ec:
-                resolved, why = pin_with_companions(up, acting, shard, osd_host)
-                if why is None and blockers_enabled:
-                    for blocker in find_blockers(
-                        up, acting, resolved, projection, backfillfull_pct
-                    ):
-                        if blocker in resolved:  # already pulled in as a companion
-                            continue
-                        trial = {**resolved, blocker: acting[blocker]}
-                        closed, blocker_why = close_pins(up, acting, trial, osd_host)
-                        if blocker_why is None:
-                            _, blocker_why = order_moves(
-                                [(s, up[s], a) for s, a in closed.items()]
-                            )
-                        if blocker_why is None:
-                            for s in closed.keys() - resolved.keys() - {blocker}:
-                                blocker_of[s] = blocker
-                            resolved = closed
-                        else:
-                            skipped.append(
-                                Skipped(pgid, blocker, f"blocker: {blocker_why}")
-                            )
-                moves, ring = order_moves([(s, up[s], a) for s, a in resolved.items()])
-                why = why or ring
-            else:
-                why = pin_replica(up, osd, acting_osd, osd_host)
-                moves = [("-", osd, acting_osd)]
-            if why is not None:
-                skipped.append(Skipped(pgid, shard, why))
-                continue
-            for s, from_osd, to_osd in moves:
-                projected = None
-                if s != shard and blockers_enabled:
-                    projected = blocker_projection(
-                        projection, from_osd, backfillfull_pct
-                    )
-                # A companion over the ratio blocks the requested shard itself.
-                of_blocker = projected is None and s in blocker_of
-                companion_of = (
-                    None if s == shard else blocker_of[s] if of_blocker else shard
+        if not pins:
+            continue
+        requested = [shard for shard, _, _ in pins]
+        # What companions and blockers name as the shard(s) they go with.
+        wanted = requested[0] if len(requested) == 1 else ", ".join(map(str, requested))
+        # Companion shard -> the blocker whose pin pulled it in.
+        blocker_of: dict[int, int] = {}
+        moves = []
+        if is_ec:
+            resolved, why = close_pins(up, acting, {s: a for s, _, a in pins}, osd_host)
+            if why is None and blockers_enabled:
+                for blocker in find_blockers(
+                    up, acting, resolved, projection, backfillfull_pct
+                ):
+                    if blocker in resolved:  # already pulled in as a companion
+                        continue
+                    trial = {**resolved, blocker: acting[blocker]}
+                    closed, blocker_why = close_pins(up, acting, trial, osd_host)
+                    if blocker_why is None:
+                        _, blocker_why = order_moves(
+                            [(s, up[s], a) for s, a in closed.items()]
+                        )
+                    if blocker_why is None:
+                        for s in closed.keys() - resolved.keys() - {blocker}:
+                            blocker_of[s] = blocker
+                        resolved = closed
+                    else:
+                        skipped.append(
+                            Skipped(pgid, blocker, f"blocker: {blocker_why}")
+                        )
+            if why is None:
+                moves, why = order_moves([(s, up[s], a) for s, a in resolved.items()])
+        else:
+            ((shard, up_osd, acting_osd),) = pins
+            why = pin_replica(up, up_osd, acting_osd, osd_host)
+            moves = [(shard, up_osd, acting_osd)]
+        if why is not None:
+            skipped.extend(Skipped(pgid, s, why) for s in requested)
+            continue
+        for s, from_osd, to_osd in moves:
+            projected = None
+            if s not in requested and blockers_enabled:
+                projected = blocker_projection(projection, from_osd, backfillfull_pct)
+            # A companion over the ratio blocks the requested shards itself.
+            of_blocker = projected is None and s in blocker_of
+            companion_of = (
+                None if s in requested else blocker_of[s] if of_blocker else wanted
+            )
+            cancellations.append(
+                Cancellation(
+                    pgid,
+                    s,
+                    from_osd,
+                    to_osd,
+                    size,
+                    pg["state"],
+                    progress,
+                    companion_of,
+                    projected,
+                    of_blocker=of_blocker,
                 )
-                cancellations.append(
-                    Cancellation(
-                        pgid,
-                        s,
-                        from_osd,
-                        to_osd,
-                        size,
-                        pg["state"],
-                        progress,
-                        companion_of,
-                        projected,
-                        of_blocker=of_blocker,
-                    )
-                )
+            )
 
     # Stable, by PG only: within a PG the order is the one to apply the pairs in.
     return (
@@ -439,8 +452,13 @@ def plan_cancellations(
 # ---------------------------------------------------------------------------
 
 
+def osd_list(osds: Iterable[int]) -> str:
+    """Name OSDs in id order, e.g. 'osd.74, osd.682'."""
+    return ", ".join(f"osd.{o}" for o in sorted(osds))
+
+
 def print_summary(
-    osd: int | None,
+    osds: list[int],
     osd_df: dict[int, dict],
     osd_host: dict[int, str],
     cancellations: list[Cancellation],
@@ -453,19 +471,20 @@ def print_summary(
     known = [c.size_bytes for c in arriving if c.size_bytes is not None]
     total = sum(known)
     unknown = len(arriving) - len(known)
-    if osd is None:
+    if not osds:
         pgs = len({c.pgid for c in cancellations})
         intro = f"{len(arriving)} moving shard(s) in {pgs} PG(s) can be pinned back"
         share = ""
     else:
-        node = osd_df[osd]
-        capacity = node.get("kb", 0) * KIB
-        share = f", {total / capacity * 100:.1f}% of its capacity" if capacity else ""
-        intro = (
-            f"osd.{osd} ({osd_host.get(osd, '?')}) is at "
-            f"{node['utilization']:.1f}%. {len(arriving)} arriving shard(s) "
-            "can be pinned back"
+        capacity = sum(osd_df[o].get("kb", 0) for o in osds) * KIB
+        its = "its" if len(osds) == 1 else "their"
+        share = f", {total / capacity * 100:.1f}% of {its} capacity" if capacity else ""
+        levels = ", ".join(
+            f"osd.{o} ({osd_host.get(o, '?')}) {'is at ' if i == 0 else 'at '}"
+            f"{format_utilization(osd_df, o)}"
+            for i, o in enumerate(sorted(osds))
         )
+        intro = f"{levels}. {len(arriving)} arriving shard(s) can be pinned back"
     stderr_para(
         f"{intro} (~{format_bytes(total)}"
         + (f" + {unknown} of unknown size" if unknown else "")
@@ -489,7 +508,7 @@ def print_summary(
 class StopResult(NamedTuple):
     """What plan() decided, for render() to print."""
 
-    osd: int | None  # None: every backfill in the cluster
+    osds: list[int]  # sorted; empty: every backfill in the cluster
     cancellations: list[Cancellation]  # in apply order, see plan_cancellations
     skipped: list[Skipped]
     chained: dict[str, list[Pair]]  # see avoid_chains
@@ -506,10 +525,10 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
     (--exclude-pgs matches, a missing backfillfull_ratio) are printed before
     planning, so they show even if it exits.
     """
-    osd = args.osd
+    osds = set(args.osds)
     exclude_pgs = set(args.exclude_pgs)
-    if osd is None and args.pin_blockers:
-        sys.exit("ERROR: --pin-blockers requires --osd.")
+    if not osds and args.pin_blockers:
+        sys.exit("ERROR: --pin-blockers requires --osds.")
 
     osd_df = fetch_osd_df(store)
     osd_host = fetch_osd_hosts(store)
@@ -518,8 +537,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
     ec_profiles = fetch_ec_profiles(store)
     crush_rules = fetch_crush_rules(store)
 
-    if osd is not None:
-        check_osds_exist("--osd", [osd], osd_df)
+    check_osds_exist("--osds", osds, osd_df)
     backfillfull_pct = fetch_backfillfull_pct(store)
     if backfillfull_pct is None and args.pin_blockers:
         stderr_para(
@@ -528,24 +546,24 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
         )
     exclude_filter = None
     if exclude_pgs:
-        # Matched: remapped and, with --osd, osd in 'up'. Not necessarily a
-        # backfill into osd, so the note claims no more.
+        # Matched: remapped and, with --osds, one of them in 'up'. Not
+        # necessarily a backfill into it, so the note claims no more.
         exclude_filter = PgidFilter.of(
             exclude_pgs,
-            (pg["pgid"] for pg in pg_stats if osd is None or osd in pg["up"]),
+            (pg["pgid"] for pg in pg_stats if not osds or osds & set(pg["up"])),
         )
-        involving = "" if osd is None else f" involving osd.{osd}"
+        involving = f" involving {osd_list(osds)}" if osds else ""
         print_pgid_filter(
             "--exclude-pgs",
             exclude_filter,
             f"matched a remapped PG{involving} and were left alone",
-            "not remapped" + ("" if osd is None else f", not involving osd.{osd}"),
+            "not remapped" + (f", not involving {osd_list(osds)}" if osds else ""),
         )
     cancellations, skipped = plan_cancellations(
         pg_stats,
         pools,
         ec_profiles,
-        osd,
+        osds,
         osd_host,
         crush_rules,
         osd_df,
@@ -553,17 +571,17 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
         args.pin_blockers,
         exclude_pgs,
     )
-    # Without --osd every pin is wanted for itself, so a chain's last pin
+    # Without --osds every pin is wanted for itself, so a chain's last pin
     # stays even when the one before it cannot.
     resolved = avoid_chains(
-        cancellations, fetch_upmap_items(store), pg_stats, osd_host, partial=osd is None
+        cancellations, fetch_upmap_items(store), pg_stats, osd_host, partial=not osds
     )
     cancellations = resolved.cancellations
     skipped = sorted(skipped + resolved.skipped, key=skipped_sort_key)
     if not args.pgremapper_mappings:  # JSON has no PROGRESS: skip the queries
         cancellations = with_exact_progress(store, cancellations, pg_stats, pools)
     return StopResult(
-        osd=osd,
+        osds=sorted(osds),
         cancellations=cancellations,
         skipped=skipped,
         chained=resolved.chained,
@@ -576,9 +594,9 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
 
 def render(result: StopResult, args: argparse.Namespace) -> None:
     """Print result: pins on stdout in the format args asks for, notes on stderr."""
-    osd, cancellations = result.osd, result.cancellations
+    osds, cancellations = result.osds, result.cancellations
     if not cancellations and not result.skipped:
-        into = "" if osd is None else f" into osd.{osd}"
+        into = f" into {osd_list(osds)}" if osds else ""
         stderr_para(f"No backfills{into}.")
         if args.pgremapper_mappings:
             print_pgremapper_mappings([])
@@ -591,18 +609,14 @@ def render(result: StopResult, args: argparse.Namespace) -> None:
             COLUMNS,
             [format_row(c, result.osd_df, result.osd_host) for c in cancellations],
         )
-    print_summary(osd, result.osd_df, result.osd_host, cancellations, result.skipped)
+    print_summary(osds, result.osd_df, result.osd_host, cancellations, result.skipped)
     if not args.pgremapper_mappings and any(
         c.progress_pct is not None and not c.progress_exact for c in cancellations
     ):
         stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
     if result.chained:
         warn_chains(result.chained)
-    if (
-        osd is not None
-        and result.backfillfull_pct is not None
-        and not args.pin_blockers
-    ):
+    if osds and result.backfillfull_pct is not None and not args.pin_blockers:
         stderr_para(
             "NOTE: --pin-blockers was not given: a backfill you keep can still "
             "be held in backfill_toofull by another shard of its PG."

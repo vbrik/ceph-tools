@@ -83,11 +83,11 @@ def pg(
 
 class EcArrivalsTest(unittest.TestCase):
     def find(self, up, acting):
-        return cb.find_arrivals(up, acting, OSD, is_ec=True)
+        return cb.find_arrivals(up, acting, {OSD}, is_ec=True)
 
     def test_shard_arriving_is_pinned_to_its_acting_osd(self):
         pins, skipped = self.find([1, 2, OSD, 4], [1, 2, 9, 4])
-        self.assertEqual(pins, [(2, 9)])
+        self.assertEqual(pins, [(2, OSD, 9)])
         self.assertEqual(skipped, [])
 
     def test_osd_not_in_up_yields_nothing(self):
@@ -98,7 +98,7 @@ class EcArrivalsTest(unittest.TestCase):
 
     def test_other_shards_moving_are_ignored(self):
         pins, _ = self.find([5, 2, OSD, 4], [1, 2, 9, 4])
-        self.assertEqual(pins, [(2, 9)])
+        self.assertEqual(pins, [(2, OSD, 9)])
 
     def test_empty_acting_slot_cannot_be_pinned(self):
         pins, skipped = self.find([1, 2, OSD, 4], [1, 2, NONE, 4])
@@ -112,26 +112,26 @@ class EcArrivalsTest(unittest.TestCase):
 
     def test_acting_osd_elsewhere_in_up_is_left_to_the_resolver(self):
         # Pinning shard 2 back to 9 would put 9 in the mapping twice;
-        # pin_with_companions deals with that, not find_arrivals.
+        # close_pins deals with that, not find_arrivals.
         pins, skipped = self.find([1, 2, OSD, 9], [1, 2, 9, 4])
-        self.assertEqual(pins, [(2, 9)])
+        self.assertEqual(pins, [(2, OSD, 9)])
         self.assertEqual(skipped, [])
 
     def test_osd_holds_another_shard_now_is_still_pinnable(self):
         # Shard 0 arrives on OSD from osd.1 while the OSD's current shard 2
         # is moving on to osd.3: the pin concerns shard 0 only.
         pins, skipped = self.find([OSD, 2, 3], [1, 2, OSD])
-        self.assertEqual(pins, [(0, 1)])
+        self.assertEqual(pins, [(0, OSD, 1)])
         self.assertEqual(skipped, [])
 
 
 class ReplicatedArrivalsTest(unittest.TestCase):
     def find(self, up, acting):
-        return cb.find_arrivals(up, acting, OSD, is_ec=False)
+        return cb.find_arrivals(up, acting, {OSD}, is_ec=False)
 
     def test_one_arriving_one_departing_is_paired(self):
         pins, skipped = self.find([1, 2, OSD], [1, 2, 9])
-        self.assertEqual(pins, [("-", 9)])
+        self.assertEqual(pins, [("-", OSD, 9)])
         self.assertEqual(skipped, [])
 
     def test_reorder_of_same_set_is_not_movement(self):
@@ -155,7 +155,7 @@ class PinWithCompanionsTest(unittest.TestCase):
     """A pin is valid only if the result has no two shards on one host/OSD."""
 
     def pin(self, up, acting, slot, hosts):
-        return cb.pin_with_companions(up, acting, slot, hosts)
+        return shared.close_pins(up, acting, {slot: acting[slot]}, hosts)
 
     def test_no_clash_pins_only_the_requested_shard(self):
         pins, why = self.pin([OSD, 2], [9, 2], 0, {9: "a", 2: "b", OSD: "c"})
@@ -224,7 +224,7 @@ def run_plan(pgs, pools=None, osd_host=None, rules=None, exclude_pgs=None):
         pgs,
         pools,
         EC_PROFILES,
-        OSD,
+        {OSD},
         osd_host or {},
         RULES if rules is None else rules,
         exclude_pgs=exclude_pgs or frozenset(),
@@ -350,7 +350,15 @@ class PlanBlockersTest(unittest.TestCase):
     def plan(self, pgs, df, osd_host=None, ratio=RATIO, pin_blockers=True):
         pools = {19: EC_POOL, 7: REP_POOL}
         return cb.plan_cancellations(
-            pgs, pools, EC_PROFILES, OSD, osd_host or {}, RULES, df, ratio, pin_blockers
+            pgs,
+            pools,
+            EC_PROFILES,
+            {OSD},
+            osd_host or {},
+            RULES,
+            df,
+            ratio,
+            pin_blockers,
         )
 
     def test_blocker_is_pinned_and_marked_with_its_projected_utilization(self):
@@ -380,7 +388,7 @@ class PlanBlockersTest(unittest.TestCase):
         pools = {19: EC_POOL}
         for df, ratio in ((None, RATIO), ({77: osd_df_node(77, 99.0)}, None)):
             cancellations, _ = cb.plan_cancellations(
-                [p], pools, EC_PROFILES, OSD, {}, RULES, df, ratio, True
+                [p], pools, EC_PROFILES, {OSD}, {}, RULES, df, ratio, True
             )
             self.assertEqual([c.shard for c in cancellations], [0])
 
@@ -457,6 +465,27 @@ class PlanBlockersTest(unittest.TestCase):
         self.assertEqual([c.shard for c in cancellations], [0, 1])
         self.assertIsNone(cancellations[1].blocker_util)
         self.assertEqual(cancellations[1].companion_of, 0)
+
+    def test_shards_arriving_on_several_given_osds_are_all_requested(self):
+        p = pg("19.5", [OSD, 77, 3, 4], [8, 66, 3, 4])
+        cancellations, skipped = cb.plan_cancellations(
+            [p], {19: EC_POOL}, EC_PROFILES, {OSD, 77}, {}, RULES
+        )
+        self.assertEqual(skipped, [])
+        self.assertEqual(
+            [(c.shard, c.role) for c in cancellations],
+            [(0, shared.ROLE_REQUESTED), (1, shared.ROLE_REQUESTED)],
+        )
+
+    def test_a_pg_with_several_requested_shards_is_pinned_whole_or_not_at_all(self):
+        # Pinning shard 1 back to osd.66 clashes with shard 2 (osd.3, same
+        # host), which is not moving: shard 0's pin goes too.
+        p = pg("19.5", [OSD, 77, 3, 4], [8, 66, 3, 4])
+        cancellations, skipped = cb.plan_cancellations(
+            [p], {19: EC_POOL}, EC_PROFILES, {OSD, 77}, {66: "H", 3: "H"}, RULES
+        )
+        self.assertEqual(cancellations, [])
+        self.assertEqual([s.shard for s in skipped], [0, 1])
 
     def test_several_blockers_come_in_shard_order(self):
         p = pg("19.5", [OSD, 77, 3, 88], [8, 66, 3, 99])
@@ -562,7 +591,7 @@ def run_plan_with_df(pgs, df, ratio=RATIO, pin_blockers=True, exclude_pgs=None):
         pgs,
         {19: EC_POOL, 7: REP_POOL},
         EC_PROFILES,
-        OSD,
+        {OSD},
         {},
         RULES,
         df,
@@ -897,7 +926,7 @@ class RenderTest(unittest.TestCase):
     def render(self, *argv, **fields):
         result = cb.StopResult(
             **{
-                "osd": 682,
+                "osds": [682],
                 "cancellations": [self.PLAIN],
                 "skipped": [shared.Skipped("19.f", 0, "would chain")],
                 "chained": self.CHAINED,
@@ -910,7 +939,7 @@ class RenderTest(unittest.TestCase):
         )
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            cb.render(result, parse_args(cb, [*argv, "--osd", "682"]))
+            cb.render(result, parse_args(cb, [*argv, "--osds", "682"]))
         return out.getvalue(), err.getvalue()
 
     def test_both_formats_print_the_same_pins_and_the_chain_warning(self):
@@ -936,7 +965,7 @@ class RenderTest(unittest.TestCase):
         snaps["crush_rule_dump"] = []
         del snaps["osd_dump"]["backfillfull_ratio"]
         store = FakeStore(snaps, load_dir=None)
-        argv = ["--pin-blockers", "--osd", "682", "--exclude-pgs", "19.zzz"]
+        argv = ["--pin-blockers", "--osds", "682", "--exclude-pgs", "19.zzz"]
         err = io.StringIO()
         with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
             cb.plan(parse_args(cb, argv), store)
@@ -1100,20 +1129,20 @@ class ParseArgsCliTest(unittest.TestCase):
     def parse(self, *argv):
         return parse_args(cb, argv)
 
-    def test_osd_is_a_flag_not_positional(self):
-        with self.assertRaises(SystemExit):
-            self.parse("682")  # no --osd: bare id is unrecognized
-        self.assertEqual(self.parse("--osd", "682").osd, 682)
-        self.assertEqual(self.parse("--osd", "osd.682").osd, 682)
+    def test_osds_is_a_flag_not_positional(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.parse("682")  # no --osds: bare id is unrecognized
+        self.assertEqual(self.parse("--osds", "682").osds, [682])
+        self.assertEqual(self.parse("--osds", "osd.682", "74").osds, [682, 74])
 
-    def test_osd_is_optional(self):
-        self.assertIsNone(self.parse().osd)
+    def test_osds_is_optional(self):
+        self.assertEqual(self.parse().osds, [])
 
     def test_exclude_pgs_defaults_to_empty(self):
-        self.assertEqual(self.parse("--osd", "682").exclude_pgs, [])
+        self.assertEqual(self.parse("--osds", "682").exclude_pgs, [])
 
     def test_exclude_pgs_takes_a_space_separated_list(self):
-        args = self.parse("--osd", "682", "--exclude-pgs", "19.9", "19.a")
+        args = self.parse("--osds", "682", "--exclude-pgs", "19.9", "19.a")
         self.assertEqual(args.exclude_pgs, ["19.9", "19.a"])
 
 
@@ -1212,7 +1241,7 @@ class MainTest(unittest.TestCase):
         return cb.plan(parse_args(cb, argv), store)
 
     def test_plan_pins_each_arrival_and_its_companion(self):
-        result = self.plan("--osd", "682")
+        result = self.plan("--osds", "682")
         self.assertEqual(
             pins(result.cancellations), ["19.9 682 8", "19.d 682 8", "19.d 9 4"]
         )
@@ -1221,7 +1250,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual([(s.pgid, s.shard) for s in result.skipped], [("19.a", 0)])
 
     def test_table_shows_acting_osd_state_and_host(self):
-        out, _ = self.run_main("--osd", "682")
+        out, _ = self.run_main("--osds", "682")
         lines = out.splitlines()
         self.assertIn("PGID", lines[1])
         self.assertEqual(len(lines), 5)  # two header lines + the 3 pins
@@ -1235,7 +1264,7 @@ class MainTest(unittest.TestCase):
     def test_approx_note_appears_when_progress_comes_from_counters(self):
         # No backfill positions (the tests' stubbed live query returns none),
         # so every row's PROGRESS is from Ceph's counters.
-        out, err = self.run_main("--osd", "682")
+        out, err = self.run_main("--osds", "682")
         self.assertIn("~100%", out)
         self.assertIn("NOTE: ~ marks PROGRESS from Ceph's misplaced/degraded", err)
 
@@ -1246,7 +1275,7 @@ class MainTest(unittest.TestCase):
         ]
         positions = mock.Mock(return_value={"19.9": {f"{OSD}(0)": "MIN"}})
         with mock.patch.object(shared, "query_backfill_positions", positions):
-            out, err = self.run_main("--osd", "682", pgs=pgs)
+            out, err = self.run_main("--osds", "682", pgs=pgs)
         positions.assert_called_once()
         self.assertEqual({"19.9"}, set(positions.call_args.args[0]))
         self.assertIn(" 0% ", out)
@@ -1254,7 +1283,7 @@ class MainTest(unittest.TestCase):
         self.assertNotIn("~ marks PROGRESS", err)
 
     def test_pgremapper_mappings_is_json_with_every_pair_and_no_warning(self):
-        out, err = self.run_main("--pgremapper-mappings", "--osd", "682")
+        out, err = self.run_main("--pgremapper-mappings", "--osds", "682")
         self.assertEqual(
             upmap_pairs(out),
             [
@@ -1267,7 +1296,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("19.a", err)  # unpinnable shards are still reported
 
     def test_table_output_does_not_warn(self):
-        _, err = self.run_main("--osd", "682")
+        _, err = self.run_main("--osds", "682")
         self.assertNotIn("WARNING", err)
 
     def test_blockers_are_not_pinned_by_default(self):
@@ -1277,9 +1306,9 @@ class MainTest(unittest.TestCase):
         # note pointing at the flag.
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         kwargs = {"pgs": pgs, "extra_osds": [osd_df_node(77, 92.0)]}
-        result = self.plan("--osd", "682", **kwargs)
+        result = self.plan("--osds", "682", **kwargs)
         self.assertEqual(pins(result.cancellations), ["19.e 682 8"])
-        _, err = self.run_main("--osd", "682", **kwargs)
+        _, err = self.run_main("--osds", "682", **kwargs)
         self.assertIn("--pin-blockers was not given", err)
 
     def test_blocker_in_the_same_pg_is_proposed_and_explained(self):
@@ -1288,12 +1317,12 @@ class MainTest(unittest.TestCase):
         # pinned back too.
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         kwargs = {"pgs": pgs, "extra_osds": [osd_df_node(77, 92.0)]}
-        result = self.plan("--pin-blockers", "--osd", "682", **kwargs)
+        result = self.plan("--pin-blockers", "--osds", "682", **kwargs)
         self.assertEqual(pins(result.cancellations), ["19.e 682 8", "19.e 77 66"])
         blocker = result.cancellations[1]
         self.assertEqual(blocker.companion_of, 0)
         self.assertIsNotNone(blocker.blocker_util)
-        _, err = self.run_main("--pin-blockers", "--osd", "682", **kwargs)
+        _, err = self.run_main("--pin-blockers", "--osds", "682", **kwargs)
         self.assertIn("1 more shard(s)", err)
         self.assertIn("(blockers: 1)", flat(err))
         self.assertNotIn("--pin-blockers was not given", err)
@@ -1302,7 +1331,7 @@ class MainTest(unittest.TestCase):
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, _ = self.run_main(
             "--pin-blockers",
-            "--osd",
+            "--osds",
             "682",
             pgs=pgs,
             extra_osds=[osd_df_node(77, 92.0)],
@@ -1316,7 +1345,7 @@ class MainTest(unittest.TestCase):
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         result = self.plan(
             "--pin-blockers",
-            "--osd",
+            "--osds",
             "682",
             pgs=pgs,
             extra_osds=[osd_df_node(77, 80.0)],
@@ -1330,10 +1359,10 @@ class MainTest(unittest.TestCase):
             "extra_osds": [osd_df_node(77, 92.0)],
             "drop": ["backfillfull_ratio"],
         }
-        result = self.plan("--pin-blockers", "--osd", "682", **kwargs)
+        result = self.plan("--pin-blockers", "--osds", "682", **kwargs)
         self.assertEqual(pins(result.cancellations), ["19.e 682 8"])
         self.assertIsNone(result.backfillfull_pct)
-        _, err = self.run_main("--pin-blockers", "--osd", "682", **kwargs)
+        _, err = self.run_main("--pin-blockers", "--osds", "682", **kwargs)
         self.assertIn("no backfillfull_ratio", err)
         self.assertNotIn("--pin-blockers was not given", err)
 
@@ -1343,7 +1372,7 @@ class MainTest(unittest.TestCase):
         pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, err = self.run_main(
             "--pgremapper-mappings",
-            "--osd",
+            "--osds",
             "682",
             pgs=pgs,
             extra_osds=[osd_df_node(77, 92.0)],
@@ -1360,12 +1389,12 @@ class MainTest(unittest.TestCase):
         # a chain pgremapper cannot apply, and the requested pin is its head
         chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
         plain = pg("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])
-        result = self.plan("--osd", "682", pgs=[chain, plain])
+        result = self.plan("--osds", "682", pgs=[chain, plain])
         self.assertEqual(pins(result.cancellations), ["19.2 682 8"])
         self.assertEqual([(s.pgid, s.shard) for s in result.skipped], [("19.f", 0)])
         self.assertEqual(result.chained, {"19.f": [(20, 30), (OSD, 20)]})
         for flags in ((), ("--pgremapper-mappings",)):
-            out, err = self.run_main(*flags, "--osd", "682", pgs=[chain, plain])
+            out, err = self.run_main(*flags, "--osds", "682", pgs=[chain, plain])
             self.assertNotIn("19.f", out)
             self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
 
@@ -1377,7 +1406,7 @@ class MainTest(unittest.TestCase):
             {"pgid": "19.2", "mappings": [{"from": 8, "to": 9}]}
         ]
         result = cb.plan(
-            parse_args(cb, ["--osd", "682"]), FakeStore(snaps, load_dir=None)
+            parse_args(cb, ["--osds", "682"]), FakeStore(snaps, load_dir=None)
         )
         self.assertEqual(result.cancellations, [])
         self.assertEqual(result.chained, {"19.2": [(8, 9), (OSD, 8)]})
@@ -1391,40 +1420,40 @@ class MainTest(unittest.TestCase):
     def test_pgremapper_mappings_is_valid_json_even_with_nothing_to_apply(self):
         # nothing arriving at all
         out, err = self.run_main(
-            "--pgremapper-mappings", "--osd", "682", pgs=[self.PGS[2]]
+            "--pgremapper-mappings", "--osds", "682", pgs=[self.PGS[2]]
         )
         self.assertEqual(json.loads(out), [])
         self.assertIn("No backfills", err)
         # only an unpinnable shard (no acting OSD)
         out, err = self.run_main(
-            "--pgremapper-mappings", "--osd", "682", pgs=[self.PGS[1]]
+            "--pgremapper-mappings", "--osds", "682", pgs=[self.PGS[1]]
         )
         self.assertEqual(json.loads(out), [])
         self.assertIn("19.a", err)
 
     def test_no_backfills_prints_nothing_on_stdout(self):
-        out, err = self.run_main("--osd", "682", pgs=[self.PGS[2]])
+        out, err = self.run_main("--osds", "682", pgs=[self.PGS[2]])
         self.assertEqual(out, "")
         self.assertIn("No backfills", err)
 
     def test_unknown_osd_is_an_error(self):
         with self.assertRaises(SystemExit) as ctx:
-            self.plan("--osd", "5000")
+            self.plan("--osds", "5000")
         self.assertEqual(
-            str(ctx.exception), "ERROR: --osd: not in 'ceph osd df': osd.5000"
+            str(ctx.exception), "ERROR: --osds: not in 'ceph osd df': osd.5000"
         )
 
     def test_exclude_pgs_removes_the_named_pg_only(self):
-        result = self.plan("--osd", "682", "--exclude-pgs", "19.9")
+        result = self.plan("--osds", "682", "--exclude-pgs", "19.9")
         # 19.9 (a plain arrival) is gone; 19.d's companion pin remains
         self.assertEqual(pins(result.cancellations), ["19.d 682 8", "19.d 9 4"])
         self.assertEqual(result.exclude_filter, shared.PgidFilter(1, 1, []))
 
     def test_exclude_pgs_reports_an_entry_that_matched_nothing(self):
-        result = self.plan("--osd", "682", "--exclude-pgs", "19.9", "19.zzz")
+        result = self.plan("--osds", "682", "--exclude-pgs", "19.9", "19.zzz")
         self.assertEqual(pins(result.cancellations), ["19.d 682 8", "19.d 9 4"])
         self.assertEqual(result.exclude_filter, shared.PgidFilter(2, 1, ["19.zzz"]))
-        _, err = self.run_main("--osd", "682", "--exclude-pgs", "19.9", "19.zzz")
+        _, err = self.run_main("--osds", "682", "--exclude-pgs", "19.9", "19.zzz")
         self.assertIn("1 of 2 given PG id(s) matched", flat(err))
         self.assertIn(
             "1 matched nothing (not remapped, not involving osd.682, or a typo): "
@@ -1435,16 +1464,16 @@ class MainTest(unittest.TestCase):
     def test_exclude_pgs_all_entries_matched_nothing(self):
         # none of PGS involves osd.5000 at all: matched must read as zero,
         # not silently omit the count.
-        result = self.plan("--osd", "682", "--exclude-pgs", "19.zzz")
+        result = self.plan("--osds", "682", "--exclude-pgs", "19.zzz")
         self.assertEqual(
             pins(result.cancellations), ["19.9 682 8", "19.d 682 8", "19.d 9 4"]
         )
         self.assertEqual(result.exclude_filter, shared.PgidFilter(1, 0, ["19.zzz"]))
-        _, err = self.run_main("--osd", "682", "--exclude-pgs", "19.zzz")
+        _, err = self.run_main("--osds", "682", "--exclude-pgs", "19.zzz")
         self.assertIn("0 of 1 given PG id(s) matched", err)
 
     def test_no_exclude_pgs_note_when_the_flag_is_not_given(self):
-        _, err = self.run_main("--osd", "682")
+        _, err = self.run_main("--osds", "682")
         self.assertNotIn("--exclude-pgs", err)
 
     def test_exclude_pgs_note_does_not_claim_a_backfill_that_never_existed(self):
@@ -1452,7 +1481,9 @@ class MainTest(unittest.TestCase):
         # onto osd.682. The note must not claim a backfill was skipped, only
         # that the PG (which does list osd.682 in 'up') matched.
         stable = pg("19.99", [OSD, 2, 3, 4, 20, 6], [OSD, 2, 3, 4, 9, 6])
-        out, err = self.run_main("--osd", "682", "--exclude-pgs", "19.99", pgs=[stable])
+        out, err = self.run_main(
+            "--osds", "682", "--exclude-pgs", "19.99", pgs=[stable]
+        )
         self.assertEqual(out, "")
         self.assertIn("No backfills into osd.682", err)
         self.assertIn("1 of 1 given PG id(s) matched", err)
@@ -1617,7 +1648,7 @@ class LoadStateCliTest(unittest.TestCase):
     def test_load_state_reproduces_the_live_output(self):
         live = run_cli(
             "--pgremapper-mappings",
-            "--osd",
+            "--osds",
             "682",
             path=self.with_ceph,
             no_rados=self.no_rados,
@@ -1633,7 +1664,7 @@ class LoadStateCliTest(unittest.TestCase):
         )
 
         replay = run_cli(
-            "--pgremapper-mappings", "--osd", "682", load_state=str(self.state)
+            "--pgremapper-mappings", "--osds", "682", load_state=str(self.state)
         )
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertEqual(replay.stdout, live.stdout)
@@ -1641,21 +1672,21 @@ class LoadStateCliTest(unittest.TestCase):
     def test_load_state_reproduces_the_live_table(self):
         # The table shows PROGRESS, so the live run queries each proposed PG's
         # backfill position through the fake ceph (see setUp).
-        live = run_cli("--osd", "682", path=self.with_ceph, no_rados=self.no_rados)
+        live = run_cli("--osds", "682", path=self.with_ceph, no_rados=self.no_rados)
         self.assertEqual(live.returncode, 0, live.stderr)
         self.assertIn("~", live.stdout)
-        replay = run_cli("--osd", "682", load_state=str(self.state))
+        replay = run_cli("--osds", "682", load_state=str(self.state))
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertEqual(replay.stdout, live.stdout)
         self.assertEqual(replay.stderr, live.stderr)
 
     def test_load_reports_a_missing_directory_and_a_missing_file(self):
-        result = run_cli("--osd", "682", load_state=str(self.root / "nope"))
+        result = run_cli("--osds", "682", load_state=str(self.root / "nope"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not found", result.stderr)
 
         (self.state / "pg_dump_pgs.json").unlink()
-        result = run_cli("--osd", "682", load_state=str(self.state))
+        result = run_cli("--osds", "682", load_state=str(self.state))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing", result.stderr)
 
@@ -1709,14 +1740,14 @@ EXPECTED_896_DEFAULT = """\
 
 def fixture_plan(fixture, osd, *flags):
     """Return plan()'s StopResult for osd on a fixture directory."""
-    return plan_from_state(cb, fixture, *flags, "--osd", str(osd))
+    return plan_from_state(cb, fixture, *flags, "--osds", str(osd))
 
 
 class FixtureReplayTest(unittest.TestCase):
     """Replay the real-cluster snapshot in tests/backfillctl/test-data (see its README.txt)."""
 
     def replay(self, osd, *flags):
-        result = run_cli(*flags, "--osd", str(osd), load_state=str(FIXTURE))
+        result = run_cli(*flags, "--osds", str(osd), load_state=str(FIXTURE))
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -1781,6 +1812,16 @@ class FixtureReplayTest(unittest.TestCase):
         err = self.replay(896, "--pin-blockers").stderr
         self.assertIn("(blockers: 7)", flat(err))
         self.assertNotIn("--pin-blockers was not given", err)
+
+    def test_several_osds_pin_the_union_of_their_backfills(self):
+        one = pins(self.plan(896).cancellations) + pins(self.plan(74).cancellations)
+        both = plan_from_state(cb, FIXTURE, "--osds", "896", "74")
+        self.assertEqual(sorted(pins(both.cancellations)), sorted(one))
+        result = run_cli("--osds", "896", "74", load_state=str(FIXTURE))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        err = flat(result.stderr)
+        self.assertIn("osd.74 (host14) is at 90.7%, osd.896 (host51) at 81.1%.", err)
+        self.assertIn("of their capacity", err)
 
     def test_osd_74_needs_no_companions(self):
         self.assertEqual(
@@ -1874,7 +1915,7 @@ class ChainFixtureReplayTest(unittest.TestCase):
     while osd.579 still holds shard 8, which is going to osd.825."""
 
     def replay(self, *flags):
-        result = run_cli(*flags, "--osd", "891", load_state=str(FIXTURE))
+        result = run_cli(*flags, "--osds", "891", load_state=str(FIXTURE))
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -1908,7 +1949,7 @@ class ChainFixtureReplayTest(unittest.TestCase):
         chained = 0
         for osd in sorted(targets):
             cancellations, _ = cb.plan_cancellations(
-                pgs, pools, ecp, osd, osd_host, rules, osd_df, pct, True
+                pgs, pools, ecp, {osd}, osd_host, rules, osd_df, pct, True
             )
             resolved = shared.avoid_chains(cancellations, {}, pgs, osd_host, False)
             by_pg = {}
@@ -1925,7 +1966,7 @@ FIXTURE_CHAINS = FIXTURE.parent / "ceph2-cancel-backfill-chained-pairs-upmap"
 
 class ChainedPairsFixtureTest(unittest.TestCase):
     """Chains among pins, into existing pairs, and among existing pairs (see
-    the fixture's README.txt), cancelled without --osd."""
+    the fixture's README.txt), cancelled without --osds."""
 
     @classmethod
     def setUpClass(cls):
@@ -1994,7 +2035,7 @@ class BlockerFixtureReplayTest(unittest.TestCase):
     with --pin-blockers -- this fixture is the reason the flag exists."""
 
     def replay(self, *flags):
-        result = run_cli(*flags, "--osd", "896", load_state=str(FIXTURE_BLOCKER))
+        result = run_cli(*flags, "--osds", "896", load_state=str(FIXTURE_BLOCKER))
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -2054,7 +2095,7 @@ class BlockerFixtureReplayTest(unittest.TestCase):
 
 
 class CancelWholePgTest(unittest.TestCase):
-    """cancel_whole_pg: every moving shard of one PG, as used without --osd."""
+    """cancel_whole_pg: every moving shard of one PG, as used without --osds."""
 
     def cancel(self, up, acting, is_ec=True, osd_host=None):
         return cb.cancel_whole_pg(up, acting, is_ec, osd_host or {})
@@ -2123,9 +2164,9 @@ class CancelWholePgTest(unittest.TestCase):
 
 
 def run_plan_all(pgs, **kwargs):
-    """plan_cancellations without --osd, on the same tiny cluster as run_plan."""
+    """plan_cancellations without --osds, on the same tiny cluster as run_plan."""
     return cb.plan_cancellations(
-        pgs, {19: EC_POOL, 7: REP_POOL}, EC_PROFILES, None, {}, RULES, **kwargs
+        pgs, {19: EC_POOL, 7: REP_POOL}, EC_PROFILES, set(), {}, RULES, **kwargs
     )
 
 
@@ -2141,7 +2182,7 @@ class PlanAllTest(unittest.TestCase):
         self.assertEqual(skipped, [])
 
     def test_no_pin_is_a_companion(self):
-        # with --osd 682, 9->4 would be a companion of shard 0 (see MainTest)
+        # with --osds 682, 9->4 would be a companion of shard 0 (see MainTest)
         cancellations, _ = run_plan_all([pg("19.d", [OSD, 2, 3, 9], [8, 2, 3, 4])])
         self.assertEqual(pins(cancellations), ["19.d 682 8", "19.d 9 4"])
         self.assertEqual({c.companion_of for c in cancellations}, {None})
@@ -2163,14 +2204,14 @@ class PlanAllTest(unittest.TestCase):
                 [pg("19.9", [10, 2, 3, 4], [1, 2, 3, 4])],
                 {19: EC_POOL},
                 EC_PROFILES,
-                None,
+                set(),
                 {},
                 {},
             )
 
 
 class MainAllTest(unittest.TestCase):
-    """plan() and run() without --osd, on MainTest's canned cluster."""
+    """plan() and run() without --osds, on MainTest's canned cluster."""
 
     run_main = MainTest.run_main
     plan = MainTest.plan
@@ -2178,7 +2219,7 @@ class MainAllTest(unittest.TestCase):
 
     def test_plan_pins_every_moving_shard(self):
         result = self.plan()
-        self.assertIsNone(result.osd)
+        self.assertEqual(result.osds, [])
         self.assertEqual(
             pins(result.cancellations), ["19.9 682 8", "19.d 682 8", "19.d 9 4"]
         )
@@ -2188,7 +2229,7 @@ class MainAllTest(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
             self.plan("--pin-blockers")
-        self.assertIn("--pin-blockers requires --osd", str(cm.exception))
+        self.assertIn("--pin-blockers requires --osds", str(cm.exception))
 
     def test_summary_counts_shards_and_pgs_and_no_blocker_note(self):
         _, err = self.run_main()
@@ -2211,7 +2252,7 @@ class MainAllTest(unittest.TestCase):
 
 
 class FixtureAllTest(unittest.TestCase):
-    """cancel-backfill without --osd on the real-cluster snapshot."""
+    """cancel-backfill without --osds on the real-cluster snapshot."""
 
     @classmethod
     def setUpClass(cls):
@@ -2230,7 +2271,7 @@ class FixtureAllTest(unittest.TestCase):
         )
 
     def test_contains_every_pin_the_osd_896_run_proposes(self):
-        # --osd 896's pins, companions included, all cancel moving shards
+        # --osds 896's pins, companions included, all cancel moving shards
         everything = set(pins(self.result.cancellations))
         self.assertLessEqual(set(EXPECTED_896_DEFAULT.splitlines()), everything)
 

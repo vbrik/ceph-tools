@@ -7,7 +7,7 @@ backfillfull_ratio, which keeps the whole PG in backfill_toofull.
 
 Captured: 2026-09-21 from a live cluster, with
 
-  backfillctl cancel-backfill --save-state <this directory> --osd 896
+  backfillctl cancel-backfill --save-state <this directory> --osds 896
 
 which stores the (anonymized) output of these commands:
 
@@ -91,9 +91,9 @@ chain 891->579, 579->825, which Ceph only applies in the order 579->825 first.
 Dry runs of pgremapper 1.0.0 on exactly this PG: in the valid order
 import-mappings panics ("conflicting mapping 579->825 found when trying to map
 891->579"), and in the order 891->579, 579->825 it plans the single pair
-891->825, a different mapping. So with --osd 891 the tool leaves the PG
+891->825, a different mapping. So with --osds 891 the tool leaves the PG
 out (its requested pin is the chain's head) and prints 'ceph osd
-pg-upmap-items 19.1299 579 825 891 579' on stderr; without --osd it keeps
+pg-upmap-items 19.1299 579 825 891 579' on stderr; without --osds it keeps
 579->825 and leaves 891->579 running. Replay with osd 891 (or 274, 883, 884, ... for the others);
 none of the 13 is a ring.
 
