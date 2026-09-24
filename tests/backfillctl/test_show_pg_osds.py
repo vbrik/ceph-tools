@@ -354,17 +354,38 @@ class MainTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.write_snapshots(tmp)
             with self.assertRaises(SystemExit) as ctx:
-                self.run_main("99.99", load_state=tmp)
-        self.assertIn("99.99", str(ctx.exception))
+                # a valid id of pool 5 (pg_num 8), but not in the dump
+                self.run_main("5.7", load_state=tmp)
+        self.assertIn("5.7", str(ctx.exception))
         self.assertIn("pg_dump_pgs.json", str(ctx.exception))
 
-    def test_pool_missing_from_pool_ls_is_treated_as_replicated_of_unknown_size(self):
+    def test_pool_missing_from_pool_ls_is_an_error(self):
+        # Not guessed as replicated: an EC PG's rows would be plausible but wrong.
         snaps = {**self.SNAPSHOTS, "pool_ls_detail": []}
         with tempfile.TemporaryDirectory() as tmp:
             self.write_snapshots(tmp, snaps)
-            (view,) = plan_from_state(op, tmp, "5.3").pgs
-        self.assertEqual([Row("-", 1, 1), Row("-", 2, 4)], view.rows)
-        self.assertEqual([None, shared.Progress(50.0, False)], view.progress)
+            with self.assertRaises(SystemExit) as ctx:
+                plan_from_state(op, tmp, "5.3")
+        self.assertIn("no such PG(s): 5.3 (no pool 5)", str(ctx.exception))
+
+    def test_every_nonexistent_pg_is_named_before_any_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_snapshots(tmp)
+            with self.assertRaises(SystemExit) as ctx:
+                plan_from_state(op, tmp, "5.3", "5.8", "9.1")
+        self.assertEqual(
+            str(ctx.exception),
+            "ERROR: no such PG(s): 5.8 (pool 5 has 8 PGs), 9.1 (no pool 9).",
+        )
+
+    def test_pgids_are_parsed_and_normalized(self):
+        self.assertEqual(parse_args(op, ["5.03", "19.92E"]).pgids, ["5.3", "19.92e"])
+        for bad in ("5", "5.", "5.g", "x.1", "5.3.1"):
+            with self.subTest(bad=bad):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                    parse_args(op, [bad])
+                self.assertIn("expected a PG id like 19.2a1", err.getvalue())
 
     def test_several_pgs_print_a_block_each_and_footnotes_once(self):
         with tempfile.TemporaryDirectory() as tmp:

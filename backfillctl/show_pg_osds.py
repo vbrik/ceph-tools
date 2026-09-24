@@ -34,6 +34,7 @@ from shared import (
     format_progress,
     is_erasure,
     osd_cells,
+    parse_pgid,
     pgid_pool_id,
     print_table,
     real_osd_set,
@@ -161,6 +162,25 @@ class PgView(NamedTuple):
     upmap_pairs: list[dict]
 
 
+def check_pgids_exist(pgids: list[str], pools: dict[int, dict]) -> None:
+    """Exit naming every PG id whose pool is unknown or past its pool's pg_num.
+
+    Checked before any 'ceph pg query', whose error for a missing PG is
+    Ceph's own. An unknown pool would also have its EC shards paired as
+    replicas.
+    """
+    bad = []
+    for pgid in pgids:
+        pool = pools.get(pgid_pool_id(pgid))
+        seed = int(pgid.split(".")[1], 16)
+        if pool is None:
+            bad.append(f"{pgid} (no pool {pgid_pool_id(pgid)})")
+        elif "pg_num" in pool and seed >= pool["pg_num"]:
+            bad.append(f"{pgid} (pool {pool['pool_id']} has {pool['pg_num']} PGs)")
+    if bad:
+        sys.exit(f"ERROR: no such PG(s): {', '.join(bad)}.")
+
+
 class ShowResult(NamedTuple):
     """What plan() looked up, for render() to print."""
 
@@ -175,8 +195,9 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> ShowResult:
     An unknown PG exits before anything is printed.
     """
     pgids = list(dict.fromkeys(args.pgids))  # drop duplicates, keep order
-    pgs = {pgid: fetch_pg_info(store, pgid) for pgid in pgids}
     pools = fetch_pools(store)
+    check_pgids_exist(pgids, pools)
+    pgs = {pgid: fetch_pg_info(store, pgid) for pgid in pgids}
     osd_host = fetch_osd_hosts(store)
     osd_df = fetch_osd_df(store)
     upmap_items = fetch_upmap_items(store)
@@ -234,7 +255,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         description=__doc__,
         formatter_class=HelpFormatter,
     )
-    parser.add_argument("pgids", nargs="+", metavar="PGID")
+    parser.add_argument("pgids", nargs="+", type=parse_pgid, metavar="PGID")
     add_load_state_arg(parser, after_command=True)
     return parser
 

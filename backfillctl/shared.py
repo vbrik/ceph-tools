@@ -626,6 +626,17 @@ def parse_osd(text: str) -> int:
     return int(match[1])
 
 
+def parse_pgid(text: str) -> str:
+    """argparse type: a PG id like '19.2a1', normalized as Ceph prints it.
+
+    Lowercase hex, no leading zeros, so '19.092E' matches '19.92e'.
+    """
+    match = re.fullmatch(r"(\d+)\.([0-9a-fA-F]+)", text)
+    if match is None:
+        raise argparse.ArgumentTypeError(f"expected a PG id like 19.2a1, got {text!r}")
+    return f"{int(match[1])}.{int(match[2], 16):x}"
+
+
 def percentage_points(text: str) -> float:
     """argparse type: a number from 0 to 100, e.g. a utilization difference."""
     try:
