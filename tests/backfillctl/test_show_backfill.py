@@ -101,15 +101,18 @@ SNAPSHOTS = {
 
 class MainTest(unittest.TestCase):
     def run_main(self, *argv, snapshots=SNAPSHOTS):
-        out = io.StringIO()
+        """Run the command; return stdout, and keep stderr (collapsed) as self.err."""
+        out, err = io.StringIO(), io.StringIO()
         args = parse_args(pm, argv)
         with (
             mock.patch.object(
                 shared.SnapshotStore, "json", lambda self, key: snapshots[key]
             ),
             contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
         ):
             pm.run(args)
+        self.err = " ".join(err.getvalue().split())
         return out.getvalue()
 
     def plan(self, *argv, snapshots=SNAPSHOTS):
@@ -181,7 +184,9 @@ class MainTest(unittest.TestCase):
         out = self.run_main()
         line = next(ln for ln in out.splitlines() if ln.startswith("5.1f"))
         self.assertIn("0(ceph1)*", line)
-        self.assertIn("* marks the PG's primary", out)
+        self.assertIn("NOTE: * marks the PG's primary", self.err)
+        self.assertIn("4 shard movement(s) across 4 PG(s).", self.err)
+        self.assertNotIn("movement(s)", out)
 
     def test_counter_progress_is_marked_and_explained(self):
         # No backfill positions (the tests' stubbed live query returns none):
@@ -190,7 +195,8 @@ class MainTest(unittest.TestCase):
         out = self.run_main()
         line = next(ln for ln in out.splitlines() if ln.startswith("5.1f"))
         self.assertIn(" ~100% ", line)
-        self.assertIn("~ marks PROGRESS from Ceph's misplaced/degraded", out)
+        self.assertNotIn("~ marks", out)  # notes go to stderr
+        self.assertIn("NOTE: ~ marks PROGRESS from Ceph's misplaced/degraded", self.err)
 
     def test_shard_beside_one_with_no_osd_yet_gets_its_own_progress(self):
         # 27.9's shard 3 is moving; its shard 4 has no OSD anywhere, which
@@ -253,7 +259,8 @@ class MainTest(unittest.TestCase):
     def test_no_movement(self):
         snaps = {**SNAPSHOTS, "pg_dump_pgs": [PGS[2]]}
         self.assertEqual([], self.plan(snapshots=snaps).rows)
-        self.assertEqual("No PG movements detected.\n", self.run_main(snapshots=snaps))
+        self.assertEqual("", self.run_main(snapshots=snaps))
+        self.assertEqual("No PG movements detected.", self.err)
 
     def test_pg_stats_not_ready_is_an_error_naming_the_command(self):
         snaps = {**SNAPSHOTS, "pg_dump_pgs": {"pg_ready": False}}
@@ -340,11 +347,12 @@ class FilterTest(unittest.TestCase):
         out, err = self.run_main("--pgs", "5.3", "--osds", "1")
         self.assertIn("1 of 1 given PG id(s) have movement", err)
         self.assertNotIn("matched nothing", err)
-        self.assertEqual("No PG movements match --osds/--pgs.\n", out)
+        self.assertEqual("", out)
+        self.assertIn("No PG movements match --osds/--pgs.", err)
 
     def test_no_note_without_pgs(self):
         _, err = self.run_main("--osds", "3")
-        self.assertEqual("", err)
+        self.assertNotIn("--pgs", err)
 
 
 FIXTURE_STUCK_AT_100 = (
@@ -380,11 +388,14 @@ class FixtureReplayTest(unittest.TestCase):
         )
 
     def test_approx_note_appears_for_the_capture_without_positions(self):
-        out = io.StringIO()
+        err = io.StringIO()
         args = parse_args(pm, [], load_state=str(FIXTURE_STUCK_AT_100))
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             pm.run(args)
-        self.assertIn("~ marks PROGRESS from Ceph's misplaced/degraded", out.getvalue())
+        self.assertIn(
+            "~ marks PROGRESS from Ceph's misplaced/degraded",
+            " ".join(err.getvalue().split()),
+        )
 
     def test_resumed_backfills_show_their_real_progress(self):
         # 27.500's counters read 100%, its backfill position 6.6% (see the

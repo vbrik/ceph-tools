@@ -1085,7 +1085,12 @@ def wrap_text(text: str, indent: str = "") -> str:
 
 
 def stderr_para(text: str) -> None:
-    """Print a wrapped stderr paragraph, separated from the previous by a blank line."""
+    """Print a wrapped stderr paragraph, separated from the previous by a blank line.
+
+    Flushes stdout first, so a table and the notes about it keep their
+    order when both streams go to one pipe (2>&1).
+    """
+    sys.stdout.flush()
     if stderr_para.printed:
         print(file=sys.stderr)
     print(wrap_text(text), file=sys.stderr)
@@ -1101,6 +1106,7 @@ def stderr_items(items: Iterable[str]) -> None:
     For the details under a stderr_para summary, e.g. each shard that could
     not be pinned or placed.
     """
+    sys.stdout.flush()
     for item in items:
         print(wrap_text(item, indent="  "), file=sys.stderr)
 

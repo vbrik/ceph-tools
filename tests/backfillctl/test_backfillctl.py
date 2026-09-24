@@ -103,6 +103,28 @@ class LoadStateTest(unittest.TestCase):
             self.assertIn("unrecognized arguments: --load-state", result.stderr)
             self.assertFalse(target.exists())
 
+    def test_stdout_is_the_table_and_notes_follow_it_on_stderr(self):
+        alone = run_backfillctl("--load-state", str(FIXTURE), "show-backfill")
+        self.assertTrue(alone.stdout.startswith("PGID"))
+        self.assertNotIn("movement(s)", alone.stdout)
+        self.assertIn("movement(s)", alone.stderr)
+        # 2>&1: stdout is flushed before each note, so the order holds.
+        both = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "backfillctl"),
+                "--load-state",
+                str(FIXTURE),
+                "show-backfill",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        ).stdout
+        self.assertTrue(both.startswith("PGID"))
+        self.assertLess(both.rindex("act+"), both.index("shard movement(s)"))
+
     def test_missing_directory_is_reported(self):
         result = run_backfillctl("--load-state", "/nonexistent-dir", "show-backfill")
         self.assertNotEqual(result.returncode, 0)

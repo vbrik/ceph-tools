@@ -21,6 +21,7 @@ from shared import (
     extract_pg_stats,
     query_backfill_positions,
     resolve_save_dir,
+    stderr_para,
 )
 from shared import anonymize_snapshots as anonymize_common
 
@@ -103,7 +104,7 @@ def run(args: argparse.Namespace) -> None:
     (save_dir / BACKFILL_POSITIONS_FILE).write_text(
         json.dumps(positions, separators=(",", ":"))
     )
-    print(
+    stderr_para(
         f"Saved {len(SNAPSHOT_COMMANDS)} snapshot(s) and the backfill positions "
-        f"of {len(positions)} remapped PG(s) to {save_dir}"
+        f"of {len(positions)} remapped PG(s) to {save_dir}."
     )

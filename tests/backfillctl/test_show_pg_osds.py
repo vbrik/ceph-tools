@@ -164,13 +164,14 @@ class RenderFootnoteTest(unittest.TestCase):
     """render()'s footnotes, on results built by hand."""
 
     def render(self, acting_primary, up_primary):
+        """Return stdout and stderr, together, as a terminal would show them."""
         pg = {"state": "s", "acting_primary": acting_primary, "up_primary": up_primary}
         rows = [op.ShardRow(0, 1, 1), op.ShardRow(1, 2, 3)]
         view = op.PgView("1.0", pg, rows, [None, None], [])
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        both = io.StringIO()
+        with contextlib.redirect_stdout(both), contextlib.redirect_stderr(both):
             op.render(op.ShowResult([view], {}, {}))
-        return out.getvalue()
+        return " ".join(both.getvalue().split())
 
     def test_primary_note_when_a_primary_is_shown(self):
         self.assertIn("1*", self.render(1, 1))
@@ -282,10 +283,12 @@ class MainTest(unittest.TestCase):
         return snaps
 
     def run_main(self, *argv, load_state=None):
-        out = io.StringIO()
+        """Run the command; return stdout, and keep stderr (collapsed) as self.err."""
+        out, err = io.StringIO(), io.StringIO()
         args = parse_args(op, argv, load_state=load_state)
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             op.run(args)
+        self.err = " ".join(err.getvalue().split())
         return out.getvalue()
 
     def test_replicated_pg_from_a_saved_state(self):
@@ -334,7 +337,7 @@ class MainTest(unittest.TestCase):
             self.write_snapshots(tmp, snaps)
             out = self.run_main("5.3", load_state=tmp)
         self.assertIn(" ~100%", out)
-        self.assertIn("~ marks PROGRESS from Ceph's misplaced/degraded", out)
+        self.assertIn("NOTE: ~ marks PROGRESS from Ceph's misplaced/degraded", self.err)
 
     def test_live_progress_from_the_pg_query(self):
         # The query run() makes anyway carries the position: 50% exact, and
@@ -401,17 +404,18 @@ class MainTest(unittest.TestCase):
         )
         # Blocks are separated by a blank line.
         self.assertIn("\n\nPG 5.3  state:", out)
-        self.assertEqual(1, out.count("* marks the primary"))
-        self.assertEqual(1, out.count("~ marks PROGRESS"))
-        # Both footnotes start with the mark they explain, '*' first.
-        self.assertLess(out.index("* marks"), out.index("~ marks"))
+        # Notes go to stderr, each once, '*' first; stdout holds only tables.
+        self.assertNotIn("marks", out)
+        self.assertEqual(1, self.err.count("NOTE: * marks the primary"))
+        self.assertEqual(1, self.err.count("NOTE: ~ marks PROGRESS"))
+        self.assertLess(self.err.index("* marks"), self.err.index("~ marks"))
 
     def test_footnote_on_progress_only_when_some_pg_is_remapped(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.write_snapshots(tmp, self.two_pg_snapshots())
-            out = self.run_main("5.4", load_state=tmp)
-        self.assertNotIn("~ marks PROGRESS", out)
-        self.assertIn("* marks the primary", out)
+            self.run_main("5.4", load_state=tmp)
+        self.assertNotIn("~ marks PROGRESS", self.err)
+        self.assertIn("* marks the primary", self.err)
 
     def test_duplicate_pgids_are_shown_once(self):
         with tempfile.TemporaryDirectory() as tmp:

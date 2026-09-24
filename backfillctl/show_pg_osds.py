@@ -39,6 +39,7 @@ from shared import (
     print_table,
     real_osd_set,
     slot,
+    stderr_para,
     target_peer,
 )
 
@@ -292,9 +293,9 @@ def render(result: ShowResult) -> None:
         )
 
     if any_primary:
-        print(f"\n{PRIMARY_NOTE}")
+        stderr_para(f"NOTE: {PRIMARY_NOTE}")
     if any_approx:
-        print(f"\n{PROGRESS_APPROX_NOTE}")
+        stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
 
 
 def run(args: argparse.Namespace) -> None:

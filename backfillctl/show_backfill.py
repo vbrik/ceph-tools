@@ -48,6 +48,7 @@ from shared import (
     print_pgid_filter,
     print_table,
     real_osd_set,
+    stderr_para,
     target_peer,
 )
 
@@ -378,7 +379,7 @@ def render(result: MovementsResult) -> None:
     if pgs_filter is not None:
         print_pgid_filter("--pgs", pgs_filter, "have movement", "not moving")
     if not rows:
-        print(
+        stderr_para(
             "No PG movements match --osds/--pgs."
             if filtered
             else "No PG movements detected."
@@ -386,15 +387,12 @@ def render(result: MovementsResult) -> None:
         return
 
     print_table(COLUMNS, [format_row(r, osd_df, osd_host) for r in rows])
-
-    if any(shows_primary(r) for r in rows):
-        print(f"\n{PRIMARY_NOTE}")
-
-    if any(r.progress_pct is not None and not r.progress_exact for r in rows):
-        print(f"\n{PROGRESS_APPROX_NOTE}")
-
     num_pgs = len({r.pgid for r in rows})
-    print(f"\n{len(rows)} shard movement(s) across {num_pgs} PG(s).")
+    stderr_para(f"{len(rows)} shard movement(s) across {num_pgs} PG(s).")
+    if any(shows_primary(r) for r in rows):
+        stderr_para(f"NOTE: {PRIMARY_NOTE}")
+    if any(r.progress_pct is not None and not r.progress_exact for r in rows):
+        stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
 
 
 def run(args: argparse.Namespace) -> None:
