@@ -73,6 +73,7 @@ from shared import (
     HelpFormatter,
     SnapshotStore,
     add_load_state_arg,
+    add_pgremapper_mappings_arg,
     chain_link,
     fetch_crush_rules,
     fetch_ec_profiles,
@@ -164,6 +165,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         metavar="N",
         help="Propose at most N moves (default: no limit).",
     )
+    add_pgremapper_mappings_arg(parser)
     add_load_state_arg(parser, after_command=True)
     return parser
 

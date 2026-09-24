@@ -65,6 +65,7 @@ from shared import (
     PgidFilter,
     SnapshotStore,
     add_load_state_arg,
+    add_pgremapper_mappings_arg,
     fetch_crush_rules,
     fetch_ec_profiles,
     fetch_osd_df,
@@ -140,6 +141,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         metavar="PGID",
         help="Consider only these PGs.",
     )
+    add_pgremapper_mappings_arg(parser)
     add_load_state_arg(parser, after_command=True)
     return parser
 

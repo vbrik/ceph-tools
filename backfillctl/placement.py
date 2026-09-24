@@ -45,7 +45,7 @@ def positive_int(text: str) -> int:
 
 
 def add_target_args(parser: argparse.ArgumentParser):
-    """Add --max-target-util, --max-target-uses and --pgremapper-mappings."""
+    """Add --max-target-util and --max-target-uses."""
     parser.add_argument(
         "--max-target-util",
         type=shared.utilization_pct,
@@ -60,7 +60,6 @@ def add_target_args(parser: argparse.ArgumentParser):
         metavar="N",
         help="Maximum shards per target OSD (default: %(default)s).",
     )
-    shared.add_pgremapper_mappings_arg(parser)
 
 
 # ---------------------------------------------------------------------------

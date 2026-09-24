@@ -66,6 +66,7 @@ from shared import (
     HelpFormatter,
     SnapshotStore,
     add_load_state_arg,
+    add_pgremapper_mappings_arg,
     close_pins,
     fetch_crush_rules,
     fetch_ec_profiles,
@@ -177,6 +178,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "(default: nearfull_ratio).",
     )
     add_target_args(parser)
+    add_pgremapper_mappings_arg(parser)
     add_load_state_arg(parser, after_command=True)
     return parser
 
