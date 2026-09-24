@@ -1055,6 +1055,19 @@ class ParseOsdTest(unittest.TestCase):
                 shared.parse_osd(text)
 
 
+class FormatPairsTest(unittest.TestCase):
+    def test_one_format_for_every_list_of_pairs(self):
+        self.assertEqual(
+            shared.format_pairs([(890, 414), (414, 341)]), "890->414, 414->341"
+        )
+        self.assertEqual(shared.format_link((1, 2), (2, 3)), "1->2, 2->3")
+        self.assertEqual(shared.format_pairs([]), "")
+
+    def test_cycle_message_uses_it(self):
+        _, why = shared.order_moves([(0, 20, 30), (1, 30, 20)])
+        self.assertIn("cycle (20->30, 30->20)", why)
+
+
 class PgidFilterTest(unittest.TestCase):
     """PgidFilter.of and print_pgid_filter: the --pgs/--exclude-pgs note."""
 

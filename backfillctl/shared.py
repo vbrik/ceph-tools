@@ -1325,7 +1325,7 @@ def order_moves(
             if not any(other[1] == move[2] for other in remaining if other is not move):
                 break
         else:
-            ring = ", ".join(f"osd.{f}->osd.{t}" for _, f, t in remaining)
+            ring = format_pairs((f, t) for _, f, t in remaining)
             return [], f"the pins form a cycle ({ring}), which upmaps cannot express"
         ordered.append(move)
         remaining.remove(move)
@@ -1394,9 +1394,14 @@ def chain_heads(
     ]
 
 
+def format_pairs(pairs: Iterable[Pair]) -> str:
+    """Format upmap pairs the way every command prints them: '890->414, 414->341'."""
+    return ", ".join(f"{f}->{t}" for f, t in pairs)
+
+
 def format_link(first: Pair, second: Pair) -> str:
-    """Format two chained pairs, e.g. '890->414, 414->341'."""
-    return f"{first[0]}->{first[1]}, {second[0]}->{second[1]}"
+    """Format two chained pairs (format_pairs)."""
+    return format_pairs([first, second])
 
 
 def host_clash(

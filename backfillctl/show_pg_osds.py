@@ -31,6 +31,7 @@ from shared import (
     fetch_pg_stats,
     fetch_pools,
     fetch_upmap_items,
+    format_pairs,
     format_progress,
     is_erasure,
     osd_cells,
@@ -227,8 +228,8 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> ShowResult:
 def format_upmaps(pairs: list[dict], row: ShardRow) -> str:
     """Return the 'from->to' pairs involving the row's acting or up OSD."""
     osds = {row.acting, row.up} - {None}
-    touching = [f"{p['from']}->{p['to']}" for p in pairs if {p["from"], p["to"]} & osds]
-    return ",".join(touching) or NOT_APPLICABLE
+    touching = [(p["from"], p["to"]) for p in pairs if {p["from"], p["to"]} & osds]
+    return format_pairs(touching) or NOT_APPLICABLE
 
 
 def format_row(

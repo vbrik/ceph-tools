@@ -76,7 +76,9 @@ class FormatTest(unittest.TestCase):
         ]
         self.assertEqual("226->59", op.format_upmaps(pairs, Row(3, 226, 59)))
         # Either side matches; several pairs are comma-joined.
-        self.assertEqual("148->134,830->556", op.format_upmaps(pairs, Row(0, 134, 830)))
+        self.assertEqual(
+            "148->134, 830->556", op.format_upmaps(pairs, Row(0, 134, 830))
+        )
         self.assertEqual("-", op.format_upmaps(pairs, Row(1, 1, 2)))
         self.assertEqual("-", op.format_upmaps([], Row(1, 1, 2)))
 
@@ -87,7 +89,7 @@ class FormatTest(unittest.TestCase):
 
     def test_upmaps_chained_pair(self):
         pairs = [{"from": 1, "to": 2}, {"from": 2, "to": 3}]
-        self.assertEqual("1->2,2->3", op.format_upmaps(pairs, Row(0, 2, 2)))
+        self.assertEqual("1->2, 2->3", op.format_upmaps(pairs, Row(0, 2, 2)))
 
     def test_row_progress(self):
         def progress(p):
