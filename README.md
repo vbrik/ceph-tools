@@ -47,6 +47,10 @@ Apply the proposals with `--pgremapper-mappings` and
 which adds to a PG's existing upmap pairs. `ceph osd pg-upmap-items` replaces
 them all. The remapping commands assume the CRUSH failure domain is `host`.
 
+pgremapper cannot apply chained pairs (A->B, B->C), which cancelling some EC
+backfills needs. The cancel commands leave such backfills running, and print
+`ceph osd pg-upmap-items` commands that would cancel them too.
+
 | Command | Purpose |
 |---|---|
 | `show-backfill` | What is moving: source and target OSDs, type, progress and state, per EC shard or replicated PG. Filter with `--osds` and `--pgs`. |

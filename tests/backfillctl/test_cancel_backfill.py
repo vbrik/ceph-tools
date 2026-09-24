@@ -526,34 +526,180 @@ def run_plan_with_df(pgs, df, ratio=RATIO, pin_blockers=True, exclude_pgs=None):
     )
 
 
-class ChainedPgsTest(unittest.TestCase):
-    def c(self, pgid, shard, up, acting):
-        return cb.Cancellation(pgid, shard, up, acting, None, "s", None)
+def up_pg(pgid: str, up: list) -> dict:
+    """The part of a PG's stats avoid_chains reads."""
+    return {"pgid": pgid, "up": up}
 
-    def test_finds_only_pgs_with_chained_pairs_in_order(self):
+
+class AvoidChainsTest(unittest.TestCase):
+    """shared.avoid_chains: what pgremapper can apply, per PG."""
+
+    def c(self, pgid, shard, up, acting, companion_of=None, blocker_util=None):
+        return cb.Cancellation(
+            pgid, shard, up, acting, None, "s", None, companion_of, blocker_util
+        )
+
+    def avoid(self, cs, ups, upmaps=None, osd_host=None, partial=True):
+        return shared.avoid_chains(
+            cs,
+            {
+                pgid: [{"from": f, "to": t} for f, t in pairs]
+                for pgid, pairs in (upmaps or {}).items()
+            },
+            [up_pg(pgid, up) for pgid, up in ups.items()],
+            osd_host or {},
+            partial,
+        )
+
+    # 19.9: shard 1 moves 20->30 while shard 0 moves onto osd.20
+    CHAIN_UP: ClassVar[dict] = {"19.9": [682, 20, 3, 4]}
+
+    def chain(self, **kw):
+        return [self.c("19.9", 1, 20, 30), self.c("19.9", 0, 682, 20, **kw)]
+
+    def test_pgs_without_chains_pass_through_in_order(self):
+        cs = [self.c("19.1", 0, 1, 2), self.c("19.1", 1, 5, 6)]
+        result = self.avoid(cs, {"19.1": [1, 5, 3]})
+        self.assertEqual(result, (cs, [], {}))
+
+    def test_partial_keeps_the_last_pin_and_leaves_the_other_running(self):
+        tail, head = self.chain()
+        result = self.avoid([tail, head], self.CHAIN_UP)
+        self.assertEqual(result.cancellations, [tail])
+        ((pgid, shard, reason),) = result.skipped
+        self.assertEqual((pgid, shard), ("19.9", 0))
+        self.assertIn("682->20, 20->30 would chain", reason)
+        self.assertEqual(result.chained, {"19.9": [(20, 30), (682, 20)]})
+
+    def test_only_the_last_pin_of_a_longer_chain_stays(self):
+        # 682->20, 20->30, 30->40: only 30->40 is valid on its own
         cs = [
-            self.c("19.1", 0, 1, 2),
-            self.c("19.1", 1, 5, 6),  # independent
-            self.c("19.9", 0, 20, 30),
-            self.c("19.9", 1, 682, 20),  # chains with the pair above
+            self.c("19.9", 2, 30, 40),
+            self.c("19.9", 1, 20, 30),
+            self.c("19.9", 0, 682, 20),
         ]
-        chained = cb.chained_pgs(cs)
-        self.assertEqual(list(chained), ["19.9"])
-        self.assertEqual(len(chained["19.9"]), 2)
+        result = self.avoid(cs, {"19.9": [682, 20, 30, 4]})
+        self.assertEqual(result.cancellations, cs[:1])
+        self.assertEqual([s.shard for s in result.skipped], [1, 0])
 
-    def test_none_when_nothing_chains(self):
-        self.assertEqual(cb.chained_pgs([self.c("19.1", 0, 1, 2)]), {})
+    def test_without_partial_a_requested_head_leaves_the_pg_out(self):
+        tail, head = self.chain()
+        tail = tail._replace(companion_of=0)
+        result = self.avoid([tail, head], self.CHAIN_UP, partial=False)
+        self.assertEqual(result.cancellations, [])
+        # only the requested shard is reported, as for other refusals
+        self.assertEqual([(s.pgid, s.shard) for s in result.skipped], [("19.9", 0)])
+        self.assertIn("19.9", result.chained)
 
-    def test_warning_gives_the_commands_in_apply_order(self):
-        chained = {"19.9": [self.c("19.9", 1, 20, 30), self.c("19.9", 0, 682, 20)]}
-        for left_out in (True, False):
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                cb.warn_chained_pgs(chained, left_out=left_out)
-            text = err.getvalue()
-            self.assertIn("ceph osd pg-upmap-items 19.9 20 30 682 20", text)
-            self.assertIn("panic", text)
-            self.assertEqual("left out of this output" in text, left_out)
+    def test_a_blocker_head_is_dropped_and_the_requested_pin_stays(self):
+        # requested shard 0 (5->6) chains with nothing; blocker shard 2
+        # (682->20) chains into blocker shard 1 (20->30)
+        requested = self.c("19.9", 0, 5, 6)
+        tail = self.c("19.9", 1, 20, 30, companion_of=0, blocker_util=95.0)
+        head = self.c("19.9", 2, 682, 20, companion_of=0, blocker_util=95.0)
+        result = self.avoid(
+            [requested, tail, head], {"19.9": [5, 20, 682, 4]}, partial=False
+        )
+        self.assertEqual(result.cancellations, [requested, tail])
+        ((_, shard, reason),) = result.skipped
+        self.assertEqual(shard, 2)
+        self.assertTrue(reason.startswith("blocker: "), reason)
+
+    def test_dropping_a_companion_head_breaks_host_validity_so_the_pg_is_left_out(self):
+        # requested shard 1 goes back to osd.30 on host H; companion shard 0
+        # was pinned because its target osd.31 is on H too. Leaving shard 0
+        # running would put osd.30 and osd.31 on H.
+        requested = self.c("19.9", 1, 20, 30)
+        companion = self.c("19.9", 0, 31, 20, companion_of=1)
+        result = self.avoid(
+            [requested, companion],
+            {"19.9": [31, 20, 3]},
+            osd_host={30: "H", 31: "H"},
+            partial=False,
+        )
+        self.assertEqual(result.cancellations, [])
+        ((_, shard, reason),) = result.skipped
+        self.assertEqual(shard, 1)
+        self.assertIn("osd.30 would share a host with osd.31", reason)
+
+    def test_partial_leaves_the_pg_out_when_the_rest_would_clash(self):
+        tail, head = self.chain()
+        result = self.avoid([tail, head], self.CHAIN_UP, osd_host={30: "H", 682: "H"})
+        self.assertEqual(result.cancellations, [])
+        self.assertEqual([s.shard for s in result.skipped], [1, 0])
+
+    def test_a_pin_chaining_into_an_existing_pair_is_dropped(self):
+        # 19.1128 in the chained-pairs fixture: existing 545->94, pin 888->545
+        pin = self.c("19.1128", 4, 888, 545)
+        other = self.c("19.1128", 1, 471, 866)
+        result = self.avoid(
+            [other, pin],
+            {"19.1128": [148, 471, 648, 328, 888, 70, 143, 352, 94, 61]},
+            upmaps={"19.1128": [(274, 148), (545, 94)]},
+        )
+        self.assertEqual(result.cancellations, [other])
+        self.assertEqual([s.shard for s in result.skipped], [4])
+        self.assertEqual(
+            result.chained["19.1128"],
+            [(274, 148), (545, 94), (471, 866), (888, 545)],
+        )
+
+    def test_a_pin_on_an_existing_pairs_target_folds_and_is_kept(self):
+        # existing 7->20 put osd.20 in 'up'; pinning 20->30 makes it 7->30,
+        # as pgremapper does: no chain
+        cs = [self.c("19.9", 1, 20, 30)]
+        result = self.avoid(cs, {"19.9": [1, 20, 3]}, upmaps={"19.9": [(7, 20)]})
+        self.assertEqual(result, (cs, [], {}))
+
+    def test_a_pin_undoing_an_existing_pair_is_kept(self):
+        cs = [self.c("19.9", 1, 20, 7)]
+        result = self.avoid(cs, {"19.9": [1, 20, 3]}, upmaps={"19.9": [(7, 20)]})
+        self.assertEqual(result, (cs, [], {}))
+
+    def test_a_stale_existing_pair_does_not_hide_a_chain(self):
+        # 24.20 in ceph1-backfills-stuck-at-100-pct: existing 652->636 is
+        # stale (652 still in 'up'), so pin 636->373 must not fold into it;
+        # pins 652->636 and 636->373 chain
+        tail, head = self.c("24.20", 12, 636, 373), self.c("24.20", 11, 652, 636)
+        result = self.avoid(
+            [tail, head],
+            {"24.20": [95, 86, 318, 188, 440, 525, 222, 529, 628, 85, 527, 652, 636]},
+            upmaps={"24.20": [(652, 636), (128, 188)]},
+        )
+        self.assertEqual(result.cancellations, [tail])
+        # the stale pair stays out of the full entry too
+        self.assertEqual(result.chained["24.20"], [(128, 188), (636, 373), (652, 636)])
+
+    def test_existing_chained_pairs_leave_the_pg_out(self):
+        # pgremapper would drop 110->753 as stale when changing the PG
+        cs = [self.c("19.3a4", 1, 256, 816)]
+        result = self.avoid(
+            cs,
+            {"19.3a4": [723, 256, 448, 110, 753]},
+            upmaps={"19.3a4": [(302, 723), (110, 753), (890, 110)]},
+        )
+        self.assertEqual(result.cancellations, [])
+        ((_, _, reason),) = result.skipped
+        self.assertIn("existing upmap pairs chain (890->110, 110->753)", reason)
+        self.assertEqual(
+            result.chained["19.3a4"], [(302, 723), (110, 753), (890, 110), (256, 816)]
+        )
+
+    def test_a_replicated_chain_through_an_existing_pair(self):
+        # existing 9->5; pinning 4->9 (osd.9 departing) chains with it
+        cs = [self.c("7.1", "-", 4, 9)]
+        result = self.avoid(cs, {"7.1": [1, 5, 4]}, upmaps={"7.1": [(9, 5)]})
+        self.assertEqual(result.cancellations, [])
+        self.assertEqual(result.chained, {"7.1": [(9, 5), (4, 9)]})
+
+    def test_warning_gives_whole_entries_in_apply_order(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            shared.warn_chains({"19.9": [(7, 8), (20, 30), (682, 20)]})
+        text = err.getvalue()
+        self.assertIn("ceph osd pg-upmap-items 19.9 7 8 20 30 682 20", text)
+        self.assertIn("pgremapper cannot apply", flat(text))
+        self.assertIn("removes part of such a chain as stale", flat(text))
 
 
 class NoteTest(unittest.TestCase):
@@ -695,20 +841,18 @@ class OutputTest(unittest.TestCase):
 class RenderTest(unittest.TestCase):
     """render() on results built by hand: no planning involved."""
 
-    # 19.f's pins chain (shard 1 frees osd.20 for shard 0), 19.2's do not.
-    CHAIN: ClassVar[list[cb.Cancellation]] = [
-        cb.Cancellation("19.f", 1, 20, 30, None, "s", None),
-        cb.Cancellation("19.f", 0, 682, 20, None, "s", None),
-    ]
+    # 19.f's pins chain (shard 1 frees osd.20 for shard 0), so avoid_chains
+    # left 19.f out; 19.2's pin is plain.
     PLAIN = cb.Cancellation("19.2", 0, 682, 8, None, "s", None)
+    CHAINED: ClassVar[dict] = {"19.f": [(20, 30), (682, 20)]}
 
     def render(self, *argv, **fields):
         result = cb.StopResult(
             **{
                 "osd": 682,
-                "cancellations": [self.PLAIN, *self.CHAIN],
-                "skipped": [],
-                "chained": {"19.f": self.CHAIN},
+                "cancellations": [self.PLAIN],
+                "skipped": [shared.Skipped("19.f", 0, "would chain")],
+                "chained": self.CHAINED,
                 "backfillfull_pct": 91.0,
                 "exclude_filter": None,
                 "osd_df": {682: {"utilization": 88.0, "kb": 1000}},
@@ -721,16 +865,20 @@ class RenderTest(unittest.TestCase):
             cb.render(result, parse_args(cb, [*argv, "--osd", "682"]))
         return out.getvalue(), err.getvalue()
 
-    def test_chained_pgs_are_left_out_of_the_machine_format(self):
+    def test_both_formats_print_the_same_pins_and_the_chain_warning(self):
         out, err = self.render("--pgremapper-mappings")
         self.assertEqual(
             json.loads(out), [{"pgid": "19.2", "mapping": {"from": 682, "to": 8}}]
         )
         self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
+        out, err = self.render()
+        self.assertEqual(len(out.splitlines()), 2 + 1)  # two header lines + 1 pin
+        self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
+        self.assertIn("cannot pin 19.f shard 0: would chain", err)
 
-    def test_the_table_keeps_chained_pgs(self):
-        out, _ = self.render()
-        self.assertEqual(len(out.splitlines()), 2 + 3)  # two header lines + 3 pins
+    def test_no_warning_without_chains(self):
+        _, err = self.render(chained={}, skipped=[])
+        self.assertNotIn("WARNING", err)
 
     def test_planning_notes_are_printed_even_when_planning_then_exits(self):
         # A typo in --exclude-pgs is worth knowing about even when a PG then
@@ -753,7 +901,11 @@ class RenderTest(unittest.TestCase):
 
     def test_nothing_to_pin_says_so(self):
         out, err = self.render(
-            "--pgremapper-mappings", cancellations=[], chained={}, osd_df={682: {}}
+            "--pgremapper-mappings",
+            cancellations=[],
+            skipped=[],
+            chained={},
+            osd_df={682: {}},
         )
         self.assertEqual(json.loads(out), [])
         self.assertIn("No backfills into osd.682.", err)
@@ -1140,29 +1292,38 @@ class MainTest(unittest.TestCase):
         self.assertNotIn("no backfillfull_ratio", err)
         self.assertNotIn("--pin-blockers was not given", err)
 
-    def test_chained_pgs_are_left_out_of_the_machine_format(self):
+    def test_a_requested_pin_that_chains_leaves_its_pg_out(self):
+        # shard 0 comes back to osd.20 only once shard 1 (20->30) is pinned:
+        # a chain pgremapper cannot apply, and the requested pin is its head
         chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
         plain = pg("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])
-        out, err = self.run_main(
-            "--pgremapper-mappings", "--osd", "682", pgs=[chain, plain]
-        )
-        self.assertEqual(
-            json.loads(out), [{"pgid": "19.2", "mapping": {"from": 682, "to": 8}}]
-        )
-        self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
+        result = self.plan("--osd", "682", pgs=[chain, plain])
+        self.assertEqual(pins(result.cancellations), ["19.2 682 8"])
+        self.assertEqual([(s.pgid, s.shard) for s in result.skipped], [("19.f", 0)])
+        self.assertEqual(result.chained, {"19.f": [(20, 30), (OSD, 20)]})
+        for flags in ((), ("--pgremapper-mappings",)):
+            out, err = self.run_main(*flags, "--osd", "682", pgs=[chain, plain])
+            self.assertNotIn("19.f", out)
+            self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
 
-    def test_the_table_still_shows_a_chained_pg_in_apply_order(self):
-        chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
-        result = self.plan("--osd", "682", pgs=[chain])
-        self.assertEqual(
-            [(c.pgid, c.shard) for c in result.cancellations],
-            [("19.f", 1), ("19.f", 0)],
+    def test_existing_upmap_pairs_are_checked_for_chains(self):
+        # the pin's target, osd.8, is the source of an existing pair
+        fake = canned_ceph([pg("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])])
+        snaps = {k: fake(None, k) for k in cb.SNAPSHOT_COMMANDS if k != "pg_dump_pgs"}
+        snaps["osd_dump"]["pg_upmap_items"] = [
+            {"pgid": "19.2", "mappings": [{"from": 8, "to": 9}]}
+        ]
+        result = cb.plan(
+            parse_args(cb, ["--osd", "682"]), FakeStore(snaps, load_dir=None)
         )
-        self.assertEqual(list(result.chained), ["19.f"])
-        out, err = self.run_main("--osd", "682", pgs=[chain])
-        self.assertEqual(len(out.splitlines()), 2 + 2)  # two header lines + 2 pins
-        self.assertIn("ceph osd pg-upmap-items 19.f 20 30 682 20", err)
-        self.assertNotIn("left out", err)
+        self.assertEqual(result.cancellations, [])
+        self.assertEqual(result.chained, {"19.2": [(8, 9), (OSD, 8)]})
+
+    def test_without_osd_a_chain_keeps_its_last_pin(self):
+        chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
+        result = self.plan(pgs=[chain])
+        self.assertEqual(pins(result.cancellations), ["19.f 20 30"])
+        self.assertEqual([(s.pgid, s.shard) for s in result.skipped], [("19.f", 0)])
 
     def test_pgremapper_mappings_is_valid_json_even_with_nothing_to_apply(self):
         # nothing arriving at all
@@ -1643,25 +1804,21 @@ class ChainFixtureReplayTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
-    def test_the_pair_that_frees_osd_579_comes_first(self):
+    def test_it_is_left_out_and_the_warning_has_the_pairs_in_apply_order(self):
+        # the requested pin (891->579) is the chain's head, so no pin helps
         result = fixture_plan(FIXTURE, 891)
-        self.assertEqual(
-            [(c.shard, c.up_osd, c.acting_osd) for c in result.chained["19.1299"]],
-            [(8, 579, 825), (1, 891, 579)],
-        )
-        self.assertEqual(
-            [c for c in result.cancellations if c.pgid == "19.1299"],
-            result.chained["19.1299"],
-        )
+        self.assertEqual(result.chained["19.1299"], [(579, 825), (891, 579)])
+        self.assertNotIn("19.1299", {c.pgid for c in result.cancellations})
+        self.assertIn(("19.1299", 1), {(s.pgid, s.shard) for s in result.skipped})
 
     def test_machine_format_leaves_it_out_and_the_warning_gives_the_command(self):
         result = self.replay("--pgremapper-mappings")
         self.assertNotIn("19.1299", result.stdout)
         self.assertIn("ceph osd pg-upmap-items 19.1299 579 825 891 579", result.stderr)
 
-    def test_every_chained_pg_in_the_cluster_is_ordered_or_reported(self):
-        """Across every OSD that is a target of a remapped shard: no output ever
-        lists a pair before the pair that frees its target OSD."""
+    def test_no_output_in_the_cluster_chains(self):
+        """Across every OSD that is a target of a remapped shard: no PG's pins
+        chain once avoid_chains is done."""
         snap = {p.stem: json.loads(p.read_text()) for p in FIXTURE.glob("*.json")}
         store = FakeStore(snap)
         osd_df, osd_host = cb.fetch_osd_df(store), cb.fetch_osd_hosts(store)
@@ -1679,15 +1836,80 @@ class ChainFixtureReplayTest(unittest.TestCase):
             cancellations, _ = cb.plan_cancellations(
                 pgs, pools, ecp, osd, osd_host, rules, osd_df, pct, True
             )
+            resolved = shared.avoid_chains(cancellations, {}, pgs, osd_host, False)
             by_pg = {}
-            for c in cancellations:
+            for c in resolved.cancellations:
                 by_pg.setdefault(c.pgid, []).append(c)
             for pgid, cs in by_pg.items():
-                for i, c in enumerate(cs):
-                    later_sources = {o.up_osd for o in cs[i + 1 :]}
-                    self.assertNotIn(c.acting_osd, later_sources, (osd, pgid))
-                chained += pgid in cb.chained_pgs(cancellations)
+                self.assertEqual(shared.chain_heads([], cs), [], (osd, pgid))
+            chained += len(resolved.chained)
         self.assertGreaterEqual(chained, 13)  # the real chains this test is about
+
+
+FIXTURE_CHAINS = FIXTURE.parent / "ceph2-cancel-backfill-chained-pairs-upmap"
+
+
+class ChainedPairsFixtureTest(unittest.TestCase):
+    """Chains among pins, into existing pairs, and among existing pairs (see
+    the fixture's README.txt), cancelled without --osd."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.result = plan_from_state(cb, FIXTURE_CHAINS)
+        store = FakeStore(
+            {p.stem: json.loads(p.read_text()) for p in FIXTURE_CHAINS.glob("*.json")}
+        )
+        cls.upmaps = {
+            pgid: [(m["from"], m["to"]) for m in pairs]
+            for pgid, pairs in shared.fetch_upmap_items(store).items()
+        }
+
+    def test_each_chain_leaves_one_backfill_running(self):
+        self.assertEqual(
+            [(s.pgid, s.shard) for s in self.result.skipped],
+            [
+                ("19.3a4", 1),
+                ("19.5fd", 8),
+                ("19.1128", 4),
+                ("19.1399", 9),
+                ("19.146e", 3),
+                ("19.1a6f", 4),
+                ("19.1d52", 7),
+            ],
+        )
+
+    def test_the_last_pin_of_each_chain_stays(self):
+        self.assertEqual(
+            pins(self.result.cancellations),
+            [
+                "19.1128 471 866",
+                "19.1128 328 588",
+                "19.1399 414 341",
+                "19.146e 246 161",
+                "19.146e 563 610",
+                "19.1a6f 357 59",
+                "19.1d52 838 82",
+            ],
+        )
+
+    def test_no_pgs_pairs_chain_with_existing_ones(self):
+        by_pg: dict[str, list] = {}
+        for c in self.result.cancellations:
+            by_pg.setdefault(c.pgid, []).append(c)
+        for pgid, cs in by_pg.items():
+            existing = self.upmaps.get(pgid, [])
+            self.assertIsNone(shared.chain_link(existing), pgid)
+            self.assertEqual(shared.chain_heads(existing, cs), [], pgid)
+
+    def test_the_warning_commands_keep_the_existing_pairs(self):
+        self.assertEqual(
+            self.result.chained["19.1128"],
+            [(274, 148), (545, 94), (471, 866), (328, 588), (888, 545)],
+        )
+        self.assertEqual(
+            self.result.chained["19.3a4"],
+            [(302, 723), (110, 753), (890, 110), (256, 816)],
+        )
 
 
 class BlockerFixtureReplayTest(unittest.TestCase):
@@ -1913,10 +2135,17 @@ class FixtureAllTest(unittest.TestCase):
     def setUpClass(cls):
         cls.result = plan_from_state(cb, FIXTURE)
 
-    def test_every_remapped_pg_is_covered_and_nothing_is_unpinnable(self):
+    def test_every_remapped_pg_is_covered_and_only_chains_are_unpinnable(self):
         # 688 remapped PGs, see the fixture's README.txt
-        self.assertEqual(len({c.pgid for c in self.result.cancellations}), 688)
-        self.assertEqual(self.result.skipped, [])
+        covered = {c.pgid for c in self.result.cancellations}
+        covered |= {s.pgid for s in self.result.skipped}
+        self.assertEqual(len(covered), 688)
+        self.assertGreater(len(self.result.skipped), 0)
+        for s in self.result.skipped:
+            self.assertIn("would chain", s.reason)
+        self.assertEqual(
+            set(self.result.chained), {s.pgid for s in self.result.skipped}
+        )
 
     def test_contains_every_pin_the_osd_896_run_proposes(self):
         # --osd 896's pins, companions included, all cancel moving shards
@@ -1924,13 +2153,15 @@ class FixtureAllTest(unittest.TestCase):
         self.assertLessEqual(set(EXPECTED_896_DEFAULT.splitlines()), everything)
 
     def test_every_pin_turns_up_into_acting(self):
-        # after the pins, each PG's 'up' is its 'acting' (no degraded shards here)
+        # after the pins, each PG's 'up' is its 'acting' (no degraded shards
+        # here), except for shards left running because their pin would chain
         pgs = {
             p["pgid"]: p
             for p in shared.extract_pg_stats(
                 json.loads((FIXTURE / "pg_dump_pgs.json").read_text()), "pg_dump_pgs"
             )
         }
+        left_running = {(s.pgid, s.shard) for s in self.result.skipped}
         by_pg: dict[str, list] = {}
         for c in self.result.cancellations:
             by_pg.setdefault(c.pgid, []).append(c)
@@ -1941,8 +2172,12 @@ class FixtureAllTest(unittest.TestCase):
             with self.subTest(pgid=pgid):
                 if cs[0].shard == "-":
                     self.assertEqual(sorted(up), sorted(pgs[pgid]["acting"]))
-                else:
-                    self.assertEqual(up, pgs[pgid]["acting"])
+                    continue
+                expected = [
+                    osd if (pgid, i) in left_running else pgs[pgid]["acting"][i]
+                    for i, osd in enumerate(pgs[pgid]["up"])
+                ]
+                self.assertEqual(up, expected)
 
 
 if __name__ == "__main__":

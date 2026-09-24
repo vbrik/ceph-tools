@@ -418,6 +418,15 @@ class RenderTest(unittest.TestCase):
         out, _ = self.render("--pgremapper-mappings")
         self.assertEqual(out.strip(), "[]")
 
+    def test_chains_are_warned_about_in_both_formats(self):
+        for argv in ((), ("--pgremapper-mappings",)):
+            _, err = self.render(
+                *argv,
+                skipped=[shared.Skipped("19.9", 0, "would chain")],
+                chained={"19.9": [(20, 30), (682, 20)]},
+            )
+            self.assertIn("ceph osd pg-upmap-items 19.9 20 30 682 20", err)
+
     def test_one_cancellation_is_printed_as_a_table(self):
         c = shared.Cancellation("19.1", 2, 20, 9, 1_000, "s", 50.0)
         out, _err = self.render(cancellations=[c])
@@ -468,10 +477,23 @@ class FixtureReplayTest(unittest.TestCase):
             hosts = [host[o] for o in up]
             self.assertEqual(len(set(hosts)), len(hosts), (pgid, hosts))
 
-    def test_some_pgs_have_chained_pairs(self):
-        # Confirms shared.chained_pgs is actually reached against real data,
-        # not just the small hand-built fixtures above.
+    def test_chained_pgs_are_left_out_whole(self):
+        # Confirms shared.avoid_chains is reached against real data. Without
+        # partial, a PG whose pins chain gets none: its uphill shards go
+        # together or not at all.
         self.assertGreater(len(self.result.chained), 0)
+        pinned = {c.pgid for c in self.result.cancellations}
+        self.assertFalse(pinned & set(self.result.chained))
+        by_pg: dict[str, list] = {}
+        for c in self.result.cancellations:
+            by_pg.setdefault(c.pgid, []).append(c)
+        dump = json.loads((FIXTURE / "osd_dump.json").read_text())
+        upmaps = {
+            e["pgid"]: [(m["from"], m["to"]) for m in e["mappings"]]
+            for e in dump["pg_upmap_items"]
+        }
+        for pgid, cs in by_pg.items():
+            self.assertEqual(shared.chain_heads(upmaps.get(pgid, []), cs), [], pgid)
 
 
 class ExactProgressTest(unittest.TestCase):

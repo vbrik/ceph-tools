@@ -13,6 +13,11 @@ through selectively.
 Remove the entries of backfills you want to keep, or pass their PGs to
 --exclude-pgs. Cancelling a running backfill discards its progress.
 
+pgremapper cannot apply chained pairs (A->B, B->C). Without --osd, the last
+pin of a chain is kept and the backfills before it keep running; with
+--osd, a PG whose requested pin would chain is left out. Both are listed on
+stderr, with 'ceph osd pg-upmap-items' commands that pin everything.
+
 With --osd, the NOTE column marks pins of backfills into other OSDs:
 
 - companion: another shard of the PG moving onto the host of a pinned
@@ -48,12 +53,13 @@ from shared import (
     PROGRESS_APPROX_NOTE,
     Cancellation,
     HelpFormatter,
+    Pair,
     PgidFilter,
     Skipped,
     SnapshotStore,
     add_exclude_pgs_arg,
     add_pgremapper_mappings_arg,
-    chained_pgs,
+    avoid_chains,
     close_pins,
     copies_moving,
     fetch_crush_rules,
@@ -62,6 +68,7 @@ from shared import (
     fetch_osd_hosts,
     fetch_pools,
     fetch_remapped_pg_stats,
+    fetch_upmap_items,
     format_bytes,
     format_row,
     is_real_osd,
@@ -77,9 +84,10 @@ from shared import (
     rule_failure_domain,
     same_place,
     shard_size_bytes,
+    skipped_sort_key,
     slot,
     stderr_para,
-    warn_chained_pgs,
+    warn_chains,
     with_exact_progress,
     wrap_text,
 )
@@ -379,13 +387,10 @@ def plan_cancellations(
                     )
                 )
 
-    def skipped_order(item: Skipped) -> tuple:
-        return (*pgid_sort_key(item.pgid), item.shard if item.shard != "-" else -1)
-
     # Stable, by PG only: within a PG the order is the one to apply the pairs in.
     return (
         sorted(cancellations, key=lambda c: pgid_sort_key(c.pgid)),
-        sorted(skipped, key=skipped_order),
+        sorted(skipped, key=skipped_sort_key),
     )
 
 
@@ -451,7 +456,7 @@ class StopResult(NamedTuple):
     osd: int | None  # None: every backfill in the cluster
     cancellations: list[Cancellation]  # in apply order, see plan_cancellations
     skipped: list[Skipped]
-    chained: dict[str, list[Cancellation]]  # see chained_pgs
+    chained: dict[str, list[Pair]]  # see avoid_chains
     backfillfull_pct: float | None  # None if 'osd dump' has no backfillfull_ratio
     exclude_filter: PgidFilter | None  # None without --exclude-pgs
     osd_df: dict[int, dict]
@@ -510,13 +515,20 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
         args.pin_blockers,
         exclude_pgs,
     )
+    # Without --osd every pin is wanted for itself, so a chain's last pin
+    # stays even when the one before it cannot.
+    resolved = avoid_chains(
+        cancellations, fetch_upmap_items(store), pg_stats, osd_host, partial=osd is None
+    )
+    cancellations = resolved.cancellations
+    skipped = sorted(skipped + resolved.skipped, key=skipped_sort_key)
     if not args.pgremapper_mappings:  # JSON has no PROGRESS: skip the queries
         cancellations = with_exact_progress(store, cancellations, pg_stats, pools)
     return StopResult(
         osd=osd,
         cancellations=cancellations,
         skipped=skipped,
-        chained=chained_pgs(cancellations),
+        chained=resolved.chained,
         backfillfull_pct=backfillfull_pct,
         exclude_filter=exclude_filter,
         osd_df=osd_df,
@@ -551,16 +563,8 @@ def render(result: StopResult, args: argparse.Namespace) -> None:
         return
 
     print_summary(osd, result.osd_df, result.osd_host, cancellations, result.skipped)
-    chained = result.chained
-    machine_format = args.pgremapper_mappings
-    # pgremapper cannot apply chained pairs (see warn_chained_pgs).
-    printable = (
-        [c for c in cancellations if c.pgid not in chained]
-        if machine_format
-        else cancellations
-    )
     if args.pgremapper_mappings:
-        print_pgremapper_mappings(printable)
+        print_pgremapper_mappings(cancellations)
     elif cancellations:
         print_table(
             COLUMNS,
@@ -570,8 +574,8 @@ def render(result: StopResult, args: argparse.Namespace) -> None:
             c.progress_pct is not None and not c.progress_exact for c in cancellations
         ):
             stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
-    if chained:
-        warn_chained_pgs(chained, left_out=machine_format)
+    if result.chained:
+        warn_chains(result.chained)
     if (
         osd is not None
         and result.backfillfull_pct is not None

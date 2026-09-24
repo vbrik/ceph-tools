@@ -12,6 +12,8 @@ A destination's utilization includes what the backfill has copied so far,
 while the source keeps its copy until the PG is clean, so a move can look
 uphill once partly done. --min-delta filters out such small differences.
 
+A PG whose pins would chain is left out (see cancel-backfill).
+
 Apply the output as with cancel-backfill. Consider 'ceph balancer off' while
 the pins are in place. Assumes the CRUSH failure domain is host.
 """
@@ -26,12 +28,13 @@ from shared import (
     PROGRESS_APPROX_NOTE,
     Cancellation,
     HelpFormatter,
+    Pair,
     PgidFilter,
     Skipped,
     SnapshotStore,
     add_exclude_pgs_arg,
     add_pgremapper_mappings_arg,
-    chained_pgs,
+    avoid_chains,
     close_pins,
     copies_moving,
     ec_shard_moves,
@@ -41,6 +44,7 @@ from shared import (
     fetch_osd_hosts,
     fetch_pools,
     fetch_remapped_pg_stats,
+    fetch_upmap_items,
     format_bytes,
     format_row,
     order_moves,
@@ -52,8 +56,9 @@ from shared import (
     real_osd_set,
     rule_failure_domain,
     shard_size_bytes,
+    skipped_sort_key,
     stderr_para,
-    warn_chained_pgs,
+    warn_chains,
     with_exact_progress,
     wrap_text,
 )
@@ -249,12 +254,9 @@ def plan_cancellations(
                 )
             )
 
-    def skipped_order(item: Skipped) -> tuple:
-        return (*pgid_sort_key(item.pgid), item.shard if item.shard != "-" else -1)
-
     return (
         sorted(cancellations, key=lambda c: pgid_sort_key(c.pgid)),
-        sorted(skipped, key=skipped_order),
+        sorted(skipped, key=skipped_sort_key),
     )
 
 
@@ -315,7 +317,7 @@ class UphillResult(NamedTuple):
 
     cancellations: list[Cancellation]  # in apply order, see plan_cancellations
     skipped: list[Skipped]
-    chained: dict[str, list[Cancellation]]  # see shared.chained_pgs
+    chained: dict[str, list[Pair]]  # see shared.avoid_chains
     exclude_filter: PgidFilter | None  # None without --exclude-pgs
     osd_df: dict[int, dict]
     osd_host: dict[int, str]
@@ -349,12 +351,18 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> UphillResult:
         exclude_pgs,
         args.min_delta,
     )
+    # A PG's uphill shards go together (plan_cancellations), so no partial.
+    resolved = avoid_chains(
+        cancellations, fetch_upmap_items(store), pg_stats, osd_host, partial=False
+    )
+    cancellations = resolved.cancellations
+    skipped = sorted(skipped + resolved.skipped, key=skipped_sort_key)
     if not args.pgremapper_mappings:  # JSON has no PROGRESS: skip the queries
         cancellations = with_exact_progress(store, cancellations, pg_stats, pools)
     return UphillResult(
         cancellations=cancellations,
         skipped=skipped,
-        chained=chained_pgs(cancellations),
+        chained=resolved.chained,
         exclude_filter=exclude_filter,
         osd_df=osd_df,
         osd_host=osd_host,
@@ -371,15 +379,8 @@ def render(result: UphillResult, args: argparse.Namespace) -> None:
         return
 
     print_summary(cancellations, result.skipped)
-    chained = result.chained
-    machine_format = args.pgremapper_mappings
-    printable = (
-        [c for c in cancellations if c.pgid not in chained]
-        if machine_format
-        else cancellations
-    )
-    if machine_format:
-        print_pgremapper_mappings(printable)
+    if args.pgremapper_mappings:
+        print_pgremapper_mappings(cancellations)
     elif cancellations:
         print_table(
             COLUMNS,
@@ -389,8 +390,8 @@ def render(result: UphillResult, args: argparse.Namespace) -> None:
             c.progress_pct is not None and not c.progress_exact for c in cancellations
         ):
             stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
-    if chained:
-        warn_chained_pgs(chained, left_out=machine_format)
+    if result.chained:
+        warn_chains(result.chained)
     stderr_para(
         "NOTE: cancelling a running backfill discards its progress. Consider "
         "'ceph balancer off' while these are pinned."

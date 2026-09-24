@@ -1160,41 +1160,178 @@ def order_moves(
     return ordered, None
 
 
-def chained_pgs(cancellations: list[Cancellation]) -> dict[str, list[Cancellation]]:
-    """Return {pgid: its cancellations} for PGs whose pairs chain (A->B, B->C)."""
+def skipped_sort_key(item: Skipped) -> tuple:
+    """Order Skipped by PG, then shard ('-' first)."""
+    return (*pgid_sort_key(item.pgid), item.shard if item.shard != "-" else -1)
+
+
+Pair = tuple[int, int]  # an upmap pair: (from_osd, to_osd)
+
+
+class ChainResolution(NamedTuple):
+    """What avoid_chains() kept, dropped and would apply in full."""
+
+    cancellations: list[Cancellation]  # the pgremapper-safe pins, order kept
+    skipped: list[Skipped]  # pins left out, and why
+    chained: dict[str, list[Pair]]  # pgid: full upmap entry (see avoid_chains)
+
+
+def fold_pins(
+    existing: list[Pair], pins: list[Cancellation]
+) -> tuple[list[Pair], list[Pair]]:
+    """Return (untouched existing pairs, each pin's effective pair).
+
+    Like pgremapper, a pin X->Y where an existing pair A->X put X in 'up'
+    rewrites that pair to A->Y: the same up set, and no chain.
+    """
+    rest = list(existing)
+    effective = []
+    for c in pins:
+        folded = next((p for p in rest if p[1] == c.up_osd), None)
+        if folded is None:
+            effective.append((c.up_osd, c.acting_osd))
+        else:
+            rest.remove(folded)
+            effective.append((folded[0], c.acting_osd))
+    return rest, effective
+
+
+def chain_link(pairs: list[Pair]) -> tuple[Pair, Pair] | None:
+    """Return some (A->B, B->C) in pairs, or None. A->A pairs are no-ops."""
+    real = [p for p in pairs if p[0] != p[1]]
+    by_from = {p[0]: p for p in real}
+    for p in real:
+        if p[1] in by_from:
+            return p, by_from[p[1]]
+    return None
+
+
+def chain_heads(
+    existing: list[Pair], pins: list[Cancellation]
+) -> list[tuple[Cancellation, Pair]]:
+    """Return (pin, the pair it chains into) for pins whose 'to' is another pair's 'from'.
+
+    Pairs are compared after folding (fold_pins).
+    """
+    rest, effective = fold_pins(existing, pins)
+    by_from = {f: (f, t) for f, t in rest + effective if f != t}
+    return [
+        (pin, by_from[t])
+        for pin, (f, t) in zip(pins, effective)
+        if f != t and t in by_from
+    ]
+
+
+def format_link(first: Pair, second: Pair) -> str:
+    """Format two chained pairs, e.g. '890->414, 414->341'."""
+    return f"{first[0]}->{first[1]}, {second[0]}->{second[1]}"
+
+
+def host_clash(
+    up: list, pins: list[Cancellation], osd_host: dict[int, str]
+) -> str | None:
+    """Return why applying pins to up puts two shards on one host, or None."""
+    new_up, pinned = list(up), {}
+    for c in pins:
+        i = c.shard if isinstance(c.shard, int) else new_up.index(c.up_osd)
+        new_up[i] = c.acting_osd
+        pinned[i] = c.acting_osd
+    for i, osd in pinned.items():
+        for j, other in enumerate(new_up):
+            if j != i and is_real_osd(other) and same_place(osd, other, osd_host):
+                return f"acting osd.{osd} would share a host with osd.{other}"
+    return None
+
+
+def avoid_chains(
+    cancellations: list[Cancellation],
+    upmap_items: dict[str, list[dict]],
+    pg_stats: list[dict],
+    osd_host: dict[int, str],
+    partial: bool,
+) -> ChainResolution:
+    """Drop the pins that pgremapper cannot apply because they chain.
+
+    Dry runs of pgremapper 1.0.0 import-mappings: a PG's pairs, existing and
+    new, must not chain (A->B, B->C), except for a pin folded into an
+    existing pair (fold_pins). Otherwise it panics, aborting the whole
+    import, or folds the chain into a wrong pair. Changing a PG whose
+    existing pairs chain, it removes one link as stale.
+
+    A pin whose 'to' is another pair's 'from' is dropped, leaving its backfill
+    running; the chain's last pin, valid on its own, stays. The whole PG is
+    left out instead if its existing pairs chain, a dropped pin is a
+    requested one (companion_of None) and not partial, or the remaining pins
+    clash on a host (the dropped pin was a companion).
+
+    chained holds, per affected PG, the upmap entry that applies every pin:
+    existing pairs (the up set's source; stale ones left out), then the pins
+    in apply order.
+    """
+    ups = {pg["pgid"]: pg["up"] for pg in pg_stats}
     by_pg: dict[str, list[Cancellation]] = {}
     for c in cancellations:
         by_pg.setdefault(c.pgid, []).append(c)
-    return {
-        pgid: cs
-        for pgid, cs in by_pg.items()
-        if any(
-            c.acting_osd == other.up_osd for c in cs for other in cs if other is not c
-        )
-    }
+
+    kept, skipped, chained = [], [], {}
+    for pgid, cs in by_pg.items():
+        existing = [(m["from"], m["to"]) for m in upmap_items.get(pgid, [])]
+        pins, dropped, why = cs, [], None
+        if link := chain_link(existing):
+            why = (
+                f"its existing upmap pairs chain ({format_link(*link)}), "
+                "which pgremapper would break"
+            )
+        else:
+            # A pair whose 'from' is still in 'up' is stale: Ceph skips it,
+            # and pgremapper removes it before adding pins.
+            existing = [p for p in existing if p[0] not in ups[pgid]]
+        # One pass drops every head; the loop only guards against folds
+        # changing as pins go.
+        while why is None and (heads := chain_heads(existing, pins)):
+            for pin, successor in heads:
+                reason = (
+                    f"{format_link((pin.up_osd, pin.acting_osd), successor)} "
+                    "would chain, which pgremapper cannot apply"
+                )
+                if pin.companion_of is None and not partial:
+                    why = reason
+                    break
+                dropped.append((pin, reason))
+            pins = [c for c in pins if c not in {pin for pin, _ in heads}]
+        if why is None and dropped and (clash := host_clash(ups[pgid], pins, osd_host)):
+            why = f"leaving a chained pin out: {clash}"
+        if not dropped and why is None:
+            kept.extend(cs)
+            continue
+
+        chained[pgid] = existing + [(c.up_osd, c.acting_osd) for c in cs]
+        if why is not None:
+            skipped.extend(
+                Skipped(pgid, c.shard, why) for c in cs if c.companion_of is None
+            )
+            continue
+        kept.extend(pins)
+        for pin, reason in dropped:
+            prefix = "blocker: " if pin.blocker_util is not None else ""
+            skipped.append(Skipped(pgid, pin.shard, prefix + reason))
+    return ChainResolution(kept, skipped, chained)
 
 
-def warn_chained_pgs(chained: dict[str, list[Cancellation]], left_out: bool) -> None:
-    """Warn on stderr about PGs with chained pairs, and print commands for them.
-
-    Dry runs of pgremapper 1.0.0 showed import-mappings cannot apply a chain:
-    it panics ("conflicting mapping") on the order Ceph needs, and folds the
-    chain into a different pair in the other. So the JSON output leaves these
-    PGs out (left_out).
-    """
+def warn_chains(chained: dict[str, list[Pair]]) -> None:
+    """Warn on stderr about PGs whose pins chain, with commands that apply them all."""
     stderr_para(
-        f"WARNING: {len(chained)} PG(s) have chained pairs (A->B, B->C): "
-        f"{', '.join(chained)}. pgremapper cannot apply these (it panics)"
-        + ("; they are left out of this output" if left_out else "")
-        + ". Apply them with the (untested) commands below, pairs in the order "
-        "given. "
-        "'ceph osd pg-upmap-items' replaces the PG's whole upmap entry: first "
-        "add the PG's existing pairs from 'ceph osd dump'."
+        f"WARNING: the pins of {len(chained)} PG(s) chain (A->B, B->C), which "
+        f"pgremapper cannot apply: {', '.join(chained)}. Pins left out are "
+        "listed above. To apply them all, run the (untested) commands below; "
+        "each sets the PG's whole upmap entry, existing pairs included. "
+        "pgremapper removes part of such a chain as stale when it later "
+        "changes the PG."
     )
-    for pgid, cs in chained.items():
-        pairs = " ".join(f"{c.up_osd} {c.acting_osd}" for c in cs)
+    for pgid, pairs in chained.items():
+        flat_pairs = " ".join(f"{f} {t}" for f, t in pairs)
         # Not wrapped: for copy-pasting.
-        print(f"  ceph osd pg-upmap-items {pgid} {pairs}", file=sys.stderr)
+        print(f"  ceph osd pg-upmap-items {pgid} {flat_pairs}", file=sys.stderr)
 
 
 def format_bytes(num: int | None) -> str:
