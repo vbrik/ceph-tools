@@ -7,7 +7,7 @@ same host's other OSDs. On a full cluster those cross backfillfull_ratio and
 the backfills stall, while other hosts have room.
 
 For every backfill_toofull PG, each shard arriving on an OSD at or above
---min-up-util is re-targeted. Ceph does not say which shard was refused, so
+--toofull-util is re-targeted. Ceph does not say which shard was refused, so
 this is a guess, and shards arriving on emptier OSDs are left alone. The
 target is the OSD that ends up least utilized among those that:
 
@@ -124,7 +124,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         formatter_class=HelpFormatter,
     )
     parser.add_argument(
-        "--min-up-util",
+        "--toofull-util",
         type=float,
         metavar="PERCENT",
         help="Divert only shards arriving on an OSD at least this full "
@@ -158,12 +158,12 @@ def filter_toofull_pgs(
 def select_stuck_shards(
     shards: list[ArrivingShard],
     osd_df: dict[int, dict],
-    min_up_util: float,
+    toofull_util: float,
 ) -> tuple[list[ArrivingShard], list[ArrivingShard]]:
     """Split arriving shards into (stuck, skipped), keeping their order.
 
     Ceph reports backfill_toofull per PG, not per shard, so a shard counts as
-    stuck when its OSD is at or above min_up_util. Diverting healthy shards
+    stuck when its OSD is at or above toofull_util. Diverting healthy shards
     would waste target room that stuck ones need.
 
     The default, nearfull_ratio, is below backfillfull_ratio because Ceph
@@ -173,7 +173,7 @@ def select_stuck_shards(
     for shard in shards:
         util = osd_df.get(shard.up_osd, {}).get("utilization")
         # Unknown utilization cannot rule the OSD out.
-        if util is None or util >= min_up_util:
+        if util is None or util >= toofull_util:
             stuck.append(shard)
         else:
             skipped.append(shard)
@@ -400,10 +400,10 @@ class DivertResult(NamedTuple):
     toofull_pg_count: int  # backfill_toofull PGs considered (after --pgs)
     pgs_with_shards: int  # of those, the ones with a newly-arriving shard
     arriving_count: int  # arriving shards in all
-    stuck_count: int  # arriving on an OSD at or above min_up_util
+    stuck_count: int  # arriving on an OSD at or above toofull_util
     left_alone_count: int  # arriving on an OSD below it: not the blocker
     candidates: dict[str, list[int]]  # see build_candidate_osds
-    min_up_util: float
+    toofull_util: float
     max_target_util: float
     ratios: FullRatios
     pgs_filter: PgidFilter | None  # None without --pgs
@@ -428,7 +428,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
     ec_profiles = fetch_ec_profiles(store)
 
     ratios = fetch_full_ratios(store)
-    min_up_util = ratios.nearfull if args.min_up_util is None else args.min_up_util
+    toofull_util = ratios.nearfull if args.toofull_util is None else args.toofull_util
     max_target_util = resolve_max_target_util(args.max_target_util, ratios)
 
     pgs_filter = None
@@ -467,7 +467,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
         )
         arriving.extend(found)
         pgs_with_shards += bool(found)
-    shards, not_full_enough = select_stuck_shards(arriving, osd_df, min_up_util)
+    shards, not_full_enough = select_stuck_shards(arriving, osd_df, toofull_util)
     shards.sort(
         key=lambda s: (
             pgid_sort_key(s.pgid),
@@ -496,7 +496,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
         stuck_count=len(shards),
         left_alone_count=len(not_full_enough),
         candidates=candidates,
-        min_up_util=min_up_util,
+        toofull_util=toofull_util,
         max_target_util=max_target_util,
         ratios=ratios,
         pgs_filter=pgs_filter,
@@ -534,8 +534,8 @@ def render(result: DivertResult, args: argparse.Namespace) -> None:
         f"{result.toofull_pg_count} backfill_toofull PG(s), "
         f"{result.pgs_with_shards} with arriving shards. "
         f"{result.arriving_count} arriving shard(s), of which "
-        f"{result.stuck_count} on an OSD at or above --min-up-util "
-        f"{result.min_up_util:g}% ({result.left_alone_count} left alone as "
+        f"{result.stuck_count} on an OSD at or above --toofull-util "
+        f"{result.toofull_util:g}% ({result.left_alone_count} left alone as "
         "not the blocker)."
     )
     stderr_para(

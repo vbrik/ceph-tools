@@ -84,17 +84,17 @@ class SelectSourcesTest(unittest.TestCase):
             sorted(self.UTILS),
             self.UTILS.__getitem__,
             osds=kw.get("osds"),
-            min_up_util=kw.get("min_up_util"),
+            min_source_util=kw.get("min_source_util"),
         )
 
     def test_default_is_the_fuller_half_ties_to_lower_id(self):
         self.assertEqual(self.select(), ([1, 2, 3], 7))
 
-    def test_min_up_util_selects_at_or_above(self):
-        self.assertEqual(self.select(min_up_util=80.0), ([1, 2, 3], 3))
+    def test_min_source_util_selects_at_or_above(self):
+        self.assertEqual(self.select(min_source_util=80.0), ([1, 2, 3], 3))
 
-    def test_min_up_util_is_capped_at_half(self):
-        self.assertEqual(self.select(min_up_util=60.0), ([1, 2, 3], 5))
+    def test_min_source_util_is_capped_at_half(self):
+        self.assertEqual(self.select(min_source_util=60.0), ([1, 2, 3], 5))
 
     def test_osds_are_taken_as_given_fullest_first(self):
         self.assertEqual(self.select(osds=[7, 4, 5, 6, 1]), ([1, 4, 5, 6, 7], 5))
@@ -107,7 +107,8 @@ class SelectSourcesTest(unittest.TestCase):
 
     def test_one_osd_class_has_no_sources(self):
         self.assertEqual(
-            ut.select_sources([1], {1: 90.0}.get, osds=None, min_up_util=None), ([], 1)
+            ut.select_sources([1], {1: 90.0}.get, osds=None, min_source_util=None),
+            ([], 1),
         )
 
 
@@ -121,9 +122,9 @@ class SourcesFromClusterTest(unittest.TestCase):
         self.assertIn(51, result.sources)
         self.assertEqual(result.sources[0], 51)
 
-    def test_osds_and_min_up_util_are_mutually_exclusive(self):
+    def test_osds_and_min_source_util_are_mutually_exclusive(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            parse_args(ut, ["--osds", "1", "--min-up-util", "80"])
+            parse_args(ut, ["--osds", "1", "--min-source-util", "80"])
 
     def test_unknown_class_names_the_classes_present(self):
         with self.assertRaises(SystemExit) as cm:
@@ -394,7 +395,7 @@ class PlanTest(unittest.TestCase):
 
     def test_no_sources(self):
         c = Cluster()
-        result = c.plan("--min-up-util", 90)
+        result = c.plan("--min-source-util", 90)
         self.assertEqual((result.moves, result.stop), ([], ut.Stop(ut.STOP_NO_SOURCES)))
 
 

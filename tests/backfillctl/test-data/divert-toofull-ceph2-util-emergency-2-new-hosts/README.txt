@@ -39,7 +39,7 @@ thresholds, and it is the capture that exposed the two bugs they fix.
     nearfull_ratio, and every one of those 537 is on host50 (274) or
     host51 (263) -- the two new hosts, at ~70%, which plainly are not what
     is blocking anything. Diverting them wastes target OSDs that genuinely
-    stuck shards then cannot get, so --min-up-util (default:
+    stuck shards then cannot get, so --toofull-util (default:
     nearfull_ratio) leaves them alone.
 
   - Target ranking is relative, so with no cap "least utilized" degrades
@@ -52,12 +52,12 @@ thresholds, and it is the capture that exposed the two bugs they fix.
     the ratio once the shard is on it. It may not exceed backfillfull_ratio;
     a higher value (100 included) is an error.
 
-Expected results with the default settings (--min-up-util 85,
+Expected results with the default settings (--toofull-util 85,
 --max-target-util 90, both derived from this cluster's own ratios, and
 --max-target-uses 5):
 
   808 backfill_toofull PGs, 808 with newly-arriving shards
-  1513 arriving shards, 976 at or above --min-up-util, 537 left alone
+  1513 arriving shards, 976 at or above --toofull-util, 537 left alone
   candidate target OSDs: hdd=822, ssd=78
   52 remaps proposed, 924 unplaceable
   52 shards go to 27 distinct OSDs; none is used more than 5 times
@@ -104,7 +104,7 @@ reachable (--max-target-util can no longer exceed backfillfull_ratio, and 100
 is an error), and what the invariant test guards against regressing past:
 
   backfillctl divert-toofull --load-state . \
-      --min-up-util 0 --max-target-util 91
+      --toofull-util 0 --max-target-util 91
   -> 210 remaps proposed, 1303 unplaceable, none projected past backfillfull
 
 (With one use per OSD and no projection this was 573 remaps proposed, 940

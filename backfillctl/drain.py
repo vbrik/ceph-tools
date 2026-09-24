@@ -15,7 +15,7 @@ first.
 backfill_toofull holds back the whole PG, so a moved shard also waits on any
 other shard of its PG heading for an OSD projected over --max-target-util or,
 if the PG is backfill_toofull now, arriving on an OSD at or above
---min-up-util. Such a blocker is diverted if there is room, otherwise pinned
+--toofull-util. Such a blocker is diverted if there is room, otherwise pinned
 back to its acting OSD (with companions, as in cancel-backfill). If neither
 is possible, the NOTE column says the PG will stay stuck, and why.
 
@@ -163,7 +163,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         help="Drain every OSD of these hosts.",
     )
     parser.add_argument(
-        "--min-up-util",
+        "--toofull-util",
         type=float,
         metavar="PERCENT",
         help="Blocker threshold for PGs that are backfill_toofull now "
@@ -204,7 +204,7 @@ class DrainResult(NamedTuple):
     stuck_pgs: list[str]  # PGs with an evacuee that will stay toofull
     unexplained_pgs: list[str]  # toofull now, blocker not identified
     max_target_util: float
-    min_up_util: float
+    toofull_util: float
     ratios: FullRatios
     osd_df: dict[int, dict]
     osd_host: dict[int, str]
@@ -231,7 +231,7 @@ class Planner:
         *,
         max_uses: int,
         max_target_util: float,
-        min_up_util: float,
+        toofull_util: float,
         drained: set[int],
     ):
         self.osd_df = osd_df
@@ -240,7 +240,7 @@ class Planner:
         self.projection = projection
         self.max_uses = max_uses
         self.max_target_util = max_target_util
-        self.min_up_util = min_up_util
+        self.toofull_util = toofull_util
         self.drained = drained
         self.uses: Counter[int] = Counter()
 
@@ -269,7 +269,7 @@ class Planner:
         """Return why the sibling blocks its PG, or None.
 
         It blocks if its OSD is projected over max_target_util or, with
-        toofull_now, is at or above min_up_util. The reason cites the cap
+        toofull_now, is at or above toofull_util. The reason cites the cap
         first, e.g. 'now 90.5%, projected 91.4% > --max-target-util 90%'.
         """
         if not self.projection.knows(sibling.up_osd):
@@ -282,9 +282,9 @@ class Planner:
                 f"now {now_text}, projected {projected:.1f}% > "
                 f"--max-target-util {self.max_target_util:g}%"
             )
-        if toofull_now and now is not None and now >= self.min_up_util:
+        if toofull_now and now is not None and now >= self.toofull_util:
             return (
-                f"now {now:.1f}% >= --min-up-util {self.min_up_util:g}% "
+                f"now {now:.1f}% >= --toofull-util {self.toofull_util:g}% "
                 f"and PG is backfill_toofull, projected {projected:.1f}%"
             )
         return None
@@ -470,7 +470,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
         verdict = UNEXPLAINED
         note = (
             "PG is backfill_toofull now, but no other shard is arriving on "
-            "an OSD at or above --min-up-util or projected over "
+            "an OSD at or above --toofull-util or projected over "
             "--max-target-util: blocker unidentified"
         )
     else:
@@ -526,7 +526,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
     ec_profiles = fetch_ec_profiles(store)
     ratios = fetch_full_ratios(store)
     max_target_util = resolve_max_target_util(args.max_target_util, ratios)
-    min_up_util = ratios.nearfull if args.min_up_util is None else args.min_up_util
+    toofull_util = ratios.nearfull if args.toofull_util is None else args.toofull_util
 
     drained_pgs = fetch_drained_pg_stats(store, drained)
     remapped_pgs = fetch_remapped_pg_stats(store)
@@ -576,7 +576,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
         projection,
         max_uses=args.max_target_uses,
         max_target_util=max_target_util,
-        min_up_util=min_up_util,
+        toofull_util=toofull_util,
         drained=drained,
     )
     unplaceable = place_evacuees(planner, states, evacuees)
@@ -609,7 +609,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
         stuck_pgs=stuck_pgs,
         unexplained_pgs=unexplained_pgs,
         max_target_util=max_target_util,
-        min_up_util=min_up_util,
+        toofull_util=toofull_util,
         ratios=ratios,
         osd_df=osd_df,
         osd_host=osd_host,
@@ -670,8 +670,8 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
         f"at or below --max-target-util {result.max_target_util:g}% "
         f"(backfillfull_ratio {result.ratios.backfillfull:g}%). Blockers: "
         "other shards of a PG heading over that cap or, if the PG is "
-        f"backfill_toofull now, onto an OSD at or above --min-up-util "
-        f"{result.min_up_util:g}%."
+        f"backfill_toofull now, onto an OSD at or above --toofull-util "
+        f"{result.toofull_util:g}%."
     )
     if args.pgremapper_mappings:
         print_pgremapper_mappings(result.moves)

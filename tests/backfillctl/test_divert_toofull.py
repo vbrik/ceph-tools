@@ -7,7 +7,7 @@ The table's column layout: the columns are grouped under the PG set they
 come from (ACTING/UP/TARGET) and ordered along the shard's path, so a row
 that silently drifts out of that order still looks like a valid proposal.
 
-The two safety thresholds: --min-up-util keeps shards that were never
+The two safety thresholds: --toofull-util keeps shards that were never
 blocked from being diverted (backfill_toofull is a property of the PG, not
 of each shard arriving on it), and --max-target-util caps a target's
 projected utilization (and may not exceed backfillfull_ratio, which Ceph
@@ -318,7 +318,7 @@ class FullRatiosTest(unittest.TestCase):
         )
 
 
-# Arriving OSDs spanning the --min-up-util decision: well over the
+# Arriving OSDs spanning the --toofull-util decision: well over the
 # threshold, exactly on it, plainly below it, and one 'ceph osd df' has no
 # figure for.
 SOURCE_DF = {
@@ -501,7 +501,7 @@ CEPH2_MAX_TARGET_UTIL = CEPH2_BACKFILLFULL - 1
 # may be projected right up to the ratio, with no margin.
 CEPH2_NO_MARGIN_PROPOSED = 199
 
-# With both thresholds at their loosest (--min-up-util 0, cap at
+# With both thresholds at their loosest (--toofull-util 0, cap at
 # backfillfull_ratio) the tool used to propose every usable hdd OSD (822),
 # 342 of them already past backfillfull_ratio. The projection now keeps every
 # target at or below the cap.
@@ -611,7 +611,7 @@ class FixturePlanTest(unittest.TestCase):
                 # Ceph keeps the ratios as float32, so 0.85 reads back as
                 # 85.0000024%.
                 result = fixture_plan(fixture)
-                self.assertAlmostEqual(result.min_up_util, nearfull, places=3)
+                self.assertAlmostEqual(result.toofull_util, nearfull, places=3)
                 self.assertAlmostEqual(result.max_target_util, max_target, places=3)
 
 
@@ -671,7 +671,7 @@ class FixtureReplayTest(unittest.TestCase):
 
     def test_default_thresholds_are_reported_on_stderr(self):
         err = flat(self.run_proc("divert-toofull-osd457-down").stderr)
-        self.assertIn("--min-up-util 85%", err)
+        self.assertIn("--toofull-util 85%", err)
         self.assertIn("--max-target-util 89%", err)
 
 
@@ -1493,7 +1493,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
         # backfillfull_ratio itself, so nothing is doomed any more.
         proposals = fixture_plan(
             CEPH2_FIXTURE,
-            "--min-up-util",
+            "--toofull-util",
             "0",
             "--max-target-util",
             f"{CEPH2_BACKFILLFULL:g}",

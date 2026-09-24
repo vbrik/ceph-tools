@@ -6,7 +6,7 @@ the emptiest ones, lowering the class's highest utilization.
 It is not a full balancer. It stops as soon as no move can lower the class's
 highest projected utilization, rather than moving data only to even things
 out. By default, sources are the fuller half of the class's up and in OSDs.
---min-up-util selects the OSDs at or above a level instead, still at most
+--min-source-util selects the OSDs at or above a level instead, still at most
 half of the class. --osds names the sources; the run then continues while
 they can shed data, even if a non-source is fuller.
 
@@ -149,7 +149,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         help="Move data off only these OSDs.",
     )
     sources.add_argument(
-        "--min-up-util",
+        "--min-source-util",
         type=float,
         metavar="PERCENT",
         help="Move data off OSDs projected at least this full, at most half "
@@ -175,13 +175,13 @@ def select_sources(
     utilization: Callable[[int], float],
     *,
     osds: list[int] | None,
-    min_up_util: float | None,
+    min_source_util: float | None,
 ) -> tuple[list[int], int]:
     """Return (the sources, fullest first; how many qualified before the cap).
 
     class_osds: the class's usable OSDs (build_candidate_osds). osds is
     taken as given, exiting if one is not in class_osds. Otherwise sources
-    are the OSDs whose utilization is at or above min_up_util (all, if
+    are the OSDs whose utilization is at or above min_source_util (all, if
     None), at most half of class_osds. Ties go to the lower id.
     """
 
@@ -197,8 +197,8 @@ def select_sources(
             )
         return fullest_first(set(osds)), len(set(osds))
     ranked = fullest_first(class_osds)
-    if min_up_util is not None:
-        ranked = [o for o in ranked if utilization(o) >= min_up_util]
+    if min_source_util is not None:
+        ranked = [o for o in ranked if utilization(o) >= min_source_util]
     return ranked[: len(class_osds) // 2], len(ranked)
 
 
@@ -492,7 +492,10 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> BalanceResult:
     final = FinalUsage(osd_df, ((s.up_osd, s.size_bytes) for s in arriving), departing)
 
     sources, qualified = select_sources(
-        class_osds, final.utilization, osds=args.osds, min_up_util=args.min_up_util
+        class_osds,
+        final.utilization,
+        osds=args.osds,
+        min_source_util=args.min_source_util,
     )
     source_set = set(sources)
     targets = [o for o in class_osds if o not in source_set]
@@ -632,12 +635,12 @@ def describe_sources(result: BalanceResult, args: argparse.Namespace) -> str:
     n, total = len(result.sources), len(result.sources) + len(result.targets)
     if args.osds:
         return f"{n} given by --osds"
-    if args.min_up_util is None:
+    if args.min_source_util is None:
         return f"the fuller half, {n} of {total}"
     capped = f", capped at half of the class ({n})" if result.qualified > n else ""
     return (
-        f"{result.qualified} of {total} at or above --min-up-util "
-        f"{args.min_up_util:g}%{capped}"
+        f"{result.qualified} of {total} at or above --min-source-util "
+        f"{args.min_source_util:g}%{capped}"
     )
 
 
