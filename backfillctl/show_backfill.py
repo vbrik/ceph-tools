@@ -22,8 +22,12 @@ per-PG counters, which can read far too high.
 import argparse
 from typing import NamedTuple
 
+from messages import (
+    print_pgid_filter,
+    print_progress_note,
+    stderr_para,
+)
 from shared import (
-    PROGRESS_APPROX_NOTE,
     HelpFormatter,
     PgidFilter,
     SnapshotStore,
@@ -45,10 +49,8 @@ from shared import (
     pg_progress,
     pgid_pool_id,
     pgid_sort_key,
-    print_pgid_filter,
     print_table,
     real_osd_set,
-    stderr_para,
     target_peer,
 )
 
@@ -391,8 +393,7 @@ def render(result: MovementsResult) -> None:
     stderr_para(f"{len(rows)} shard movement(s) across {num_pgs} PG(s).")
     if any(shows_primary(r) for r in rows):
         stderr_para(f"NOTE: {PRIMARY_NOTE}")
-    if any(r.progress_pct is not None and not r.progress_exact for r in rows):
-        stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
+    print_progress_note((r.progress_pct, r.progress_exact) for r in rows)
 
 
 def run(args: argparse.Namespace) -> None:

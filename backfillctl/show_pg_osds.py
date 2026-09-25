@@ -16,9 +16,12 @@ import sys
 from itertools import zip_longest
 from typing import NamedTuple
 
+from messages import (
+    print_progress_note,
+    stderr_para,
+)
 from shared import (
     NOT_APPLICABLE,
-    PROGRESS_APPROX_NOTE,
     HelpFormatter,
     Progress,
     SnapshotStore,
@@ -40,7 +43,6 @@ from shared import (
     print_table,
     real_osd_set,
     slot,
-    stderr_para,
     target_peer,
 )
 
@@ -270,7 +272,7 @@ PRIMARY_NOTE = (
 
 def render(result: ShowResult) -> None:
     """Print a table per PG, then the footnotes that apply."""
-    any_approx = any_primary = False
+    any_primary = False
     for i, view in enumerate(result.pgs):
         if i:
             print()
@@ -284,9 +286,6 @@ def render(result: ShowResult) -> None:
                 for r, p in zip(view.rows, view.progress, strict=True)
             ],
         )
-        any_approx |= any(
-            p is not None and p.pct is not None and not p.exact for p in view.progress
-        )
         any_primary |= any(
             r.acting == view.pg["acting_primary"] or r.up == view.pg["up_primary"]
             for r in view.rows
@@ -295,8 +294,9 @@ def render(result: ShowResult) -> None:
 
     if any_primary:
         stderr_para(f"NOTE: {PRIMARY_NOTE}")
-    if any_approx:
-        stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
+    print_progress_note(
+        (p.pct, p.exact) for view in result.pgs for p in view.progress if p is not None
+    )
 
 
 def run(args: argparse.Namespace) -> None:

@@ -9,6 +9,8 @@
 * CLI helpers, the grouped table (print_table) and its cell formatters.
 * Pinning moving shards back (close_pins and friends), shared by
   cancel-backfill and cancel-uphill.
+
+Message text more than one command prints is in messages.py.
 """
 
 import argparse
@@ -28,6 +30,14 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
+
+from messages import (
+    blocking_reason,
+    companion_note,
+    format_bytes,
+    osd_list,
+    stderr_para,
+)
 
 # Sentinel used by CRUSH/Ceph for "no OSD in this slot" (crush/crush.h).
 # 'ceph pg' JSON uses this value, not -1, to mark unfilled up/acting slots.
@@ -62,17 +72,17 @@ def is_real_osd(osd_id) -> bool:
     return osd_id not in (CRUSH_ITEM_NONE, -1, None)
 
 
-def slot(osd_list: list, index: int) -> int | None:
+def slot(osds: list, index: int) -> int | None:
     """Return the real OSD at a position of an up/acting array, else None."""
-    if index >= len(osd_list):
+    if index >= len(osds):
         return None
-    osd_id = osd_list[index]
+    osd_id = osds[index]
     return osd_id if is_real_osd(osd_id) else None
 
 
-def real_osd_set(osd_list: list) -> set[int]:
+def real_osd_set(osds: list) -> set[int]:
     """Return the set of real (non-placeholder) OSD ids in an up/acting array."""
-    return {o for o in osd_list if is_real_osd(o)}
+    return {o for o in osds if is_real_osd(o)}
 
 
 def pgid_pool_id(pgid: str) -> int:
@@ -99,24 +109,6 @@ class PgidFilter(NamedTuple):
         given = set(given)
         matched = given & set(present)
         return cls(len(given), len(matched), sorted(given - matched))
-
-
-def print_pgid_filter(option: str, f: PgidFilter, matched: str, unmatched: str) -> None:
-    """Report on stderr what option's PG ids matched, naming those that did not.
-
-    matched says what a match means ('have movement'); unmatched, what else
-    than a typo a non-match may be ('not moving').
-    """
-    stderr_para(
-        f"NOTE: {option}: {f.matched} of {f.given} given PG id(s) {matched}"
-        + (
-            f"; {len(f.unmatched)} matched nothing ({unmatched}, or a typo): "
-            + ", ".join(f.unmatched)
-            if f.unmatched
-            else ""
-        )
-        + "."
-    )
 
 
 def is_erasure(pool: dict | None) -> bool:
@@ -256,7 +248,7 @@ def pg_progress_pct(pg: dict, n_copies: int) -> float | None:
     units, so the total is num_objects * n_copies (see copies_moving). Counts
     objects, not bytes. None if the PG has no objects.
 
-    Unreliable after re-peering (see PROGRESS_APPROX_NOTE); only the fallback
+    Unreliable after re-peering (see messages.PROGRESS_APPROX_NOTE); only the fallback
     for backfill positions.
     """
     stat_sum = pg.get("stat_sum", {})
@@ -420,15 +412,6 @@ def pg_progress(pg: dict, pool: dict | None, positions: dict[str, str]) -> Progr
         if None not in pcts:
             return Progress(sum(pcts) / len(pcts), True)
     return counter_progress(pg, pool)
-
-
-# Footnote for PROGRESS figures marked '~'. Pre-wrapped for printing as-is;
-# stderr_para reflows it.
-PROGRESS_APPROX_NOTE = (
-    "~ marks PROGRESS from Ceph's misplaced/degraded counters, used where\n"
-    "backfill positions are unavailable. The counters are per PG and can read\n"
-    "far too high after re-peering, even ~100% for a backfill a third done."
-)
 
 
 # ---------------------------------------------------------------------------
@@ -655,10 +638,7 @@ def check_osds_exist(option: str, osds: Iterable[int], osd_df: dict[int, dict]) 
     """Exit naming the OSDs given with option that 'ceph osd df' does not list."""
     unknown = sorted(set(osds) - osd_df.keys())
     if unknown:
-        sys.exit(
-            f"ERROR: {option}: not in 'ceph osd df': "
-            + ", ".join(f"osd.{o}" for o in unknown)
-        )
+        sys.exit(f"ERROR: {option}: not in 'ceph osd df': " + osd_list(unknown))
 
 
 def parse_pgid(text: str) -> str:
@@ -1068,49 +1048,6 @@ def osd_cells(
     ]
 
 
-def wrap_text(text: str, indent: str = "") -> str:
-    """Wrap a stderr paragraph to the terminal, 40 to 100 columns.
-
-    Continuation lines hang two spaces deeper than indent.
-    """
-    width = min(100, max(40, shutil.get_terminal_size().columns))
-    return textwrap.fill(
-        text,
-        width=width,
-        initial_indent=indent,
-        subsequent_indent=indent + "  ",
-        break_long_words=False,
-        break_on_hyphens=False,
-    )
-
-
-def stderr_para(text: str) -> None:
-    """Print a wrapped stderr paragraph, separated from the previous by a blank line.
-
-    Flushes stdout first, so a table and the notes about it keep their
-    order when both streams go to one pipe (2>&1).
-    """
-    sys.stdout.flush()
-    if stderr_para.printed:
-        print(file=sys.stderr)
-    print(wrap_text(text), file=sys.stderr)
-    stderr_para.printed = True
-
-
-stderr_para.printed = False
-
-
-def stderr_items(items: Iterable[str]) -> None:
-    """Print items on stderr, one indented, wrapped line each.
-
-    For the details under a stderr_para summary, e.g. each shard that could
-    not be pinned or placed.
-    """
-    sys.stdout.flush()
-    for item in items:
-        print(wrap_text(item, indent="  "), file=sys.stderr)
-
-
 def print_table(columns: Columns, rows: list[list[str]]) -> None:
     """Print rows under a two-line header: group names, then column labels.
 
@@ -1240,6 +1177,30 @@ class Skipped(NamedTuple):
     pgid: str
     shard: "int | str"
     reason: str
+
+
+class PinTotals(NamedTuple):
+    """What a cancel command's summary counts (see messages.print_pin_summary)."""
+
+    requested: int  # shards pinned for themselves: not companions or blockers
+    pgs: int  # PGs with any pin
+    others: int  # companions and blockers
+    blockers: int
+    size_bytes: int  # of the requested shards of known size
+    unknown_size: int  # requested shards of unknown size
+
+    @classmethod
+    def of(cls, cancellations: list[Cancellation]) -> "PinTotals":
+        requested = [c for c in cancellations if c.companion_of is None]
+        known = [c.size_bytes for c in requested if c.size_bytes is not None]
+        return cls(
+            requested=len(requested),
+            pgs=len({c.pgid for c in cancellations}),
+            others=len(cancellations) - len(requested),
+            blockers=sum(c.blocker_util is not None for c in cancellations),
+            size_bytes=sum(known),
+            unknown_size=len(requested) - len(known),
+        )
 
 
 def same_place(a: int, b: int, osd_host: dict[int, str]) -> bool:
@@ -1495,44 +1456,6 @@ def avoid_chains(
     return ChainResolution(kept, skipped, chained)
 
 
-def warn_chains(chained: dict[str, list[Pair]]) -> None:
-    """Warn on stderr about PGs whose pins chain, with commands that apply them all."""
-    stderr_para(
-        f"WARNING: the pins of {len(chained)} PG(s) chain (A->B, B->C), which "
-        f"pgremapper cannot apply: {', '.join(chained)}. Pins left out are "
-        "listed above. To apply them all, run the (untested) commands below; "
-        "each sets the PG's whole upmap entry, existing pairs included. "
-        "pgremapper removes part of such a chain as stale when it later "
-        "changes the PG."
-    )
-    for pgid, pairs in chained.items():
-        flat_pairs = " ".join(f"{f} {t}" for f, t in pairs)
-        # Not wrapped: for copy-pasting.
-        print(f"  ceph osd pg-upmap-items {pgid} {flat_pairs}", file=sys.stderr)
-
-
-def format_bytes(num: int | None) -> str:
-    """Format a byte count in binary units, or '?' if unknown."""
-    if num is None:
-        return "?"
-    value = float(num)
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if value < 1024 or unit == "TiB":
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-        value /= 1024
-    raise AssertionError("unreachable")
-
-
-def blocking_reason(osd_id: int, projected: float) -> str:
-    """Say why a shard headed for osd_id is a blocker, in the words every command uses.
-
-    A blocker's target is projected, counting every shard arriving on it,
-    at or over backfillfull_ratio: Ceph refuses that backfill, and
-    backfill_toofull then holds back the whole PG.
-    """
-    return f"osd.{osd_id} projected at {projected:.1f}%, at or over backfillfull_ratio"
-
-
 def format_note(c: Cancellation) -> str:
     """Return the NOTE cell: why a shard not chosen directly is pinned."""
     if c.blocker_util is not None:
@@ -1542,9 +1465,7 @@ def format_note(c: Cancellation) -> str:
         )
     if c.companion_of is None:
         return ""
-    if c.of_blocker:
-        return f"companion of blocker shard {c.companion_of}"
-    return f"companion of shard {c.companion_of}"
+    return companion_note(c.companion_of, of_blocker=c.of_blocker)
 
 
 # (group, label). ACTING is where the data is (the pair's 'to'), UP where

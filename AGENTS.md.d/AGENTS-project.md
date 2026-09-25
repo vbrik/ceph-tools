@@ -1,3 +1,4 @@
 # Other
 - note that there are some files in ./gitignore that are useful for testing of some scripts (don't add them to the repo and don't delete them!)
 - `tests/` holds the unit tests (all of them), one subdirectory per script group (`tests/backfillctl/`, `tests/cephfs/`); `tests/backfillctl/test-data` contains cluster state snapshot data for testing
+- backfillctl: a message that another command also prints (a note, warning, summary clause or NOTE cell) goes in `backfillctl/messages.py`; check there before wording a new one

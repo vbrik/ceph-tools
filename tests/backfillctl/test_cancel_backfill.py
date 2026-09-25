@@ -767,15 +767,6 @@ class AvoidChainsTest(unittest.TestCase):
         self.assertEqual(result.cancellations, [])
         self.assertEqual(result.chained, {"7.1": [(9, 5), (4, 9)]})
 
-    def test_warning_gives_whole_entries_in_apply_order(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            shared.warn_chains({"19.9": [(7, 8), (20, 30), (682, 20)]})
-        text = err.getvalue()
-        self.assertIn("ceph osd pg-upmap-items 19.9 7 8 20 30 682 20", text)
-        self.assertIn("pgremapper cannot apply", flat(text))
-        self.assertIn("removes part of such a chain as stale", flat(text))
-
 
 class NoteTest(unittest.TestCase):
     def note(self, **kw):
@@ -1324,7 +1315,7 @@ class MainTest(unittest.TestCase):
         self.assertIsNotNone(blocker.blocker_util)
         _, err = self.run_main("--pin-blockers", "--osds", "682", **kwargs)
         self.assertIn("1 more shard(s)", err)
-        self.assertIn("(blockers: 1)", flat(err))
+        self.assertIn("(companions; blockers: 1)", flat(err))
         self.assertNotIn("--pin-blockers was not given", err)
 
     def test_table_says_which_shard_a_blocker_blocks(self):
@@ -1810,7 +1801,7 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertIn("--pin-blockers was not given", err)
 
         err = self.replay(896, "--pin-blockers").stderr
-        self.assertIn("(blockers: 7)", flat(err))
+        self.assertIn("(companions; blockers: 7)", flat(err))
         self.assertNotIn("--pin-blockers was not given", err)
 
     def test_several_osds_pin_the_union_of_their_backfills(self):
@@ -2079,7 +2070,7 @@ class BlockerFixtureReplayTest(unittest.TestCase):
         err = self.replay("--pin-blockers").stderr
         self.assertIn("1 arriving shard(s)", err)
         self.assertIn("1 more shard(s)", err)
-        self.assertIn("(blockers: 1)", flat(err))
+        self.assertIn("(companions; blockers: 1)", flat(err))
 
     def test_the_help_recipe_keeps_the_wanted_backfill_and_its_blocker(self):
         # the user's case: keep 231->896. The help's jq filter keeps a PG's

@@ -13,6 +13,9 @@ import argparse
 import json
 import sys
 
+from messages import (
+    stderr_para,
+)
 from shared import (
     BACKFILL_POSITIONS_FILE,
     PROGRESS_COUNTERS,
@@ -21,7 +24,6 @@ from shared import (
     extract_pg_stats,
     query_backfill_positions,
     resolve_save_dir,
-    stderr_para,
 )
 from shared import anonymize_snapshots as anonymize_common
 
