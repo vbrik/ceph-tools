@@ -18,8 +18,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _support import REPO_ROOT, TEST_DATA
+from _support import REPO_ROOT, TEST_DATA, run_command
 
+from backfillctl import divert_toofull as dt
 from backfillctl.__main__ import _COMMAND_MODULES, build_parser
 
 FIXTURE = TEST_DATA / "ceph1-backfills-stuck-at-100-pct"
@@ -58,9 +59,9 @@ def run_backfillctl(*argv: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         check=False,
-        # Plain text even when the caller's shell sets FORCE_COLOR.
+        # Plain text, wrapped at 80 columns, whatever the caller's shell sets.
         env={k: v for k, v in os.environ.items() if k != "FORCE_COLOR"}
-        | {"PYTHON_COLORS": "0"},
+        | {"PYTHON_COLORS": "0", "COLUMNS": "80"},
     )
 
 
@@ -210,6 +211,29 @@ class TopLevelHelpTest(unittest.TestCase):
     def test_cancel_backfill_usage_shows_pin_blockers_needs_osds(self):
         usage = help_text("cancel-backfill")
         self.assertIn("[--osds OSD [OSD ...] [--pin-blockers]]", usage)
+
+
+class RunCommandTest(unittest.TestCase):
+    """_support.run_command, which most end-to-end tests use instead of a
+    subprocess, prints exactly what backfillctl does."""
+
+    def test_matches_a_subprocess_run(self):
+        fixture = TEST_DATA / "divert-toofull-osd457-down"
+        for argv in (
+            [],  # stderr paragraphs, and a table
+            ["--max-target-uses", "0"],  # an argparse error, naming the program
+        ):
+            with self.subTest(argv=argv):
+                real = run_backfillctl(
+                    "--load-state", str(fixture), "divert-toofull", *argv
+                )
+                # Twice: nothing a run leaves behind may change the next one.
+                for _ in range(2):
+                    fake = run_command(dt, *argv, load_state=fixture)
+                    self.assertEqual(
+                        (fake.returncode, fake.stdout, fake.stderr),
+                        (real.returncode, real.stdout, real.stderr),
+                    )
 
 
 if __name__ == "__main__":
