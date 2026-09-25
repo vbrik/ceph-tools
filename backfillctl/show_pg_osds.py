@@ -35,6 +35,7 @@ from shared import (
     format_progress,
     is_erasure,
     osd_cells,
+    osd_columns,
     parse_pgid,
     pgid_pool_id,
     print_table,
@@ -57,12 +58,8 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 # (group, label)
 COLUMNS = [
     ("", "SHARD"),
-    ("ACTING", "OSD"),
-    ("ACTING", "UTIL"),
-    ("ACTING", "HOST"),
-    ("UP", "OSD"),
-    ("UP", "UTIL"),
-    ("UP", "HOST"),
+    *osd_columns("ACTING"),
+    *osd_columns("UP"),
     ("", "PROGRESS"),
     ("", "UPMAPS"),
 ]

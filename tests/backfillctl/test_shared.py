@@ -271,17 +271,10 @@ class ExtractBackfillPositionsTest(unittest.TestCase):
         self.assertEqual({}, shared.extract_backfill_positions(q))
         self.assertEqual({}, shared.extract_backfill_positions({}))
 
-    def test_target_peers_named_like_pg_query(self):
-        self.assertEqual(
-            ["5(1)", "7(3)"],
-            shared.backfill_target_peers([1, 5, 3, 7], [1, 2, 3, NONE], True),
-        )
-        self.assertEqual(
-            ["4", "6"], shared.backfill_target_peers([6, 1, 4], [1, 2], False)
-        )
 
+class CopyProgressTest(unittest.TestCase):
+    """One moving copy's own progress (EC shard or replica)."""
 
-class PgProgressTest(unittest.TestCase):
     EC = {"type": shared.POOL_TYPE_ERASURE, "size": 3, "pg_num": 16}  # noqa: RUF012
     REP = {"type": 1, "size": 2, "pg_num": 16}  # noqa: RUF012
 
@@ -302,72 +295,13 @@ class PgProgressTest(unittest.TestCase):
         span = 1 << (32 - bits)
         return f"{(top << (32 - bits)) | int(frac * span):08x}"
 
-    def test_positions_average_over_targets(self):
-        # The counters say done; the positions say 25% and 75%.
-        pg = self.pg([4, 5, 3], [1, 2, 3])
-        positions = {"4(0)": self.key(3, 16, 0.25), "5(1)": self.key(3, 16, 0.75)}
-        progress = shared.pg_progress(pg, self.EC, positions)
-        self.assertTrue(progress.exact)
-        self.assertAlmostEqual(50.0, progress.pct, 3)
-
-    def test_finished_target_counts_as_done(self):
-        pg = self.pg([4, 5, 3], [1, 2, 3], misplaced=200)
-        progress = shared.pg_progress(pg, self.EC, {"4(0)": "MAX", "5(1)": "MIN"})
-        self.assertEqual(shared.Progress(50.0, True), progress)
-
-    def test_replicated(self):
-        pg = self.pg([1, 4], [1, 2])
-        progress = shared.pg_progress(pg, self.REP, {"4": self.key(3, 16, 0.5)})
-        self.assertTrue(progress.exact)
-        self.assertAlmostEqual(50.0, progress.pct, 3)
-
-    def test_falls_back_on_counters(self):
-        pg = self.pg([4, 5, 3], [1, 2, 3], misplaced=50)  # 75% by the counters
-        counters = shared.Progress(75.0, False)
-        cases = {
-            "no positions": (self.EC, {}),
-            "a target without one": (self.EC, {"4(0)": "MIN"}),
-            "a position of another PG": (
-                self.EC,
-                {"4(0)": "MIN", "5(1)": self.key(2, 16, 0.5)},
-            ),
-            "unknown pool": (None, {"4(0)": "MIN", "5(1)": "MIN"}),
-            "unknown pg_num": (
-                {"type": shared.POOL_TYPE_ERASURE, "size": 3},
-                {"4(0)": "MIN", "5(1)": "MIN"},
-            ),
-        }
-        for name, (pool, positions) in cases.items():
-            with self.subTest(name):
-                # With the pool unknown, EC shards are diffed as replicas: the
-                # counters then give a different, still counter-based, figure.
-                progress = shared.pg_progress(pg, pool, positions)
-                self.assertFalse(progress.exact)
-                if pool is not None:
-                    self.assertEqual(counters, progress)
-
-    def test_shard_with_no_osd_yet_falls_back_on_counters(self):
-        # Shard 2 has nowhere to go: its copies are work no position covers.
-        pg = self.pg([4, 1, NONE], [1, 2, NONE])
-        pg["up"], pg["acting"] = [4, 2, NONE], [1, 2, NONE]
-        progress = shared.pg_progress(pg, self.EC, {"4(0)": "MAX"})
-        self.assertFalse(progress.exact)
-
-
-class CopyProgressTest(unittest.TestCase):
-    """One moving copy's own progress (EC shard or replica)."""
-
-    EC = PgProgressTest.EC
-    REP = PgProgressTest.REP
-    key = staticmethod(PgProgressTest.key)
-
     def test_target_peer(self):
         self.assertEqual("5(1)", shared.target_peer(5, 1))
         self.assertEqual("5(0)", shared.target_peer(5, 0))
         self.assertEqual("5", shared.target_peer(5, "-"))
 
     def test_each_shard_its_own(self):
-        pg = PgProgressTest.pg([4, 5, 3], [1, 2, 3])
+        pg = self.pg([4, 5, 3], [1, 2, 3])
         positions = {"4(0)": self.key(3, 16, 0.9), "5(1)": self.key(3, 16, 0.1)}
         pcts = [
             shared.copy_progress(pg, self.EC, positions, peer).pct
@@ -377,20 +311,18 @@ class CopyProgressTest(unittest.TestCase):
         self.assertAlmostEqual(10.0, pcts[1], 3)
 
     def test_replica(self):
-        pg = PgProgressTest.pg([1, 4], [1, 2])
+        pg = self.pg([1, 4], [1, 2])
         progress = shared.copy_progress(pg, self.REP, {"4": "MAX"}, "4")
         self.assertEqual(shared.Progress(100.0, True), progress)
 
     def test_shard_beside_one_with_no_osd_yet(self):
-        # pg_progress can't cover shard 2 (nowhere to go), but shard 0 has a
-        # position of its own.
-        pg = PgProgressTest.pg([4, 2, NONE], [1, 2, NONE])
+        # Shard 2 has nowhere to go, but shard 0 has a position of its own.
+        pg = self.pg([4, 2, NONE], [1, 2, NONE])
         progress = shared.copy_progress(pg, self.EC, {"4(0)": "MIN"}, "4(0)")
         self.assertEqual(shared.Progress(0.0, True), progress)
-        self.assertFalse(shared.pg_progress(pg, self.EC, {"4(0)": "MIN"}).exact)
 
     def test_falls_back_on_the_pgs_counters(self):
-        pg = PgProgressTest.pg([4, 5, 3], [1, 2, 3], misplaced=50)  # 75% by them
+        pg = self.pg([4, 5, 3], [1, 2, 3], misplaced=50)  # 75% by them
         counters = shared.Progress(75.0, False)
         self.assertEqual(counters, shared.counter_progress(pg, self.EC))
         cases = {
@@ -415,9 +347,9 @@ class WithExactProgressTest(unittest.TestCase):
         return shared.Cancellation(pgid, shard, up_osd, acting_osd, 0, "s", 75.0)
 
     def test_each_cancellation_gets_its_shards_progress(self):
-        ec = PgProgressTest.pg([4, 5, 3], [1, 2, 3], misplaced=50)
-        rep = PgProgressTest.pg([1, 6], [1, 2], pgid="2.3", misplaced=50)
-        pools = {1: PgProgressTest.EC, 2: PgProgressTest.REP}
+        ec = CopyProgressTest.pg([4, 5, 3], [1, 2, 3], misplaced=50)
+        rep = CopyProgressTest.pg([1, 6], [1, 2], pgid="2.3", misplaced=50)
+        pools = {1: CopyProgressTest.EC, 2: CopyProgressTest.REP}
         cancellations = [
             self.cancellation("1.3", 0, 4, 1),
             self.cancellation("1.3", 1, 5, 2),
@@ -756,6 +688,11 @@ class CellTest(unittest.TestCase):
             "act+remap+bkfl_wt+brand_new",
         )
         self.assertEqual(shared.abbreviate_state(""), "")
+
+    def test_osd_columns_label_osd_cells(self):
+        columns = shared.osd_columns("UP")
+        self.assertEqual([("UP", "OSD"), ("UP", "UTIL"), ("UP", "HOST")], columns)
+        self.assertEqual(len(columns), len(shared.osd_cells(self.DF, {}, 1)))
 
     def test_osd_cells_empty_slot(self):
         self.assertEqual(shared.osd_cells(self.DF, {}, None), ["none", "-", "-"])

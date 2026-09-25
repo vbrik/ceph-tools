@@ -105,7 +105,7 @@ class LoadStateTest(unittest.TestCase):
 
     def test_stdout_is_the_table_and_notes_follow_it_on_stderr(self):
         alone = run_backfillctl("--load-state", str(FIXTURE), "show-backfill")
-        self.assertTrue(alone.stdout.startswith("PGID"))
+        self.assertTrue(alone.stdout.splitlines()[1].startswith("PGID"))
         self.assertNotIn("movement(s)", alone.stdout)
         self.assertIn("movement(s)", alone.stderr)
         # 2>&1: stdout is flushed before each note, so the order holds.
@@ -122,8 +122,8 @@ class LoadStateTest(unittest.TestCase):
             text=True,
             check=False,
         ).stdout
-        self.assertTrue(both.startswith("PGID"))
-        self.assertLess(both.rindex("act+"), both.index("shard movement(s)"))
+        self.assertTrue(both.splitlines()[1].startswith("PGID"))
+        self.assertLess(both.rindex("act+"), both.index("copy movement(s)"))
 
     def test_missing_directory_is_reported(self):
         result = run_backfillctl("--load-state", "/nonexistent-dir", "show-backfill")

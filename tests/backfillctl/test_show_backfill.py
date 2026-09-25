@@ -23,6 +23,40 @@ from backfillctl import show_backfill as pm
 NONE = shared.CRUSH_ITEM_NONE
 
 
+class ReplicaPairsTest(unittest.TestCase):
+    def test_sources_pair_with_targets_in_osd_order(self):
+        self.assertEqual(
+            [(2, 5, False), (7, 9, False)],
+            pm.replica_pairs([9, 1, 5], [7, 1, 2], primary=7),
+        )
+
+    def test_a_missing_copy_is_paired_with_the_marked_primary(self):
+        self.assertEqual(
+            [(2, 5, False), (1, 9, True)],
+            pm.replica_pairs([1, 5, 9], [1, 2], primary=1),
+        )
+
+    def test_the_primary_can_be_a_source_and_rebuild_a_copy_too(self):
+        # osd.0 loses its copy to osd.2 and, as primary, rebuilds osd.4's.
+        self.assertEqual(
+            [(0, 2, False), (1, 3, False), (0, 4, True)],
+            pm.replica_pairs([2, 3, 4], [0, 1], primary=0),
+        )
+
+    def test_a_missing_copy_without_a_primary_has_no_acting_osd(self):
+        self.assertEqual([(None, 5, False)], pm.replica_pairs([5], [], primary=None))
+
+    def test_a_dropped_copy_has_no_target(self):
+        self.assertEqual(
+            [(2, 5, False), (3, None, False)],
+            pm.replica_pairs([1, 5], [1, 2, 3], primary=1),
+        )
+
+    def test_reorders_and_pure_drops_are_not_movement(self):
+        self.assertEqual([], pm.replica_pairs([2, 1], [1, 2], primary=1))
+        self.assertEqual([], pm.replica_pairs([1], [1, 2], primary=1))
+
+
 class MovementTypeTest(unittest.TestCase):
     def test_recovery_backfill_and_both(self):
         self.assertEqual(pm.movement_type("active+recovering"), "recovery")
@@ -129,8 +163,8 @@ class MainTest(unittest.TestCase):
     def test_ec_row_names_the_shard_and_both_osds(self):
         row = self.row("27.10")
         self.assertEqual(
-            (1, {3}, {2}, "backfill"),
-            (row.shard, row.sources, row.destinations, row.move_type),
+            (1, 3, 2, "backfill", False),
+            (row.shard, row.acting_osd, row.up_osd, row.move_type, row.primary_marked),
         )
 
     def test_ec_row_rendering(self):
@@ -138,7 +172,7 @@ class MainTest(unittest.TestCase):
         line = next(ln for ln in out.splitlines() if ln.startswith("27.10"))
         self.assertRegex(
             line,
-            r"^27\.10\s+1\s+3\(ceph2,89\.0%\)\s+->\s+2\(ceph2,70\.0%\)\s+backfill\s+~0%",
+            r"^27\.10\s+1\s+3\s+89\.0%\s+ceph2\s+2\s+70\.0%\s+ceph2\s+backfill\s+~0%",
         )
 
     def test_unknown_osds_are_an_error_not_an_empty_match(self):
@@ -149,16 +183,24 @@ class MainTest(unittest.TestCase):
         )
 
     def test_table_matches_the_other_commands(self):
-        # print_table's layout: the label line first (no groups, no rule),
-        # and utilization to one decimal, so 88.6% never reads as 89%.
-        row = pm.MovementRow(
-            "1.0", 0, frozenset({3}), frozenset({2}), "backfill", "s", 3, False
-        )
+        # ACTING and UP groups of osd_cells, as in cancel-backfill, with
+        # utilization to one decimal, so 88.6% never reads as 89%.
+        row = pm.MovementRow("1.0", 0, 3, 2, "backfill", "s")
         cells = pm.format_row(row, {3: {"utilization": 88.6}, 2: {}}, {3: "a", 2: "b"})
-        self.assertEqual(cells[2:5], ["3(a,88.6%)", "->", "2(b,?)"])
-        out = self.run_main()
-        self.assertTrue(out.startswith("PGID "))
-        self.assertNotIn("─", out)
+        self.assertEqual(cells[2:8], ["3", "88.6%", "a", "2", "?", "b"])
+        group_line, label_line, *_ = self.run_main().splitlines()
+        self.assertRegex(group_line, r"^\s+-+ ACTING -+\s+-+ UP -+$")
+        self.assertRegex(label_line, r"^PGID\s+SHARD\s+OSD\s+UTIL\s+HOST\s+OSD\s")
+
+    def test_dropped_replica_has_no_target_and_no_progress(self):
+        snaps = {**SNAPSHOTS, "pg_dump_pgs": [pg("5.2", [0, 3], [0, 1, 2], "active")]}
+        rows = self.plan(snapshots=snaps).rows
+        self.assertEqual([(1, 3), (2, None)], [(r.acting_osd, r.up_osd) for r in rows])
+        self.assertEqual((None, True), (rows[1].progress_pct, rows[1].progress_exact))
+        line = self.run_main(snapshots=snaps).splitlines()[-1]
+        self.assertRegex(
+            line, r"^5\.2\s+-\s+2\s+70\.0%\s+ceph2\s+none\s+-\s+-\s+remapped\s+-\s"
+        )
 
     def test_progress_denominator_counts_unassigned_shards(self):
         # 27.9: one shard moving plus one with no OSD anywhere = 2 copies to
@@ -176,16 +218,15 @@ class MainTest(unittest.TestCase):
 
     def test_degraded_replica_has_no_source_but_the_primary(self):
         row = self.row("5.1f")
-        self.assertEqual((set(), {2}), (row.sources, row.destinations))
-        self.assertEqual(0, row.primary)
-        self.assertTrue(row.needs_primary_marker)
+        self.assertEqual((0, 2, True), (row.acting_osd, row.up_osd, row.primary_marked))
 
     def test_degraded_replica_shows_the_primary_as_the_worker(self):
         out = self.run_main()
         line = next(ln for ln in out.splitlines() if ln.startswith("5.1f"))
-        self.assertIn("0(ceph1)*", line)
+        # Its UTIL is '-': it loses no data.
+        self.assertRegex(line, r"^5\.1f\s+-\s+0\*\s+-\s+ceph1\s+2\s+70\.0%")
         self.assertIn("NOTE: * marks the PG's primary", self.err)
-        self.assertIn("4 shard movement(s) across 4 PG(s).", self.err)
+        self.assertIn("4 copy movement(s) across 4 PG(s).", self.err)
         self.assertNotIn("movement(s)", out)
 
     def test_counter_progress_is_marked_and_explained(self):
@@ -209,17 +250,11 @@ class MainTest(unittest.TestCase):
         self.assertEqual((100.0, True), (row.progress_pct, row.progress_exact))
 
     def test_progress_from_backfill_positions(self):
-        # Every target at MIN: 0% however done the counters say it is. 27.9
-        # is left out: a shard with no OSD anywhere keeps it on the counters.
-        pools = {5: False, 27: True}
+        # Every target at MIN: 0% however done the counters say it is.
         positions = {
-            p["pgid"]: dict.fromkeys(
-                shared.backfill_target_peers(
-                    p["up"], p["acting"], pools[shared.pgid_pool_id(p["pgid"])]
-                ),
-                "MIN",
-            )
-            for p in PGS
+            "5.3": {"3": "MIN"},
+            "5.1f": {"2": "MIN"},
+            "27.10": {"2(1)": "MIN"},
         }
         query = mock.Mock(return_value=positions)
         with mock.patch.object(shared, "query_backfill_positions", query):
@@ -253,8 +288,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(33.0, result.osd_df[4]["utilization"])
         self.assertNotIn(3, result.osd_df)
         out = self.run_main(snapshots=snaps)
-        self.assertIn("4(h2,33.0%)", out)
-        self.assertIn("3(h2,?)", out)
+        self.assertRegex(out, r"\s3\s+\?\s+h2\s+4\s+33\.0%\s+h2\s")
 
     def test_no_movement(self):
         snaps = {**SNAPSHOTS, "pg_dump_pgs": [PGS[2]]}
@@ -268,9 +302,14 @@ class MainTest(unittest.TestCase):
             self.run_main(snapshots=snaps)
         self.assertIn("ceph pg dump pgs", str(ctx.exception))
 
-    def test_sort_by_destination(self):
-        rows = self.plan("--sort-by", "to-osd").rows
-        self.assertEqual("5.3", rows[-1].pgid)  # osd.3 is the highest destination
+    def test_sort_by_up_osd(self):
+        rows = self.plan("--sort-by", "up-osd").rows
+        self.assertEqual("5.3", rows[-1].pgid)  # osd.3 is the highest target
+
+    def test_sort_by_acting_osd(self):
+        rows = self.plan("--sort-by", "acting-osd").rows
+        # By ACTING OSD (a marked primary counts as its OSD), ties in PG order.
+        self.assertEqual(["5.1f", "27.9", "5.3", "27.10"], [r.pgid for r in rows])
 
     def test_load_state_reads_the_saved_snapshots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,7 +340,7 @@ class FilterTest(unittest.TestCase):
             pm.run(parse_args(pm, argv))
         return out.getvalue(), err.getvalue()
 
-    def test_osds_matches_sources_and_destinations(self):
+    def test_osds_matches_acting_and_up(self):
         self.assertEqual(["5.3", "27.10"], self.pgids("--osds", "3"))
         self.assertEqual(["5.3", "5.1f", "27.10"], self.pgids("--osds", "2"))
 
@@ -340,7 +379,7 @@ class FilterTest(unittest.TestCase):
         err = " ".join(err.split())
         self.assertIn("NOTE: --pgs: 1 of 3 given PG id(s) have movement", err)
         self.assertIn("2 matched nothing (not moving, or a typo): 27.a, 99.1.", err)
-        self.assertTrue(out.startswith("PGID"))
+        self.assertIn("PGID", out)
 
     def test_pgs_unmatched_is_judged_before_osds(self):
         # 5.3 moves, so it is not a typo even though --osds filters it out.

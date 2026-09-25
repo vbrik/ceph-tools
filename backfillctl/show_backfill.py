@@ -1,31 +1,34 @@
 # SPDX-License-Identifier: MIT
 """
-Show backfills: the PGs whose 'up' set differs from 'acting', with source
-and target OSDs, progress and state.
+Show backfills: the PGs whose 'up' set differs from 'acting', one row per
+moving copy, with its acting (source) and up (target) OSD, progress and state.
 
-EC pools get a row per moving shard. Replicated pools get one row per PG,
-since replicas are interchangeable; their SHARD is '-'.
+EC pools get a row per moving shard. Replicated pools diff up and acting as
+sets, pairing sources with targets in OSD order (replicas are
+interchangeable); their SHARD is '-'.
 
-FROM_OSD is the OSD losing data. When a missing copy is being rebuilt there
-is none, so it shows the PG's primary, marked '*': the primary keeps its copy
-but does the work.
+When a missing copy is being rebuilt, no OSD loses data, so ACTING shows the
+PG's primary, marked '*': the primary keeps its copy but does the work. UP
+reads 'none' for a replica dropped with nowhere to go.
 
 TYPE is recovery, backfill, or remapped (not started). PROGRESS is how far
-the row's target has got, from its backfill position in 'ceph pg query'
-(averaged over a replicated row's targets). '~' marks a fallback on Ceph's
-per-PG counters, which can read far too high.
+the row's target has got, from its backfill position in 'ceph pg query'.
+'~' marks a fallback on Ceph's per-PG counters, which can read far too high.
 
 --osds keeps rows involving any of the given OSDs, including a '*' primary;
 --pgs keeps rows of the given PGs. Given both, a row must match both.
 """
 
 import argparse
+from itertools import zip_longest
 from typing import NamedTuple
 
 from shared import (
+    NOT_APPLICABLE,
     PROGRESS_APPROX_NOTE,
     HelpFormatter,
     PgidFilter,
+    Progress,
     SnapshotStore,
     abbreviate_state,
     add_load_state_arg,
@@ -38,11 +41,11 @@ from shared import (
     fetch_pg_stats,
     fetch_pools,
     format_progress,
-    format_utilization,
     is_erasure,
     is_real_osd,
+    osd_cells,
+    osd_columns,
     parse_osd,
-    pg_progress,
     pgid_pool_id,
     pgid_sort_key,
     print_pgid_filter,
@@ -52,7 +55,7 @@ from shared import (
     target_peer,
 )
 
-# Footnote for the '*' after a FROM_OSD primary (see fmt_from in render).
+# Footnote for the '*' after an ACTING primary (see MovementRow.primary_marked).
 PRIMARY_NOTE = (
     "* marks the PG's primary where no OSD loses a copy: it keeps its copy, "
     "but drives the recovery."
@@ -79,7 +82,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     )
     parser.add_argument(
         "--sort-by",
-        choices=["pgid", "from-osd", "to-osd"],
+        choices=["pgid", "acting-osd", "up-osd"],
         default="pgid",
         help="Sort rows by this column (default: %(default)s).",
     )
@@ -125,24 +128,50 @@ def movement_type(state: str) -> str:
     return "+".join(labels)
 
 
+class MovementRow(NamedTuple):
+    """One row: a moving EC shard, or one replica of a replicated PG."""
+
+    pgid: str
+    shard: "int | str"  # EC shard index, or '-' for replicated pools
+    acting_osd: int | None  # losing the copy, or the primary (primary_marked)
+    up_osd: int | None  # gaining it; None for a replica dropped outright
+    move_type: str
+    state: str
+    primary_marked: bool = False  # acting_osd is the primary rebuilding a
+    # missing copy, shown with '*'; it loses nothing
+    progress_pct: float | None = None  # set by with_progress
+    progress_exact: bool = False  # from backfill positions, not counters
+
+
+def replica_pairs(
+    up: list, acting: list, primary: int | None
+) -> list[tuple[int | None, int | None, bool]]:
+    """Return (acting_osd, up_osd, primary_marked) for a replicated PG's moving copies.
+
+    Sources (acting only) pair with targets (up only) in OSD order. A target
+    left over is a missing copy, paired with the primary, marked; a source
+    left over is dropped, paired with None. A reorder yields nothing, and so
+    does a PG only dropping copies: nothing moves.
+    """
+    up_set, acting_set = real_osd_set(up), real_osd_set(acting)
+    sources, targets = sorted(acting_set - up_set), sorted(up_set - acting_set)
+    if not targets:
+        return []
+    return [
+        (primary, target, primary is not None)
+        if source is None
+        else (source, target, False)
+        for source, target in zip_longest(sources, targets)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Sorting
 # ---------------------------------------------------------------------------
 
 
-class MovementRow(NamedTuple):
-    """One row: an EC shard's move, or a replicated PG's."""
-
-    pgid: str
-    shard: "int | str"  # EC shard index, or '-' for replicated pools
-    sources: frozenset  # OSDs losing data; may be empty
-    destinations: frozenset  # OSDs gaining data
-    move_type: str
-    state: str
-    primary: "int | None"  # acting primary, shown with '*' (see from_osds)
-    needs_primary_marker: bool  # a destination has no matching source
-    progress_pct: "float | None" = None  # set by with_progress
-    progress_exact: bool = False  # from backfill positions, not counters
+def _osd_key(osd: int | None) -> int:
+    return -1 if osd is None else osd
 
 
 def _row_pgid_key(row: MovementRow) -> tuple:
@@ -150,26 +179,10 @@ def _row_pgid_key(row: MovementRow) -> tuple:
     return (*pgid_sort_key(row.pgid), shard_key)
 
 
-def from_osds(row: MovementRow) -> set[int]:
-    """Return the OSDs the row's FROM_OSD cell shows: sources plus any '*' primary."""
-    ids = set(row.sources)
-    if (not ids or row.needs_primary_marker) and row.primary is not None:
-        ids.add(row.primary)
-    return ids
-
-
-def _row_from_osd_key(row: MovementRow) -> tuple:
-    return (tuple(sorted(from_osds(row))), pgid_sort_key(row.pgid))
-
-
-def _row_to_osd_key(row: MovementRow) -> tuple:
-    return (tuple(sorted(row.destinations)), pgid_sort_key(row.pgid))
-
-
 _SORT_KEYS = {
     "pgid": _row_pgid_key,
-    "from-osd": _row_from_osd_key,
-    "to-osd": _row_to_osd_key,
+    "acting-osd": lambda r: (_osd_key(r.acting_osd), _row_pgid_key(r)),
+    "up-osd": lambda r: (_osd_key(r.up_osd), _row_pgid_key(r)),
 }
 
 
@@ -199,66 +212,25 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
     rows: list[MovementRow] = []
 
     for pg in pg_stats:
-        pgid = pg["pgid"]
-        state = pg["state"]
-        up = pg["up"]
-        acting = pg["acting"]
-        pool_id = pgid_pool_id(pgid)
-
+        pgid, state, up, acting = pg["pgid"], pg["state"], pg["up"], pg["acting"]
         primary = pg.get("acting_primary")
         if not is_real_osd(primary):
             primary = next(iter(sorted(real_osd_set(acting))), None)
-
         mtype = movement_type(state)
-        pool = pools.get(pool_id)
 
-        if is_erasure(pool):
-            # EC: shards are positional, so each moving shard gets its own row.
-            moves = ec_shard_moves(up, acting)
-            for i, source, destination in moves:
-                sources = frozenset() if source is None else frozenset({source})
+        if is_erasure(pools.get(pgid_pool_id(pgid))):
+            # Shards are positional: an empty acting slot is a missing copy.
+            for i, source, target in ec_shard_moves(up, acting):
+                acting_osd = primary if source is None else source
+                marked = source is None and primary is not None
                 rows.append(
-                    MovementRow(
-                        pgid,
-                        i,
-                        sources,
-                        frozenset({destination}),
-                        mtype,
-                        state,
-                        primary,
-                        False,
-                    )
+                    MovementRow(pgid, i, acting_osd, target, mtype, state, marked)
                 )
         else:
-            # Replicated: diff as sets (a reorder is not movement), one row per PG.
-            up_set = real_osd_set(up)
-            acting_set = real_osd_set(acting)
-
-            if up_set == acting_set:
-                continue
-
-            destinations = up_set - acting_set
-            sources = acting_set - up_set
-
-            if not destinations:
-                continue
-
-            # More destinations than sources: the primary is rebuilding a
-            # missing replica.
-            needs_primary_marker = len(destinations) > len(sources)
-
-            rows.append(
-                MovementRow(
-                    pgid,
-                    "-",
-                    frozenset(sources),
-                    frozenset(destinations),
-                    mtype,
-                    state,
-                    primary,
-                    needs_primary_marker,
+            for acting_osd, target, marked in replica_pairs(up, acting, primary):
+                rows.append(
+                    MovementRow(pgid, "-", acting_osd, target, mtype, state, marked)
                 )
-            )
 
     rows, pgs_filter = filter_rows(rows, set(args.osds), set(args.pgs))
     rows = with_progress(store, rows, pg_stats, pools)
@@ -274,21 +246,24 @@ def with_progress(
     pg_stats: list[dict],
     pools: dict[int, dict],
 ) -> list[MovementRow]:
-    """Return rows with PROGRESS filled in: an EC shard's own, a replicated PG's overall."""
+    """Return rows with PROGRESS filled in: each row's target's own.
+
+    A dropped replica (no target) has none.
+    """
     shown = {r.pgid for r in rows}
     pgs = {pg["pgid"]: pg for pg in pg_stats if pg["pgid"] in shown}
     positions = fetch_backfill_positions(store, pgs)
     result = []
     for r in rows:
-        pg, pool = pgs[r.pgid], pools.get(pgid_pool_id(r.pgid))
-        pg_positions = positions.get(r.pgid, {})
-        if isinstance(r.shard, int):
-            (destination,) = r.destinations
-            progress = copy_progress(
-                pg, pool, pg_positions, target_peer(destination, r.shard)
-            )
+        if r.up_osd is None:
+            progress = Progress(None, True)
         else:
-            progress = pg_progress(pg, pool, pg_positions)
+            progress = copy_progress(
+                pgs[r.pgid],
+                pools.get(pgid_pool_id(r.pgid)),
+                positions.get(r.pgid, {}),
+                target_peer(r.up_osd, r.shard),
+            )
         result.append(
             r._replace(progress_pct=progress.pct, progress_exact=progress.exact)
         )
@@ -308,44 +283,25 @@ def filter_rows(
         pgs_filter = PgidFilter.of(pgids, (r.pgid for r in rows))
         rows = [r for r in rows if r.pgid in pgids]
     if osds:
-        rows = [r for r in rows if osds & (from_osds(r) | r.destinations)]
+        rows = [r for r in rows if {r.acting_osd, r.up_osd} & osds]
     return rows, pgs_filter
 
 
-# (group, label). The unlabeled column holds the '->' from FROM to TO.
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+# (group, label). ACTING is where the copy is (or its '*' primary), UP where
+# CRUSH wants it.
 COLUMNS = [
     ("", "PGID"),
     ("", "SHARD"),
-    ("", "FROM_OSD"),
-    ("", ""),
-    ("", "TO_OSD"),
+    *osd_columns("ACTING"),
+    *osd_columns("UP"),
     ("", "TYPE"),
     ("", "PROGRESS"),
     ("", "STATE"),
 ]
-
-
-def osd_label(
-    osd_id: int, osd_df: dict[int, dict], osd_host: dict[int, str], util: bool = True
-) -> str:
-    """Format an OSD as 'ID(host,NN.N%)', or 'ID(host)' without util."""
-    host = osd_host.get(osd_id, "?")
-    if not util:
-        return f"{osd_id}({host})"
-    return f"{osd_id}({host},{format_utilization(osd_df, osd_id)})"
-
-
-def shows_primary(row: MovementRow) -> bool:
-    """True if the row's FROM_OSD cell shows the primary, marked '*'.
-
-    It does when the primary rebuilds a missing copy (no source, or
-    needs_primary_marker) and is not a source itself.
-    """
-    return (
-        (not row.sources or row.needs_primary_marker)
-        and row.primary is not None
-        and row.primary not in row.sources
-    )
 
 
 def format_row(
@@ -353,20 +309,18 @@ def format_row(
 ) -> list[str]:
     """Return one table row's cells.
 
-    FROM_OSD lists the sources, plus the primary marked '*' (shows_primary),
-    without utilization: it loses no data.
+    A '*' primary's UTIL is '-': it loses no data.
     """
-    sources = [osd_label(o, osd_df, osd_host) for o in sorted(row.sources)]
-    if shows_primary(row):
-        sources.append(osd_label(row.primary, osd_df, osd_host, util=False) + "*")
-    elif (not row.sources or row.needs_primary_marker) and row.primary is None:
-        sources.append("unknown")  # a copy is rebuilt, but by no known primary
+    acting = osd_cells(
+        osd_df, osd_host, row.acting_osd, row.acting_osd if row.primary_marked else None
+    )
+    if row.primary_marked:
+        acting[1] = NOT_APPLICABLE
     return [
         row.pgid,
         str(row.shard),
-        ",".join(sources),
-        "->",
-        ",".join(osd_label(o, osd_df, osd_host) for o in sorted(row.destinations)),
+        *acting,
+        *osd_cells(osd_df, osd_host, row.up_osd),
         row.move_type,
         format_progress(row.progress_pct, row.progress_exact),
         abbreviate_state(row.state),
@@ -388,8 +342,8 @@ def render(result: MovementsResult) -> None:
 
     print_table(COLUMNS, [format_row(r, osd_df, osd_host) for r in rows])
     num_pgs = len({r.pgid for r in rows})
-    stderr_para(f"{len(rows)} shard movement(s) across {num_pgs} PG(s).")
-    if any(shows_primary(r) for r in rows):
+    stderr_para(f"{len(rows)} copy movement(s) across {num_pgs} PG(s).")
+    if any(r.primary_marked for r in rows):
         stderr_para(f"NOTE: {PRIMARY_NOTE}")
     if any(r.progress_pct is not None and not r.progress_exact for r in rows):
         stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")

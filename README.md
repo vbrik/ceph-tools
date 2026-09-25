@@ -57,7 +57,7 @@ backfills needs. The cancel commands leave such backfills running, and print
 
 | Command | Purpose |
 |---|---|
-| `show-backfill` | What is moving: source and target OSDs, type, progress and state, per EC shard or replicated PG. Filter with `--osds` and `--pgs`. |
+| `show-backfill` | What is moving: acting and up OSDs, type, progress and state, per moving EC shard or replica. Filter with `--osds` and `--pgs`. |
 | `show-pg-osds PGID...` | Acting and up OSDs of given PGs, per shard, with utilization, host, progress and upmap pairs. |
 | `divert-toofull` | Re-target shards stuck in `backfill_toofull` to the least-utilized legal OSDs, e.g. after an OSD failure piles its data onto its host's other OSDs. |
 | `drain --osds OSD... \| --hosts HOST...` | Move every shard off OSDs or hosts, spread across the cluster rather than onto the same host. Also diverts or pins back shards that would hold the moved ones in `backfill_toofull`. Keep the OSDs up and in until empty: marking them out voids the upmaps. |

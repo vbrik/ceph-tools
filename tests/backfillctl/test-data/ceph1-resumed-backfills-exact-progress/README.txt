@@ -1,6 +1,6 @@
 Fixture: real, live-cluster snapshot of backfills whose misplaced counters
 read 0 (so a counter-based PROGRESS says 100%) while they are really
-anywhere from 6.6% to 99.8% done. This is what shared.pg_progress's
+anywhere from 6.6% to 99.8% done. This is what shared.copy_progress's
 backfill positions are for.
 
 Captured: 2026-09-23, cluster ceph1, 17.2.5 (quincy), still rebalancing off

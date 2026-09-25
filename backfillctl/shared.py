@@ -328,13 +328,6 @@ def backfill_fraction(position: str, seed: int, pg_num: int) -> float | None:
     return (key & (span - 1)) / span
 
 
-def backfill_target_peers(up: list, acting: list, is_ec: bool) -> list[str]:
-    """Return a PG's backfill targets, named as 'ceph pg query' peers (see target_peer)."""
-    if is_ec:
-        return [f"{dst}({i})" for i, _, dst in ec_shard_moves(up, acting)]
-    return [str(o) for o in sorted(real_osd_set(up) - real_osd_set(acting))]
-
-
 def extract_backfill_positions(query: dict) -> dict[str, str]:
     """Return {peer: position} for the backfill targets in a 'ceph pg query'.
 
@@ -401,25 +394,6 @@ def copy_progress(
     """
     pct = target_progress_pct(pg["pgid"], pool, positions.get(peer))
     return counter_progress(pg, pool) if pct is None else Progress(pct, True)
-
-
-def pg_progress(pg: dict, pool: dict | None, positions: dict[str, str]) -> Progress:
-    """Return a PG's overall progress: its targets' positions averaged.
-
-    Falls back on counter_progress unless every moving copy has a usable
-    position.
-    """
-    is_ec = is_erasure(pool)
-    up, acting = pg["up"], pg["acting"]
-    n_copies = copies_moving(up, acting, is_ec, pool.get("size", 0) if pool else 0)
-    targets = backfill_target_peers(up, acting, is_ec)
-    if targets and len(targets) == n_copies:
-        pcts = [
-            target_progress_pct(pg["pgid"], pool, positions.get(t)) for t in targets
-        ]
-        if None not in pcts:
-            return Progress(sum(pcts) / len(pcts), True)
-    return counter_progress(pg, pool)
 
 
 # Footnote for PROGRESS figures marked '~'. Pre-wrapped for printing as-is;
@@ -1048,6 +1022,11 @@ def abbreviate_state(state: str) -> str:
     return "+".join(_STATE_ABBREVS.get(flag, flag) for flag in state.split("+"))
 
 
+def osd_columns(group: str) -> Columns:
+    """Return the (group, label) columns osd_cells fills: OSD, UTIL, HOST."""
+    return [(group, label) for label in ("OSD", "UTIL", "HOST")]
+
+
 def osd_cells(
     osd_df: dict[int, dict],
     osd_host: dict[int, str],
@@ -1552,12 +1531,8 @@ def format_note(c: Cancellation) -> str:
 COLUMNS = [
     ("", "PGID"),
     ("", "SHARD"),
-    ("ACTING", "OSD"),
-    ("ACTING", "UTIL"),
-    ("ACTING", "HOST"),
-    ("UP", "OSD"),
-    ("UP", "UTIL"),
-    ("UP", "HOST"),
+    *osd_columns("ACTING"),
+    *osd_columns("UP"),
     ("", "SIZE"),
     ("", "PROGRESS"),
     ("", "STATE"),
