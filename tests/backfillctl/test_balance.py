@@ -22,53 +22,29 @@ from typing import ClassVar
 from unittest import mock
 
 from _support import (
-    KB,
+    NONE,
     PCT,
-    REPO_ROOT,
+    TEST_DATA,
     SyntheticCluster,
+    flat,
+    osd_df_of,
     parse_args,
     placement,
     plan_from_state,
     shared,
 )
 
-from backfillctl import balance as ut
-
-TEST_DATA = REPO_ROOT / "tests" / "backfillctl" / "test-data"
-NONE = shared.CRUSH_ITEM_NONE
-
-
-def flat(text: str) -> str:
-    """Collapse whitespace, so a substring check survives stderr's line wrapping."""
-    return " ".join(text.split())
-
-
-def host(osd: int) -> int:
-    return osd // 10
+from backfillctl import balance as bal
 
 
 class Cluster(SyntheticCluster):
-    def plan(self, *argv) -> ut.BalanceResult:
+    def plan(self, *argv) -> bal.BalanceResult:
         """Run plan() on this cluster; leading bare OSD ids go to --osds."""
-        return self.plan_with(ut, *argv)
+        return self.plan_with(bal, *argv)
 
 
-def pairs(result: ut.BalanceResult) -> list[tuple[str, object, int, int]]:
+def pairs(result: bal.BalanceResult) -> list[tuple[str, object, int, int]]:
     return [(m.pgid, m.shard, m.from_osd, m.target_osd) for m in result.moves]
-
-
-def osd_df_of(utils: dict[int, float]) -> dict[int, dict]:
-    """A minimal 'ceph osd df' map from {osd: utilization}, all of class hdd."""
-    return {
-        o: {
-            "id": o,
-            "utilization": u,
-            "device_class": "hdd",
-            "kb": KB,
-            "kb_used": u / 100 * KB,
-        }
-        for o, u in utils.items()
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +56,7 @@ class SelectSourcesTest(unittest.TestCase):
     UTILS: ClassVar = {1: 90.0, 2: 80.0, 3: 80.0, 4: 70.0, 5: 60.0, 6: 50.0, 7: 40.0}
 
     def select(self, **kw):
-        return ut.select_sources(
+        return bal.select_sources(
             sorted(self.UTILS),
             self.UTILS.__getitem__,
             osds=kw.get("osds"),
@@ -107,7 +83,7 @@ class SelectSourcesTest(unittest.TestCase):
 
     def test_one_osd_class_has_no_sources(self):
         self.assertEqual(
-            ut.select_sources([1], {1: 90.0}.get, osds=None, min_source_util=None),
+            bal.select_sources([1], {1: 90.0}.get, osds=None, min_source_util=None),
             ([], 1),
         )
 
@@ -124,14 +100,14 @@ class SourcesFromClusterTest(unittest.TestCase):
 
     def test_osds_and_min_source_util_are_mutually_exclusive(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            parse_args(ut, ["--osds", "1", "--min-source-util", "80"])
+            parse_args(bal, ["--osds", "1", "--min-source-util", "80"])
 
     def test_percent_options_refuse_a_ratio(self):
         for argv in (["--min-source-util", "0.8"], ["--max-target-util", "0.9"]):
             with self.subTest(argv=argv):
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
-                    parse_args(ut, argv)
+                    parse_args(bal, argv)
                 self.assertIn("not a ratio", err.getvalue())
 
     def test_osds_unknown_to_ceph_are_named_as_elsewhere(self):
@@ -155,19 +131,19 @@ class SourcesFromClusterTest(unittest.TestCase):
 class DepartingOsdsTest(unittest.TestCase):
     def test_ec_slot_moving_departs_its_acting_osd(self):
         pg = {"up": [4, 2, 3], "acting": [1, 2, 3]}
-        self.assertEqual(ut.departing_osds(pg, True), [1])
+        self.assertEqual(bal.departing_osds(pg, True), [1])
 
     def test_ec_shard_with_empty_up_slot_stays(self):
         pg = {"up": [NONE, 2, 3], "acting": [1, 2, 3]}
-        self.assertEqual(ut.departing_osds(pg, True), [])
+        self.assertEqual(bal.departing_osds(pg, True), [])
 
     def test_ec_empty_acting_slot_departs_nothing(self):
         pg = {"up": [4, 2, 3], "acting": [NONE, 2, 3]}
-        self.assertEqual(ut.departing_osds(pg, True), [])
+        self.assertEqual(bal.departing_osds(pg, True), [])
 
     def test_replicated_compares_sets(self):
         pg = {"up": [3, 2, 4], "acting": [1, 2, 3]}
-        self.assertEqual(ut.departing_osds(pg, False), [1])
+        self.assertEqual(bal.departing_osds(pg, False), [1])
 
 
 class IsSettledTest(unittest.TestCase):
@@ -183,12 +159,12 @@ class IsSettledTest(unittest.TestCase):
         }
         for state, settled in cases.items():
             with self.subTest(state):
-                self.assertEqual(ut.is_settled({"state": state}), settled)
+                self.assertEqual(bal.is_settled({"state": state}), settled)
 
 
 class FinalUsageTest(unittest.TestCase):
     def test_arrivals_added_departures_credited(self):
-        final = ut.FinalUsage(
+        final = bal.FinalUsage(
             osd_df_of({1: 50.0, 2: 50.0}), [(1, 10 * PCT)], [(2, 5 * PCT)]
         )
         self.assertEqual(final.utilization(1), 60.0)
@@ -196,7 +172,7 @@ class FinalUsageTest(unittest.TestCase):
         self.assertEqual(final.utilization(2, 3 * PCT), 48.0)
 
     def test_move(self):
-        final = ut.FinalUsage(osd_df_of({1: 50.0, 2: 50.0}), [], [])
+        final = bal.FinalUsage(osd_df_of({1: 50.0, 2: 50.0}), [], [])
         final.move(1, 2, 10 * PCT)
         self.assertEqual((final.utilization(1), final.utilization(2)), (40.0, 60.0))
 
@@ -211,12 +187,12 @@ class PickTargetTest(unittest.TestCase):
 
     def balancer(self, utils, *, arriving=(), departing=(), max_uses=5, cap=89.0):
         osd_df = osd_df_of(utils)
-        return ut.Balancer(
+        return bal.Balancer(
             sorted((o for o in utils if o != 1), key=lambda o: (utils[o], o)),
             osd_df,
             {o: f"h{o}" for o in utils},
             reservation=placement.ProjectedUsage(osd_df, arriving),
-            final=ut.FinalUsage(
+            final=bal.FinalUsage(
                 osd_df, ((s.up_osd, s.size_bytes) for s in arriving), departing
             ),
             max_uses=max_uses,
@@ -283,7 +259,7 @@ class PlanTest(unittest.TestCase):
         result = c.pg("1.0", [0, 10, 20]).plan()
         self.assertEqual(pairs(result), [("1.0", 0, 0, 31)])
         self.assertEqual(result.moves[0].acting_osd, 0)
-        self.assertEqual(result.stop, ut.Stop(ut.STOP_NO_SHARDS, 0, 79.0))
+        self.assertEqual(result.stop, bal.Stop(bal.STOP_NO_SHARDS, 0, 79.0))
         self.assertEqual(result.max_before, (80.0, 0))
         self.assertEqual(result.max_after, (79.0, 0))
 
@@ -327,7 +303,7 @@ class PlanTest(unittest.TestCase):
         result = c.pg("1.0", [0, 10, 20]).plan(0, 10)
         targets = [m.target_osd for m in result.moves]
         self.assertEqual(len(targets), 2)
-        self.assertEqual(len({host(t) for t in targets} | {2}), 3)
+        self.assertEqual(len({Cluster.host(t) for t in targets} | {2}), 3)
 
     def test_osd_in_the_raw_crush_mapping_is_not_a_target(self):
         c = Cluster()
@@ -349,7 +325,7 @@ class PlanTest(unittest.TestCase):
         c.pg("1.0", [0, 10, 20], shard_pct=1.0).pg("1.1", [0, 10, 20], shard_pct=3.0)
         result = c.plan(0, "--max-moves", 1)
         self.assertEqual(pairs(result), [("1.1", 0, 0, 1)])
-        self.assertEqual(result.stop.reason, ut.STOP_MAX_MOVES)
+        self.assertEqual(result.stop.reason, bal.STOP_MAX_MOVES)
 
     def test_ties_at_the_max_are_both_relieved(self):
         c = Cluster()
@@ -391,7 +367,7 @@ class PlanTest(unittest.TestCase):
         )
         result = c.pg("1.0", [0, 10, 20]).plan(0)
         self.assertEqual((result.moves, result.chained_pgs), ([], 1))
-        self.assertEqual(result.stop.reason, ut.STOP_NO_SHARDS)
+        self.assertEqual(result.stop.reason, bal.STOP_NO_SHARDS)
 
     def test_source_whose_shards_have_no_legal_target_stops(self):
         c = Cluster()
@@ -399,19 +375,21 @@ class PlanTest(unittest.TestCase):
         # Any target would end at 70%, above the source's 60%.
         result = c.pg("1.0", [0, 10, 20], shard_pct=20.0).plan()
         self.assertEqual(result.moves, [])
-        self.assertEqual(result.stop, ut.Stop(ut.STOP_NO_MOVE, 0, 80.0))
+        self.assertEqual(result.stop, bal.Stop(bal.STOP_NO_MOVE, 0, 80.0))
 
     def test_source_with_nothing_movable_stops(self):
         c = Cluster()
         c.util[0] = 80.0
         c.pg("1.0", [0, 10, 20], state="active+undersized+degraded")
         result = c.plan()
-        self.assertEqual(result.stop, ut.Stop(ut.STOP_NO_SHARDS, 0, 80.0))
+        self.assertEqual(result.stop, bal.Stop(bal.STOP_NO_SHARDS, 0, 80.0))
 
     def test_no_sources(self):
         c = Cluster()
         result = c.plan("--min-source-util", 90)
-        self.assertEqual((result.moves, result.stop), ([], ut.Stop(ut.STOP_NO_SOURCES)))
+        self.assertEqual(
+            (result.moves, result.stop), ([], bal.Stop(bal.STOP_NO_SOURCES))
+        )
 
 
 class StopBelowOtherTest(unittest.TestCase):
@@ -429,12 +407,14 @@ class StopBelowOtherTest(unittest.TestCase):
     def test_default_stops_when_a_non_source_is_as_full(self):
         result = self.cluster().plan()
         self.assertEqual(len(result.moves), 2)
-        self.assertEqual(result.stop, ut.Stop(ut.STOP_NOT_A_SOURCE, 0, 70.0, 30, 70.0))
+        self.assertEqual(
+            result.stop, bal.Stop(bal.STOP_NOT_A_SOURCE, 0, 70.0, 30, 70.0)
+        )
 
     def test_osds_keeps_relieving_them(self):
         result = self.cluster().plan(0)
         self.assertEqual(len(result.moves), 3)
-        self.assertEqual(result.stop.reason, ut.STOP_NO_SHARDS)
+        self.assertEqual(result.stop.reason, bal.STOP_NO_SHARDS)
 
     def test_max_target_uses(self):
         result = self.cluster().plan(0, "--max-target-uses", 1)
@@ -451,11 +431,11 @@ class RenderTest(unittest.TestCase):
         c = Cluster()
         c.util[0] = 80.0
         c.pg("1.0", [0, 10, 20]).pg("2.0", [10, 0, 20])
-        args = parse_args(ut, ["--osds", "0", *argv])
+        args = parse_args(bal, ["--osds", "0", *argv])
         result = c.plan(0, *argv)
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            ut.render(result, args)
+            bal.render(result, args)
         return out.getvalue(), flat(err.getvalue())
 
     def test_table(self):
@@ -487,8 +467,8 @@ class RenderTest(unittest.TestCase):
         c = Cluster()
         c.util[0] = 80.0
         result = c.pg("1.0", [0, 10, 20]).plan(0)
-        row = ut.format_row(result.moves[0], result.osd_host, result.osd_df)
-        self.assertEqual(len(row), len(ut.COLUMNS))
+        row = bal.format_row(result.moves[0], result.osd_host, result.osd_df)
+        self.assertEqual(len(row), len(bal.COLUMNS))
 
 
 # ---------------------------------------------------------------------------
@@ -508,24 +488,24 @@ class FixtureInvariantTest(unittest.TestCase):
     def run_traced(self, fixture):
         """Return (result, the class max after each move, in turn order)."""
         trace = []
-        commit = ut.Balancer.commit
+        commit = bal.Balancer.commit
 
         def traced(balancer, shard, state, target):
             commit(balancer, shard, state, target)
             osds = [*balancer.targets, *self.sources]
             trace.append(max(balancer.final.utilization(o) for o in osds))
 
-        balance = ut.balance
+        balance = bal.balance
 
         def capture(balancer, by_source, *a, **kw):
             self.sources = list(by_source)
             return balance(balancer, by_source, *a, **kw)
 
         with (
-            mock.patch.object(ut.Balancer, "commit", traced),
-            mock.patch.object(ut, "balance", capture),
+            mock.patch.object(bal.Balancer, "commit", traced),
+            mock.patch.object(bal, "balance", capture),
         ):
-            result = plan_from_state(ut, TEST_DATA / fixture)
+            result = plan_from_state(bal, TEST_DATA / fixture)
         return result, trace
 
     def test_invariants(self):
@@ -551,8 +531,8 @@ class FixtureInvariantTest(unittest.TestCase):
         }
         upmaps = shared.fetch_upmap_items(
             shared.SnapshotStore.from_args(
-                parse_args(ut, [], load_state=str(TEST_DATA / fixture)),
-                ut.SNAPSHOT_COMMANDS,
+                parse_args(bal, [], load_state=str(TEST_DATA / fixture)),
+                bal.SNAPSHOT_COMMANDS,
             )
         )
         new_up = {pgid: list(pg["up"]) for pgid, pg in pgs.items()}

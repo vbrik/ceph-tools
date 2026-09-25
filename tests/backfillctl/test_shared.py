@@ -22,9 +22,7 @@ import unittest
 from typing import ClassVar
 from unittest import mock
 
-from _support import FakeStore, real_query_backfill_positions, shared
-
-NONE = shared.CRUSH_ITEM_NONE
+from _support import NONE, FakeStore, real_query_backfill_positions, shared
 
 
 def pg(num_objects: int, misplaced: int = 0, degraded: int = 0) -> dict:

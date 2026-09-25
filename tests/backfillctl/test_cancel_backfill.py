@@ -21,9 +21,18 @@ from typing import ClassVar
 from unittest import mock
 
 from _support import (
+    EC_POOL_DETAIL,
+    EC_PROFILES,
+    HOST_RULE,
+    NONE,
+    REP_POOL_DETAIL,
     REPO_ROOT,
+    RULES,
+    TEST_DATA,
     FakeStore,
+    flat,
     parse_args,
+    pg_stat,
     placement,
     plan_from_state,
     shared,
@@ -32,53 +41,7 @@ from _support import (
 
 from backfillctl import cancel_backfill as cb
 
-
-def flat(text: str) -> str:
-    """Collapse whitespace, so a substring check survives stderr's line wrapping."""
-    return " ".join(text.split())
-
-
-NONE = shared.CRUSH_ITEM_NONE
 OSD = 682
-EC_POOL = {
-    "pool_id": 19,
-    "type": 3,
-    "size": 6,
-    "erasure_code_profile": "p",
-    "crush_rule": 0,
-    "pg_num": 16,
-}
-REP_POOL = {"pool_id": 7, "type": 1, "size": 3, "crush_rule": 0}
-HOST_RULE = {
-    "rule_id": 0,
-    "steps": [{"op": "take"}, {"op": "chooseleaf_indep", "type": "host"}],
-}
-RULES = {0: HOST_RULE}
-EC_PROFILES = {"p": {"k": "4", "m": "2"}}
-
-
-def pg(
-    pgid: str,
-    up: list,
-    acting: list,
-    state: str = "active+remapped+backfill_wait",
-    num_objects: int = 100,
-    num_bytes: int = 4_000,
-    misplaced: int = 0,
-    degraded: int = 0,
-) -> dict:
-    return {
-        "pgid": pgid,
-        "up": up,
-        "acting": acting,
-        "state": state,
-        "stat_sum": {
-            "num_objects": num_objects,
-            "num_bytes": num_bytes,
-            "num_objects_misplaced": misplaced,
-            "num_objects_degraded": degraded,
-        },
-    }
 
 
 class EcArrivalsTest(unittest.TestCase):
@@ -219,7 +182,7 @@ class PinReplicaTest(unittest.TestCase):
 
 
 def run_plan(pgs, pools=None, osd_host=None, rules=None, exclude_pgs=None):
-    pools = pools or {19: EC_POOL, 7: REP_POOL}
+    pools = pools or {19: EC_POOL_DETAIL, 7: REP_POOL_DETAIL}
     return cb.plan_cancellations(
         pgs,
         pools,
@@ -236,10 +199,10 @@ class PlanTest(unittest.TestCase):
 
     def test_sorted_numerically_by_pool_then_hex_pg_then_shard(self):
         pgs = [
-            pg("19.16fc", [1, OSD, 3, 4], [1, 9, 3, 4]),
-            pg("19.2a", [1, 2, OSD, 4], [1, 2, 9, 4]),
-            pg("7.ff", [1, 2, OSD], [1, 2, 9]),
-            pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4]),
+            pg_stat("19.16fc", [1, OSD, 3, 4], [1, 9, 3, 4]),
+            pg_stat("19.2a", [1, 2, OSD, 4], [1, 2, 9, 4]),
+            pg_stat("7.ff", [1, 2, OSD], [1, 2, 9]),
+            pg_stat("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4]),
         ]
         cancellations, _ = self.plan(pgs)
         self.assertEqual(
@@ -249,24 +212,26 @@ class PlanTest(unittest.TestCase):
 
     def test_carries_acting_osd_state_size_and_progress(self):
         state = "active+remapped+backfilling"
-        p = pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4], state, misplaced=25)
+        p = pg_stat("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4], state, misplaced=25)
         (c,), skipped = self.plan([p])
         self.assertEqual(skipped, [])
         self.assertEqual((c.acting_osd, c.state, c.size_bytes), (8, state, 1_000))
         self.assertEqual(c.progress_pct, 75.0)
 
     def test_skipped_are_reported_with_pgid(self):
-        p = pg("19.9", [OSD, 2, 3, 4], [NONE, 2, 3, 4])
+        p = pg_stat("19.9", [OSD, 2, 3, 4], [NONE, 2, 3, 4])
         cancellations, skipped = self.plan([p])
         self.assertEqual(cancellations, [])
         self.assertEqual([(s.pgid, s.shard) for s in skipped], [("19.9", 0)])
 
     def test_pg_of_unlisted_pool_is_an_error(self):
         with self.assertRaises(SystemExit):
-            self.plan([pg("99.1", [OSD], [9])])
+            self.plan([pg_stat("99.1", [OSD], [9])])
 
     def test_pgs_not_involving_osd_are_ignored(self):
-        self.assertEqual(self.plan([pg("19.9", [1, 2, 3, 4], [1, 2, 3, 4])]), ([], []))
+        self.assertEqual(
+            self.plan([pg_stat("19.9", [1, 2, 3, 4], [1, 2, 3, 4])]), ([], [])
+        )
 
 
 RATIO = 91.0
@@ -280,22 +245,24 @@ class ArrivalProjectionTest(unittest.TestCase):
         self.df = {77: osd_df_node(77, 89.0, kb=1000), 5: osd_df_node(5, 50.0, kb=1000)}
 
     def projection(self, pgs, pools=None):
-        return cb.arrival_projection(pgs, pools or {19: EC_POOL}, EC_PROFILES, self.df)
+        return cb.arrival_projection(
+            pgs, pools or {19: EC_POOL_DETAIL}, EC_PROFILES, self.df
+        )
 
     def test_every_shard_arriving_counts(self):
         # Two PGs send a shard to osd.77: 89% + 1% + 1%.
         pgs = [
-            pg("19.1", [77, 2], [8, 2], num_bytes=40 * 1024),
-            pg("19.2", [3, 77], [3, 9], num_bytes=40 * 1024),
+            pg_stat("19.1", [77, 2], [8, 2], num_bytes=40 * 1024),
+            pg_stat("19.2", [3, 77], [3, 9], num_bytes=40 * 1024),
         ]
         self.assertAlmostEqual(self.projection(pgs).utilization_after(77, 0), 91.0)
 
     def test_pgs_of_unknown_pools_add_nothing(self):
-        pgs = [pg("42.1", [77, 2], [8, 2], num_bytes=40 * 1024)]
+        pgs = [pg_stat("42.1", [77, 2], [8, 2], num_bytes=40 * 1024)]
         self.assertAlmostEqual(self.projection(pgs).utilization_after(77, 0), 89.0)
 
     def test_blocks_at_or_over_the_ratio_only(self):
-        pgs = [pg(f"19.{i}", [77, 2], [8, 2], num_bytes=40 * 1024) for i in (1, 2)]
+        pgs = [pg_stat(f"19.{i}", [77, 2], [8, 2], num_bytes=40 * 1024) for i in (1, 2)]
         at_ratio = self.projection(pgs)  # 91%
         self.assertAlmostEqual(cb.blocker_projection(at_ratio, 77, RATIO), 91.0)
         self.assertIsNone(cb.blocker_projection(self.projection(pgs[:1]), 77, RATIO))
@@ -348,7 +315,7 @@ class PlanBlockersTest(unittest.TestCase):
     backfillfull_ratio given: what --pin-blockers finds."""
 
     def plan(self, pgs, df, osd_host=None, ratio=RATIO, pin_blockers=True):
-        pools = {19: EC_POOL, 7: REP_POOL}
+        pools = {19: EC_POOL_DETAIL, 7: REP_POOL_DETAIL}
         return cb.plan_cancellations(
             pgs,
             pools,
@@ -362,7 +329,7 @@ class PlanBlockersTest(unittest.TestCase):
         )
 
     def test_blocker_is_pinned_and_marked_with_its_projected_utilization(self):
-        p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
+        p = pg_stat("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
         cancellations, skipped = self.plan([p], {77: osd_df_node(77, 92.0)})
         self.assertEqual(skipped, [])
         self.assertEqual(
@@ -373,19 +340,19 @@ class PlanBlockersTest(unittest.TestCase):
         self.assertAlmostEqual(cancellations[1].blocker_util, 92.0, places=2)
 
     def test_the_requested_shard_is_never_marked_a_blocker(self):
-        p = pg("19.5", [OSD, 2], [8, 2])
+        p = pg_stat("19.5", [OSD, 2], [8, 2])
         (c,), _ = self.plan([p], {OSD: osd_df_node(OSD, 99.0)})
         self.assertIsNone(c.blocker_util)
 
     def test_pgs_without_a_shard_into_the_osd_are_left_alone(self):
-        p = pg("19.5", [1, 2, 3, 77], [1, 2, 3, 66])
+        p = pg_stat("19.5", [1, 2, 3, 77], [1, 2, 3, 66])
         self.assertEqual(self.plan([p], {77: osd_df_node(77, 99.0)}), ([], []))
 
     def test_no_blockers_without_utilizations_or_ratio(self):
         # even with pin_blockers=True, no osd_df or no backfillfull_pct means
         # there is nothing to look blockers up in.
-        p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
-        pools = {19: EC_POOL}
+        p = pg_stat("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
+        pools = {19: EC_POOL_DETAIL}
         for df, ratio in ((None, RATIO), ({77: osd_df_node(77, 99.0)}, None)):
             cancellations, _ = cb.plan_cancellations(
                 [p], pools, EC_PROFILES, {OSD}, {}, RULES, df, ratio, True
@@ -395,7 +362,7 @@ class PlanBlockersTest(unittest.TestCase):
     def test_no_blockers_without_pin_blockers_even_with_utilization_and_ratio(self):
         # pin_blockers defaults to False: osd.77 is over the ratio, but the
         # blocker search never runs unless the flag says to.
-        p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
+        p = pg_stat("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
         cancellations, _ = self.plan(
             [p], {77: osd_df_node(77, 92.0)}, pin_blockers=False
         )
@@ -404,7 +371,7 @@ class PlanBlockersTest(unittest.TestCase):
     def test_a_blocker_that_cannot_be_pinned_is_reported_and_the_pin_is_kept(self):
         # pinning shard 3 back to osd.66 would share host H with shard 1
         # (osd.2), which is not moving, so the blocker is skipped.
-        p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
+        p = pg_stat("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
         cancellations, skipped = self.plan(
             [p], {77: osd_df_node(77, 92.0)}, osd_host={66: "H", 2: "H"}
         )
@@ -416,7 +383,7 @@ class PlanBlockersTest(unittest.TestCase):
         # shard 2 (77) is the blocker; its acting osd.66 shares a host with
         # shard 3's target osd.88, so shard 3 comes along as the blocker's
         # companion: it goes with the blocker, not with requested shard 0.
-        p = pg("19.5", [OSD, 2, 77, 88], [8, 2, 66, 99])
+        p = pg_stat("19.5", [OSD, 2, 77, 88], [8, 2, 66, 99])
         df = {77: osd_df_node(77, 92.0), 88: osd_df_node(88, 50.0)}
         cancellations, skipped = self.plan([p], df, osd_host={66: "H", 88: "H"})
         self.assertEqual(skipped, [])
@@ -434,7 +401,7 @@ class PlanBlockersTest(unittest.TestCase):
 
     def test_a_requested_pins_companion_is_not_a_blocker(self):
         # shard 1's target shares a host with shard 0's acting osd.8.
-        p = pg("19.5", [OSD, 88], [8, 99])
+        p = pg_stat("19.5", [OSD, 88], [8, 99])
         cancellations, _ = self.plan(
             [p], {88: osd_df_node(88, 50.0)}, osd_host={8: "H", 88: "H"}
         )
@@ -444,7 +411,7 @@ class PlanBlockersTest(unittest.TestCase):
         )
 
     def test_a_companion_whose_target_is_over_the_ratio_counts_as_a_blocker(self):
-        p = pg("19.5", [OSD, 149], [627, 497])
+        p = pg_stat("19.5", [OSD, 149], [627, 497])
         cancellations, _ = self.plan(
             [p], {149: osd_df_node(149, 92.0)}, osd_host={627: "H", 149: "H"}
         )
@@ -455,7 +422,7 @@ class PlanBlockersTest(unittest.TestCase):
         # the companion pin itself is unconditional (host clash), but with the
         # flag off it must not be mislabeled "blocks shard N": that would
         # contradict the run's own note that blockers were not looked for.
-        p = pg("19.5", [OSD, 149], [627, 497])
+        p = pg_stat("19.5", [OSD, 149], [627, 497])
         cancellations, _ = self.plan(
             [p],
             {149: osd_df_node(149, 92.0)},
@@ -467,9 +434,9 @@ class PlanBlockersTest(unittest.TestCase):
         self.assertEqual(cancellations[1].companion_of, 0)
 
     def test_shards_arriving_on_several_given_osds_are_all_requested(self):
-        p = pg("19.5", [OSD, 77, 3, 4], [8, 66, 3, 4])
+        p = pg_stat("19.5", [OSD, 77, 3, 4], [8, 66, 3, 4])
         cancellations, skipped = cb.plan_cancellations(
-            [p], {19: EC_POOL}, EC_PROFILES, {OSD, 77}, {}, RULES
+            [p], {19: EC_POOL_DETAIL}, EC_PROFILES, {OSD, 77}, {}, RULES
         )
         self.assertEqual(skipped, [])
         self.assertEqual(
@@ -480,21 +447,21 @@ class PlanBlockersTest(unittest.TestCase):
     def test_a_pg_with_several_requested_shards_is_pinned_whole_or_not_at_all(self):
         # Pinning shard 1 back to osd.66 clashes with shard 2 (osd.3, same
         # host), which is not moving: shard 0's pin goes too.
-        p = pg("19.5", [OSD, 77, 3, 4], [8, 66, 3, 4])
+        p = pg_stat("19.5", [OSD, 77, 3, 4], [8, 66, 3, 4])
         cancellations, skipped = cb.plan_cancellations(
-            [p], {19: EC_POOL}, EC_PROFILES, {OSD, 77}, {66: "H", 3: "H"}, RULES
+            [p], {19: EC_POOL_DETAIL}, EC_PROFILES, {OSD, 77}, {66: "H", 3: "H"}, RULES
         )
         self.assertEqual(cancellations, [])
         self.assertEqual([s.shard for s in skipped], [0, 1])
 
     def test_several_blockers_come_in_shard_order(self):
-        p = pg("19.5", [OSD, 77, 3, 88], [8, 66, 3, 99])
+        p = pg_stat("19.5", [OSD, 77, 3, 88], [8, 66, 3, 99])
         df = {77: osd_df_node(77, 92.0), 88: osd_df_node(88, 93.0)}
         cancellations, _ = self.plan([p], df)
         self.assertEqual([c.shard for c in cancellations], [0, 1, 3])
 
     def test_replicated_pgs_get_no_blockers(self):
-        p = pg("7.1", [1, 2, OSD], [1, 2, 9])
+        p = pg_stat("7.1", [1, 2, OSD], [1, 2, 9])
         cancellations, _ = self.plan([p], {2: osd_df_node(2, 99.0)})
         self.assertEqual(
             [(c.shard, c.blocker_util) for c in cancellations], [("-", None)]
@@ -549,7 +516,7 @@ class PlanChainTest(unittest.TestCase):
     def test_a_chained_pin_comes_out_in_the_valid_order(self):
         # shard 0 moves to osd.20 while osd.20 still holds shard 1, which is
         # itself going to osd.30: (20->30) has to be applied before (OSD->20)
-        p = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
+        p = pg_stat("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
         cancellations, skipped = self.plan([p])
         self.assertEqual(skipped, [])
         self.assertEqual(
@@ -559,15 +526,15 @@ class PlanChainTest(unittest.TestCase):
 
     def test_a_ring_skips_the_pin_and_says_why(self):
         # osd.20 and OSD would swap places between shards 0 and 1
-        p = pg("19.f", [OSD, 20, 3, 4], [20, OSD, 3, 4])
+        p = pg_stat("19.f", [OSD, 20, 3, 4], [20, OSD, 3, 4])
         cancellations, skipped = self.plan([p])
         self.assertEqual(cancellations, [])
         self.assertEqual([(s.pgid, s.shard) for s in skipped], [("19.f", 0)])
         self.assertIn("cycle", skipped[0].reason)
 
     def test_the_order_survives_sorting_across_pgs(self):
-        chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
-        plain = pg("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        chain = pg_stat("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
+        plain = pg_stat("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])
         cancellations, _ = self.plan([chain, plain])
         self.assertEqual(
             [(c.pgid, c.shard) for c in cancellations],
@@ -577,7 +544,7 @@ class PlanChainTest(unittest.TestCase):
     def test_a_blocker_that_would_make_a_ring_is_skipped_but_the_pin_stays(self):
         # shard 3 (77->66) is a blocker (osd.77 is over the ratio) but pinning
         # it back would ring with shard 2 (66 <-> 77 swap): skip it only.
-        p = pg("19.5", [OSD, 2, 66, 77], [8, 2, 77, 66])
+        p = pg_stat("19.5", [OSD, 2, 66, 77], [8, 2, 77, 66])
         cancellations, skipped = run_plan_with_df(
             [p], {77: osd_df_node(77, 92.0), 66: osd_df_node(66, 50.0)}
         )
@@ -589,7 +556,7 @@ class PlanChainTest(unittest.TestCase):
 def run_plan_with_df(pgs, df, ratio=RATIO, pin_blockers=True, exclude_pgs=None):
     return cb.plan_cancellations(
         pgs,
-        {19: EC_POOL, 7: REP_POOL},
+        {19: EC_POOL_DETAIL, 7: REP_POOL_DETAIL},
         EC_PROFILES,
         {OSD},
         {},
@@ -795,7 +762,7 @@ class PlanCompanionsTest(unittest.TestCase):
     HOSTS: ClassVar[dict[int, str]] = {OSD: "x", 627: "H", 149: "H", 497: "z"}
 
     def test_companion_is_emitted_and_marked(self):
-        p = pg("19.7e9", [OSD, 300, 626, 149], [627, 300, 626, 497])
+        p = pg_stat("19.7e9", [OSD, 300, 626, 149], [627, 300, 626, 497])
         cancellations, skipped = self.plan([p], osd_host=self.HOSTS)
         self.assertEqual(skipped, [])
         self.assertEqual(
@@ -807,25 +774,25 @@ class PlanCompanionsTest(unittest.TestCase):
         self.assertEqual({c.size_bytes for c in cancellations}, {1_000})
 
     def test_unresolvable_clash_is_skipped_without_partial_output(self):
-        p = pg("19.7e9", [OSD, 300, 149], [627, 300, 149])
+        p = pg_stat("19.7e9", [OSD, 300, 149], [627, 300, 149])
         cancellations, skipped = self.plan([p], osd_host=self.HOSTS)
         self.assertEqual(cancellations, [])
         self.assertEqual([(s.pgid, s.shard) for s in skipped], [("19.7e9", 0)])
 
     def test_replicated_clash_is_skipped(self):
-        p = pg("7.1", [1, 2, OSD], [1, 2, 9])
+        p = pg_stat("7.1", [1, 2, OSD], [1, 2, 9])
         cancellations, skipped = self.plan([p], osd_host={9: "H", 2: "H"})
         self.assertEqual(cancellations, [])
         self.assertEqual([(s.pgid, s.shard) for s in skipped], [("7.1", "-")])
 
     def test_replicated_without_clash_is_pinned(self):
-        p = pg("7.1", [1, 2, OSD], [1, 2, 9])
+        p = pg_stat("7.1", [1, 2, OSD], [1, 2, 9])
         (c,), _ = self.plan([p], osd_host={9: "a", 2: "b"})
         self.assertEqual((c.shard, c.up_osd, c.acting_osd), ("-", OSD, 9))
 
     def test_companions_sort_with_their_pg(self):
-        a = pg("19.2", [OSD, 300, 626, 149], [627, 300, 626, 497])
-        b = pg("19.1", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        a = pg_stat("19.2", [OSD, 300, 626, 149], [627, 300, 626, 497])
+        b = pg_stat("19.1", [OSD, 2, 3, 4], [8, 2, 3, 4])
         cancellations, _ = self.plan([a, b], osd_host=self.HOSTS)
         self.assertEqual(
             [(c.pgid, c.shard) for c in cancellations],
@@ -837,17 +804,17 @@ class PlanCompanionsTest(unittest.TestCase):
             0: {"rule_id": 0, "steps": [{"op": "chooseleaf_indep", "type": "rack"}]}
         }
         with self.assertRaises(SystemExit) as ctx:
-            self.plan([pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])], rules=rack)
+            self.plan([pg_stat("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])], rules=rack)
         self.assertIn("failure domain rack", str(ctx.exception))
         self.assertIn("PGs with a backfill into osd.682", str(ctx.exception))
 
     def test_missing_crush_rule_is_an_error(self):
         with self.assertRaises(SystemExit):
-            self.plan([pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])], rules={})
+            self.plan([pg_stat("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])], rules={})
 
     def test_failure_domain_is_not_checked_for_uninvolved_pgs(self):
         self.assertEqual(
-            self.plan([pg("19.9", [1, 2, 3, 4], [1, 2, 3, 4])], rules={}), ([], [])
+            self.plan([pg_stat("19.9", [1, 2, 3, 4], [1, 2, 3, 4])], rules={}), ([], [])
         )
 
 
@@ -857,31 +824,31 @@ class PlanExcludeTest(unittest.TestCase):
     plan = staticmethod(run_plan)
 
     def test_excluded_pg_produces_no_cancellation(self):
-        p = pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        p = pg_stat("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])
         self.assertEqual(self.plan([p], exclude_pgs={"19.9"}), ([], []))
 
     def test_excluded_pg_is_not_reported_as_skipped_either(self):
         # normally an empty acting slot is reported on stderr as unpinnable;
         # once the PG is excluded it must not be mentioned at all.
-        p = pg("19.9", [OSD, 2, 3, 4], [NONE, 2, 3, 4])
+        p = pg_stat("19.9", [OSD, 2, 3, 4], [NONE, 2, 3, 4])
         self.assertEqual(self.plan([p], exclude_pgs={"19.9"}), ([], []))
 
     def test_excluding_one_pg_does_not_touch_others(self):
-        excluded = pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])
-        kept = pg("19.10", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        excluded = pg_stat("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        kept = pg_stat("19.10", [OSD, 2, 3, 4], [8, 2, 3, 4])
         cancellations, _ = self.plan([excluded, kept], exclude_pgs={"19.9"})
         self.assertEqual([c.pgid for c in cancellations], ["19.10"])
 
     def test_excluding_a_pg_also_drops_its_companions(self):
         # shard 0 (->627, host H) would otherwise force shard 3's companion
         # (149->497, also host H); excluding the PG must drop both.
-        p = pg("19.7e9", [OSD, 300, 626, 149], [627, 300, 626, 497])
+        p = pg_stat("19.7e9", [OSD, 300, 626, 149], [627, 300, 626, 497])
         hosts = {OSD: "x", 627: "H", 149: "H", 497: "z"}
         cancellations, skipped = self.plan([p], osd_host=hosts, exclude_pgs={"19.7e9"})
         self.assertEqual((cancellations, skipped), ([], []))
 
     def test_excluding_a_pg_also_drops_its_blockers(self):
-        p = pg("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
+        p = pg_stat("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])
         cancellations, skipped = run_plan_with_df(
             [p], {77: osd_df_node(77, 92.0)}, exclude_pgs={"19.5"}
         )
@@ -952,7 +919,7 @@ class RenderTest(unittest.TestCase):
         # A typo in --exclude-pgs is worth knowing about even when a PG then
         # cannot be analyzed (here: its CRUSH rule is missing), so the notes
         # must not wait for render(), which an exit never reaches.
-        snaps = canned_snapshots([pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])])
+        snaps = canned_snapshots([pg_stat("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4])])
         snaps["crush_rule_dump"] = []
         del snaps["osd_dump"]["backfillfull_ratio"]
         store = FakeStore(snaps, load_dir=None)
@@ -1151,7 +1118,7 @@ def canned_snapshots(pg_stats, extra_osds=()):
     """The six snapshots (cb.SNAPSHOT_COMMANDS keys) of a tiny cluster."""
     return {
         "pg_ls_remapped": {"pg_ready": True, "pg_stats": pg_stats},
-        "pool_ls_detail": [{**EC_POOL, "pool_name": "ec"}, REP_POOL],
+        "pool_ls_detail": [{**EC_POOL_DETAIL, "pool_name": "ec"}, REP_POOL_DETAIL],
         "osd_df": {
             "nodes": [
                 {"id": OSD, "utilization": 88.0, "kb": 1000, "kb_used": 880},
@@ -1202,12 +1169,12 @@ def canned_ceph(pg_stats, extra_osds=(), drop=()):
 
 class MainTest(unittest.TestCase):
     PGS: ClassVar[list[dict]] = [
-        pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4], "active+remapped+backfilling"),
-        pg("19.a", [OSD, 2, 3, 4], [NONE, 2, 3, 4]),
-        pg("19.b", [1, 2, 3, 4], [1, 2, 3, 4], "active+clean"),
+        pg_stat("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4], "active+remapped+backfilling"),
+        pg_stat("19.a", [OSD, 2, 3, 4], [NONE, 2, 3, 4]),
+        pg_stat("19.b", [1, 2, 3, 4], [1, 2, 3, 4], "active+clean"),
         # osd.8 and osd.9 share host h2: pinning shard 0 back to 8 clashes with
         # shard 3 arriving on 9, so 9->4 is pinned back as a companion.
-        pg("19.d", [OSD, 2, 3, 9], [8, 2, 3, 4]),
+        pg_stat("19.d", [OSD, 2, 3, 9], [8, 2, 3, 4]),
     ]
 
     def run_main(self, *argv, pgs=None, extra_osds=(), drop=()):
@@ -1262,7 +1229,9 @@ class MainTest(unittest.TestCase):
     def test_progress_from_backfill_positions(self):
         # The counters say 100%; the target's position says it hasn't started.
         pgs = [
-            pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4], "active+remapped+backfilling"),
+            pg_stat(
+                "19.9", [OSD, 2, 3, 4], [8, 2, 3, 4], "active+remapped+backfilling"
+            ),
         ]
         positions = mock.Mock(return_value={"19.9": {f"{OSD}(0)": "MIN"}})
         with mock.patch.object(shared, "query_backfill_positions", positions):
@@ -1295,7 +1264,7 @@ class MainTest(unittest.TestCase):
         # would hold 19.e in backfill_toofull, but without --pin-blockers the
         # tool never looks for it: only the requested pin comes out, plus a
         # note pointing at the flag.
-        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        pgs = [pg_stat("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         kwargs = {"pgs": pgs, "extra_osds": [osd_df_node(77, 92.0)]}
         result = self.plan("--osds", "682", **kwargs)
         self.assertEqual(pins(result.cancellations), ["19.e 682 8"])
@@ -1306,7 +1275,7 @@ class MainTest(unittest.TestCase):
         # osd.77 is at 92%, over the 91% backfillfull_ratio, so shard 3 (66->77)
         # would hold 19.e in backfill_toofull and, with --pin-blockers, must be
         # pinned back too.
-        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        pgs = [pg_stat("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         kwargs = {"pgs": pgs, "extra_osds": [osd_df_node(77, 92.0)]}
         result = self.plan("--pin-blockers", "--osds", "682", **kwargs)
         self.assertEqual(pins(result.cancellations), ["19.e 682 8", "19.e 77 66"])
@@ -1319,7 +1288,7 @@ class MainTest(unittest.TestCase):
         self.assertNotIn("--pin-blockers was not given", err)
 
     def test_table_says_which_shard_a_blocker_blocks(self):
-        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        pgs = [pg_stat("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, _ = self.run_main(
             "--pin-blockers",
             "--osds",
@@ -1333,7 +1302,7 @@ class MainTest(unittest.TestCase):
         self.assertNotIn("blocks", rows[2])
 
     def test_a_target_below_the_ratio_is_not_a_blocker(self):
-        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        pgs = [pg_stat("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         result = self.plan(
             "--pin-blockers",
             "--osds",
@@ -1344,7 +1313,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(pins(result.cancellations), ["19.e 682 8"])
 
     def test_without_a_backfillfull_ratio_pin_blockers_has_nothing_to_work_from(self):
-        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        pgs = [pg_stat("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         kwargs = {
             "pgs": pgs,
             "extra_osds": [osd_df_node(77, 92.0)],
@@ -1360,7 +1329,7 @@ class MainTest(unittest.TestCase):
     def test_without_a_backfillfull_ratio_and_without_the_flag_only_one_note(self):
         # nothing useful to say about a flag whose search would find nothing
         # anyway: neither note is worth printing.
-        pgs = [pg("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        pgs = [pg_stat("19.e", [OSD, 2, 3, 77], [8, 2, 3, 66])]
         out, err = self.run_main(
             "--pgremapper-mappings",
             "--osds",
@@ -1378,8 +1347,8 @@ class MainTest(unittest.TestCase):
     def test_a_requested_pin_that_chains_leaves_its_pg_out(self):
         # shard 0 comes back to osd.20 only once shard 1 (20->30) is pinned:
         # a chain pgremapper cannot apply, and the requested pin is its head
-        chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
-        plain = pg("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])
+        chain = pg_stat("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
+        plain = pg_stat("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])
         result = self.plan("--osds", "682", pgs=[chain, plain])
         self.assertEqual(pins(result.cancellations), ["19.2 682 8"])
         self.assertEqual([(s.pgid, s.shard) for s in result.skipped], [("19.f", 0)])
@@ -1391,7 +1360,7 @@ class MainTest(unittest.TestCase):
 
     def test_existing_upmap_pairs_are_checked_for_chains(self):
         # the pin's target, osd.8, is the source of an existing pair
-        fake = canned_ceph([pg("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])])
+        fake = canned_ceph([pg_stat("19.2", [OSD, 2, 3, 4], [8, 2, 3, 4])])
         snaps = {k: fake(None, k) for k in cb.SNAPSHOT_COMMANDS if k != "pg_dump_pgs"}
         snaps["osd_dump"]["pg_upmap_items"] = [
             {"pgid": "19.2", "mappings": [{"from": 8, "to": 9}]}
@@ -1403,7 +1372,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(result.chained, {"19.2": [(8, 9), (OSD, 8)]})
 
     def test_without_osd_a_chain_keeps_its_last_pin(self):
-        chain = pg("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
+        chain = pg_stat("19.f", [OSD, 20, 3, 4], [20, 30, 3, 4])
         result = self.plan(pgs=[chain])
         self.assertEqual(pins(result.cancellations), ["19.f 20 30"])
         self.assertEqual([(s.pgid, s.shard) for s in result.skipped], [("19.f", 0)])
@@ -1471,7 +1440,7 @@ class MainTest(unittest.TestCase):
         # osd.682 is stable here (shard 0); only shard 4 is remapped, and not
         # onto osd.682. The note must not claim a backfill was skipped, only
         # that the PG (which does list osd.682 in 'up') matched.
-        stable = pg("19.99", [OSD, 2, 3, 4, 20, 6], [OSD, 2, 3, 4, 9, 6])
+        stable = pg_stat("19.99", [OSD, 2, 3, 4, 20, 6], [OSD, 2, 3, 4, 9, 6])
         out, err = self.run_main(
             "--osds", "682", "--exclude-pgs", "19.99", pgs=[stable]
         )
@@ -1682,15 +1651,9 @@ class LoadStateCliTest(unittest.TestCase):
         self.assertIn("missing", result.stderr)
 
 
-FIXTURE = (
-    REPO_ROOT
-    / "tests"
-    / "backfillctl"
-    / "test-data"
-    / "cancel-backfill-ceph2-osd896-host-clash-companions"
-)
+FIXTURE = TEST_DATA / "cancel-backfill-ceph2-osd896-host-clash-companions"
 
-FIXTURE_BLOCKER = FIXTURE.parent / "cancel-backfill-ceph2-osd896-blocker-in-same-pg"
+FIXTURE_BLOCKER = TEST_DATA / "cancel-backfill-ceph2-osd896-blocker-in-same-pg"
 
 # Documented in the fixture's README.txt. The pins that are neither into 896 nor
 # needed for host validity alone are the blockers (targets over backfillfull),
@@ -1943,7 +1906,7 @@ class ChainFixtureReplayTest(unittest.TestCase):
         self.assertGreaterEqual(chained, 13)  # the real chains this test is about
 
 
-FIXTURE_CHAINS = FIXTURE.parent / "ceph2-cancel-backfill-chained-pairs-upmap"
+FIXTURE_CHAINS = TEST_DATA / "ceph2-cancel-backfill-chained-pairs-upmap"
 
 
 class ChainedPairsFixtureTest(unittest.TestCase):
@@ -2148,16 +2111,22 @@ class CancelWholePgTest(unittest.TestCase):
 def run_plan_all(pgs, **kwargs):
     """plan_cancellations without --osds, on the same tiny cluster as run_plan."""
     return cb.plan_cancellations(
-        pgs, {19: EC_POOL, 7: REP_POOL}, EC_PROFILES, set(), {}, RULES, **kwargs
+        pgs,
+        {19: EC_POOL_DETAIL, 7: REP_POOL_DETAIL},
+        EC_PROFILES,
+        set(),
+        {},
+        RULES,
+        **kwargs,
     )
 
 
 class PlanAllTest(unittest.TestCase):
     def test_every_remapped_pg_is_cancelled_whatever_its_osds(self):
         pgs = [
-            pg("19.9", [10, 2, 30, 4], [1, 2, 3, 4]),
-            pg("7.ff", [1, 2, 50], [1, 2, 5]),
-            pg("19.b", [1, 2, 3, 4], [1, 2, 3, 4], "active+clean"),
+            pg_stat("19.9", [10, 2, 30, 4], [1, 2, 3, 4]),
+            pg_stat("7.ff", [1, 2, 50], [1, 2, 5]),
+            pg_stat("19.b", [1, 2, 3, 4], [1, 2, 3, 4], "active+clean"),
         ]
         cancellations, skipped = run_plan_all(pgs)
         self.assertEqual(pins(cancellations), ["7.ff 50 5", "19.9 10 1", "19.9 30 3"])
@@ -2165,26 +2134,26 @@ class PlanAllTest(unittest.TestCase):
 
     def test_no_pin_is_a_companion(self):
         # with --osds 682, 9->4 would be a companion of shard 0 (see MainTest)
-        cancellations, _ = run_plan_all([pg("19.d", [OSD, 2, 3, 9], [8, 2, 3, 4])])
+        cancellations, _ = run_plan_all([pg_stat("19.d", [OSD, 2, 3, 9], [8, 2, 3, 4])])
         self.assertEqual(pins(cancellations), ["19.d 682 8", "19.d 9 4"])
         self.assertEqual({c.companion_of for c in cancellations}, {None})
 
     def test_carries_state_size_and_progress(self):
         state = "active+remapped+backfilling"
-        p = pg("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4], state, misplaced=25)
+        p = pg_stat("19.9", [OSD, 2, 3, 4], [8, 2, 3, 4], state, misplaced=25)
         (c,), _ = run_plan_all([p])
         self.assertEqual((c.state, c.size_bytes, c.progress_pct), (state, 1_000, 75.0))
 
     def test_excluded_pgs_are_left_alone(self):
-        pgs = [pg("19.9", [10, 2, 3, 4], [1, 2, 3, 4]), pg("19.a", [10], [1])]
+        pgs = [pg_stat("19.9", [10, 2, 3, 4], [1, 2, 3, 4]), pg_stat("19.a", [10], [1])]
         cancellations, _ = run_plan_all(pgs, exclude_pgs={"19.9"})
         self.assertEqual(pins(cancellations), ["19.a 10 1"])
 
     def test_failure_domain_is_checked_for_every_remapped_pg(self):
         with self.assertRaises(SystemExit):
             cb.plan_cancellations(
-                [pg("19.9", [10, 2, 3, 4], [1, 2, 3, 4])],
-                {19: EC_POOL},
+                [pg_stat("19.9", [10, 2, 3, 4], [1, 2, 3, 4])],
+                {19: EC_POOL_DETAIL},
                 EC_PROFILES,
                 set(),
                 {},

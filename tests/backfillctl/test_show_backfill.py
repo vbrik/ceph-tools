@@ -16,11 +16,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import REPO_ROOT, FakeStore, parse_args, plan_from_state, shared
+from _support import NONE, TEST_DATA, FakeStore, parse_args, plan_from_state, shared
 
 from backfillctl import show_backfill as pm
-
-NONE = shared.CRUSH_ITEM_NONE
 
 
 class ReplicaPairsTest(unittest.TestCase):
@@ -394,20 +392,8 @@ class FilterTest(unittest.TestCase):
         self.assertNotIn("--pgs", err)
 
 
-FIXTURE_STUCK_AT_100 = (
-    REPO_ROOT
-    / "tests"
-    / "backfillctl"
-    / "test-data"
-    / "ceph1-backfills-stuck-at-100-pct"
-)
-FIXTURE_RESUMED = (
-    REPO_ROOT
-    / "tests"
-    / "backfillctl"
-    / "test-data"
-    / "ceph1-resumed-backfills-exact-progress"
-)
+FIXTURE_STUCK_AT_100 = TEST_DATA / "ceph1-backfills-stuck-at-100-pct"
+FIXTURE_RESUMED = TEST_DATA / "ceph1-resumed-backfills-exact-progress"
 
 
 class FixtureReplayTest(unittest.TestCase):

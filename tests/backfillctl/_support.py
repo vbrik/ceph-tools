@@ -1,4 +1,5 @@
-"""Test support: import backfillctl's modules, and fake cluster state.
+"""Test support: import backfillctl's modules, fake cluster state, and the
+helpers more than one test file uses.
 
 REPO_ROOT is put on sys.path so `from backfillctl import ...` resolves.
 backfillctl/'s own directory is put on sys.path here too (the same thing
@@ -20,6 +21,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BACKFILLCTL_DIR = REPO_ROOT / "backfillctl"
+TEST_DATA = REPO_ROOT / "tests" / "backfillctl" / "test-data"  # captures
 
 for path in (REPO_ROOT, BACKFILLCTL_DIR):
     if str(path) not in sys.path:
@@ -36,22 +38,39 @@ import shared
 real_query_backfill_positions = shared.query_backfill_positions
 shared.query_backfill_positions = lambda pgids: {}
 
+NONE = shared.CRUSH_ITEM_NONE
+
 __all__ = [
     "EC_POOL",
+    "EC_POOL_DETAIL",
+    "EC_PROFILES",
+    "HOST_RULE",
     "KB",
+    "NONE",
     "PCT",
     "REPO_ROOT",
     "REP_POOL",
+    "REP_POOL_DETAIL",
+    "RULES",
+    "TEST_DATA",
     "FakeStore",
     "SyntheticCluster",
+    "flat",
     "messages",
+    "osd_df_of",
     "parse_args",
+    "pg_stat",
     "placement",
     "plan_from_state",
     "real_query_backfill_positions",
     "shared",
     "upmap_pairs",
 ]
+
+
+def flat(text: str) -> str:
+    """Collapse whitespace, so a substring check survives stderr's line wrapping."""
+    return " ".join(text.split())
 
 
 def parse_args(
@@ -117,14 +136,76 @@ class FakeStore:
         return self.snapshots[key]
 
 
-KB = 1_000_000  # every synthetic OSD's capacity, in KiB
-PCT = KB * shared.KIB // 100  # bytes in 1% of an OSD
+# Every fake OSD's capacity, in KiB; chosen so that 1% of it is a whole
+# number of bytes, PCT.
+KB = 1_000_000
+PCT = KB * shared.KIB // 100
 
-EC_POOL, REP_POOL = 1, 2
 HOST_RULE = {
     "rule_id": 0,
     "steps": [{"op": "take"}, {"op": "chooseleaf_indep", "type": "host"}],
 }
+
+
+def osd_df_of(utils: dict[int, float | None]) -> dict[int, dict]:
+    """A minimal 'ceph osd df' map from {osd: utilization}: hdd OSDs of KB KiB.
+
+    A None utilization is kept as unknown, with nothing used.
+    """
+    return {
+        o: {
+            "id": o,
+            "utilization": u,
+            "device_class": "hdd",
+            "kb": KB,
+            "kb_used": (u or 0) / 100 * KB,
+        }
+        for o, u in utils.items()
+    }
+
+
+# Inputs for tests that call the planning functions directly, bypassing
+# plan(): a pool map (EC 4+2 pool 19, replicated pool 7), its rules and EC
+# profiles, and pg_stat() for its PGs.
+EC_POOL_DETAIL = {
+    "pool_id": 19,
+    "type": 3,
+    "size": 6,
+    "erasure_code_profile": "p",
+    "crush_rule": 0,
+    "pg_num": 16,
+}
+REP_POOL_DETAIL = {"pool_id": 7, "type": 1, "size": 3, "crush_rule": 0}
+RULES = {0: HOST_RULE}
+EC_PROFILES = {"p": {"k": "4", "m": "2"}}
+
+
+def pg_stat(
+    pgid: str,
+    up: list,
+    acting: list,
+    state: str = "active+remapped+backfill_wait",
+    num_objects: int = 100,
+    num_bytes: int = 4_000,
+    misplaced: int = 0,
+    degraded: int = 0,
+) -> dict:
+    """A 'ceph pg dump pgs' entry; by default a remapped PG waiting to backfill."""
+    return {
+        "pgid": pgid,
+        "up": up,
+        "acting": acting,
+        "state": state,
+        "stat_sum": {
+            "num_objects": num_objects,
+            "num_bytes": num_bytes,
+            "num_objects_misplaced": misplaced,
+            "num_objects_degraded": degraded,
+        },
+    }
+
+
+EC_POOL, REP_POOL = 1, 2  # SyntheticCluster's pool ids
 
 
 class SyntheticCluster:
@@ -143,6 +224,11 @@ class SyntheticCluster:
         self.upmaps: list[dict] = []
         self.classes: dict[int, str] = {}  # device class, if not hdd
         self.rule = HOST_RULE
+
+    @staticmethod
+    def host(osd: int) -> int:
+        """The number of the host osd is on: 3 for h3."""
+        return osd // 10
 
     def pg(self, pgid, up, acting=None, *, shard_pct=1.0, state="active+clean"):
         """Add a PG whose shards are each shard_pct of an OSD."""

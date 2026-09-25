@@ -16,67 +16,28 @@ import subprocess
 import sys
 import unittest
 
-from _support import REPO_ROOT, parse_args, plan_from_state, shared
+from _support import (
+    EC_POOL_DETAIL,
+    EC_PROFILES,
+    NONE,
+    REP_POOL_DETAIL,
+    REPO_ROOT,
+    RULES,
+    TEST_DATA,
+    parse_args,
+    pg_stat,
+    plan_from_state,
+    shared,
+)
 
 from backfillctl import cancel_uphill as cu
 
-FIXTURE = (
-    REPO_ROOT
-    / "tests"
-    / "backfillctl"
-    / "test-data"
-    / "ceph1-backfills-stuck-at-100-pct"
-)
-FIXTURE_RESUMED = (
-    REPO_ROOT
-    / "tests"
-    / "backfillctl"
-    / "test-data"
-    / "ceph1-resumed-backfills-exact-progress"
-)
-
-NONE = shared.CRUSH_ITEM_NONE
-EC_POOL = {
-    "pool_id": 19,
-    "type": 3,
-    "size": 6,
-    "erasure_code_profile": "p",
-    "crush_rule": 0,
-}
-REP_POOL = {"pool_id": 7, "type": 1, "size": 3, "crush_rule": 0}
-HOST_RULE = {
-    "rule_id": 0,
-    "steps": [{"op": "take"}, {"op": "chooseleaf_indep", "type": "host"}],
-}
-RULES = {0: HOST_RULE}
-EC_PROFILES = {"p": {"k": "4", "m": "2"}}
+FIXTURE = TEST_DATA / "ceph1-backfills-stuck-at-100-pct"
+FIXTURE_RESUMED = TEST_DATA / "ceph1-resumed-backfills-exact-progress"
 
 
 def util(pct: float) -> dict:
     return {"utilization": pct}
-
-
-def pg(
-    pgid: str,
-    up: list,
-    acting: list,
-    state: str = "active+remapped+backfill_wait",
-    num_objects: int = 100,
-    num_bytes: int = 4_000,
-    misplaced: int = 0,
-) -> dict:
-    return {
-        "pgid": pgid,
-        "up": up,
-        "acting": acting,
-        "state": state,
-        "stat_sum": {
-            "num_objects": num_objects,
-            "num_bytes": num_bytes,
-            "num_objects_misplaced": misplaced,
-            "num_objects_degraded": 0,
-        },
-    }
 
 
 class EcUphillShardsTest(unittest.TestCase):
@@ -228,7 +189,7 @@ class PlanCancellationsTest(unittest.TestCase):
     ):
         return cu.plan_cancellations(
             pg_stats,
-            pools or {19: EC_POOL, 7: REP_POOL},
+            pools or {19: EC_POOL_DETAIL, 7: REP_POOL_DETAIL},
             EC_PROFILES,
             {},
             RULES,
@@ -238,7 +199,7 @@ class PlanCancellationsTest(unittest.TestCase):
         )
 
     def test_min_delta_is_passed_through(self):
-        p = pg("19.1", [1, 2, 20, 4, 5, 6], [1, 2, 9, 4, 5, 6])
+        p = pg_stat("19.1", [1, 2, 20, 4, 5, 6], [1, 2, 9, 4, 5, 6])
         osd_df = {9: util(50.0), 20: util(53.0)}
         cancellations, skipped = self.plan(
             [p], osd_df, exclude_pgs=frozenset(), min_delta=5.0
@@ -250,7 +211,7 @@ class PlanCancellationsTest(unittest.TestCase):
 
     def test_single_uphill_ec_shard_is_cancelled_with_no_companion_note(self):
         cancellations, skipped = self.plan(
-            [pg("19.1", [1, 2, 20, 4, 5, 6], [1, 2, 9, 4, 5, 6])],
+            [pg_stat("19.1", [1, 2, 20, 4, 5, 6], [1, 2, 9, 4, 5, 6])],
             {9: util(10.0), 20: util(90.0)},
         )
         self.assertEqual(len(cancellations), 1)
@@ -261,7 +222,7 @@ class PlanCancellationsTest(unittest.TestCase):
 
     def test_no_uphill_shards_yields_nothing(self):
         cancellations, skipped = self.plan(
-            [pg("19.1", [1, 2, 20, 4, 5, 6], [1, 2, 9, 4, 5, 6])],
+            [pg_stat("19.1", [1, 2, 20, 4, 5, 6], [1, 2, 9, 4, 5, 6])],
             {9: util(90.0), 20: util(10.0)},
         )
         self.assertEqual(cancellations, [])
@@ -269,7 +230,7 @@ class PlanCancellationsTest(unittest.TestCase):
 
     def test_replicated_uphill_shard_is_cancelled(self):
         cancellations, _skipped = self.plan(
-            [pg("7.1", [1, 2, 30], [1, 2, 9])],
+            [pg_stat("7.1", [1, 2, 30], [1, 2, 9])],
             {9: util(10.0), 30: util(90.0)},
         )
         self.assertEqual(len(cancellations), 1)
@@ -278,7 +239,7 @@ class PlanCancellationsTest(unittest.TestCase):
 
     def test_excluded_pg_is_left_alone(self):
         cancellations, skipped = self.plan(
-            [pg("19.1", [1, 2, 20, 4, 5, 6], [1, 2, 9, 4, 5, 6])],
+            [pg_stat("19.1", [1, 2, 20, 4, 5, 6], [1, 2, 9, 4, 5, 6])],
             {9: util(10.0), 20: util(90.0)},
             exclude_pgs={"19.1"},
         )
@@ -291,7 +252,7 @@ class PlanCancellationsTest(unittest.TestCase):
         # still headed for 149 (also host H), so shard 3 must be pinned too.
         # Shard 3's own utilization is NOT uphill, so it must only appear as
         # a companion, never as a candidate in its own right.
-        p = pg("19.7e9", [682, 300, 626, 149], [627, 300, 626, 497])
+        p = pg_stat("19.7e9", [682, 300, 626, 149], [627, 300, 626, 497])
         osd_host = {682: "x", 627: "H", 149: "H", 497: "z"}
         candidates, _ = cu.find_uphill_shards(
             p["up"],
@@ -302,7 +263,7 @@ class PlanCancellationsTest(unittest.TestCase):
         self.assertEqual(candidates, [(0, 627, 682)])
         cancellations, skipped = cu.plan_cancellations(
             [p],
-            {19: EC_POOL},
+            {19: EC_POOL_DETAIL},
             EC_PROFILES,
             osd_host,
             RULES,
@@ -316,7 +277,7 @@ class PlanCancellationsTest(unittest.TestCase):
 
     def test_two_independent_uphill_shards_in_one_pg_both_appear(self):
         cancellations, _skipped = self.plan(
-            [pg("19.1", [10, 20, 30, 4, 5, 6], [1, 2, 3, 4, 5, 6])],
+            [pg_stat("19.1", [10, 20, 30, 4, 5, 6], [1, 2, 3, 4, 5, 6])],
             {
                 1: util(10),
                 10: util(90),
@@ -339,13 +300,13 @@ class PlanCancellationsTest(unittest.TestCase):
         # clash of its own. Both are requested together (one close_pins
         # call per PG), so both must be skipped -- not just shard 0 -- since
         # nothing partial is proposed for a PG.
-        p = pg("19.1", [682, 300, 149, 20, 5, 6], [627, 300, 149, 10, 5, 6])
+        p = pg_stat("19.1", [682, 300, 149, 20, 5, 6], [627, 300, 149, 10, 5, 6])
         osd_host = {682: "x", 627: "H", 149: "H", 10: "p", 20: "q"}
         osd_df = {627: util(10), 682: util(90), 10: util(5), 20: util(95)}
         candidates, _ = cu.find_uphill_shards(p["up"], p["acting"], True, osd_df)
         self.assertEqual(candidates, [(0, 627, 682), (3, 10, 20)])
         cancellations, skipped = cu.plan_cancellations(
-            [p], {19: EC_POOL}, EC_PROFILES, osd_host, RULES, osd_df
+            [p], {19: EC_POOL_DETAIL}, EC_PROFILES, osd_host, RULES, osd_df
         )
         self.assertEqual(cancellations, [])
         self.assertEqual({s.shard for s in skipped}, {0, 3})
@@ -354,7 +315,7 @@ class PlanCancellationsTest(unittest.TestCase):
         # Shards 0 and 1 are both uphill and, once pinned back to 627/628
         # (both host H), each independently clashes with shard 2, which is
         # still headed for 200 (also host H) but is itself not uphill.
-        p = pg("19.1", [682, 800, 200, 4, 5, 6], [627, 628, 149, 4, 5, 6])
+        p = pg_stat("19.1", [682, 800, 200, 4, 5, 6], [627, 628, 149, 4, 5, 6])
         osd_host = {682: "A", 627: "H", 800: "B", 628: "H", 200: "H", 149: "Z"}
         osd_df = {
             627: util(10),
@@ -367,7 +328,7 @@ class PlanCancellationsTest(unittest.TestCase):
         candidates, _ = cu.find_uphill_shards(p["up"], p["acting"], True, osd_df)
         self.assertEqual(candidates, [(0, 627, 682), (1, 628, 800)])
         cancellations, skipped = cu.plan_cancellations(
-            [p], {19: EC_POOL}, EC_PROFILES, osd_host, RULES, osd_df
+            [p], {19: EC_POOL_DETAIL}, EC_PROFILES, osd_host, RULES, osd_df
         )
         self.assertEqual(skipped, [])
         by_shard = {c.shard: c for c in cancellations}

@@ -24,13 +24,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import REPO_ROOT, FakeStore, parse_args, shared
+from _support import TEST_DATA, FakeStore, parse_args, shared
 
 from backfillctl import cancel_backfill as cb
 from backfillctl import divert_toofull as dt
 from backfillctl import save_state as ss
 
-TEST_DATA = REPO_ROOT / "tests" / "backfillctl" / "test-data"
 FIXTURE = TEST_DATA / "cancel-backfill-ceph2-osd896-host-clash-companions"
 
 

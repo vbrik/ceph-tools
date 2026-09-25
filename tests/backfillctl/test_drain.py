@@ -18,7 +18,9 @@ import unittest
 from collections import Counter
 
 from _support import (
+    NONE,
     REPO_ROOT,
+    TEST_DATA,
     FakeStore,
     SyntheticCluster,
     parse_args,
@@ -26,29 +28,19 @@ from _support import (
     upmap_pairs,
 )
 
-from backfillctl import drain as ut
+from backfillctl import drain as dr
 
-FIXTURE = (
-    REPO_ROOT
-    / "tests"
-    / "backfillctl"
-    / "test-data"
-    / "ceph1-backfills-stuck-at-100-pct"
-)
+FIXTURE = TEST_DATA / "ceph1-backfills-stuck-at-100-pct"
 
 
 class Cluster(SyntheticCluster):
-    def plan(self, *argv) -> ut.DrainResult:
+    def plan(self, *argv) -> dr.DrainResult:
         """Run plan() on this cluster; leading bare OSD ids go to --osds."""
-        return self.plan_with(ut, *argv)
+        return self.plan_with(dr, *argv)
 
 
-def pairs(result: ut.DrainResult) -> list[tuple[str, object, int, int]]:
+def pairs(result: dr.DrainResult) -> list[tuple[str, object, int, int]]:
     return [(m.pgid, m.shard, m.up_osd, m.target_osd) for m in result.moves]
-
-
-def host(osd: int) -> int:
-    return osd // 10
 
 
 class EvacueeSelectionTest(unittest.TestCase):
@@ -104,7 +96,7 @@ class EvacueeSelectionTest(unittest.TestCase):
         result = c.pg("1.0", [0, 10, 20]).plan(0, 10)
         targets = [m.target_osd for m in result.moves]
         self.assertEqual(len(targets), 2)
-        self.assertEqual(len({host(t) for t in targets} | {2}), 3)
+        self.assertEqual(len({Cluster.host(t) for t in targets} | {2}), 3)
         self.assertFalse({0, 10} & set(targets))
 
     def test_osd_in_the_raw_crush_mapping_is_not_a_target(self):
@@ -171,8 +163,7 @@ class CapacityTest(unittest.TestCase):
         # An 11-slot up set with drained OSDs in shards 2 and 10 ("10" sorts
         # before "2" as a string). Not a real layout for pool 1, but the
         # planner only needs the slots.
-        none = shared.CRUSH_ITEM_NONE
-        up = [none] * 11
+        up = [NONE] * 11
         up[2], up[10] = 0, 10
         c = Cluster(default_util=95.0).pg("1.0", up)
         result = c.plan(0, 10)
@@ -297,8 +288,7 @@ class BlockerTest(unittest.TestCase):
     def test_unpinnable_blocker_keeps_the_evacuee_with_a_note(self):
         c = Cluster(default_util=95.0)
         c.util[1] = 10.0
-        none = shared.CRUSH_ITEM_NONE
-        result = c.pg("1.0", [0, 10, 20], [0, none, 20]).plan(0)
+        result = c.pg("1.0", [0, 10, 20], [0, NONE, 20]).plan(0)
         self.assertEqual(pairs(result), [("1.0", 0, 0, 1)])
         self.assertIn("PG stays toofull: shard 1 -> osd.10", result.moves[0].note)
         self.assertIn("no acting OSD", result.moves[0].note)
@@ -310,7 +300,7 @@ class BlockerTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(err),
             ):
-                ut.render(result, parse_args(ut, ["--osds", *argv]))
+                dr.render(result, parse_args(dr, ["--osds", *argv]))
             text = " ".join(err.getvalue().split())
             self.assertIn("stay backfill_toofull: 1 (1.0);", text)
             self.assertIn("Their NOTE (JSON: 'note') says why.", text)
@@ -361,7 +351,7 @@ class BlockerTest(unittest.TestCase):
     def test_toofull_util_refuses_a_ratio(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
-            parse_args(ut, ["--osds", "0", "--toofull-util", "0.85"])
+            parse_args(dr, ["--osds", "0", "--toofull-util", "0.85"])
         self.assertIn("not a ratio", err.getvalue())
 
     def test_toofull_util_overrides_nearfull(self):
@@ -376,8 +366,7 @@ class BlockerTest(unittest.TestCase):
         c = Cluster(default_util=95.0)
         c.util[1] = 10.0
         c.util[10] = 86.0
-        none = shared.CRUSH_ITEM_NONE
-        c.pg("1.0", [0, 10, 20], [0, none, 20], state="active+backfill_toofull")
+        c.pg("1.0", [0, 10, 20], [0, NONE, 20], state="active+backfill_toofull")
         note = c.plan(0).moves[0].note
         self.assertIn(
             "shard 1 -> osd.10 now 86.0% >= --toofull-util 85% and PG is "
@@ -430,7 +419,7 @@ class HostsTest(unittest.TestCase):
         self.assertEqual(result.osds, [10, 11])
         self.assertEqual(result.hosts, ["h1"])
         self.assertEqual({m.up_osd for m in result.moves}, {10, 11})
-        self.assertFalse({host(m.target_osd) for m in result.moves} & {1})
+        self.assertFalse({Cluster.host(m.target_osd) for m in result.moves} & {1})
 
     def test_fully_qualified_name_matches_the_short_one(self):
         result = Cluster().pg("1.0", [0, 10, 20]).plan("--hosts", "h1.example.org")
@@ -454,7 +443,7 @@ class HostsTest(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()),
                 self.assertRaises(SystemExit) as cm,
             ):
-                parse_args(ut, argv)
+                parse_args(dr, argv)
             self.assertEqual(cm.exception.code, 2)
 
 
@@ -468,9 +457,9 @@ class OutputTest(unittest.TestCase):
     def test_row_matches_columns(self):
         result = self.result()
         for move in result.moves:
-            row = ut.format_row(move, result.osd_host, result.osd_df)
-            self.assertEqual(len(row), len(ut.COLUMNS))
-        row = ut.format_row(result.moves[0], result.osd_host, result.osd_df)
+            row = dr.format_row(move, result.osd_host, result.osd_df)
+            self.assertEqual(len(row), len(dr.COLUMNS))
+        row = dr.format_row(result.moves[0], result.osd_host, result.osd_df)
         self.assertEqual(row[:2], ["1.0", "0"])
         self.assertEqual(row[5], "0")  # UP OSD: the upmap's 'from'
         self.assertEqual(row[8], "31")  # TARGET OSD: its 'to'
@@ -478,7 +467,7 @@ class OutputTest(unittest.TestCase):
     def test_pgremapper_mappings_is_valid_json_of_from_to_pairs(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            ut.print_pgremapper_mappings(self.result().moves)
+            dr.print_pgremapper_mappings(self.result().moves)
         self.assertEqual(
             upmap_pairs(out.getvalue()),
             [
@@ -491,7 +480,7 @@ class OutputTest(unittest.TestCase):
         moves = self.result().moves
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            ut.print_pgremapper_mappings(moves)
+            dr.print_pgremapper_mappings(moves)
         self.assertEqual(
             [(e["shard"], e["role"], e["note"]) for e in json.loads(out.getvalue())],
             [(m.shard, m.role, m.note) for m in moves],
@@ -507,7 +496,7 @@ class OutputTest(unittest.TestCase):
         self.assertEqual([e.pgid for e in result.unplaceable], ["1.0"])
         err = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-            ut.render(result, parse_args(ut, ["--osds", "0"]))
+            dr.render(result, parse_args(dr, ["--osds", "0"]))
         self.assertIn(
             "  cannot place 1.0 shard 0 off osd.0: no legal target", err.getvalue()
         )
@@ -519,7 +508,7 @@ class OutputTest(unittest.TestCase):
         result = c.pg("1.0", [0, 10, 20], [0, 11, 20]).plan(0)
         err = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-            ut.render(result, parse_args(ut, ["--osds", "0"]))
+            dr.render(result, parse_args(dr, ["--osds", "0"]))
         text = " ".join(err.getvalue().split())
         self.assertIn("Proposed 1 move(s) off the drained OSDs, 0 unplaceable;", text)
         self.assertIn("0 blocking shard(s) diverted, 1 pinned back.", text)
@@ -528,7 +517,7 @@ class OutputTest(unittest.TestCase):
         for argv, out_text in ((["0"], ""), (["0", "--pgremapper-mappings"], "[]\n")):
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                ut.render(Cluster().plan(0), parse_args(ut, ["--osds", *argv]))
+                dr.render(Cluster().plan(0), parse_args(dr, ["--osds", *argv]))
             self.assertEqual(out.getvalue(), out_text)
             self.assertEqual(
                 err.getvalue().strip(), "Nothing to drain: no shard is mapped to osd.0."
@@ -537,7 +526,7 @@ class OutputTest(unittest.TestCase):
     def test_summary_without_stuck_pgs_points_nowhere(self):
         err = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-            ut.render(self.result(), parse_args(ut, ["--osds", "0"]))
+            dr.render(self.result(), parse_args(dr, ["--osds", "0"]))
         text = " ".join(err.getvalue().split())
         self.assertIn("backfill_toofull: 0; for an unidentified reason: 0.", text)
         self.assertNotIn("NOTE (JSON", text)
@@ -545,7 +534,7 @@ class OutputTest(unittest.TestCase):
     def test_pgremapper_mappings_empty(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            ut.print_pgremapper_mappings([])
+            dr.print_pgremapper_mappings([])
         self.assertEqual(out.getvalue(), "[]\n")
 
 
@@ -555,19 +544,19 @@ class LiveFetchTest(unittest.TestCase):
         pg_b = {"pgid": "1.2", "up": [0, 10], "acting": [0, 10]}
         store = FakeStore(
             {
-                ut.ls_by_osd_key(0): {"pg_stats": [pg_a, pg_b]},
-                ut.ls_by_osd_key(10): {"pg_stats": [pg_b]},
+                dr.ls_by_osd_key(0): {"pg_stats": [pg_a, pg_b]},
+                dr.ls_by_osd_key(10): {"pg_stats": [pg_b]},
             },
             load_dir=None,
         )
-        pgs = ut.fetch_drained_pg_stats(store, {0, 10})
+        pgs = dr.fetch_drained_pg_stats(store, {0, 10})
         self.assertEqual([pg["pgid"] for pg in pgs], ["1.2", "1.a"])
 
     def test_one_ls_by_osd_command_per_osd(self):
-        cmds = ut.ls_by_osd_commands({3, 7})
-        self.assertEqual(set(cmds), {ut.ls_by_osd_key(3), ut.ls_by_osd_key(7)})
+        cmds = dr.ls_by_osd_commands({3, 7})
+        self.assertEqual(set(cmds), {dr.ls_by_osd_key(3), dr.ls_by_osd_key(7)})
         self.assertEqual(
-            cmds[ut.ls_by_osd_key(7)][:4], ["ceph", "pg", "ls-by-osd", "osd.7"]
+            cmds[dr.ls_by_osd_key(7)][:4], ["ceph", "pg", "ls-by-osd", "osd.7"]
         )
 
     def test_plan_registers_the_drained_osds_commands_with_the_store(self):
@@ -575,9 +564,9 @@ class LiveFetchTest(unittest.TestCase):
         # live run depends on plan() adding their commands to the store.
         c = Cluster().pg("1.0", [0, 10, 20])
         store = FakeStore(c.snapshots())
-        ut.plan(parse_args(ut, ["--hosts", "h1"]), store)
-        self.assertIn(ut.ls_by_osd_key(10), store.commands)
-        self.assertIn(ut.ls_by_osd_key(11), store.commands)
+        dr.plan(parse_args(dr, ["--hosts", "h1"]), store)
+        self.assertIn(dr.ls_by_osd_key(10), store.commands)
+        self.assertIn(dr.ls_by_osd_key(11), store.commands)
 
 
 class FixtureInvariants:
@@ -592,14 +581,14 @@ class FixtureInvariants:
 
     @classmethod
     def setUpClass(cls):
-        args = parse_args(ut, list(cls.ARGV), load_state=str(cls.FIXTURE_DIR))
-        store = shared.SnapshotStore.from_args(args, dict(ut.SNAPSHOT_COMMANDS))
-        cls.result = ut.plan(args, store)
+        args = parse_args(dr, list(cls.ARGV), load_state=str(cls.FIXTURE_DIR))
+        store = shared.SnapshotStore.from_args(args, dict(dr.SNAPSHOT_COMMANDS))
+        cls.result = dr.plan(args, store)
         cls.OSDS = set(cls.result.osds)
         cls.pgs = {pg["pgid"]: pg for pg in shared.fetch_pg_stats(store, "pg_dump_pgs")}
 
-    def by_pg(self) -> dict[str, list[ut.Move]]:
-        by_pg: dict[str, list[ut.Move]] = {}
+    def by_pg(self) -> dict[str, list[dr.Move]]:
+        by_pg: dict[str, list[dr.Move]] = {}
         for m in self.result.moves:
             by_pg.setdefault(m.pgid, []).append(m)
         return by_pg
@@ -649,7 +638,7 @@ class Ceph1FixtureTest(FixtureInvariants, unittest.TestCase):
 class Ceph2EmergencyFixtureTest(FixtureInvariants, unittest.TestCase):
     """A cluster in a fullness emergency, where blockers abound."""
 
-    FIXTURE_DIR = FIXTURE.parent / "divert-toofull-ceph2-util-emergency-2-new-hosts"
+    FIXTURE_DIR = TEST_DATA / "divert-toofull-ceph2-util-emergency-2-new-hosts"
     ARGV = ("--osds", "883")
 
     def test_blockers_are_diverted_and_pinned(self):

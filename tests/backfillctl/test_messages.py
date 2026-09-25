@@ -10,12 +10,7 @@ import contextlib
 import io
 import unittest
 
-from _support import REPO_ROOT, messages, shared
-
-
-def flat(text: str) -> str:
-    """Collapse whitespace, so a substring check survives stderr's line wrapping."""
-    return " ".join(text.split())
+from _support import REPO_ROOT, flat, messages, shared
 
 
 def stderr_of(fn, *args, **kwargs) -> str:

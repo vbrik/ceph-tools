@@ -28,6 +28,7 @@ import io
 import json
 import math
 import os
+import pathlib
 import random
 import re
 import shutil
@@ -39,25 +40,24 @@ from collections import Counter
 from typing import ClassVar
 
 from _support import (
+    KB,
+    NONE,
+    PCT,
     REPO_ROOT,
+    TEST_DATA,
     FakeStore,
+    flat,
+    osd_df_of,
     parse_args,
     placement,
     plan_from_state,
     shared,
 )
 
-from backfillctl import divert_toofull as ut
-
-TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+from backfillctl import divert_toofull as dt
 
 
-def flat(text: str) -> str:
-    """Collapse whitespace, so a substring check survives stderr's line wrapping."""
-    return " ".join(text.split())
-
-
-def cli(state_dir: str) -> list[str]:
+def cli(state_dir) -> list[str]:
     """Argv prefix that runs this subcommand as a subprocess on a saved state
     (directory-execution form, works from any cwd); subcommand args follow.
     """
@@ -65,12 +65,9 @@ def cli(state_dir: str) -> list[str]:
         sys.executable,
         str(REPO_ROOT / "backfillctl"),
         "--load-state",
-        state_dir,
+        str(state_dir),
         "divert-toofull",
     ]
-
-
-TEST_DATA = os.path.join(TESTS_DIR, "test-data")
 
 
 # The column labels in order, as print_table's label line splits: the OSD/UTIL/
@@ -90,12 +87,6 @@ OSD_DF = {
 }
 
 
-# Every OSD in the unit tests below has this capacity, chosen so that a
-# percentage of it is a whole number of bytes: 1% is PCT bytes exactly.
-KB = 1_000_000
-PCT = KB * shared.KIB // 100
-
-
 def make_proposal(acting_osd=406):
     shard = placement.ArrivingShard(
         pgid="19.2",
@@ -104,12 +95,12 @@ def make_proposal(acting_osd=406):
         acting_osd=acting_osd,
         up_set=[882, 111, 222],
     )
-    return ut.Proposal(shard, 898, "host51", 61.7, 62.9)
+    return dt.Proposal(shard, 898, "host51", 61.7, 62.9)
 
 
 class FormatRowTest(unittest.TestCase):
     def test_row_matches_column_order(self):
-        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
+        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
         self.assertEqual(
             row,
             [
@@ -131,14 +122,14 @@ class FormatRowTest(unittest.TestCase):
     def test_row_length_tracks_columns(self):
         # Guards against a column being added to COLUMNS (or to the row)
         # without the other side following.
-        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
-        self.assertEqual(len(row), len(ut.COLUMNS))
+        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
+        self.assertEqual(len(row), len(dt.COLUMNS))
 
     def test_unknown_acting_osd_renders_as_none_and_dashes(self):
         # The usual out-OSD case: the slot the shard is coming from reads as
         # CRUSH_ITEM_NONE, so neither its utilization nor its host exists.
-        row = ut.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF)
-        cells = dict(zip(ut.COLUMNS, row))
+        row = dt.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF)
+        cells = dict(zip(dt.COLUMNS, row))
         self.assertEqual(cells[("ACTING", "OSD")], "none")
         self.assertEqual(cells[("ACTING", "UTIL")], shared.NOT_APPLICABLE)
         self.assertEqual(cells[("ACTING", "HOST")], shared.NOT_APPLICABLE)
@@ -151,19 +142,19 @@ def table_lines(rows):
     """Return the lines print_table writes for rows."""
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        shared.print_table(ut.COLUMNS, rows)
+        shared.print_table(dt.COLUMNS, rows)
     return buf.getvalue().splitlines()
 
 
 class PrintTableTest(unittest.TestCase):
     def test_header_is_two_lines_with_each_group_named_once(self):
-        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
+        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
         group_line, label_line, _ = table_lines([row])
         self.assertEqual(re.findall(r"[A-Z]+", group_line), ["ACTING", "UP", "TARGET"])
         self.assertEqual(label_line.split(), LABELS)
 
     def test_group_span_covers_exactly_its_own_columns(self):
-        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
+        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
         group_line, label_line, data_line = table_lines([row])
         spans = list(re.finditer(r"-+ [A-Z]+ -+", group_line))
         osd_starts = [m.start() for m in re.finditer("OSD", label_line)]
@@ -180,13 +171,13 @@ class PrintTableTest(unittest.TestCase):
             self.assertTrue(m.group().startswith("-") and m.group().endswith("-"))
 
     def test_ungrouped_columns_have_a_blank_group_line(self):
-        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
+        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
         group_line, label_line, _ = table_lines([row])
         pgid_and_shard = label_line.index("OSD")
         self.assertEqual(group_line[:pgid_and_shard], " " * pgid_and_shard)
 
     def test_groups_are_set_apart_by_a_wider_gap_than_columns_within_one(self):
-        row = ut.format_row(make_proposal(), OSD_HOST, OSD_DF)
+        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
         _, _, data_line = table_lines([row])
         # Data cells fill their columns exactly, so the gaps read off directly:
         # 2 spaces within a group, 4 between groups (and after SHARD).
@@ -199,14 +190,14 @@ class PrintTableTest(unittest.TestCase):
     def test_no_trailing_whitespace(self):
         # Narrow cells (unknown acting OSD) and a blank final group cell
         # must not leave padding on any line.
-        row = ut.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF)
+        row = dt.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF)
         for line in table_lines([row]):
             self.assertEqual(line, line.rstrip())
 
     def test_columns_widen_to_fit_the_widest_cell(self):
         rows = [
-            ut.format_row(make_proposal(), OSD_HOST, OSD_DF),
-            ["19.1ce0"] + ut.format_row(make_proposal(), OSD_HOST, OSD_DF)[1:],
+            dt.format_row(make_proposal(), OSD_HOST, OSD_DF),
+            ["19.1ce0"] + dt.format_row(make_proposal(), OSD_HOST, OSD_DF)[1:],
         ]
         lines = table_lines(rows)
         # The widest PGID ('19.1ce0') pushes every line's SHARD column right.
@@ -216,9 +207,9 @@ class PrintTableTest(unittest.TestCase):
     def test_column_and_row_widths_agree(self):
         # Every cell of the group line and label line must be a column of
         # the same table as the data rows.
-        rows = [ut.format_row(make_proposal(), OSD_HOST, OSD_DF)]
+        rows = [dt.format_row(make_proposal(), OSD_HOST, OSD_DF)]
         _, label_line, data_line = table_lines(rows)
-        self.assertEqual(len(ut.COLUMNS), len(rows[0]))
+        self.assertEqual(len(dt.COLUMNS), len(rows[0]))
         self.assertEqual(
             len(label_line.split()), len(data_line.split()), (label_line, data_line)
         )
@@ -231,7 +222,7 @@ class FindArrivingShardsTest(unittest.TestCase):
         self.assertEqual((shard.shard, shard.up_osd, shard.acting_osd), (0, 882, 406))
 
     def test_ec_empty_acting_slot_yields_unknown_acting_osd(self):
-        pg = {"pgid": "19.2", "up": [882, 111], "acting": [shared.CRUSH_ITEM_NONE, 111]}
+        pg = {"pgid": "19.2", "up": [882, 111], "acting": [NONE, 111]}
         (shard,) = placement.find_arriving_shards(pg, is_ec=True)
         self.assertEqual(shard.up_osd, 882)
         self.assertIsNone(shard.acting_osd)
@@ -279,25 +270,25 @@ class FilterToofullPgsTest(unittest.TestCase):
         return [{"pgid": p} for p in pgids]
 
     def test_only_wanted_pgs_are_kept(self):
-        kept, matched = ut.filter_toofull_pgs(
+        kept, matched = dt.filter_toofull_pgs(
             self.pgs("19.1", "19.2", "19.3"), {"19.2"}
         )
         self.assertEqual([pg["pgid"] for pg in kept], ["19.2"])
         self.assertEqual(matched, {"19.2"})
 
     def test_input_order_is_preserved(self):
-        kept, _ = ut.filter_toofull_pgs(
+        kept, _ = dt.filter_toofull_pgs(
             self.pgs("19.3", "19.1", "19.2"), {"19.1", "19.3"}
         )
         self.assertEqual([pg["pgid"] for pg in kept], ["19.3", "19.1"])
 
     def test_wanted_id_that_matches_nothing_is_left_out_of_matched(self):
-        kept, matched = ut.filter_toofull_pgs(self.pgs("19.1"), {"19.1", "19.zzz"})
+        kept, matched = dt.filter_toofull_pgs(self.pgs("19.1"), {"19.1", "19.zzz"})
         self.assertEqual([pg["pgid"] for pg in kept], ["19.1"])
         self.assertEqual(matched, {"19.1"})
 
     def test_empty_wanted_set_keeps_nothing(self):
-        kept, matched = ut.filter_toofull_pgs(self.pgs("19.1", "19.2"), set())
+        kept, matched = dt.filter_toofull_pgs(self.pgs("19.1", "19.2"), set())
         self.assertEqual((kept, matched), ([], set()))
 
 
@@ -343,33 +334,33 @@ class SelectStuckShardsTest(unittest.TestCase):
         return placement.ArrivingShard("19.1", "-", up_osd, None, [up_osd])
 
     def test_shard_on_a_full_osd_is_kept(self):
-        stuck, skipped = ut.select_stuck_shards([self.shard(1)], SOURCE_DF, 85.0)
+        stuck, skipped = dt.select_stuck_shards([self.shard(1)], SOURCE_DF, 85.0)
         self.assertEqual(([s.up_osd for s in stuck], skipped), ([1], []))
 
     def test_threshold_is_inclusive(self):
         # An OSD exactly at nearfull_ratio is still a plausible blocker.
-        stuck, skipped = ut.select_stuck_shards([self.shard(2)], SOURCE_DF, 85.0)
+        stuck, skipped = dt.select_stuck_shards([self.shard(2)], SOURCE_DF, 85.0)
         self.assertEqual(([s.up_osd for s in stuck], skipped), ([2], []))
 
     def test_shard_arriving_on_an_empty_osd_is_left_alone(self):
         # The case that wasted targets before: a healthy shard of a PG that
         # is in backfill_toofull because some *other* shard is wedged.
-        stuck, skipped = ut.select_stuck_shards([self.shard(3)], SOURCE_DF, 85.0)
+        stuck, skipped = dt.select_stuck_shards([self.shard(3)], SOURCE_DF, 85.0)
         self.assertEqual((stuck, [s.up_osd for s in skipped]), ([], [3]))
 
     def test_unknown_utilization_is_kept_not_dropped(self):
         # Cannot be ruled out as the blocker, so it must not vanish silently.
-        stuck, skipped = ut.select_stuck_shards([self.shard(4)], SOURCE_DF, 85.0)
+        stuck, skipped = dt.select_stuck_shards([self.shard(4)], SOURCE_DF, 85.0)
         self.assertEqual(([s.up_osd for s in stuck], skipped), ([4], []))
 
     def test_zero_threshold_keeps_everything(self):
         shards = [self.shard(o) for o in (1, 2, 3, 4)]
-        stuck, skipped = ut.select_stuck_shards(shards, SOURCE_DF, 0)
+        stuck, skipped = dt.select_stuck_shards(shards, SOURCE_DF, 0)
         self.assertEqual((len(stuck), skipped), (4, []))
 
     def test_input_order_is_preserved_in_both_halves(self):
         shards = [self.shard(o) for o in (3, 1, 3, 2)]
-        stuck, skipped = ut.select_stuck_shards(shards, SOURCE_DF, 85.0)
+        stuck, skipped = dt.select_stuck_shards(shards, SOURCE_DF, 85.0)
         self.assertEqual([s.up_osd for s in stuck], [1, 2])
         self.assertEqual([s.up_osd for s in skipped], [3, 3])
 
@@ -443,9 +434,7 @@ def proposals_from_readme(fixture):
     README, rather than duplicating them here, is what keeps the two from
     drifting apart.
     """
-    path = os.path.join(TEST_DATA, fixture, "README.txt")
-    with open(path) as f:
-        lines = f.read().splitlines()
+    lines = (TEST_DATA / fixture / "README.txt").read_text().splitlines()
     # The heading wraps onto further lines before the indented block.
     start = next(i for i, ln in enumerate(lines) if ln.startswith("Expected proposals"))
     block = []
@@ -471,7 +460,20 @@ def proposal_tuple(p):
 
 def fixture_plan(fixture, *argv):
     """Return plan()'s DivertResult for a fixture under test-data."""
-    return plan_from_state(ut, os.path.join(TEST_DATA, fixture), *argv)
+    return plan_from_state(dt, TEST_DATA / fixture, *argv)
+
+
+def copy_without_pool(fixture: str, pool_id: int, tmp: str) -> pathlib.Path:
+    """Copy fixture into directory tmp minus pool_id's 'pool ls detail' entry.
+
+    Returns the copy's path.
+    """
+    dst = pathlib.Path(tmp) / "fixture"
+    shutil.copytree(TEST_DATA / fixture, dst)
+    path = dst / "pool_ls_detail.json"
+    pools = json.loads(path.read_text())
+    path.write_text(json.dumps([p for p in pools if p["pool_id"] != pool_id]))
+    return dst
 
 
 def remap_triples(proposals):
@@ -519,7 +521,7 @@ class PrintOutcomeTest(unittest.TestCase):
     def capture(self, unplaceable):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            ut.print_outcome(5, unplaceable)
+            dt.print_outcome(5, unplaceable)
         return err.getvalue()
 
     def test_names_each_unplaceable_shard_then_the_caveat(self):
@@ -552,7 +554,7 @@ class PrintOutcomeTest(unittest.TestCase):
 def proposal(pgid, up_osd, target_osd, shard=0):
     """A Proposal with just enough fields set for the pgremapper-mappings tests."""
     ds = placement.ArrivingShard(pgid, shard, up_osd, None, [up_osd])
-    return ut.Proposal(ds, target_osd, "h", 50.0, 55.0)
+    return dt.Proposal(ds, target_osd, "h", 50.0, 55.0)
 
 
 class PgremapperMappingsOutputTest(unittest.TestCase):
@@ -566,7 +568,7 @@ class PgremapperMappingsOutputTest(unittest.TestCase):
     def printed(self, proposals):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            ut.print_pgremapper_mappings(proposals)
+            dt.print_pgremapper_mappings(proposals)
         return out.getvalue()
 
     def test_is_a_json_array_of_pgid_and_mapping_entries(self):
@@ -643,7 +645,7 @@ class FixtureReplayTest(unittest.TestCase):
 
     def run_proc(self, fixture, *extra):
         return subprocess.run(
-            [*cli(os.path.join(TEST_DATA, fixture))] + list(extra),
+            [*cli(TEST_DATA / fixture)] + list(extra),
             capture_output=True,
             text=True,
             check=True,
@@ -744,7 +746,7 @@ class NothingToDivertTest(unittest.TestCase):
             with self.subTest(extra=extra):
                 proc = subprocess.run(
                     [
-                        *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
+                        *cli(TEST_DATA / CEPH2_FIXTURE),
                         "--pgs",
                         "1.0",
                         *extra,
@@ -766,17 +768,10 @@ class PrintPgsFilterTest(unittest.TestCase):
         # A typo in --pgs can be what trips a later error, so the note naming
         # it must not wait for render(), which an exit never reaches.
         with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(TEST_DATA, "divert-toofull-osd457-down")
-            dst = os.path.join(tmp, "fixture")
-            shutil.copytree(src, dst)
-            path = os.path.join(dst, "pool_ls_detail.json")
-            with open(path) as f:
-                pools = json.load(f)
-            with open(path, "w") as f:
-                json.dump([p for p in pools if p["pool_id"] != 19], f)
+            dst = copy_without_pool("divert-toofull-osd457-down", 19, tmp)
             err = io.StringIO()
             with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
-                plan_from_state(ut, dst, "--pgs", "19.21f", "19.zzz")
+                plan_from_state(dt, dst, "--pgs", "19.21f", "19.zzz")
         self.assertIn("pool id(s) 19", str(ctx.exception))
         self.assertIn(
             "are backfill_toofull and will be the only ones considered; 1 matched "
@@ -786,7 +781,7 @@ class PrintPgsFilterTest(unittest.TestCase):
 
     def test_printed_only_with_pgs(self):
         # The note goes to stderr, ahead of the summary, only under --pgs.
-        fixture = os.path.join(TEST_DATA, "divert-toofull-osd263-existing-upmap-chain")
+        fixture = TEST_DATA / "divert-toofull-osd263-existing-upmap-chain"
         for extra, shown in [((), False), (("--pgs", "19.zzz"), True)]:
             with self.subTest(extra=extra):
                 proc = subprocess.run(
@@ -796,20 +791,6 @@ class PrintPgsFilterTest(unittest.TestCase):
                     check=True,
                 )
                 self.assertEqual("--pgs:" in proc.stderr, shown)
-
-
-def osd_df_of(utils):
-    """Build a minimal 'ceph osd df' map from {osd: utilization}."""
-    return {
-        osd: {
-            "id": osd,
-            "utilization": util,
-            "device_class": "hdd",
-            "kb": KB,
-            "kb_used": (util or 0) / 100 * KB,
-        }
-        for osd, util in utils.items()
-    }
 
 
 def stuck(pgid, up_osd=1, up_set=None, size_pct=0, shard=0, acting=None):
@@ -869,7 +850,7 @@ class ProjectedUsageTest(unittest.TestCase):
 
 class SourcePressureTest(unittest.TestCase):
     def pressure(self, utils):
-        return ut.SourcePressure(osd_df_of(utils))
+        return dt.SourcePressure(osd_df_of(utils))
 
     def test_utilization_is_the_acting_osds(self):
         pressure = self.pressure({6: 90.0})
@@ -999,7 +980,7 @@ class AssignTargetsTest(unittest.TestCase):
         df = osd_df_of(utils)
         projection = RecordingProjection(df, list(arriving))
         self.placed = projection.placed  # PG ids, in the order placed
-        return ut.assign_targets(
+        return dt.assign_targets(
             shards,
             {"hdd": candidates},
             self.HOSTS,
@@ -1169,7 +1150,7 @@ class AssignTargetsTest(unittest.TestCase):
         df[3]["kb"] *= 2
         df[3]["kb_used"] *= 2
         shards = [stuck("1.0", size_pct=20)]
-        proposals, _ = ut.assign_targets(
+        proposals, _ = dt.assign_targets(
             shards,
             {"hdd": [2, 3]},
             self.HOSTS,
@@ -1377,7 +1358,7 @@ def run_ceph2(*extra):
     """Run the script on the cluster-sized fixture; return the CompletedProcess."""
     return subprocess.run(
         [
-            *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
+            *cli(TEST_DATA / CEPH2_FIXTURE),
             *extra,
         ],
         capture_output=True,
@@ -1479,7 +1460,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
                 self.assertEqual(len(set(values)), 1)
 
     def test_proposals_are_in_pg_order_whatever_order_shards_were_placed_in(self):
-        keys = [(ut.pgid_sort_key(p.shard.pgid), p.shard.shard) for p in self.proposals]
+        keys = [(dt.pgid_sort_key(p.shard.pgid), p.shard.shard) for p in self.proposals]
         self.assertEqual(keys, sorted(keys))
 
     def test_only_shards_on_the_fullest_acting_osds_get_the_scarce_room(self):
@@ -1569,7 +1550,7 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
             with self.subTest(value=value):
                 proc = subprocess.run(
                     [
-                        *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
+                        *cli(TEST_DATA / CEPH2_FIXTURE),
                         "--max-target-uses",
                         value,
                     ],
@@ -1594,7 +1575,7 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
             with self.subTest(value=value):
                 proc = subprocess.run(
                     [
-                        *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
+                        *cli(TEST_DATA / CEPH2_FIXTURE),
                         "--max-target-util",
                         value,
                     ],
@@ -1618,7 +1599,7 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
             with self.subTest(value=value):
                 proc = subprocess.run(
                     [
-                        *cli(os.path.join(TEST_DATA, CEPH2_FIXTURE)),
+                        *cli(TEST_DATA / CEPH2_FIXTURE),
                         f"--max-target-util={value}",
                     ],
                     capture_output=True,
@@ -1635,7 +1616,7 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
-                    parse_args(ut, argv)
+                    parse_args(dt, argv)
                 self.assertIn("not a ratio", err.getvalue())
 
     def test_pgremapper_mappings_mode_prints_the_planned_proposals(self):
@@ -1679,14 +1660,7 @@ class UnknownPoolTest(unittest.TestCase):
         # diff the pool's EC shards as interchangeable replicas — both
         # failures produce plausible-looking rows.
         with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(TEST_DATA, "divert-toofull-osd457-down")
-            dst = os.path.join(tmp, "fixture")
-            shutil.copytree(src, dst)
-            path = os.path.join(dst, "pool_ls_detail.json")
-            with open(path) as f:
-                pools = json.load(f)
-            with open(path, "w") as f:
-                json.dump([p for p in pools if p["pool_id"] != 19], f)
+            dst = copy_without_pool("divert-toofull-osd457-down", 19, tmp)
             proc = subprocess.run(
                 [*cli(dst)],
                 capture_output=True,

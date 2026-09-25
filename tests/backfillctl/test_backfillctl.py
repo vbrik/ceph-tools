@@ -13,17 +13,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from _support import REPO_ROOT
+from _support import REPO_ROOT, TEST_DATA
 
 from backfillctl.__main__ import _COMMAND_MODULES
 
-FIXTURE = (
-    REPO_ROOT
-    / "tests"
-    / "backfillctl"
-    / "test-data"
-    / "ceph1-backfills-stuck-at-100-pct"
-)
+FIXTURE = TEST_DATA / "ceph1-backfills-stuck-at-100-pct"
 
 
 def command_names() -> list[str]:

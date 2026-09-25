@@ -13,11 +13,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import parse_args, plan_from_state, shared
+from _support import NONE, parse_args, plan_from_state, shared
 
 from backfillctl import show_pg_osds as op
 
-NONE = shared.CRUSH_ITEM_NONE
 Row = op.ShardRow
 
 
