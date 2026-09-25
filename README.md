@@ -74,6 +74,11 @@ PROGRESS is computed from each backfill target's position (`last_backfill` in
 are only a fallback, marked `~`: after re-peering they can read ~100% for a
 backfill a third done.
 
+`measure-rate`'s MiB/s is what lands on the destination OSDs. For EC pools
+this is less than the recovery rate in `ceph status`, which counts each
+recovered object once, at its full size: for a PG moving one shard, Ceph shows
+k times the MiB/s, at the same objects/s.
+
 Shell completion via [shtab](https://docs.iterative.ai/shtab/), from the repo
 root:
 

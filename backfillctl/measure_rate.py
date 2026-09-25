@@ -8,6 +8,11 @@ RATE is objects and MiB per second arriving at the row's UP OSD, from how far
 its PROGRESS moved; MiB assume the PG's objects are of even size. ETA is the
 time left at that rate. The stderr summary totals the rates.
 
+The total differs from the recovery rate in 'ceph status' for EC pools: Ceph
+counts each recovered object once, at its full size, however many of its
+shards move; RATE counts each moving shard, at 1/k of that. For a PG moving
+one shard, Ceph shows the same objects/s but k times the MiB/s.
+
 The interval starts once the first sample is complete, and is timed per PG
 query, so every row is measured over at least --interval seconds.
 
@@ -367,6 +372,9 @@ def copy_rate(
     seconds is the time between the two progress readings; pg is after's
     'ceph pg dump pgs' entry, shard_bytes its copy's size. A copy's objects
     and bytes arrive in proportion to its PROGRESS.
+
+    Bytes are what lands on the target, not Ceph's num_bytes_recovered: for
+    EC, ECCommon.cc adds each object's full size once per object recovered.
     """
     if before is None:
         return None, NEW
