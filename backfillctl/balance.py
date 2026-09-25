@@ -11,7 +11,9 @@ half of the class. --osds names the sources; the run then continues while
 they can shed data, even if a non-source is fuller.
 
 Utilization here is projected: what an OSD will hold once every backfill in
-motion and every proposal completes (PROJ in the table).
+motion and every proposal completes (PROJ in the table). Unlike drain's and
+divert-toofull's PROJ, this credits data leaving an OSD, since balancing is
+about where each OSD ends up, not just what a target might reserve.
 
 Each turn takes the source with the highest projected utilization and moves
 its largest shard that has a legal target. The target is the OSD that ends
@@ -596,17 +598,17 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> BalanceResult:
 # Output
 # ---------------------------------------------------------------------------
 
-# (group, label), along the shard's path: ACTING (data now), FROM (the
+# (group, label), along the shard's path: ACTING (data now), UP (the
 # source it is mapped to), TARGET (proposed). PROJ: see the module docstring.
 COLUMNS = [
     ("", "PGID"),
     ("", "SHARD"),
     ("", "SIZE"),
     *osd_columns("ACTING"),
-    ("FROM", "OSD"),
-    ("FROM", "UTIL"),
-    ("FROM", "PROJ"),
-    ("FROM", "HOST"),
+    ("UP", "OSD"),
+    ("UP", "UTIL"),
+    ("UP", "PROJ"),
+    ("UP", "HOST"),
     ("TARGET", "OSD"),
     ("TARGET", "UTIL"),
     ("TARGET", "PROJ"),
