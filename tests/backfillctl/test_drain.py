@@ -511,6 +511,7 @@ class OutputTest(unittest.TestCase):
         self.assertIn(
             "  cannot place 1.0 shard 0 off osd.0: no legal target", err.getvalue()
         )
+        self.assertIn("NOTE: targets ran out of room", " ".join(err.getvalue().split()))
 
     def test_outcome_counts_moves_and_pins_in_the_shared_words(self):
         c = Cluster(default_util=95.0)

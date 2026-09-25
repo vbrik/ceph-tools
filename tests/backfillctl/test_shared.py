@@ -367,6 +367,28 @@ class WithExactProgressTest(unittest.TestCase):
         )
 
 
+class PinTotalsTest(unittest.TestCase):
+    """What the cancel commands' summary counts."""
+
+    def test_companions_and_blockers_are_counted_apart_from_the_requested(self):
+        c = shared.Cancellation
+        cancellations = [
+            c("1.3", 0, 4, 1, 100, "s", None),
+            c("1.3", 1, 5, 2, 100, "s", None, companion_of=0),
+            c("1.3", 2, 6, 3, 100, "s", None, companion_of=0, blocker_util=92.0),
+            c("2.7", "-", 8, 9, None, "s", None),  # size unknown
+        ]
+        self.assertEqual(
+            shared.PinTotals.of(cancellations),
+            shared.PinTotals(
+                requested=2, pgs=2, others=2, blockers=1, size_bytes=100, unknown_size=1
+            ),
+        )
+
+    def test_none(self):
+        self.assertEqual(shared.PinTotals.of([]), shared.PinTotals(0, 0, 0, 0, 0, 0))
+
+
 class PositionsFromOutputTest(unittest.TestCase):
     """A bad 'ceph pg query' output fails only that PG (None), not the run."""
 
@@ -1006,31 +1028,12 @@ class FormatPairsTest(unittest.TestCase):
 
 
 class PgidFilterTest(unittest.TestCase):
-    """PgidFilter.of and print_pgid_filter: the --pgs/--exclude-pgs note."""
-
-    def capture(self, f):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            shared.print_pgid_filter("--pgs", f, "have movement", "not moving")
-        return " ".join(err.getvalue().split())
+    """PgidFilter.of; messages.print_pgid_filter reports it."""
 
     def test_of_counts_distinct_ids_and_sorts_the_unmatched(self):
         self.assertEqual(
             shared.PgidFilter.of(["19.zzz", "1.a", "1.a", "19.yyy"], ["1.a", "2.b"]),
             shared.PgidFilter(3, 1, ["19.yyy", "19.zzz"]),
-        )
-
-    def test_all_matched(self):
-        self.assertEqual(
-            self.capture(shared.PgidFilter(1, 1, [])),
-            "NOTE: --pgs: 1 of 1 given PG id(s) have movement.",
-        )
-
-    def test_unmatched_ids_are_named_with_what_else_they_may_be(self):
-        self.assertEqual(
-            self.capture(shared.PgidFilter(3, 1, ["19.yyy", "19.zzz"])),
-            "NOTE: --pgs: 1 of 3 given PG id(s) have movement; 2 matched nothing "
-            "(not moving, or a typo): 19.yyy, 19.zzz.",
         )
 
 

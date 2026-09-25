@@ -51,6 +51,12 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from typing import NamedTuple
 
+from messages import (
+    format_bytes,
+    osd_list,
+    stderr_para,
+    targets_clause,
+)
 from placement import (
     FullRatios,
     MappedShard,
@@ -84,7 +90,6 @@ from shared import (
     fetch_pg_stats,
     fetch_pools,
     fetch_upmap_items,
-    format_bytes,
     osd_cells,
     osd_columns,
     parse_osd,
@@ -94,7 +99,6 @@ from shared import (
     print_upmap_pairs,
     real_osd_set,
     slot,
-    stderr_para,
     utilization_pct,
 )
 
@@ -201,7 +205,7 @@ def select_sources(
         if bad:
             sys.exit(
                 "ERROR: --osds: not up and in OSDs of this device class, with "
-                "a utilization: " + ", ".join(f"osd.{o}" for o in bad)
+                "a utilization: " + osd_list(bad)
             )
         return fullest_first(set(osds)), len(set(osds))
     ranked = fullest_first(class_osds)
@@ -682,10 +686,11 @@ def render(result: BalanceResult, args: argparse.Namespace) -> None:
         "chain (A->B, B->C), which pgremapper would break."
     )
     stderr_para(
-        f"Targets: the other {len(result.targets)} {cls} OSD(s), up to "
-        f"--max-target-uses {args.max_target_uses} shard(s) each, projected at "
-        f"or below --max-target-util {result.max_target_util:g}% "
-        f"(backfillfull_ratio {result.ratios.backfillfull:g}%)."
+        f"Targets: the other {len(result.targets)} {cls} OSD(s), "
+        + targets_clause(
+            args.max_target_uses, result.max_target_util, result.ratios.backfillfull
+        )
+        + "."
     )
 
     if args.pgremapper_mappings:

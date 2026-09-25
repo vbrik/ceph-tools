@@ -173,7 +173,8 @@ python3 -m unittest discover -s tests/cephfs
 
 No test needs a cluster. Each `backfillctl` command is split into `plan()`,
 which returns a typed result, and `render()`, which prints it. Logic tests
-assert on the result, and output tests on the rendering. Many tests replay
+assert on the result, and output tests on the rendering. Text that more
+than one command prints is in `backfillctl/messages.py`. Many tests replay
 cluster captures in `tests/backfillctl/test-data/` (mostly real, anonymized)
 through `--load-state`. Each capture's `README.txt` documents its scenario
 and the expected result, which the tests check.

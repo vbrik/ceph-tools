@@ -522,16 +522,18 @@ class PrintOutcomeTest(unittest.TestCase):
             ut.print_outcome(5, unplaceable)
         return err.getvalue()
 
-    def test_names_each_unplaceable_shard_under_a_heuristic_caveat(self):
+    def test_names_each_unplaceable_shard_then_the_caveat(self):
         shards = [
             placement.ArrivingShard("19.1", 3, 31, 7, [31]),
             placement.ArrivingShard("7.2", "-", 40, None, [40]),
         ]
         text = self.capture(shards)
-        self.assertIn("Proposed 5 move(s); 2 shard(s) could not be placed", flat(text))
-        self.assertIn("greedy heuristic", flat(text))
-        # One indented item per shard, after the summary (wrapping aside).
-        items = flat(text).split(" cannot place ")[1:]
+        self.assertIn("Proposed 5 move(s); 2 shard(s) could not be placed.", flat(text))
+        # One indented item per shard, after the summary (wrapping aside),
+        # then the caveat.
+        items, caveat = flat(text).split(" NOTE: ")
+        self.assertIn("greedy placement", caveat)
+        items = items.split(" cannot place ")[1:]
         self.assertEqual(
             items,
             [
@@ -543,7 +545,7 @@ class PrintOutcomeTest(unittest.TestCase):
     def test_no_caveat_or_list_when_everything_is_placed(self):
         text = self.capture([])
         self.assertIn("0 shard(s) could not be placed.", flat(text))
-        self.assertNotIn("heuristic", text)
+        self.assertNotIn("NOTE:", text)
         self.assertNotIn("cannot place", text)
 
 
@@ -1650,9 +1652,10 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
     def test_unplaceable_shards_are_only_counted(self):
         err = flat(self.proc.stderr)
         self.assertEqual(err.count("could not be placed"), 1)
+        self.assertIn(f"{CEPH2_UNPLACEABLE} shard(s) could not be placed.", err)
         self.assertIn(
-            f"{CEPH2_UNPLACEABLE} shard(s) could not be placed: targets ran "
-            "out of room, or the greedy heuristic",
+            "NOTE: targets ran out of room (--max-target-util, --max-target-uses), "
+            "or the greedy placement missed some",
             err,
         )
         # No per-shard '<pgid>:<shard>' list, however long the tail is.

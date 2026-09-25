@@ -21,14 +21,21 @@ the pins are in place. Assumes the CRUSH failure domain is host.
 import argparse
 from typing import NamedTuple
 
+from messages import (
+    print_pgid_filter,
+    print_pin_footer,
+    print_pin_summary,
+    print_progress_note,
+    stderr_para,
+)
 from shared import (
     COLUMNS,
     POOL_TYPE_ERASURE,
-    PROGRESS_APPROX_NOTE,
     Cancellation,
     HelpFormatter,
     Pair,
     PgidFilter,
+    PinTotals,
     Skipped,
     SnapshotStore,
     add_exclude_pgs_arg,
@@ -47,7 +54,6 @@ from shared import (
     fetch_pools,
     fetch_remapped_pg_stats,
     fetch_upmap_items,
-    format_bytes,
     format_row,
     order_moves,
     percentage_points,
@@ -55,15 +61,11 @@ from shared import (
     pgid_pool_id,
     pgid_sort_key,
     pin_replica,
-    print_pgid_filter,
     print_pgremapper_mappings,
     print_table,
     real_osd_set,
     shard_size_bytes,
     skipped_sort_key,
-    stderr_items,
-    stderr_para,
-    warn_chains,
     with_exact_progress,
 )
 
@@ -263,25 +265,10 @@ def plan_cancellations(
 
 def print_summary(cancellations: list[Cancellation], skipped: list[Skipped]) -> None:
     """Summarize the proposal on stderr, and list what cannot be pinned."""
-    direct = [c for c in cancellations if c.companion_of is None]
-    others = len(cancellations) - len(direct)
-    known = [c.size_bytes for c in direct if c.size_bytes is not None]
-    total = sum(known)
-    unknown = len(direct) - len(known)
-    pgs = len({c.pgid for c in cancellations})
-    stderr_para(
-        f"{len(direct)} uphill shard(s) in {pgs} PG(s) can be pinned back, "
-        f"~{format_bytes(total)} of data"
-        + (f" (+{unknown} of unknown size)" if unknown else "")
-        + f"; {len(skipped)} cannot be judged or pinned."
-        + (
-            f" {others} more shard(s), moving to other OSDs, are pinned too "
-            "(companions)."
-            if others
-            else ""
-        )
+    t = PinTotals.of(cancellations)
+    print_pin_summary(
+        f"{t.requested} uphill shard(s) in {t.pgs} PG(s)", t, skipped, unjudged=True
     )
-    stderr_items(f"cannot pin {s.pgid} shard {s.shard}: {s.reason}" for s in skipped)
 
 
 # ---------------------------------------------------------------------------
@@ -365,16 +352,9 @@ def render(result: UphillResult, args: argparse.Namespace) -> None:
             [format_row(c, result.osd_df, result.osd_host) for c in cancellations],
         )
     print_summary(cancellations, result.skipped)
-    if not args.pgremapper_mappings and any(
-        c.progress_pct is not None and not c.progress_exact for c in cancellations
-    ):
-        stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
-    if result.chained:
-        warn_chains(result.chained)
-    stderr_para(
-        "NOTE: cancelling a running backfill discards its progress. Consider "
-        "'ceph balancer off' while these are pinned."
-    )
+    if not args.pgremapper_mappings:  # JSON has no PROGRESS
+        print_progress_note((c.progress_pct, c.progress_exact) for c in cancellations)
+    print_pin_footer(result.chained)
 
 
 def run(args: argparse.Namespace) -> None:

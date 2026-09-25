@@ -1,7 +1,7 @@
 Fixture: real, live-cluster snapshot showing the false-100% PROGRESS case
 of Ceph's misplaced counters. It predates 'save-state' capturing backfill
 positions, so a replay shows counter-based PROGRESS, marked '~' (see
-PROGRESS_APPROX_NOTE in shared.py). See
+PROGRESS_APPROX_NOTE in messages.py). See
 ../ceph1-resumed-backfills-exact-progress for the cause, and a capture
 with positions.
 

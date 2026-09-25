@@ -42,6 +42,12 @@ import math
 from collections import Counter, deque
 from typing import NamedTuple
 
+from messages import (
+    print_pgid_filter,
+    print_unplaceable,
+    stderr_para,
+    targets_clause,
+)
 from placement import (
     ArrivingShard,
     FullRatios,
@@ -80,11 +86,8 @@ from shared import (
     osd_columns,
     pgid_pool_id,
     pgid_sort_key,
-    print_pgid_filter,
     print_table,
     print_upmap_pairs,
-    stderr_items,
-    stderr_para,
 )
 
 # Live runs read pg_ls_backfill_toofull; --load-state filters pg_dump_pgs
@@ -363,19 +366,10 @@ def format_row(
 def print_outcome(proposed: int, unplaceable: list[ArrivingShard]) -> None:
     """Report on stderr how many shards were placed, and name those that were not."""
     stderr_para(
-        f"Proposed {proposed} move(s); {len(unplaceable)} shard(s) could not be "
-        "placed"
-        + (
-            ": targets ran out of room, or the greedy heuristic missed some. "
-            "Apply these, let them finish, then re-run."
-            if unplaceable
-            else "."
-        )
+        f"Proposed {proposed} move(s); {len(unplaceable)} shard(s) could not be placed."
     )
-    stderr_items(
-        f"cannot place {s.pgid} shard {s.shard} (headed for osd.{s.up_osd}): "
-        "no legal target"
-        for s in unplaceable
+    print_unplaceable(
+        (s.pgid, s.shard, f"(headed for osd.{s.up_osd})") for s in unplaceable
     )
 
 
@@ -528,9 +522,11 @@ def render(result: DivertResult, args: argparse.Namespace) -> None:
         "not the blocker)."
     )
     stderr_para(
-        f"Targets: up to --max-target-uses {args.max_target_uses} shard(s) "
-        f"each, projected at or below --max-target-util {max_target_util:g}% "
-        f"(backfillfull_ratio {result.ratios.backfillfull:g}%). Candidates "
+        "Targets: "
+        + targets_clause(
+            args.max_target_uses, max_target_util, result.ratios.backfillfull
+        )
+        + ". Candidates "
         f"under that now / in all, per device class: {by_class or 'none'}."
     )
 

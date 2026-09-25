@@ -25,6 +25,7 @@ for path in (REPO_ROOT, BACKFILLCTL_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+import messages
 import placement
 import shared
 
@@ -43,6 +44,7 @@ __all__ = [
     "REP_POOL",
     "FakeStore",
     "SyntheticCluster",
+    "messages",
     "parse_args",
     "placement",
     "plan_from_state",

@@ -41,6 +41,14 @@ import sys
 from collections import Counter
 from typing import NamedTuple
 
+from messages import (
+    blocking_reason,
+    companion_note,
+    osd_list,
+    print_unplaceable,
+    stderr_para,
+    targets_clause,
+)
 from placement import (
     ArrivingShard,
     FullRatios,
@@ -69,7 +77,6 @@ from shared import (
     SnapshotStore,
     add_load_state_arg,
     add_pgremapper_mappings_arg,
-    blocking_reason,
     check_host_failure_domain,
     check_known_pools,
     check_osds_exist,
@@ -91,8 +98,6 @@ from shared import (
     print_table,
     print_upmap_entries,
     real_osd_set,
-    stderr_items,
-    stderr_para,
     upmap_entry,
 )
 
@@ -285,7 +290,7 @@ class Planner:
         """Return why the sibling blocks its PG, naming its OSD, or None.
 
         It blocks if its OSD is projected at or over backfillfull_ratio
-        (shared.blocking_reason, as in cancel-backfill) or, with toofull_now,
+        (messages.blocking_reason, as in cancel-backfill) or, with toofull_now,
         is at or above toofull_util now: Ceph may count more than the
         projection sees.
         """
@@ -463,7 +468,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
             note = (
                 blocker_note("pinned, no room to divert", sibling, blocking)
                 if k == 0
-                else f"companion of blocker shard {sibling.shard}"
+                else companion_note(sibling.shard, of_blocker=True)
             )
             state.moves.append(
                 Move(
@@ -673,7 +678,7 @@ def print_pgremapper_mappings(moves: list[Move]) -> None:
 
 def render(result: DrainResult, args: argparse.Namespace) -> None:
     """Print result: proposals on stdout in the format args asks for, notes on stderr."""
-    osds = ", ".join(f"osd.{o}" for o in result.osds)
+    osds = osd_list(result.osds)
     if result.hosts:
         osds = f"host(s) {', '.join(result.hosts)} ({osds})"
     if not result.evacuee_count:
@@ -687,10 +692,11 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
         return
     stderr_para(
         f"Draining {osds}: {result.evacuee_count} shard(s) mapped to them "
-        f"({result.leaving_count} more already moving off). Targets: up to "
-        f"--max-target-uses {args.max_target_uses} shard(s) each, projected "
-        f"at or below --max-target-util {result.max_target_util:g}% "
-        f"(backfillfull_ratio {result.ratios.backfillfull:g}%). Blockers: "
+        f"({result.leaving_count} more already moving off). Targets: "
+        + targets_clause(
+            args.max_target_uses, result.max_target_util, result.ratios.backfillfull
+        )
+        + ". Blockers: "
         "other shards of a PG heading for an OSD projected at or over "
         "backfillfull_ratio or, if the PG is backfill_toofull now, onto an "
         f"OSD at or above --toofull-util {result.toofull_util:g}%."
@@ -717,15 +723,9 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
         f"{pg_list(unexplained)}"
         + (". Their NOTE (JSON: 'note') says why." if stuck or unexplained else ".")
     )
-    stderr_items(
-        f"cannot place {e.pgid} shard {e.shard} off osd.{e.up_osd}: no legal target"
-        for e in result.unplaceable
+    print_unplaceable(
+        (e.pgid, e.shard, f"off osd.{e.up_osd}") for e in result.unplaceable
     )
-    if result.unplaceable:
-        stderr_para(
-            "NOTE: targets ran out of room (--max-target-util, "
-            "--max-target-uses). Apply these, let them finish, then re-run."
-        )
 
 
 def run(args: argparse.Namespace) -> None:

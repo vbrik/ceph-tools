@@ -23,9 +23,13 @@ import argparse
 from itertools import zip_longest
 from typing import NamedTuple
 
+from messages import (
+    print_pgid_filter,
+    print_progress_note,
+    stderr_para,
+)
 from shared import (
     NOT_APPLICABLE,
-    PROGRESS_APPROX_NOTE,
     HelpFormatter,
     PgidFilter,
     Progress,
@@ -48,10 +52,8 @@ from shared import (
     parse_osd,
     pgid_pool_id,
     pgid_sort_key,
-    print_pgid_filter,
     print_table,
     real_osd_set,
-    stderr_para,
     target_peer,
 )
 
@@ -345,8 +347,7 @@ def render(result: MovementsResult) -> None:
     stderr_para(f"{len(rows)} copy movement(s) across {num_pgs} PG(s).")
     if any(r.primary_marked for r in rows):
         stderr_para(f"NOTE: {PRIMARY_NOTE}")
-    if any(r.progress_pct is not None and not r.progress_exact for r in rows):
-        stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
+    print_progress_note((r.progress_pct, r.progress_exact) for r in rows)
 
 
 def run(args: argparse.Namespace) -> None:
