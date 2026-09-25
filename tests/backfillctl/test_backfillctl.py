@@ -5,6 +5,7 @@ build their own parsers (see _support.parse_args): the real top-level parser,
 and that --load-state works before or after the subcommand name.
 """
 
+import argparse
 import os
 import subprocess
 import sys
@@ -14,6 +15,8 @@ from pathlib import Path
 
 from _support import REPO_ROOT
 
+from backfillctl.__main__ import _COMMAND_MODULES
+
 FIXTURE = (
     REPO_ROOT
     / "tests"
@@ -21,6 +24,18 @@ FIXTURE = (
     / "test-data"
     / "ceph1-backfills-stuck-at-100-pct"
 )
+
+
+def command_names() -> list[str]:
+    """Every subcommand the dispatcher registers, in its order."""
+    subparsers = argparse.ArgumentParser().add_subparsers()
+    for module in _COMMAND_MODULES:
+        module.build_parser(subparsers)
+    return list(subparsers.choices)
+
+
+# What a subcommand needs on its command line besides --load-state.
+REQUIRED_ARGS = {"show-pg-osds": ["1.0"], "drain": ["--osds", "0"]}
 
 
 def run_backfillctl(*argv: str) -> subprocess.CompletedProcess:
@@ -48,17 +63,13 @@ class LoadStateTest(unittest.TestCase):
         self.assertEqual((after.stdout, after.stderr), (before.stdout, before.stderr))
 
     def test_every_state_reading_subcommand_accepts_it_after_its_name(self):
-        for argv in (
-            ["show-pg-osds", "1.0"],
-            ["show-backfill"],
-            ["divert-toofull"],
-            ["cancel-backfill"],
-            ["cancel-uphill"],
-            ["drain", "--osds", "0"],
-            ["balance"],
-        ):
-            with self.subTest(command=argv[0]):
-                result = run_backfillctl(*argv, "--load-state", "/nonexistent-dir")
+        for name in command_names():
+            if name == "save-state":  # writes a capture; see the tests below
+                continue
+            with self.subTest(command=name):
+                result = run_backfillctl(
+                    name, *REQUIRED_ARGS.get(name, []), "--load-state", "/nonexistent"
+                )
                 # Parsed, and read: the directory check is the run's own.
                 self.assertIn("--load-state directory not found", result.stderr)
 
@@ -131,20 +142,8 @@ class LoadStateTest(unittest.TestCase):
         self.assertIn("--load-state directory not found", result.stderr)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TopLevelHelpTest(unittest.TestCase):
-    COMMANDS = (
-        "show-pg-osds",
-        "show-backfill",
-        "divert-toofull",
-        "cancel-backfill",
-        "cancel-uphill",
-        "drain",
-        "save-state",
-    )
+    COMMANDS = command_names()
 
     def test_every_subcommand_is_described(self):
         """Each subcommand is listed in --help followed by a description."""
@@ -166,11 +165,15 @@ class TopLevelHelpTest(unittest.TestCase):
                 self.assertIn("\n\n", result.stdout.split("options:")[0].strip())
 
     def test_shared_options_have_one_help_text(self):
-        def option_help(command, option):
-            """The help text of option in command's option list."""
-            lines = run_backfillctl(command, "--help").stdout.splitlines()
-            lines = lines[lines.index("options:") :]
-            i = next(i for i, ln in enumerate(lines) if ln.startswith(f"  {option} "))
+        """An option several subcommands take reads the same in each."""
+
+        def option_help(lines, option):
+            """The help text of option in an option list, or None if absent."""
+            i = next(
+                (i for i, ln in enumerate(lines) if ln.startswith(f"  {option} ")), None
+            )
+            if i is None:
+                return None
             block = [lines[i]]
             for line in lines[i + 1 :]:
                 if not line.startswith(" " * 20):  # the next option, or the end
@@ -178,12 +181,24 @@ class TopLevelHelpTest(unittest.TestCase):
                 block.append(line)
             return " ".join(" ".join(block).split()[2:])
 
+        option_lists = {}
+        for name in self.COMMANDS:
+            lines = run_backfillctl(name, "--help").stdout.splitlines()
+            option_lists[name] = lines[lines.index("options:") :]
         for option in ("--toofull-util", "--max-target-util", "--max-target-uses"):
             with self.subTest(option=option):
-                self.assertEqual(
-                    option_help("divert-toofull", option), option_help("drain", option)
-                )
+                helps = {
+                    name: text
+                    for name, lines in option_lists.items()
+                    if (text := option_help(lines, option)) is not None
+                }
+                self.assertGreater(len(helps), 1, helps)
+                self.assertEqual(len(set(helps.values())), 1, helps)
 
     def test_cancel_backfill_usage_shows_pin_blockers_needs_osds(self):
         usage = run_backfillctl("cancel-backfill", "-h").stdout
         self.assertIn("[--osds OSD [OSD ...] [--pin-blockers]]", usage)
+
+
+if __name__ == "__main__":
+    unittest.main()
