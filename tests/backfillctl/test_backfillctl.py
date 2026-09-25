@@ -1,10 +1,11 @@
-"""Tests for backfillctl's dispatcher (__main__.py).
+"""Tests for backfillctl's dispatcher (__main__.py) and entry points.
 
 What's covered here is what the per-subcommand tests can't see, because they
 build their own parsers (see _support.parse_args): the real top-level parser,
-and that --load-state works before or after the subcommand name. Runs go
-through a subprocess, as a user's would; help text only needs the parser, so
-it is rendered in-process.
+that --load-state works before or after the subcommand name, and that every
+documented way of starting backfillctl works. Runs go through a subprocess,
+as a user's would; help text only needs the parser, so it is rendered
+in-process.
 """
 
 import argparse
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 from unittest import mock
 
@@ -53,15 +55,28 @@ def help_text(*argv: str) -> str:
     return out.getvalue()
 
 
-def run_backfillctl(*argv: str) -> subprocess.CompletedProcess:
+def run_backfillctl(
+    *argv: str,
+    launch: Sequence[str] = (sys.executable, str(REPO_ROOT / "backfillctl")),
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess:
+    """Run 'backfillctl *argv', started by the command line launch, in cwd."""
+    env = {k: v for k, v in os.environ.items() if k != "FORCE_COLOR"}
     return subprocess.run(
-        [sys.executable, str(REPO_ROOT / "backfillctl"), *argv],
+        [*launch, *argv],
         capture_output=True,
         text=True,
         check=False,
+        cwd=cwd,
         # Plain text, wrapped at 80 columns, whatever the caller's shell sets.
-        env={k: v for k, v in os.environ.items() if k != "FORCE_COLOR"}
-        | {"PYTHON_COLORS": "0", "COLUMNS": "80"},
+        # A '#!/usr/bin/env python3' script gets this interpreter, if its
+        # directory has a python3.
+        env=env
+        | {
+            "PYTHON_COLORS": "0",
+            "COLUMNS": "80",
+            "PATH": os.pathsep.join([str(Path(sys.executable).parent), env["PATH"]]),
+        },
     )
 
 
@@ -155,6 +170,43 @@ class LoadStateTest(unittest.TestCase):
         result = run_backfillctl("--load-state", "/nonexistent-dir", "show-backfill")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--load-state directory not found", result.stderr)
+
+
+class EntryPointTest(unittest.TestCase):
+    """Each way the README starts backfillctl finds the package's modules
+    (they import each other unqualified) and prints the same."""
+
+    ARGV = ("--load-state", str(FIXTURE), "show-backfill")
+
+    def assert_like_reference(self, result: subprocess.CompletedProcess) -> None:
+        reference = run_backfillctl(*self.ARGV)
+        self.assertEqual(reference.returncode, 0, reference.stderr)
+        self.assertEqual(
+            (result.returncode, result.stdout, result.stderr),
+            (0, reference.stdout, reference.stderr),
+        )
+
+    def test_python_m_backfillctl(self):
+        self.assert_like_reference(
+            run_backfillctl(
+                *self.ARGV, launch=[sys.executable, "-m", "backfillctl"], cwd=REPO_ROOT
+            )
+        )
+
+    def test_launcher_script(self):
+        # Executed itself, as './backfillctl.py': needs its shebang and exec bit.
+        self.assert_like_reference(
+            run_backfillctl(*self.ARGV, launch=["./backfillctl.py"], cwd=REPO_ROOT)
+        )
+
+    def test_launcher_through_a_symlink_elsewhere(self):
+        # E.g. ~/bin/backfillctl.py: the package is next to the link's target.
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "backfillctl.py"
+            link.symlink_to(REPO_ROOT / "backfillctl.py")
+            self.assert_like_reference(
+                run_backfillctl(*self.ARGV, launch=[str(link)], cwd=Path(tmp))
+            )
 
 
 class TopLevelHelpTest(unittest.TestCase):
