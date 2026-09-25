@@ -1887,15 +1887,6 @@ class FixtureReplayTest(unittest.TestCase):
                         len(set(hosts)), len(hosts), (osd, pin_blockers, pgid, hosts)
                     )
 
-    def test_fixtures_hold_no_real_hostnames_addresses_or_uuids(self):
-        for fixture in (FIXTURE, FIXTURE_BLOCKER):
-            text = "".join(f.read_text() for f in fixture.glob("*.json"))
-            self.assertNotIn("ceph2", text, fixture.name)
-            self.assertNotRegex(text, r"\b\d{1,3}(\.\d{1,3}){3}\b", fixture.name)
-            self.assertNotRegex(
-                text, r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-", fixture.name
-            )
-
     def test_the_older_fixture_only_gained_the_ratios_it_lacked(self):
         dump = json.loads((FIXTURE / "osd_dump.json").read_text())
         self.assertEqual(dump["backfillfull_ratio"], 0.91)

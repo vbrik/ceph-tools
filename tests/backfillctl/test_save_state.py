@@ -15,9 +15,11 @@ tell a correct filter from one that just returns everything.
 """
 
 import contextlib
+import copy
 import io
 import json
 import pathlib
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -28,13 +30,8 @@ from backfillctl import cancel_backfill as cb
 from backfillctl import divert_toofull as dt
 from backfillctl import save_state as ss
 
-FIXTURE = (
-    REPO_ROOT
-    / "tests"
-    / "backfillctl"
-    / "test-data"
-    / "cancel-backfill-ceph2-osd896-host-clash-companions"
-)
+TEST_DATA = REPO_ROOT / "tests" / "backfillctl" / "test-data"
+FIXTURE = TEST_DATA / "cancel-backfill-ceph2-osd896-host-clash-companions"
 
 
 def pg(pgid, state, num_bytes=1000, **extra):
@@ -232,6 +229,58 @@ class CrossSubcommandFixtureTest(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             dt.run(args)
         self.assertIn("585 backfill_toofull PG(s),", out.getvalue())
+
+
+class CommittedFixturesTest(unittest.TestCase):
+    """Every capture in test-data/ is anonymized, however it was made.
+
+    Some are trimmed save-state captures, others full 'osd dump's, so this
+    checks the result rather than the route.
+    """
+
+    IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+    UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+    FAKE_UUID = re.compile(
+        rf"{shared.FAKE_FSID}|{re.escape(shared._fake_uuid(0)[:-12])}\d{{12}}"
+    )
+
+    def fixtures(self):
+        fixtures = sorted(d for d in TEST_DATA.iterdir() if d.is_dir())
+        self.assertGreater(len(fixtures), 1)
+        return fixtures
+
+    def test_anonymizing_again_changes_nothing(self):
+        # anonymize_snapshots is idempotent, so a capture that went through
+        # it is a fixed point. The one exception: it sets osd_dump's fsid
+        # unconditionally, and save-state then trims that key away.
+        for fixture in self.fixtures():
+            with self.subTest(fixture.name):
+                snaps = {
+                    p.stem: json.loads(p.read_text()) for p in fixture.glob("*.json")
+                }
+                anonymized = copy.deepcopy(snaps)
+                shared.anonymize_snapshots(anonymized)
+                if "fsid" not in snaps["osd_dump"]:
+                    del anonymized["osd_dump"]["fsid"]
+                # Names the files only: a diff of a capture runs to megabytes.
+                changed = [k for k in snaps if anonymized[k] != snaps[k]]
+                self.assertEqual(changed, [], "these files hold unanonymized data")
+
+    def test_no_address_uuid_or_cluster_name_escaped_the_anonymizer(self):
+        # Catches fields anonymize_snapshots doesn't know about.
+        for fixture in self.fixtures():
+            with self.subTest(fixture.name):
+                text = "".join(f.read_text() for f in fixture.glob("*.json"))
+                ips = {m.group() for m in self.IPV4.finditer(text)}
+                self.assertEqual(
+                    {ip for ip in ips if not ip.startswith(shared._FAKE_IP_PREFIX)},
+                    set(),
+                )
+                uuids = {m.group() for m in self.UUID.finditer(text)}
+                self.assertEqual(
+                    {u for u in uuids if not self.FAKE_UUID.fullmatch(u)}, set()
+                )
+                self.assertNotRegex(text, r"ceph\d")
 
 
 if __name__ == "__main__":
