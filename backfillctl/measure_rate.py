@@ -18,7 +18,9 @@ position in one sample and the counters in the other, or went down (restarted,
 or counters reset).
 
 Two more tables sum the rates per UP OSD and per host of the first. COPIES
-counts every row, with a RATE or not.
+counts every row, with a RATE or not. All three tables sort by host, in human
+order ('ceph1-2' before 'ceph1-10'), then OSD, PG and shard; --sort-by obj/s
+or mib/s sorts them all fastest first, progress and eta just the copies.
 
 Copies without a destination (a replica dropped outright) are left out.
 --osds and --hosts keep rows whose UP OSD they match; --pgs keeps rows of the
@@ -50,6 +52,7 @@ from save_state import trim_osd_dump, trim_pg_dump
 from shared import (
     BACKFILL_POSITIONS_FILE,
     NOT_APPLICABLE,
+    UNKNOWN_HOST,
     HelpFormatter,
     PgidFilter,
     SnapshotStore,
@@ -64,6 +67,7 @@ from shared import (
     fetch_pg_stats,
     fetch_pools,
     format_progress,
+    natural_sort_key,
     osd_cells,
     osd_columns,
     pgid_pool_id,
@@ -130,9 +134,10 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     )
     parser.add_argument(
         "--sort-by",
-        choices=["pgid", "up-osd", "eta"],
-        default="pgid",
-        help="Sort rows by this column (default: %(default)s).",
+        choices=SORT_CHOICES,
+        default="host",
+        help="Sort by UP host (then OSD, PG, shard), fastest rate, or the "
+        "copies by most progress or soonest ETA (default: %(default)s).",
     )
     sb.add_filter_args(parser)
     state = parser.add_mutually_exclusive_group()
@@ -465,7 +470,7 @@ class FlowRow(NamedTuple):
 def aggregate(
     rows: list[RateRow], key_of: Callable[[int], "int | str"]
 ) -> list[FlowRow]:
-    """Sum rows' rates per key_of(UP OSD), in key order.
+    """Sum rows' rates per key_of(UP OSD), unsorted (see flow_sort_key).
 
     rows must all have an UP OSD (see plan()).
     """
@@ -473,20 +478,85 @@ def aggregate(
     for row in rows:
         key = key_of(row.move.up_osd)
         flows[key] = add_to_flow(flows.get(key, NO_FLOW), row.rate)
-    return [FlowRow(key, flows[key]) for key in sorted(flows)]
+    return [FlowRow(key, flow) for key, flow in flows.items()]
 
 
-def _eta_key(row: RateRow) -> tuple:
-    eta = row.rate.eta_s if row.rate else None
-    return (eta is None, eta or 0.0, sb.SORT_KEYS["pgid"](row.move))
+def _rate_field(name: str) -> Callable[[RateRow], float | None]:
+    return lambda row: None if row.rate is None else getattr(row.rate, name)
 
 
-def sort_key(sort_by: str) -> Callable[[RateRow], tuple]:
-    """Return the key for --sort-by: 'pgid' and 'up-osd' as in show-backfill, or
-    'eta' (soonest first; none last)."""
-    if sort_by == "eta":
-        return _eta_key
-    return lambda row: sb.SORT_KEYS[sort_by](row.move)
+def _flow_field(name: str) -> Callable[[FlowRow], float | None]:
+    return lambda f: getattr(f.flow, name) if f.flow.measured else None
+
+
+# --sort-by's choices, bar the default order ('host'): the value a copy, OSD
+# or host sorts by, None if it has none. Larger values come first, except
+# eta's. The OSD and host tables have no progress or ETA: they stay in the
+# default order.
+SORT_VALUES: dict[str, Callable[[RateRow], float | None]] = {
+    "obj/s": _rate_field("objects_per_s"),
+    "mib/s": _rate_field("bytes_per_s"),
+    "progress": lambda row: row.move.progress_pct,
+    "eta": _rate_field("eta_s"),
+}
+FLOW_SORT_VALUES: dict[str, Callable[[FlowRow], float | None]] = {
+    "obj/s": _flow_field("objects_per_s"),
+    "mib/s": _flow_field("bytes_per_s"),
+}
+ASCENDING = {"eta"}
+SORT_CHOICES = ["host", *SORT_VALUES]
+
+
+def _by_value(
+    sort_by: str,
+    values: dict[str, Callable],
+    default: Callable[..., tuple],
+) -> Callable[..., tuple]:
+    """Return the key sorting by values[sort_by], valueless last, ties by default.
+
+    Just default if values has no sort_by.
+    """
+    value_of = values.get(sort_by)
+    if value_of is None:
+        return default
+    sign = 1 if sort_by in ASCENDING else -1
+
+    def key(item: RateRow | FlowRow) -> tuple:
+        value = value_of(item)
+        return (value is None, 0.0 if value is None else sign * value, default(item))
+
+    return key
+
+
+def host_key(osd_host: dict[int, str], osd: int) -> tuple:
+    """Sort key of osd's host, in human order (UNKNOWN_HOST if unknown)."""
+    return natural_sort_key(osd_host.get(osd, UNKNOWN_HOST))
+
+
+def sort_key(sort_by: str, osd_host: dict[int, str]) -> Callable[[RateRow], tuple]:
+    """Return the copy table's key for --sort-by.
+
+    'host' (the default order) sorts by the UP OSD's host (host_key), then
+    the OSD, PG and shard. The others sort by SORT_VALUES, rows without a
+    value last, and break ties in the default order.
+    """
+
+    def default(row: RateRow) -> tuple:
+        osd = row.move.up_osd
+        return (host_key(osd_host, osd), osd, sb.SORT_KEYS["pgid"](row.move))
+
+    return _by_value(sort_by, SORT_VALUES, default)
+
+
+def flow_sort_key(
+    sort_by: str, default: Callable[[FlowRow], tuple]
+) -> Callable[[FlowRow], tuple]:
+    """Return an OSD or host table's key for --sort-by, as sort_key does.
+
+    default is the table's default order; it is also the order under the
+    choices without FLOW_SORT_VALUES.
+    """
+    return _by_value(sort_by, FLOW_SORT_VALUES, default)
 
 
 # ---------------------------------------------------------------------------
@@ -498,8 +568,8 @@ class RatesResult(NamedTuple):
     """What plan() found, for render() to print."""
 
     rows: list[RateRow]  # the second sample's, sorted by --sort-by
-    osd_flows: list[FlowRow]  # per UP OSD of rows, by id
-    host_flows: list[FlowRow]  # per host of those, by name ('?' if unknown)
+    osd_flows: list[FlowRow]  # per UP OSD of rows, sorted by --sort-by
+    host_flows: list[FlowRow]  # per host of those (UNKNOWN_HOST if unknown), sorted too
     gone: int  # movements of the first sample the second no longer has
     pgs_filter: PgidFilter | None  # None without --pgs
     filter_options: tuple[str, ...]  # sb.RowFilter.options
@@ -546,13 +616,19 @@ def plan(args: argparse.Namespace, sampler: LiveSampler | ReplaySampler) -> Rate
         measured, gone = rate_rows(
             samples[0], rows[0], samples[1], rows[1], pools, ec_profiles
         )
-    measured.sort(key=sort_key(args.sort_by))
+    measured.sort(key=sort_key(args.sort_by, osd_host))
+    osd_flows = aggregate(measured, lambda osd: osd)
+    osd_flows.sort(
+        key=flow_sort_key(args.sort_by, lambda f: (host_key(osd_host, f.key), f.key))
+    )
+    host_flows = aggregate(measured, lambda osd: osd_host.get(osd, UNKNOWN_HOST))
+    host_flows.sort(key=flow_sort_key(args.sort_by, lambda f: natural_sort_key(f.key)))
     queried = frozenset().union(*(s.queried for s in samples))
     failed = frozenset().union(*(s.failed for s in samples))
     return RatesResult(
         measured,
-        aggregate(measured, lambda osd: osd),
-        aggregate(measured, lambda osd: osd_host.get(osd, "?")),
+        osd_flows,
+        host_flows,
         gone,
         pgs_filter,
         row_filter.options,

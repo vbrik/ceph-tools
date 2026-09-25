@@ -66,6 +66,22 @@ class PgidTest(unittest.TestCase):
         )
 
 
+class NaturalSortKeyTest(unittest.TestCase):
+    def test_digit_runs_sort_as_numbers(self):
+        hosts = ["ceph1-10", "ceph10-1", "ceph1-2", "ceph2", "ceph", "?", "1a"]
+        self.assertEqual(
+            ["1a", "?", "ceph", "ceph1-2", "ceph1-10", "ceph2", "ceph10-1"],
+            sorted(hosts, key=shared.natural_sort_key),
+        )
+
+    def test_equal_numbers_break_ties_on_the_text(self):
+        for names in (["a1", "a01"], ["a01", "a1"]):
+            with self.subTest(names=names):
+                self.assertEqual(
+                    ["a01", "a1"], sorted(names, key=shared.natural_sort_key)
+                )
+
+
 class PoolTest(unittest.TestCase):
     def test_is_erasure(self):
         self.assertTrue(shared.is_erasure({"type": shared.POOL_TYPE_ERASURE}))

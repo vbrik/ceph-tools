@@ -67,6 +67,7 @@ from placement import (
     usage_and_capacity,
 )
 from shared import (
+    UNKNOWN_HOST,
     HelpFormatter,
     PgidFilter,
     SnapshotStore,
@@ -317,7 +318,7 @@ def assign_targets(
             Proposal(
                 shards[i],
                 proposed[i],
-                osd_host.get(proposed[i], "?"),
+                osd_host.get(proposed[i], UNKNOWN_HOST),
                 osd_df[proposed[i]]["utilization"],
                 projection.utilization_after(proposed[i], 0),
             )

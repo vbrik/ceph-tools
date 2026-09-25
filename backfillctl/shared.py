@@ -97,6 +97,20 @@ def pgid_sort_key(pgid: str) -> tuple[int, int]:
     return (int(pool_str), int(pg_hex, 16))
 
 
+_DIGIT_RUNS = re.compile(r"(\d+)")
+
+
+def natural_sort_key(text: str) -> tuple:
+    """Sort text with its digit runs as numbers: 'ceph1-2' before 'ceph1-10'.
+
+    Ties ('a01', 'a1') break on the text itself.
+    """
+    # Split on a capture group: text at even indices, digits at odd ones, so
+    # keys only ever compare str with str and int with int.
+    parts = _DIGIT_RUNS.split(text)
+    return (tuple(int(p) if i % 2 else p for i, p in enumerate(parts)), text)
+
+
 class PgidFilter(NamedTuple):
     """What a list of PG ids given on the command line (e.g. --pgs) matched."""
 
@@ -856,8 +870,11 @@ def _osd_nodes(tree_or_df: dict) -> list[dict]:
     return tree_or_df.get("nodes", []) + tree_or_df.get("stray", [])
 
 
+UNKNOWN_HOST = "?"  # shown for an OSD fetch_osd_hosts has no host for
+
+
 def fetch_osd_hosts(store: SnapshotStore, key: str = "osd_tree") -> dict[int, str]:
-    """Return {osd_id: short_hostname} from 'ceph osd tree'."""
+    """Return {osd_id: short_hostname} from 'ceph osd tree'; see UNKNOWN_HOST."""
     nodes = _osd_nodes(store.json(key))
     by_id = {n["id"]: n for n in nodes}
     result = {}
@@ -1084,7 +1101,7 @@ def osd_cells(
     return [
         f"{osd_id}{star}",
         format_utilization(osd_df, osd_id),
-        osd_host.get(osd_id, "?"),
+        osd_host.get(osd_id, UNKNOWN_HOST),
     ]
 
 

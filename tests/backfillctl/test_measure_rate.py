@@ -9,6 +9,7 @@ against a second sample made from it.
 """
 
 import contextlib
+import copy
 import io
 import json
 import shutil
@@ -182,6 +183,17 @@ def two_samples(first=None, second=None):
             (PGS, second, {"27.1": 11.0, "5.3": 11.0}),
         ]
     )
+
+
+def human_hosts(first=None, second=None):
+    """two_samples, with hosts h1, h2, h3 renamed n1, n10, n9."""
+    cluster = two_samples(first, second)
+    tree = copy.deepcopy(SNAPSHOTS["osd_tree"])
+    for node in tree["nodes"]:
+        if node["type"] == "host":
+            node["name"] = {"h1": "n1", "h2": "n10", "h3": "n9"}[node["name"]]
+    cluster.snapshots = {**SNAPSHOTS, "osd_tree": tree}
+    return cluster
 
 
 def by_pgid(result) -> dict[str, mr.RateRow]:
@@ -384,6 +396,132 @@ class LivePlanTest(unittest.TestCase):
         rows = cluster.plan("--sort-by", "eta").rows
         # 5.3: 12 s (12.5% left at 37.5%/36 s), 27.1: 40 s; 5.5 isn't moving.
         self.assertEqual(["5.3", "27.1", "5.5"], [r.move.pgid for r in rows])
+
+    def test_sorted_by_up_host_by_default(self):
+        rows = two_samples().plan().rows
+        # 27.1 -> osd.2 and 5.3 -> osd.3 on h2, 5.5 -> osd.5 on h3; not PG order.
+        self.assertEqual(["27.1", "5.3", "5.5"], [r.move.pgid for r in rows])
+
+    def test_sort_by_rates_and_progress_highest_first(self):
+        # 5.3: 10.4 obj/s, 20.8 MiB/s, 87.5%; 27.1: 9.4, 9.4, 62.5%; 5.5: 0, 0, 0%.
+        for sort_by in ("obj/s", "mib/s", "progress"):
+            with self.subTest(sort_by=sort_by):
+                cluster = two_samples(second=positions(0.625, 0.875))
+                rows = cluster.plan("--sort-by", sort_by).rows
+                self.assertEqual(["5.3", "27.1", "5.5"], [r.move.pgid for r in rows])
+
+    def test_all_tables_sorted_by_host_in_human_order_by_default(self):
+        # h2 -> n10 (osd.2, osd.3; 27.1, 5.3), h3 -> n9 (osd.5; 5.5).
+        result = human_hosts().plan()
+        self.assertEqual(["5.5", "27.1", "5.3"], [r.move.pgid for r in result.rows])
+        self.assertEqual([5, 2, 3], [f.key for f in result.osd_flows])
+        self.assertEqual(["n9", "n10"], [f.key for f in result.host_flows])
+
+    def test_rate_sorts_resort_the_osd_and_host_tables(self):
+        # osd.3 (5.3): 10.4 obj/s, 20.8 MiB/s; osd.2 (27.1): 9.4, 9.4; osd.5: 0.
+        for sort_by in ("obj/s", "mib/s"):
+            with self.subTest(sort_by=sort_by):
+                result = human_hosts(second=positions(0.625, 0.875)).plan(
+                    "--sort-by", sort_by
+                )
+                self.assertEqual([3, 2, 5], [f.key for f in result.osd_flows])
+                self.assertEqual(["n10", "n9"], [f.key for f in result.host_flows])
+
+    def test_progress_and_eta_leave_the_osd_and_host_tables_by_host(self):
+        for sort_by in ("progress", "eta"):
+            with self.subTest(sort_by=sort_by):
+                result = human_hosts(second=positions(0.625, 0.875)).plan(
+                    "--sort-by", sort_by
+                )
+                self.assertEqual(
+                    ["5.3", "27.1", "5.5"], [r.move.pgid for r in result.rows]
+                )
+                self.assertEqual([5, 2, 3], [f.key for f in result.osd_flows])
+                self.assertEqual(["n9", "n10"], [f.key for f in result.host_flows])
+
+    def test_the_old_sort_choices_are_gone(self):
+        for sort_by in ("pgid", "up-osd"):
+            with (
+                self.subTest(sort_by=sort_by),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                parse_args(mr, ["--sort-by", sort_by])
+
+
+SORT_OSD_HOST = {1: "b10", 2: "b2", 3: "b2"}  # osd.9's host is unknown
+
+
+class SortKeyTest(unittest.TestCase):
+    @staticmethod
+    def row(pgid, shard, up, progress=None, rate=None):
+        move = sb.MovementRow(pgid, shard, 0, up, "backfill", "s", False, progress)
+        return mr.RateRow(move, rate, None if rate else mr.UNKNOWN)
+
+    @staticmethod
+    def rate(objects, size=MIB, eta=None):
+        return mr.Rate(1.0, objects, size, eta, True, 30.0)
+
+    def order(self, sort_by, rows):
+        key = mr.sort_key(sort_by, SORT_OSD_HOST)
+        return [rows.index(r) for r in sorted(rows, key=key)]
+
+    def test_host_then_osd_then_pg_then_shard(self):
+        rows = [
+            self.row("27.1", 1, 1),  # host b10, after b2
+            self.row("27.1", 1, 3),  # host b2, osd.3
+            self.row("27.10", 0, 2),  # host b2, osd.2: 27.10 after 27.2 (hex)
+            self.row("27.2", 3, 2),
+            self.row("27.2", 1, 2),
+            self.row("5.1", "-", 2),  # pool 5 before pool 27
+            self.row("1.0", "-", 9),  # host '?' sorts as its cell does, first
+        ]
+        self.assertEqual([6, 5, 4, 3, 2, 1, 0], self.order("host", rows))
+
+    def test_rates_highest_first_unknown_last_ties_in_host_order(self):
+        rows = [
+            self.row("1.0", "-", 1, rate=self.rate(5, size=None)),
+            self.row("1.1", "-", 1),  # no rate
+            self.row("1.2", "-", 1, rate=self.rate(9, size=2 * MIB)),
+            self.row("1.3", "-", 2, rate=self.rate(5, size=MIB)),  # host b2
+        ]
+        self.assertEqual([2, 3, 0, 1], self.order("obj/s", rows))
+        self.assertEqual([2, 3, 0, 1], self.order("mib/s", rows))  # 0: size unknown
+
+    def test_progress_highest_first_unknown_last(self):
+        rows = [
+            self.row("1.0", "-", 1, progress=10.0),
+            self.row("1.1", "-", 1),
+            self.row("1.2", "-", 1, progress=100.0),
+            self.row("1.3", "-", 1, progress=0.0),  # 0 is known
+        ]
+        self.assertEqual([2, 0, 3, 1], self.order("progress", rows))
+
+    def test_eta_soonest_first_unknown_last(self):
+        rows = [
+            self.row("1.0", "-", 1, rate=self.rate(1, eta=60.0)),
+            self.row("1.1", "-", 1, rate=self.rate(0)),  # not moving: no ETA
+            self.row("1.2", "-", 1, rate=self.rate(1, eta=0.0)),  # done
+            self.row("1.3", "-", 1),
+        ]
+        self.assertEqual([2, 0, 1, 3], self.order("eta", rows))
+
+    def test_flows_fastest_first_unmeasured_last_ties_by_default(self):
+        flows = [
+            mr.FlowRow("a", mr.Flow(1, 0, 0.0, 0.0, True)),  # nothing measured
+            mr.FlowRow("b", mr.Flow(2, 2, 5.0, None, True)),  # a size unknown
+            mr.FlowRow("c", mr.Flow(1, 1, 5.0, 3 * MIB, True)),
+            mr.FlowRow("d", mr.Flow(1, 1, 9.0, MIB, True)),
+        ]
+        for sort_by, want in (
+            ("obj/s", ["d", "b", "c", "a"]),
+            ("mib/s", ["c", "d", "a", "b"]),
+            ("progress", ["a", "b", "c", "d"]),  # no progress: the default
+            ("host", ["a", "b", "c", "d"]),
+        ):
+            with self.subTest(sort_by=sort_by):
+                key = mr.flow_sort_key(sort_by, lambda f: f.key)
+                self.assertEqual(want, [f.key for f in sorted(flows, key=key)])
 
 
 class AggregateTest(unittest.TestCase):

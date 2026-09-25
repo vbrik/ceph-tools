@@ -72,6 +72,7 @@ from shared import (
     NOT_APPLICABLE,
     ROLE_BLOCKER,
     ROLE_REQUESTED,
+    UNKNOWN_HOST,
     HelpFormatter,
     SnapshotStore,
     add_load_state_arg,
@@ -645,7 +646,7 @@ def format_row(
         *osd_cells(osd_df, osd_host, move.up_osd),
         *osd_cells(osd_df, osd_host, move.target_osd)[:2],
         NOT_APPLICABLE if move.projected is None else f"{move.projected:.1f}%",
-        osd_host.get(move.target_osd, "?"),
+        osd_host.get(move.target_osd, UNKNOWN_HOST),
         move.note,
     ]
 
