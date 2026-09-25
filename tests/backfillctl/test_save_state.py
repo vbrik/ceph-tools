@@ -269,7 +269,8 @@ class CommittedFixturesTest(unittest.TestCase):
         # Catches fields anonymize_snapshots doesn't know about.
         for fixture in self.fixtures():
             with self.subTest(fixture.name):
-                text = "".join(f.read_text() for f in fixture.glob("*.json"))
+                # rglob: measure-rate captures keep their samples in subdirectories.
+                text = "".join(f.read_text() for f in fixture.rglob("*.json"))
                 ips = {m.group() for m in self.IPV4.finditer(text)}
                 self.assertEqual(
                     {ip for ip in ips if not ip.startswith(shared._FAKE_IP_PREFIX)},

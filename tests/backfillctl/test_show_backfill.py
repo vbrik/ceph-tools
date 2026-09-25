@@ -396,6 +396,31 @@ class FilterTest(unittest.TestCase):
         self.assertEqual("", out)
         self.assertIn("No PG movements match --osds/--pgs.", err)
 
+    def test_hosts_matches_any_osd_of_the_hosts_by_short_name(self):
+        # ceph2 has osd.2 and osd.3; 27.9 moves 0* -> 1, both on ceph1.
+        self.assertEqual(["5.3", "5.1f", "27.10"], self.pgids("--hosts", "ceph2"))
+        self.assertEqual(
+            ["5.1f", "27.9"], self.pgids("--hosts", "ceph1.example.org", "--osds", "0")
+        )
+
+    def test_hosts_intersects_with_osds_and_pgs(self):
+        self.assertEqual(["5.1f"], self.pgids("--hosts", "ceph2", "--osds", "0"))
+        self.assertEqual(
+            ["5.3"], self.pgids("--hosts", "ceph2", "--pgs", "5.3", "27.9")
+        )
+
+    def test_unknown_host_is_an_error(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.pgids("--hosts", "ceph9")
+        self.assertIn(
+            "--hosts: no OSDs under these in 'ceph osd tree': ceph9", str(cm.exception)
+        )
+
+    def test_empty_intersection_names_the_filters_given(self):
+        out, err = self.run_main("--hosts", "ceph1", "--osds", "3")
+        self.assertEqual("", out)
+        self.assertIn("No PG movements match --osds/--hosts.", err)
+
     def test_no_note_without_pgs(self):
         _, err = self.run_main("--osds", "3")
         self.assertNotIn("--pgs", err)

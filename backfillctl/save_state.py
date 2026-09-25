@@ -3,8 +3,9 @@
 Capture the cluster state the other subcommands read into DIR, for replay
 with '--load-state DIR', before or after the subcommand.
 
-One capture serves every subcommand: it includes a full 'ceph pg dump pgs'
-and the backfill positions of remapped PGs. It is anonymized (fsid,
+One capture serves every subcommand but measure-rate, which saves its own
+two samples ('measure-rate --save-state DIR'). It includes a full 'ceph pg
+dump pgs' and the backfill positions of remapped PGs. It is anonymized (fsid,
 addresses, hostnames, pool and rule names) and trimmed to the fields the
 subcommands use, so it is safe to share.
 """
@@ -52,15 +53,15 @@ KEPT_OSD_DUMP_KEYS = (
 )
 
 
-def anonymize_snapshots(snapshots: dict[str, object]) -> None:
-    """Anonymize a capture in place (shared.anonymize_snapshots), then trim
-    'osd_dump' and 'pg_dump_pgs' to the fields subcommands read.
-    """
-    anonymize_common(snapshots)
-    dump = snapshots["osd_dump"]
-    snapshots["osd_dump"] = {k: dump[k] for k in KEPT_OSD_DUMP_KEYS if k in dump}
-    pg_stats = extract_pg_stats(snapshots["pg_dump_pgs"], "ceph pg dump pgs")
-    snapshots["pg_dump_pgs"] = {
+def trim_osd_dump(dump: dict) -> dict:
+    """Return 'ceph osd dump' trimmed to the fields subcommands read."""
+    return {k: dump[k] for k in KEPT_OSD_DUMP_KEYS if k in dump}
+
+
+def trim_pg_dump(raw: object) -> dict:
+    """Return 'ceph pg dump pgs' trimmed to the fields subcommands read."""
+    pg_stats = extract_pg_stats(raw, "ceph pg dump pgs")
+    return {
         "pg_stats": [
             {
                 **{k: pg[k] for k in KEPT_PG_STAT_KEYS if k in pg},
@@ -73,6 +74,15 @@ def anonymize_snapshots(snapshots: dict[str, object]) -> None:
             for pg in pg_stats
         ]
     }
+
+
+def anonymize_snapshots(snapshots: dict[str, object]) -> None:
+    """Anonymize a capture in place (shared.anonymize_snapshots), then trim
+    'osd_dump' and 'pg_dump_pgs' to the fields subcommands read.
+    """
+    anonymize_common(snapshots)
+    snapshots["osd_dump"] = trim_osd_dump(snapshots["osd_dump"])
+    snapshots["pg_dump_pgs"] = trim_pg_dump(snapshots["pg_dump_pgs"])
 
 
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:

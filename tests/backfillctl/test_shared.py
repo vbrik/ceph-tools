@@ -406,10 +406,22 @@ class PositionsFromOutputTest(unittest.TestCase):
 class QueryBackfillPositionsTest(unittest.TestCase):
     """The live query, with librados and the CLI both faked."""
 
-    def run_query(self, pgids, *, rados, rados_result=None, cli_result=None):
-        """Call the real query_backfill_positions; return (result, stderr, cli mock)."""
+    @staticmethod
+    def replies(result):
+        """{pgid: positions or None} as the query functions return it, at time 1.0."""
+        if not isinstance(result, dict):
+            return result
+        return {pgid: shared.QueryReply(p, 1.0) for pgid, p in result.items()}
+
+    def run_query(
+        self, pgids, *, rados, rados_result=None, cli_result=None, timed=False
+    ):
+        """Call the real query_backfill_positions (with timed, _timed's
+        underlying query); return (result, stderr, cli mock)."""
         err = io.StringIO()
-        cli = mock.Mock(return_value=cli_result)
+        rados_result = self.replies(rados_result)
+        cli = mock.Mock(return_value=self.replies(cli_result))
+        query = shared._query_positions if timed else real_query_backfill_positions
         with (
             mock.patch.dict(sys.modules, {"rados": rados}),
             mock.patch.object(
@@ -420,7 +432,7 @@ class QueryBackfillPositionsTest(unittest.TestCase):
         ):
             if isinstance(rados_result, Exception):
                 via_rados.side_effect = rados_result
-            result = real_query_backfill_positions(pgids)
+            result = query(pgids)
         return result, err.getvalue(), cli
 
     def fake_rados(self):
@@ -464,6 +476,45 @@ class QueryBackfillPositionsTest(unittest.TestCase):
         result, _, cli = self.run_query([], rados=None)
         self.assertEqual({}, result)
         cli.assert_not_called()
+
+    def test_timed_gives_each_successful_query_its_time_and_names_failures(self):
+        result, err, _ = self.run_query(
+            ["1.2", "1.1", "1.3"],
+            rados=None,
+            cli_result={"1.1": None, "1.2": {"4": "MIN"}, "1.3": {}},
+            timed=True,
+        )
+        self.assertEqual(
+            shared.TimedPositions(
+                {"1.2": {"4": "MIN"}, "1.3": {}}, {"1.2": 1.0, "1.3": 1.0}, ["1.1"]
+            ),
+            result,
+        )
+        self.assertEqual("", err)  # the caller reports failures
+
+
+class TimedQueryTest(unittest.TestCase):
+    def test_reply_time_is_midway_through_the_request(self):
+        clock = iter([10.0, 14.0])
+        with mock.patch.object(shared.time, "monotonic", lambda: next(clock)):
+            reply = shared._timed(lambda pgid: {"3": "MAX"})("1.1")
+        self.assertEqual(shared.QueryReply({"3": "MAX"}, 12.0), reply)
+
+
+OSD_HOST = {0: "ceph1", 1: "ceph1", 2: "ceph2"}
+
+
+class HostOsdsTest(unittest.TestCase):
+    def test_every_osd_of_the_hosts_by_short_name(self):
+        self.assertEqual(
+            {0, 1, 2}, shared.host_osds(["ceph1.example.org", "ceph2"], OSD_HOST)
+        )
+
+    def test_a_host_without_osds_is_an_error_naming_it(self):
+        with self.assertRaises(SystemExit) as cm:
+            shared.host_osds(["ceph1", "nope", "ceph9"], OSD_HOST)
+        self.assertIn("--hosts: no OSDs under these", str(cm.exception))
+        self.assertIn("ceph9, nope", str(cm.exception))
 
 
 class FetchBackfillPositionsTest(unittest.TestCase):

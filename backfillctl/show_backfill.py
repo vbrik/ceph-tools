@@ -16,7 +16,8 @@ the row's target has got, from its backfill position in 'ceph pg query'.
 '~' marks a fallback on Ceph's per-PG counters, which can read far too high.
 
 --osds keeps rows involving any of the given OSDs, including a '*' primary;
---pgs keeps rows of the given PGs. Given both, a row must match both.
+--hosts, any OSD of the given hosts; --pgs keeps rows of the given PGs. A row
+must match every filter given.
 """
 
 import argparse
@@ -24,6 +25,8 @@ from itertools import zip_longest
 from typing import NamedTuple
 
 from messages import (
+    print_movement_summary,
+    print_no_movements,
     print_pgid_filter,
     print_progress_note,
     stderr_para,
@@ -45,6 +48,7 @@ from shared import (
     fetch_pg_stats,
     fetch_pools,
     format_progress,
+    host_osds,
     is_erasure,
     is_real_osd,
     osd_cells,
@@ -88,6 +92,13 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         default="pgid",
         help="Sort rows by this column (default: %(default)s).",
     )
+    add_filter_args(parser)
+    add_load_state_arg(parser, after_command=True)
+    return parser
+
+
+def add_filter_args(parser: argparse.ArgumentParser) -> None:
+    """Add the row filters --osds, --pgs and --hosts (see RowFilter)."""
     parser.add_argument(
         "--osds",
         nargs="+",
@@ -103,8 +114,13 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         metavar="PGID",
         help="Show only rows of these PGs.",
     )
-    add_load_state_arg(parser, after_command=True)
-    return parser
+    parser.add_argument(
+        "--hosts",
+        nargs="+",
+        default=[],
+        metavar="HOST",
+        help="Show only rows involving OSDs of these hosts.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +197,7 @@ def _row_pgid_key(row: MovementRow) -> tuple:
     return (*pgid_sort_key(row.pgid), shard_key)
 
 
-_SORT_KEYS = {
+SORT_KEYS = {
     "pgid": _row_pgid_key,
     "acting-osd": lambda r: (_osd_key(r.acting_osd), _row_pgid_key(r)),
     "up-osd": lambda r: (_osd_key(r.up_osd), _row_pgid_key(r)),
@@ -193,26 +209,60 @@ _SORT_KEYS = {
 # ---------------------------------------------------------------------------
 
 
-class MovementsResult(NamedTuple):
-    """What plan() found, for render() to print."""
+class RowFilter(NamedTuple):
+    """The --osds, --pgs and --hosts row filters. An empty one passes every row."""
 
-    rows: list[MovementRow]  # sorted by --sort-by; --osds/--pgs applied
-    pgs_filter: PgidFilter | None  # None without --pgs
-    filtered: bool  # --osds or --pgs given
-    osd_df: dict[int, dict]
-    osd_host: dict[int, str]
+    osds: frozenset[int]
+    pgids: frozenset[str]
+    host_osds: frozenset[int]  # every OSD of --hosts
+    options: tuple[str, ...]  # the filter options given, as '--osds'
+
+    @classmethod
+    def from_args(
+        cls, args: argparse.Namespace, osd_df: dict[int, dict], osd_host: dict[int, str]
+    ) -> "RowFilter":
+        """Build the filters from the command line, exiting on an unknown OSD or host."""
+        check_osds_exist("--osds", args.osds, osd_df)
+        hosts = host_osds(args.hosts, osd_host) if args.hosts else set()
+        given = {"--osds": args.osds, "--pgs": args.pgs, "--hosts": args.hosts}
+        return cls(
+            frozenset(args.osds),
+            frozenset(args.pgs),
+            frozenset(hosts),
+            tuple(option for option, values in given.items() if values),
+        )
+
+    def apply(
+        self, rows: list[MovementRow], *, up_only: bool = False
+    ) -> tuple[list[MovementRow], PgidFilter | None]:
+        """Return (the rows passing every filter, what --pgs matched, if given).
+
+        --osds and --hosts match a row's ACTING or UP OSD; with up_only, just
+        its UP. --pgs matches are counted before the other filters, so only
+        real typos are flagged.
+        """
+        pgs_filter = None
+        if self.pgids:
+            pgs_filter = PgidFilter.of(self.pgids, (r.pgid for r in rows))
+            rows = [r for r in rows if r.pgid in self.pgids]
+        for osds in (self.osds, self.host_osds):
+            if osds:
+                rows = [
+                    r
+                    for r in rows
+                    if (
+                        r.up_osd in osds if up_only else {r.acting_osd, r.up_osd} & osds
+                    )
+                ]
+        return rows, pgs_filter
 
 
-def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
-    """Fetch the cluster state and find the PG movements, filtered by --osds/--pgs."""
-    pg_stats = fetch_pg_stats(store, "pg_dump_pgs")
-    osd_df = fetch_osd_df(store)
-    check_osds_exist("--osds", args.osds, osd_df)
-    osd_host = fetch_osd_hosts(store)
-    pools = fetch_pools(store)
+def find_movements(pg_stats: list[dict], pools: dict[int, dict]) -> list[MovementRow]:
+    """Return a row per moving copy of the PGs in pg_stats, in pg_stats' order.
 
+    Progress is not filled in (see with_progress).
+    """
     rows: list[MovementRow] = []
-
     for pg in pg_stats:
         pgid, state, up, acting = pg["pgid"], pg["state"], pg["up"], pg["acting"]
         primary = pg.get("acting_primary")
@@ -233,28 +283,23 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
                 rows.append(
                     MovementRow(pgid, "-", acting_osd, target, mtype, state, marked)
                 )
-
-    rows, pgs_filter = filter_rows(rows, set(args.osds), set(args.pgs))
-    rows = with_progress(store, rows, pg_stats, pools)
-    rows.sort(key=_SORT_KEYS[args.sort_by])
-    return MovementsResult(
-        rows, pgs_filter, bool(args.osds or args.pgs), osd_df, osd_host
-    )
+    return rows
 
 
 def with_progress(
-    store: SnapshotStore,
     rows: list[MovementRow],
     pg_stats: list[dict],
     pools: dict[int, dict],
+    positions: dict[str, dict[str, str]],
 ) -> list[MovementRow]:
     """Return rows with PROGRESS filled in: each row's target's own.
 
-    A dropped replica (no target) has none.
+    positions is {pgid: {peer: position}} (fetch_backfill_positions); a PG
+    without falls back on the counters. A dropped replica (no target) has no
+    progress.
     """
     shown = {r.pgid for r in rows}
     pgs = {pg["pgid"]: pg for pg in pg_stats if pg["pgid"] in shown}
-    positions = fetch_backfill_positions(store, pgs)
     result = []
     for r in rows:
         if r.up_osd is None:
@@ -272,21 +317,29 @@ def with_progress(
     return result
 
 
-def filter_rows(
-    rows: list[MovementRow], osds: set[int], pgids: set[str]
-) -> tuple[list[MovementRow], PgidFilter | None]:
-    """Return (the rows passing both filters, what pgids matched).
+class MovementsResult(NamedTuple):
+    """What plan() found, for render() to print."""
 
-    An empty filter passes everything. pgids matches are counted before the
-    osds filter, so only real typos are flagged.
-    """
-    pgs_filter = None
-    if pgids:
-        pgs_filter = PgidFilter.of(pgids, (r.pgid for r in rows))
-        rows = [r for r in rows if r.pgid in pgids]
-    if osds:
-        rows = [r for r in rows if {r.acting_osd, r.up_osd} & osds]
-    return rows, pgs_filter
+    rows: list[MovementRow]  # sorted by --sort-by; filters applied
+    pgs_filter: PgidFilter | None  # None without --pgs
+    filter_options: tuple[str, ...]  # RowFilter.options
+    osd_df: dict[int, dict]
+    osd_host: dict[int, str]
+
+
+def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
+    """Fetch the cluster state and find the PG movements, filtered (RowFilter)."""
+    pg_stats = fetch_pg_stats(store, "pg_dump_pgs")
+    osd_df = fetch_osd_df(store)
+    osd_host = fetch_osd_hosts(store)
+    row_filter = RowFilter.from_args(args, osd_df, osd_host)
+    pools = fetch_pools(store)
+
+    rows, pgs_filter = row_filter.apply(find_movements(pg_stats, pools))
+    positions = fetch_backfill_positions(store, {r.pgid for r in rows})
+    rows = with_progress(rows, pg_stats, pools, positions)
+    rows.sort(key=SORT_KEYS[args.sort_by])
+    return MovementsResult(rows, pgs_filter, row_filter.options, osd_df, osd_host)
 
 
 # ---------------------------------------------------------------------------
@@ -331,20 +384,15 @@ def format_row(
 
 def render(result: MovementsResult) -> None:
     """Print the rows as a table, then the footnotes that apply."""
-    rows, pgs_filter, filtered, osd_df, osd_host = result
+    rows, pgs_filter, filter_options, osd_df, osd_host = result
     if pgs_filter is not None:
         print_pgid_filter("--pgs", pgs_filter, "have movement", "not moving")
     if not rows:
-        stderr_para(
-            "No PG movements match --osds/--pgs."
-            if filtered
-            else "No PG movements detected."
-        )
+        print_no_movements(filter_options)
         return
 
     print_table(COLUMNS, [format_row(r, osd_df, osd_host) for r in rows])
-    num_pgs = len({r.pgid for r in rows})
-    stderr_para(f"{len(rows)} copy movement(s) across {num_pgs} PG(s).")
+    print_movement_summary(len(rows), len({r.pgid for r in rows}))
     if any(r.primary_marked for r in rows):
         stderr_para(f"NOTE: {PRIMARY_NOTE}")
     print_progress_note((r.progress_pct, r.progress_exact) for r in rows)

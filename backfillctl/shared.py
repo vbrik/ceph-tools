@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from collections import Counter
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -36,7 +37,7 @@ from messages import (
     companion_note,
     format_bytes,
     osd_list,
-    stderr_para,
+    print_query_failed,
 )
 
 # Sentinel used by CRUSH/Ceph for "no OSD in this slot" (crush/crush.h).
@@ -491,11 +492,29 @@ def _positions_from_output(output: str | bytes) -> dict[str, str] | None:
     return extract_backfill_positions(query) if isinstance(query, dict) else None
 
 
-def _query_positions_rados(rados, pgids: list[str]) -> dict[str, dict[str, str] | None]:
+class QueryReply(NamedTuple):
+    """One PG's 'ceph pg query' outcome."""
+
+    positions: dict[str, str] | None  # None: the query failed
+    time: float  # time.monotonic() midway through the request
+
+
+def _timed(query: Callable[[str], dict[str, str] | None]):
+    """Wrap a per-PG query so that it returns a QueryReply."""
+
+    def timed(pgid: str) -> QueryReply:
+        start = time.monotonic()
+        positions = query(pgid)
+        return QueryReply(positions, (start + time.monotonic()) / 2)
+
+    return timed
+
+
+def _query_positions_rados(rados, pgids: list[str]) -> dict[str, QueryReply]:
     """Query PGs concurrently over one librados connection.
 
-    rados is the 'rados' module. Returns {pgid: positions, or None on
-    failure}. Raises rados.Error if the cluster can't be reached.
+    rados is the 'rados' module. Raises rados.Error if the cluster can't be
+    reached.
     """
     cluster = rados.Rados(conffile="")  # "": ceph's default config search
     cluster.conf_parse_env()  # honor CEPH_ARGS, like the ceph CLI
@@ -511,12 +530,12 @@ def _query_positions_rados(rados, pgids: list[str]) -> dict[str, dict[str, str] 
             return _positions_from_output(out) if ret == 0 else None
 
         with ThreadPoolExecutor(RADOS_QUERY_THREADS) as pool:
-            return dict(zip(pgids, pool.map(query, pgids)))
+            return dict(zip(pgids, pool.map(_timed(query), pgids)))
     finally:
         cluster.shutdown()
 
 
-def _query_positions_cli(pgids: list[str]) -> dict[str, dict[str, str] | None]:
+def _query_positions_cli(pgids: list[str]) -> dict[str, QueryReply]:
     """Query PGs with parallel 'ceph pg <pgid> query' processes.
 
     Much slower and more CPU-hungry than librados, but needs only the CLI.
@@ -539,38 +558,60 @@ def _query_positions_cli(pgids: list[str]) -> dict[str, dict[str, str] | None]:
         return _positions_from_output(proc.stdout)
 
     with ThreadPoolExecutor(max(8, 2 * (os.cpu_count() or 1))) as pool:
-        return dict(zip(pgids, pool.map(query, pgids)))
+        return dict(zip(pgids, pool.map(_timed(query), pgids)))
+
+
+class TimedPositions(NamedTuple):
+    """Backfill positions from a live query, and when each PG was read."""
+
+    positions: dict[str, dict[str, str]]  # {pgid: {peer: position}}; failed left out
+    times: dict[str, float]  # {pgid: QueryReply.time}, successful queries only
+    failed: list[str]  # in PG order
+
+
+def _query_positions(pgids: Iterable[str]) -> TimedPositions:
+    """Query pgids' backfill positions, over librados if importable, else the CLI."""
+    pgids = sorted(set(pgids), key=pgid_sort_key)
+    if not pgids:
+        return TimedPositions({}, {}, [])
+    try:
+        import rados  # optional: the CLI fallback needs nothing extra
+    except ImportError:
+        rados = None
+    replies = None
+    if rados is not None:
+        try:
+            replies = _query_positions_rados(rados, pgids)
+        except rados.Error:
+            pass  # e.g. no keyring readable by librados; try the CLI
+    if replies is None:
+        replies = _query_positions_cli(pgids)
+    ok = {pgid: r for pgid, r in replies.items() if r.positions is not None}
+    return TimedPositions(
+        {pgid: r.positions for pgid, r in ok.items()},
+        {pgid: r.time for pgid, r in ok.items()},
+        [pgid for pgid in pgids if pgid not in ok],
+    )
 
 
 def query_backfill_positions(pgids: Iterable[str]) -> dict[str, dict[str, str]]:
     """Return {pgid: {peer: position}} for pgids, queried from the live cluster.
 
-    Uses librados if importable, else the CLI. PGs whose query fails are left
-    out (and counted on stderr).
+    PGs whose query fails are left out (and counted on stderr).
     """
-    pgids = sorted(set(pgids), key=pgid_sort_key)
-    if not pgids:
-        return {}
-    try:
-        import rados  # optional: the CLI fallback needs nothing extra
-    except ImportError:
-        rados = None
-    results = None
-    if rados is not None:
-        try:
-            results = _query_positions_rados(rados, pgids)
-        except rados.Error:
-            pass  # e.g. no keyring readable by librados; try the CLI
-    if results is None:
-        results = _query_positions_cli(pgids)
-    failed = [pgid for pgid, positions in results.items() if positions is None]
-    if failed:
-        stderr_para(
-            f"NOTE: 'ceph pg query' failed for {len(failed)} of {len(pgids)} "
-            f"PG(s) ({', '.join(failed[:5])}{', ...' if len(failed) > 5 else ''}); "
-            "their PROGRESS comes from Ceph's counters (marked '~')."
-        )
-    return {pgid: p for pgid, p in results.items() if p is not None}
+    pgids = set(pgids)
+    result = _query_positions(pgids)
+    print_query_failed(
+        result.failed,
+        len(pgids),
+        "their PROGRESS comes from Ceph's counters (marked '~')",
+    )
+    return result.positions
+
+
+def query_backfill_positions_timed(pgids: Iterable[str]) -> TimedPositions:
+    """Like query_backfill_positions, with each PG's query time; reports nothing."""
+    return _query_positions(pgids)
 
 
 def fetch_backfill_positions(
@@ -613,6 +654,22 @@ def check_osds_exist(option: str, osds: Iterable[int], osd_df: dict[int, dict]) 
     unknown = sorted(set(osds) - osd_df.keys())
     if unknown:
         sys.exit(f"ERROR: {option}: not in 'ceph osd df': " + osd_list(unknown))
+
+
+def host_osds(hosts: Iterable[str], osd_host: dict[int, str]) -> set[int]:
+    """Return every OSD of the given --hosts, exiting if a host has none.
+
+    Hosts match by short name, so 'ceph1.example.org' matches 'ceph1'.
+    """
+    wanted = {h.split(".")[0] for h in hosts}
+    osds = {o for o, h in osd_host.items() if h in wanted}
+    missing = sorted(wanted - {osd_host[o] for o in osds})
+    if missing:
+        sys.exit(
+            f"ERROR: --hosts: no OSDs under these in 'ceph osd tree': "
+            f"{', '.join(missing)}"
+        )
+    return osds
 
 
 def parse_pgid(text: str) -> str:
@@ -692,18 +749,22 @@ SUB_LOAD_STATE = "sub_load_state"
 
 
 def add_load_state_arg(
-    parser: argparse.ArgumentParser, *, after_command: bool = False
+    parser: "argparse.ArgumentParser | argparse._ArgumentGroup",
+    *,
+    after_command: bool = False,
+    help: str = "Read cluster state from a 'save-state' capture instead of the "
+    "live cluster.",
 ) -> None:
     """Add --load-state: the global one, or with after_command a subcommand's.
 
     Both exist so the option works before or after the subcommand name.
+    parser may be an argument group, e.g. to make it exclusive with another.
     """
     parser.add_argument(
         "--load-state",
         metavar="DIR",
         dest=SUB_LOAD_STATE if after_command else "load_state",
-        help="Read cluster state from a 'save-state' capture instead of the "
-        "live cluster.",
+        help=help,
     )
 
 

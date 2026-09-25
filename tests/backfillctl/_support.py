@@ -42,6 +42,7 @@ import shared
 # from Ceph's counters). Tests of the query itself use the saved original.
 real_query_backfill_positions = shared.query_backfill_positions
 shared.query_backfill_positions = lambda pgids: {}
+shared.query_backfill_positions_timed = lambda pgids: shared.TimedPositions({}, {}, [])
 
 NONE = shared.CRUSH_ITEM_NONE
 

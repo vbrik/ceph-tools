@@ -12,6 +12,7 @@ import cancel_backfill
 import cancel_uphill
 import divert_toofull
 import drain
+import measure_rate
 import save_state
 import show_backfill
 import show_pg_osds
@@ -20,6 +21,7 @@ from shared import HelpFormatter, add_load_state_arg, resolve_load_state
 _COMMAND_MODULES = (
     show_pg_osds,
     show_backfill,
+    measure_rate,
     divert_toofull,
     cancel_backfill,
     cancel_uphill,
@@ -32,7 +34,7 @@ _COMMAND_MODULES = (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="backfillctl",
-        description="Ceph PG backfill and upmap tools: show what is moving, "
+        description="Ceph PG backfill and upmap tools: show what is moving and how fast, "
         "divert or cancel backfills, drain OSDs, move data off the fullest OSDs. Commands that remap PGs only "
         "print upmap proposals; they change nothing.",
         formatter_class=HelpFormatter,

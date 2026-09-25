@@ -127,6 +127,34 @@ def print_progress_note(progress: Iterable[tuple[float | None, bool]]) -> None:
         stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
 
 
+def print_query_failed(failed: Iterable[str], total: int, effect: str) -> None:
+    """Report on stderr the PGs whose 'ceph pg query' failed, out of total queried.
+
+    effect says what the failure costs, e.g. "their PROGRESS comes from
+    Ceph's counters (marked '~')". Prints nothing if none failed.
+    """
+    failed = list(failed)
+    if failed:
+        stderr_para(
+            f"NOTE: 'ceph pg query' failed for {len(failed)} of {total} PG(s) "
+            f"({', '.join(failed[:5])}{', ...' if len(failed) > 5 else ''}); "
+            f"{effect}."
+        )
+
+
+def print_movement_summary(copies: int, pgs: int) -> None:
+    """Sum up a table of copy movements (show-backfill's rows) on stderr."""
+    stderr_para(f"{copies} copy movement(s) across {pgs} PG(s).")
+
+
+def print_no_movements(filter_options: Iterable[str]) -> None:
+    """Say on stderr that no movement is shown: none at all, or none matching filter_options."""
+    options = "/".join(filter_options)
+    stderr_para(
+        f"No PG movements match {options}." if options else "No PG movements detected."
+    )
+
+
 def print_pgid_filter(
     option: str, f: "PgidFilter", matched: str, unmatched: str
 ) -> None:

@@ -37,7 +37,6 @@ domain is host.
 """
 
 import argparse
-import sys
 from collections import Counter
 from typing import NamedTuple
 
@@ -89,6 +88,7 @@ from shared import (
     fetch_pools,
     fetch_remapped_pg_stats,
     fetch_upmap_items,
+    host_osds,
     osd_cells,
     osd_columns,
     parse_osd,
@@ -512,19 +512,6 @@ def with_final_projection(moves: list[Move], projection: ProjectedUsage) -> list
         else m._replace(projected=projection.utilization_after(m.target_osd, 0))
         for m in moves
     ]
-
-
-def host_osds(hosts: list[str], osd_host: dict[int, str]) -> set[int]:
-    """Return every OSD of the given hosts, exiting if a host has none."""
-    wanted = {h.split(".")[0] for h in hosts}
-    osds = {o for o, h in osd_host.items() if h in wanted}
-    missing = sorted(wanted - {osd_host[o] for o in osds})
-    if missing:
-        sys.exit(
-            f"ERROR: --hosts: no OSDs under these in 'ceph osd tree': "
-            f"{', '.join(missing)}"
-        )
-    return osds
 
 
 def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
