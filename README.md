@@ -17,13 +17,15 @@ Every script is standalone; there is no install step. The exception is
 
 - A `ceph` CLI configured for the cluster (`rados` and `ceph-dencoder` for a
   couple of tools).
-- Python 3, standard library only, except:
+- Python 3, standard library only, except (`pip install -r requirements.txt`):
   - `cephfs/find-recent-rctime.py` needs `python-dateutil`.
   - `cephfs/mds-ops-pretty.py` can resolve UIDs/GIDs through LDAP (with
     `--ldap-server` and `--ldap-base`), using `ldap3` or the `ldapsearch` CLI.
   - `backfillctl` and `external/upmap-remapped.py` use the `rados` Python
     bindings if available, and fall back to the `ceph` CLI otherwise
-    (slower; `upmap-remapped.py` then also needs `jq`).
+    (slower; `upmap-remapped.py` then also needs `jq`). These bindings come
+    from your distro's Ceph packages, not PyPI, so they're not in
+    `requirements.txt`.
 - `jq` for the `.sh` scripts.
 - A mounted CephFS for the CephFS tree tools, and `getfattr` for `cephfs/du`.
 

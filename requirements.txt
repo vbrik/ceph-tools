@@ -1,0 +1,5 @@
+# Optional runtime dependencies; see README's Requirements section.
+# Ceph's `rados` Python bindings are not listed here: they ship with your
+# distro's Ceph packages (e.g. python3-rados), not PyPI.
+python-dateutil  # cephfs/find-recent-rctime.py
+ldap3            # cephfs/mds-ops-pretty.py --ldap-server (optional; ldapsearch CLI also works)
