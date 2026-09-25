@@ -1,0 +1,19 @@
+# Coverage.py config; see README's Tests section for how to run it.
+
+[run]
+# "." reports untested top-level scripts and packages at 0%, but coverage
+# only descends into directories with an __init__.py, so cephfs/ is named too.
+source =
+    .
+    cephfs
+omit =
+    tests/*
+    external/*
+branch = true
+# Tests run commands as `python3 SCRIPT`; measure those child processes too.
+# Each process writes its own data file: `coverage combine` merges them.
+patch = subprocess
+parallel = true
+
+[report]
+skip_empty = true

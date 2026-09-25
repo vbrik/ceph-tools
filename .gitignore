@@ -1,0 +1,3 @@
+# coverage.py data (`coverage html` writes its own ignore into htmlcov/)
+.coverage
+.coverage.*

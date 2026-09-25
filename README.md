@@ -181,6 +181,20 @@ cluster captures in `tests/backfillctl/test-data/` (mostly real, anonymized)
 through `--load-state`. Each capture's `README.txt` documents its scenario
 and the expected result, which the tests check.
 
+### Coverage
+
+With [coverage.py](https://coverage.readthedocs.io/) 7.10 or later, run
+each group under `coverage`, then merge the results:
+
+```
+coverage run -m unittest discover -s tests/backfillctl
+coverage run -m unittest discover -s tests/cephfs
+coverage combine && coverage report    # or: coverage html
+```
+
+`.coveragerc` measures branches and the commands tests run as subprocesses.
+Scripts without tests count at 0% in the total. `external/` is not measured.
+
 ## License
 
 MIT (see `LICENSE`), except the unmodified third-party tools in `external/`:
