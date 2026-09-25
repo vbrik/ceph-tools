@@ -35,6 +35,7 @@ from _support import (
     pg_stat,
     placement,
     plan_from_state,
+    run_command,
     shared,
     upmap_pairs,
 )
@@ -1701,7 +1702,7 @@ class FixtureReplayTest(unittest.TestCase):
     """Replay the real-cluster snapshot in tests/backfillctl/test-data (see its README.txt)."""
 
     def replay(self, osd, *flags):
-        result = run_cli(*flags, "--osds", str(osd), load_state=str(FIXTURE))
+        result = run_command(cb, *flags, "--osds", osd, load_state=FIXTURE)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -1771,7 +1772,7 @@ class FixtureReplayTest(unittest.TestCase):
         one = pins(self.plan(896).cancellations) + pins(self.plan(74).cancellations)
         both = plan_from_state(cb, FIXTURE, "--osds", "896", "74")
         self.assertEqual(sorted(pins(both.cancellations)), sorted(one))
-        result = run_cli("--osds", "896", "74", load_state=str(FIXTURE))
+        result = run_command(cb, "--osds", "896", "74", load_state=FIXTURE)
         self.assertEqual(result.returncode, 0, result.stderr)
         err = flat(result.stderr)
         self.assertIn("osd.74 (host14) is at 90.7%, osd.896 (host51) at 81.1%.", err)
@@ -1860,7 +1861,7 @@ class ChainFixtureReplayTest(unittest.TestCase):
     while osd.579 still holds shard 8, which is going to osd.825."""
 
     def replay(self, *flags):
-        result = run_cli(*flags, "--osds", "891", load_state=str(FIXTURE))
+        result = run_command(cb, *flags, "--osds", "891", load_state=FIXTURE)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -1980,7 +1981,7 @@ class BlockerFixtureReplayTest(unittest.TestCase):
     with --pin-blockers -- this fixture is the reason the flag exists."""
 
     def replay(self, *flags):
-        result = run_cli(*flags, "--osds", "896", load_state=str(FIXTURE_BLOCKER))
+        result = run_command(cb, *flags, "--osds", "896", load_state=FIXTURE_BLOCKER)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 

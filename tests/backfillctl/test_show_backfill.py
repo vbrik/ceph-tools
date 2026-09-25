@@ -16,7 +16,16 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import NONE, TEST_DATA, FakeStore, parse_args, plan_from_state, shared
+from _support import (
+    NONE,
+    TEST_DATA,
+    FakeStore,
+    flat,
+    parse_args,
+    plan_from_state,
+    run_command,
+    shared,
+)
 
 from backfillctl import show_backfill as pm
 
@@ -413,13 +422,9 @@ class FixtureReplayTest(unittest.TestCase):
         )
 
     def test_approx_note_appears_for_the_capture_without_positions(self):
-        err = io.StringIO()
-        args = parse_args(pm, [], load_state=str(FIXTURE_STUCK_AT_100))
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-            pm.run(args)
+        result = run_command(pm, load_state=FIXTURE_STUCK_AT_100, check=True)
         self.assertIn(
-            "~ marks PROGRESS from Ceph's misplaced/degraded",
-            " ".join(err.getvalue().split()),
+            "~ marks PROGRESS from Ceph's misplaced/degraded", flat(result.stderr)
         )
 
     def test_resumed_backfills_show_their_real_progress(self):
@@ -440,11 +445,9 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertEqual({4: 9.9, 9: 97.7}, pcts)
 
     def test_no_approx_note_when_every_position_is_known(self):
-        out = io.StringIO()
-        args = parse_args(pm, [], load_state=str(FIXTURE_RESUMED))
-        with contextlib.redirect_stdout(out):
-            pm.run(args)
-        self.assertNotIn("~ marks PROGRESS", out.getvalue())
+        result = run_command(pm, load_state=FIXTURE_RESUMED, check=True)
+        self.assertIn("copy movement(s)", result.stderr)  # the notes were captured
+        self.assertNotIn("~ marks PROGRESS", flat(result.stderr))
 
 
 if __name__ == "__main__":

@@ -1,21 +1,26 @@
-"""Tests for backfillctl's dispatcher (__main__.py), run as a subprocess.
+"""Tests for backfillctl's dispatcher (__main__.py).
 
 What's covered here is what the per-subcommand tests can't see, because they
 build their own parsers (see _support.parse_args): the real top-level parser,
-and that --load-state works before or after the subcommand name.
+and that --load-state works before or after the subcommand name. Runs go
+through a subprocess, as a user's would; help text only needs the parser, so
+it is rendered in-process.
 """
 
 import argparse
+import contextlib
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from _support import REPO_ROOT, TEST_DATA
 
-from backfillctl.__main__ import _COMMAND_MODULES
+from backfillctl.__main__ import _COMMAND_MODULES, build_parser
 
 FIXTURE = TEST_DATA / "ceph1-backfills-stuck-at-100-pct"
 
@@ -32,13 +37,28 @@ def command_names() -> list[str]:
 REQUIRED_ARGS = {"show-pg-osds": ["1.0"], "drain": ["--osds", "0"]}
 
 
+def help_text(*argv: str) -> str:
+    """What 'backfillctl *argv --help' prints, 80 columns wide and uncolored."""
+    out = io.StringIO()
+    with (
+        mock.patch.dict(os.environ, {"COLUMNS": "80", "PYTHON_COLORS": "0"}),
+        contextlib.redirect_stdout(out),
+    ):
+        try:
+            build_parser().parse_args([*argv, "--help"])
+        except SystemExit as exc:
+            if exc.code != 0:
+                raise
+    return out.getvalue()
+
+
 def run_backfillctl(*argv: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(REPO_ROOT / "backfillctl"), *argv],
         capture_output=True,
         text=True,
         check=False,
-        # Plain help text even when the caller's shell sets FORCE_COLOR.
+        # Plain text even when the caller's shell sets FORCE_COLOR.
         env={k: v for k, v in os.environ.items() if k != "FORCE_COLOR"}
         | {"PYTHON_COLORS": "0"},
     )
@@ -80,12 +100,12 @@ class LoadStateTest(unittest.TestCase):
         self.assertEqual(different.stdout, "")
 
     def test_listed_in_top_level_and_subcommand_help(self):
-        self.assertIn("--load-state DIR", run_backfillctl("--help").stdout)
+        self.assertIn("--load-state DIR", help_text())
         for command in ("show-backfill", "cancel-backfill"):
             with self.subTest(command=command):
-                help_text = run_backfillctl(command, "--help").stdout
-                self.assertIn("[--load-state DIR]", help_text)
-                self.assertIn("--load-state DIR  ", help_text)  # the option list
+                text = help_text(command)
+                self.assertIn("[--load-state DIR]", text)
+                self.assertIn("--load-state DIR  ", text)  # the option list
 
     def test_save_state_rejects_it_without_touching_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,7 +161,7 @@ class TopLevelHelpTest(unittest.TestCase):
 
     def test_every_subcommand_is_described(self):
         """Each subcommand is listed in --help followed by a description."""
-        help_lines = run_backfillctl("--help").stdout.splitlines()
+        help_lines = help_text().splitlines()
         for name in self.COMMANDS:
             with self.subTest(command=name):
                 line = next(
@@ -151,12 +171,10 @@ class TopLevelHelpTest(unittest.TestCase):
                 self.assertTrue(line.removeprefix(name).strip(), f"{name}: no help")
 
     def test_every_subcommand_help_renders(self):
-        """-h works (no stray '%' in help text) and keeps paragraphs apart."""
+        """--help works (no stray '%' in help text) and keeps paragraphs apart."""
         for name in self.COMMANDS:
             with self.subTest(command=name):
-                result = run_backfillctl(name, "-h")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("\n\n", result.stdout.split("options:")[0].strip())
+                self.assertIn("\n\n", help_text(name).split("options:")[0].strip())
 
     def test_shared_options_have_one_help_text(self):
         """An option several subcommands take reads the same in each."""
@@ -177,7 +195,7 @@ class TopLevelHelpTest(unittest.TestCase):
 
         option_lists = {}
         for name in self.COMMANDS:
-            lines = run_backfillctl(name, "--help").stdout.splitlines()
+            lines = help_text(name).splitlines()
             option_lists[name] = lines[lines.index("options:") :]
         for option in ("--toofull-util", "--max-target-util", "--max-target-uses"):
             with self.subTest(option=option):
@@ -190,7 +208,7 @@ class TopLevelHelpTest(unittest.TestCase):
                 self.assertEqual(len(set(helps.values())), 1, helps)
 
     def test_cancel_backfill_usage_shows_pin_blockers_needs_osds(self):
-        usage = run_backfillctl("cancel-backfill", "-h").stdout
+        usage = help_text("cancel-backfill")
         self.assertIn("[--osds OSD [OSD ...] [--pin-blockers]]", usage)
 
 

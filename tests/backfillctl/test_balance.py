@@ -485,20 +485,27 @@ class FixtureInvariantTest(unittest.TestCase):
         "divert-toofull-osd263-existing-upmap-chain",
     ]
 
-    def run_traced(self, fixture):
+    @classmethod
+    def setUpClass(cls):
+        # Each replay takes about a second; the tests share them.
+        cls.traced = {fixture: cls.run_traced(fixture) for fixture in cls.FIXTURES}
+
+    @staticmethod
+    def run_traced(fixture):
         """Return (result, the class max after each move, in turn order)."""
         trace = []
+        sources = []
         commit = bal.Balancer.commit
 
         def traced(balancer, shard, state, target):
             commit(balancer, shard, state, target)
-            osds = [*balancer.targets, *self.sources]
+            osds = [*balancer.targets, *sources]
             trace.append(max(balancer.final.utilization(o) for o in osds))
 
         balance = bal.balance
 
         def capture(balancer, by_source, *a, **kw):
-            self.sources = list(by_source)
+            sources[:] = by_source
             return balance(balancer, by_source, *a, **kw)
 
         with (
@@ -511,8 +518,7 @@ class FixtureInvariantTest(unittest.TestCase):
     def test_invariants(self):
         for fixture in self.FIXTURES:
             with self.subTest(fixture):
-                result, trace = self.run_traced(fixture)
-                self.check(fixture, result, trace)
+                self.check(fixture, *self.traced[fixture])
 
     def check(self, fixture, result, trace):
         before = result.max_before[0]
@@ -555,7 +561,7 @@ class FixtureInvariantTest(unittest.TestCase):
 
     def test_every_move_lowers_the_max_on_a_busy_cluster(self):
         # Sources ranked by final projection: nothing but a source holds the max.
-        _, trace = self.run_traced("ceph1-resumed-backfills-exact-progress")
+        _, trace = self.traced["ceph1-resumed-backfills-exact-progress"]
         self.assertGreater(len(trace), 100)
         drops = sum(cur < prev for prev, cur in pairwise(trace))
         self.assertEqual(drops, len(trace) - 1)

@@ -27,13 +27,10 @@ import contextlib
 import io
 import json
 import math
-import os
 import pathlib
 import random
 import re
 import shutil
-import subprocess
-import sys
 import tempfile
 import unittest
 from collections import Counter
@@ -43,7 +40,6 @@ from _support import (
     KB,
     NONE,
     PCT,
-    REPO_ROOT,
     TEST_DATA,
     FakeStore,
     flat,
@@ -51,24 +47,11 @@ from _support import (
     parse_args,
     placement,
     plan_from_state,
+    run_command,
     shared,
 )
 
 from backfillctl import divert_toofull as dt
-
-
-def cli(state_dir) -> list[str]:
-    """Argv prefix that runs this subcommand as a subprocess on a saved state
-    (directory-execution form, works from any cwd); subcommand args follow.
-    """
-    return [
-        sys.executable,
-        str(REPO_ROOT / "backfillctl"),
-        "--load-state",
-        str(state_dir),
-        "divert-toofull",
-    ]
-
 
 # The column labels in order, as print_table's label line splits: the OSD/UTIL/
 # HOST triple of ACTING and UP, then TARGET's, which adds the projection.
@@ -644,12 +627,7 @@ class FixtureReplayTest(unittest.TestCase):
     """End-to-end --load-state runs: how run() prints what plan() decides."""
 
     def run_proc(self, fixture, *extra):
-        return subprocess.run(
-            [*cli(TEST_DATA / fixture)] + list(extra),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        return run_command(dt, *extra, load_state=TEST_DATA / fixture, check=True)
 
     def run_script(self, fixture, *extra):
         return self.run_proc(fixture, *extra).stdout.rstrip("\n")
@@ -744,17 +722,7 @@ class NothingToDivertTest(unittest.TestCase):
     def test_no_toofull_pg_among_pgs_says_so_and_prints_no_table(self):
         for extra, out_text in (([], ""), (["--pgremapper-mappings"], "[]\n")):
             with self.subTest(extra=extra):
-                proc = subprocess.run(
-                    [
-                        *cli(TEST_DATA / CEPH2_FIXTURE),
-                        "--pgs",
-                        "1.0",
-                        *extra,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                proc = run_ceph2("--pgs", "1.0", *extra)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(proc.stdout, out_text)
                 self.assertIn("No backfill_toofull PGs among --pgs.", proc.stderr)
@@ -784,12 +752,7 @@ class PrintPgsFilterTest(unittest.TestCase):
         fixture = TEST_DATA / "divert-toofull-osd263-existing-upmap-chain"
         for extra, shown in [((), False), (("--pgs", "19.zzz"), True)]:
             with self.subTest(extra=extra):
-                proc = subprocess.run(
-                    [*cli(fixture), *extra],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
+                proc = run_command(dt, *extra, load_state=fixture, check=True)
                 self.assertEqual("--pgs:" in proc.stderr, shown)
 
 
@@ -1354,17 +1317,9 @@ class AssignTargetsTest(unittest.TestCase):
         )
 
 
-def run_ceph2(*extra):
-    """Run the script on the cluster-sized fixture; return the CompletedProcess."""
-    return subprocess.run(
-        [
-            *cli(TEST_DATA / CEPH2_FIXTURE),
-            *extra,
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+def run_ceph2(*extra, check=True):
+    """Run divert-toofull on the cluster-sized fixture (see run_command)."""
+    return run_command(dt, *extra, load_state=TEST_DATA / CEPH2_FIXTURE, check=check)
 
 
 class Ceph2FixtureInvariantTest(unittest.TestCase):
@@ -1518,7 +1473,7 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
 
 
 class Ceph2FixtureOutputTest(unittest.TestCase):
-    """The cluster-sized capture run as a subprocess: CLI checks and output."""
+    """The cluster-sized capture run end to end: CLI checks and output."""
 
     @classmethod
     def setUpClass(cls):
@@ -1548,16 +1503,7 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
     def test_non_positive_limit_is_refused(self):
         for value in ("0", "-1", "many"):
             with self.subTest(value=value):
-                proc = subprocess.run(
-                    [
-                        *cli(TEST_DATA / CEPH2_FIXTURE),
-                        "--max-target-uses",
-                        value,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                proc = run_ceph2("--max-target-uses", value, check=False)
                 self.assertEqual(proc.returncode, 2)
                 self.assertIn("--max-target-uses", proc.stderr)
 
@@ -1573,16 +1519,7 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
         # 100 used to mean "no cap"; it must now fail rather than be honored.
         for value in ("91.1", "100"):
             with self.subTest(value=value):
-                proc = subprocess.run(
-                    [
-                        *cli(TEST_DATA / CEPH2_FIXTURE),
-                        "--max-target-util",
-                        value,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                proc = run_ceph2("--max-target-util", value, check=False)
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertEqual(proc.stdout, "")
                 self.assertIn("ERROR: max target utilization", proc.stderr)
@@ -1597,16 +1534,7 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
             ("0.89", "not a ratio like 0.85, got 0.89"),
         ):
             with self.subTest(value=value):
-                proc = subprocess.run(
-                    [
-                        *cli(TEST_DATA / CEPH2_FIXTURE),
-                        f"--max-target-util={value}",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    env=os.environ | {"PYTHON_COLORS": "0"},
-                )
+                proc = run_ceph2(f"--max-target-util={value}", check=False)
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertEqual(proc.stdout, "")
                 self.assertIn(message, " ".join(proc.stderr.split()))
@@ -1661,12 +1589,7 @@ class UnknownPoolTest(unittest.TestCase):
         # failures produce plausible-looking rows.
         with tempfile.TemporaryDirectory() as tmp:
             dst = copy_without_pool("divert-toofull-osd457-down", 19, tmp)
-            proc = subprocess.run(
-                [*cli(dst)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            proc = run_command(dt, load_state=dst)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("pool id(s) 19", proc.stderr)
         self.assertIn("does not list", proc.stderr)

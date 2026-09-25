@@ -15,9 +15,14 @@ effect, since an isort/ruff cleanup could otherwise reorder that import after
 """
 
 import argparse
+import contextlib
+import io
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BACKFILLCTL_DIR = REPO_ROOT / "backfillctl"
@@ -63,6 +68,7 @@ __all__ = [
     "placement",
     "plan_from_state",
     "real_query_backfill_positions",
+    "run_command",
     "shared",
     "upmap_pairs",
 ]
@@ -83,13 +89,59 @@ def parse_args(
     inferred from the single subparser the module registers. load_state, if
     given, is passed as the global --load-state, before the subcommand name.
     """
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(prog="backfillctl")
     shared.add_load_state_arg(parser)
     subparsers = parser.add_subparsers(dest="command")
     module.build_parser(subparsers)
     (name,) = subparsers.choices
     global_argv = ["--load-state", load_state] if load_state is not None else []
     return parser.parse_args([*global_argv, name, *argv])
+
+
+def run_command(
+    module, *argv, load_state: str | Path | None = None, check: bool = False
+) -> subprocess.CompletedProcess:
+    """Run a subcommand in-process and capture what it prints.
+
+    Stands in for running backfillctl as a subprocess, at a fraction of the
+    cost: argv is parsed as parse_args does, then module.run() is called. A
+    SystemExit becomes the return code, as the interpreter would make it (a
+    message goes to stderr, with code 1). Help and messages wrap at 80
+    columns, uncolored, as they would with piped output, and the first
+    stderr paragraph is the run's first (see messages.stderr_para), as in a
+    fresh process. check=True raises CalledProcessError on a non-zero code,
+    like subprocess.run.
+
+    Not covered, so left to subprocess tests: backfillctl's dispatcher
+    (__main__.py, which parse_args bypasses) and the interleaving of stdout
+    and stderr on a shared file descriptor.
+    """
+    argv = [str(a) for a in argv]
+    load_state = None if load_state is None else str(load_state)
+    out, err = io.StringIO(), io.StringIO()
+    env = {"COLUMNS": "80", "PYTHON_COLORS": "0"}
+    with (
+        mock.patch.dict(os.environ, env),
+        mock.patch.object(messages.stderr_para, "printed", False),
+        contextlib.redirect_stdout(out),
+        contextlib.redirect_stderr(err),
+    ):
+        try:
+            module.run(parse_args(module, argv, load_state=load_state))
+            code = 0
+        except SystemExit as exc:
+            match exc.code:
+                case None:
+                    code = 0
+                case int():
+                    code = exc.code
+                case _:
+                    print(exc.code, file=sys.stderr)
+                    code = 1
+    result = subprocess.CompletedProcess(argv, code, out.getvalue(), err.getvalue())
+    if check:
+        result.check_returncode()
+    return result
 
 
 def upmap_pairs(text: str) -> list[dict]:
