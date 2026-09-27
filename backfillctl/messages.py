@@ -247,28 +247,43 @@ def print_pin_footer(
 # Moves: balance, divert-toofull, drain
 # ---------------------------------------------------------------------------
 
-UNPLACEABLE_NOTE = (
-    "NOTE: targets ran out of room (--max-target-util, --max-target-uses), or "
-    "the greedy placement missed some. Apply these, let them finish, then re-run."
-)
 
+def unplaceable_note(limits: str) -> str:
+    """Say what to do about shards no target was found for.
 
-def targets_clause(
-    max_target_uses: int, max_target_util: float, backfillfull_pct: float
-) -> str:
-    """Return the limits every move target is held to, as a clause."""
+    limits names what held the targets back, e.g. '--max-target-util'.
+    """
     return (
-        f"up to --max-target-uses {max_target_uses} shard(s) each, projected at "
-        f"or below --max-target-util {max_target_util:g}% (backfillfull_ratio "
-        f"{backfillfull_pct:g}%)"
+        f"NOTE: targets ran out of room ({limits}), or the greedy placement "
+        "missed some. Apply these, let them finish, then re-run."
     )
 
 
-def print_unplaceable(shards: Iterable[tuple[str, "int | str", str]]) -> None:
+def targets_clause(
+    max_target_util: float,
+    backfillfull_pct: float,
+    max_target_uses: int | None = None,
+) -> str:
+    """Return the limits every move target is held to, as a clause."""
+    uses = (
+        ""
+        if max_target_uses is None
+        else f"up to --max-target-uses {max_target_uses} shard(s) each, "
+    )
+    return (
+        f"{uses}projected at or below --max-target-util {max_target_util:g}% "
+        f"(backfillfull_ratio {backfillfull_pct:g}%)"
+    )
+
+
+def print_unplaceable(
+    shards: Iterable[tuple[str, "int | str", str]],
+    limits: str = "--max-target-util, --max-target-uses",
+) -> None:
     """List on stderr the (pgid, shard, where) no target was found for, and what to do.
 
-    where says where the shard is moving, e.g. '(headed for osd.31)'. Prints
-    nothing if shards is empty.
+    where says where the shard is moving, e.g. '(headed for osd.31)'; limits,
+    as in unplaceable_note. Prints nothing if shards is empty.
     """
     items = [
         f"cannot place {pgid} shard {shard} {where}: no legal target"
@@ -276,4 +291,118 @@ def print_unplaceable(shards: Iterable[tuple[str, "int | str", str]]) -> None:
     ]
     if items:
         stderr_items(items)
-        stderr_para(UNPLACEABLE_NOTE)
+        stderr_para(unplaceable_note(limits))
+
+
+# ---------------------------------------------------------------------------
+# Shedding: drain, balance
+# ---------------------------------------------------------------------------
+
+# At most this many OSDs or PGs are named in one note, fullest or first
+# first; the rest are counted. An unreachable level can leave most of a
+# device class above it.
+MAX_NAMED = 10
+
+
+def named_list(items: list[str]) -> str:
+    """Join items, naming at most MAX_NAMED: 'a, b, c, and 7 more'."""
+    more = len(items) - MAX_NAMED
+    return ", ".join(items[:MAX_NAMED]) + (f", and {more} more" if more > 0 else "")
+
+
+def level_text(level: float) -> str:
+    """Format a level: '55%', '72.25%', '52.35%' (at most two decimals)."""
+    return f"{level:.2f}".rstrip("0").rstrip(".") + "%"
+
+
+def left_alone_clause(unsettled: int, chained: int) -> str:
+    """Return a sentence counting the PGs left alone, or '' if none were."""
+    if not unsettled and not chained:
+        return ""
+    return (
+        f" PGs left alone: {unsettled} not active, or degraded, undersized, "
+        "recovering or peering (re-run once they settle); "
+        f"{chained} whose upmap pairs chain (A->B, B->C), which pgremapper "
+        "would break."
+    )
+
+
+def blockers_clause(nearfull_pct: float) -> str:
+    """Return a sentence saying which shards count as blockers."""
+    return (
+        "Blockers: other shards of a PG heading for an OSD projected at or over "
+        "backfillfull_ratio or, if the PG is backfill_toofull now, onto an OSD "
+        f"at or above nearfull_ratio {nearfull_pct:g}%."
+    )
+
+
+def print_shed_outcome(
+    off: str,
+    moved: int,
+    moved_bytes: int,
+    unplaceable: int,
+    kept: int | None,
+    diverted: int,
+    pinned: int,
+    stuck: list[str],
+    unexplained: list[str],
+) -> None:
+    """Sum up on stderr the moves off the sources (off names them).
+
+    kept: shards left on a source below the level; None without a level.
+    stuck and unexplained: PGs that will stay backfill_toofull.
+    """
+
+    def pg_list(pgids: list[str]) -> str:
+        return f"{len(pgids)} ({', '.join(pgids)})" if pgids else "0"
+
+    left = (
+        "" if kept is None else f", {kept} left in place (their OSD is below the level)"
+    )
+    stderr_para(
+        f"Proposed {moved} move(s) off {off}, {format_bytes(moved_bytes)}, "
+        f"{unplaceable} unplaceable{left}; {diverted} blocking shard(s) diverted, "
+        f"{pinned} pinned back. PGs that will stay backfill_toofull: "
+        f"{pg_list(stuck)}; for an unidentified reason: {pg_list(unexplained)}"
+        + (". Their NOTE (JSON: 'note') says why." if stuck or unexplained else ".")
+    )
+
+
+def print_still_above(which: str, level: float, above: list[tuple[int, float]]) -> None:
+    """Name on stderr the OSDs (which, e.g. 'source(s)') projected to stay at or
+    above level, fullest first; above is (OSD, utilization). Prints nothing if
+    it is empty.
+    """
+    if above:
+        fullest = sorted(above, key=lambda ou: (-ou[1], ou[0]))
+        named = named_list([f"osd.{o} ({u:.1f}%)" for o, u in fullest])
+        stderr_para(
+            f"{len(above)} {which} projected to stay at or above the "
+            f"{level_text(level)} level: {named}."
+        )
+
+
+def print_level_unplaceable(count: int, guards: str) -> None:
+    """Say on stderr what to do about count shards no target was found for,
+    with a level; guards says what a target had to end up below.
+    """
+    if count:
+        stderr_para(
+            f"NOTE: {count} shard(s) found no target at or below --max-target-util "
+            f"that would end up below {guards}. Apply these, let them finish, "
+            "then re-run; if little moves, the level is out of reach."
+        )
+
+
+def print_stalled(pgids: list[str]) -> None:
+    """Name on stderr the PGs a run leaves in backfill_toofull as they were.
+
+    Each has a shard backfilling onto a source that Ceph refuses, and no
+    proposed move to hold up. Prints nothing if pgids is empty.
+    """
+    if pgids:
+        stderr_para(
+            f"NOTE: {len(pgids)} PG(s) have a shard backfilling onto a source "
+            "that Ceph refuses (backfill_toofull), left as it is: "
+            f"{named_list(pgids)}. See divert-toofull or cancel-backfill."
+        )

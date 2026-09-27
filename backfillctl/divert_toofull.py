@@ -52,7 +52,8 @@ from placement import (
     ArrivingShard,
     FullRatios,
     ProjectedUsage,
-    add_target_args,
+    add_max_target_uses_arg,
+    add_max_target_util_arg,
     add_toofull_util_arg,
     build_candidate_osds,
     ec_pool_ids_from,
@@ -135,7 +136,8 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         formatter_class=HelpFormatter,
     )
     add_toofull_util_arg(parser)
-    add_target_args(parser)
+    add_max_target_util_arg(parser)
+    add_max_target_uses_arg(parser)
     parser.add_argument(
         "--pgs",
         nargs="+",
@@ -525,7 +527,7 @@ def render(result: DivertResult, args: argparse.Namespace) -> None:
     stderr_para(
         "Targets: "
         + targets_clause(
-            args.max_target_uses, max_target_util, result.ratios.backfillfull
+            max_target_util, result.ratios.backfillfull, args.max_target_uses
         )
         + ". Candidates "
         f"under that now / in all, per device class: {by_class or 'none'}."

@@ -250,7 +250,7 @@ class TopLevelHelpTest(unittest.TestCase):
         for name in self.COMMANDS:
             lines = help_text(name).splitlines()
             option_lists[name] = lines[lines.index("options:") :]
-        for option in ("--toofull-util", "--max-target-util", "--max-target-uses"):
+        for option in ("--max-target-util", "--until-util"):
             with self.subTest(option=option):
                 helps = {
                     name: text

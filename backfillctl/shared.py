@@ -1366,24 +1366,31 @@ class ChainResolution(NamedTuple):
     chained: dict[str, list[Pair]]  # pgid: full upmap entry (see avoid_chains)
 
 
-def fold_pins(
-    existing: list[Pair], pins: list[Cancellation]
+def fold_pairs(
+    existing: list[Pair], pairs: list[Pair]
 ) -> tuple[list[Pair], list[Pair]]:
-    """Return (untouched existing pairs, each pin's effective pair).
+    """Return (untouched existing pairs, each new pair's effective pair).
 
-    Like pgremapper, a pin X->Y where an existing pair A->X put X in 'up'
-    rewrites that pair to A->Y: the same up set, and no chain.
+    Like pgremapper, a new pair X->Y where an existing pair A->X put X in
+    'up' rewrites that pair to A->Y: the same up set, and no chain.
     """
     rest = list(existing)
     effective = []
-    for c in pins:
-        folded = next((p for p in rest if p[1] == c.up_osd), None)
+    for from_osd, to_osd in pairs:
+        folded = next((p for p in rest if p[1] == from_osd), None)
         if folded is None:
-            effective.append((c.up_osd, c.acting_osd))
+            effective.append((from_osd, to_osd))
         else:
             rest.remove(folded)
-            effective.append((folded[0], c.acting_osd))
+            effective.append((folded[0], to_osd))
     return rest, effective
+
+
+def fold_pins(
+    existing: list[Pair], pins: list[Cancellation]
+) -> tuple[list[Pair], list[Pair]]:
+    """fold_pairs for pins: each pin's pair is up_osd->acting_osd."""
+    return fold_pairs(existing, [(c.up_osd, c.acting_osd) for c in pins])
 
 
 def chain_link(pairs: list[Pair]) -> tuple[Pair, Pair] | None:

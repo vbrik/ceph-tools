@@ -185,9 +185,15 @@ class PinFooterTest(unittest.TestCase):
 class PlacementTextTest(unittest.TestCase):
     def test_targets_clause(self):
         self.assertEqual(
-            messages.targets_clause(5, 90.0, 91.5),
+            messages.targets_clause(90.0, 91.5, 5),
             "up to --max-target-uses 5 shard(s) each, projected at or below "
             "--max-target-util 90% (backfillfull_ratio 91.5%)",
+        )
+
+    def test_targets_clause_without_a_use_cap(self):
+        self.assertEqual(
+            messages.targets_clause(90.0, 91.5),
+            "projected at or below --max-target-util 90% (backfillfull_ratio 91.5%)",
         )
 
     def test_unplaceable_items_then_the_caveat(self):
@@ -199,11 +205,98 @@ class PlacementTextTest(unittest.TestCase):
             text,
             "cannot place 19.1 shard 3 (headed for osd.31): no legal target "
             "cannot place 7.2 shard - off osd.4: no legal target "
-            + flat(messages.UNPLACEABLE_NOTE),
+            + flat(messages.unplaceable_note("--max-target-util, --max-target-uses")),
         )
+
+    def test_unplaceable_note_names_the_limits_given(self):
+        text = stderr_of(
+            messages.print_unplaceable,
+            iter([("7.2", "-", "off osd.4")]),
+            "--max-target-util",
+        )
+        self.assertIn("ran out of room (--max-target-util), or", text)
 
     def test_nothing_when_everything_is_placed(self):
         self.assertEqual(stderr_of(messages.print_unplaceable, iter([])), "")
+
+
+class ShedTextTest(unittest.TestCase):
+    def test_level_text(self):
+        self.assertEqual(messages.level_text(55.0), "55%")
+        self.assertEqual(messages.level_text(72.25), "72.25%")
+        self.assertEqual(messages.level_text(52.34567), "52.35%")
+
+    def test_named_list_caps_and_counts(self):
+        self.assertEqual(messages.named_list(["a", "b"]), "a, b")
+        items = [str(i) for i in range(messages.MAX_NAMED + 3)]
+        self.assertTrue(messages.named_list(items).endswith(", 9, and 3 more"))
+
+    def test_left_alone_clause(self):
+        self.assertEqual(messages.left_alone_clause(0, 0), "")
+        self.assertEqual(
+            messages.left_alone_clause(1, 2),
+            " PGs left alone: 1 not active, or degraded, undersized, recovering "
+            "or peering (re-run once they settle); 2 whose upmap pairs chain "
+            "(A->B, B->C), which pgremapper would break.",
+        )
+
+    def test_shed_outcome(self):
+        text = stderr_of(
+            messages.print_shed_outcome,
+            "the sources",
+            2,
+            3 * 1024**2,
+            1,
+            4,
+            0,
+            1,
+            [],
+            ["1.2"],
+        )
+        self.assertEqual(
+            text,
+            "Proposed 2 move(s) off the sources, 3.0 MiB, 1 unplaceable, 4 left in "
+            "place (their OSD is below the level); 0 blocking shard(s) diverted, 1 "
+            "pinned back. PGs that will stay backfill_toofull: 0; for an "
+            "unidentified reason: 1 (1.2). Their NOTE (JSON: 'note') says why.",
+        )
+        text = stderr_of(messages.print_shed_outcome, "x", 0, 0, 0, None, 0, 0, [], [])
+        self.assertNotIn("left in place", text)
+        self.assertTrue(text.endswith("for an unidentified reason: 0."), text)
+
+    def test_still_above_names_the_fullest_and_counts_the_rest(self):
+        above = [(o, 80.0 + o) for o in range(12)]
+        text = stderr_of(messages.print_still_above, "source(s)", 60.0, above)
+        self.assertTrue(
+            text.startswith(
+                "12 source(s) projected to stay at or above the 60% level: "
+                "osd.11 (91.0%), osd.10 (90.0%), osd.9 (89.0%),"
+            ),
+            text,
+        )
+        self.assertTrue(text.endswith("osd.2 (82.0%), and 2 more."), text)
+        self.assertEqual(stderr_of(messages.print_still_above, "x", 60.0, []), "")
+
+    def test_level_unplaceable(self):
+        text = stderr_of(messages.print_level_unplaceable, 3, "their source")
+        self.assertTrue(
+            text.startswith(
+                "NOTE: 3 shard(s) found no target at or below --max-target-util "
+                "that would end up below their source."
+            ),
+            text,
+        )
+        self.assertEqual(stderr_of(messages.print_level_unplaceable, 0, "x"), "")
+
+    def test_stalled(self):
+        text = stderr_of(messages.print_stalled, ["1.0", "2.a"])
+        self.assertEqual(
+            text,
+            "NOTE: 2 PG(s) have a shard backfilling onto a source that Ceph "
+            "refuses (backfill_toofull), left as it is: 1.0, 2.a. See "
+            "divert-toofull or cancel-backfill.",
+        )
+        self.assertEqual(stderr_of(messages.print_stalled, []), "")
 
 
 if __name__ == "__main__":

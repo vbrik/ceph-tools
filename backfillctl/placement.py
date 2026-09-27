@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Choosing target OSDs for shards; shared by divert-toofull, drain and balance.
+"""Choosing target OSDs for shards; shared by divert-toofull and shed (drain, balance).
 
 A target is the legal OSD of the shard's device class with the lowest
-projected utilization (pick_target, ProjectedUsage; balance ranks its own).
-Also: finding shards in motion or on given OSDs, where each OSD ends up
+projected utilization (pick_target): what it will reserve (ProjectedUsage),
+or, for shed, where it ends up (FinalUsage). Also: finding shards in motion or on given OSDs, where each OSD ends up
 (FinalUsage), tracking a PG's up set as moves are proposed (PgPlacement),
 and the cluster's full ratios.
 """
@@ -45,11 +45,10 @@ def positive_int(text: str) -> int:
 
 
 def add_toofull_util_arg(parser: argparse.ArgumentParser):
-    """Add --toofull-util, shared by divert-toofull and drain.
+    """Add --toofull-util (divert-toofull).
 
-    Ceph reports backfill_toofull per PG, not per shard, so both guess
-    which shard was refused the same way; each says in its help what it
-    then does with that shard.
+    Ceph reports backfill_toofull per PG, not per shard, so this guesses
+    which shard was refused; shed makes the same guess at nearfull_ratio.
     """
     parser.add_argument(
         "--toofull-util",
@@ -65,8 +64,8 @@ def resolve_toofull_util(given: float | None, ratios: "FullRatios") -> float:
     return ratios.nearfull if given is None else given
 
 
-def add_target_args(parser: argparse.ArgumentParser):
-    """Add --max-target-util and --max-target-uses."""
+def add_max_target_util_arg(parser: argparse.ArgumentParser):
+    """Add --max-target-util (see resolve_max_target_util)."""
     parser.add_argument(
         "--max-target-util",
         type=shared.utilization_pct,
@@ -74,6 +73,10 @@ def add_target_args(parser: argparse.ArgumentParser):
         help="Cap on a target's projected utilization (default: "
         "backfillfull_ratio - 1; at most backfillfull_ratio).",
     )
+
+
+def add_max_target_uses_arg(parser: argparse.ArgumentParser):
+    """Add --max-target-uses (divert-toofull)."""
     parser.add_argument(
         "--max-target-uses",
         type=positive_int,
@@ -367,7 +370,7 @@ class FinalUsage:
     """What each OSD will hold once every backfill in motion and every move completes.
 
     Unlike ProjectedUsage, data leaving an OSD is credited: this is where an
-    OSD ends up (balance's ranking, drain's --until-util). Target caps still
+    OSD ends up (shed's ranking and levels). Target caps still
     use ProjectedUsage, since Ceph checks a target when reserving the
     backfill, before the source frees any space.
     """
@@ -394,6 +397,18 @@ class FinalUsage:
     def utilization(self, osd_id: int, extra_bytes: int = 0) -> float:
         """Return the OSD's final utilization (percent) with extra_bytes more."""
         return (self._used[osd_id] + extra_bytes) / self._capacity[osd_id] * 100
+
+    def mean_utilization(self, osd_ids: Iterable[int]) -> float:
+        """Return the final utilization (percent) of osd_ids taken together.
+
+        Capacity-weighted: what each would be at if the data were spread
+        evenly. OSDs without a capacity figure are left out; exits if none has one.
+        """
+        known = [o for o in osd_ids if o in self._used]
+        if not known:
+            sys.exit("ERROR: no OSD with a size in 'ceph osd df' to average over.")
+        used = sum(self._used[o] for o in known)
+        return used / sum(self._capacity[o] for o in known) * 100
 
     def move(self, from_osd: int, to_osd: int, size_bytes: int) -> None:
         """Record that size_bytes will end up on to_osd instead of from_osd.
@@ -456,20 +471,25 @@ def pick_target(
     osd_host: dict[int, str],
     osd_df: dict[int, dict],
     projection: ProjectedUsage,
-    uses: Counter[int],
-    max_uses: int,
     max_target_util: float,
+    uses: Counter[int] | None = None,
+    max_uses: int | None = None,
     below_util: float | None = None,
+    final: FinalUsage | None = None,
+    final_below: float | None = None,
 ) -> tuple[float, int] | None:
     """Return (projected utilization, OSD) of the best legal target, or None.
 
     pool: candidates of the shard's class, least-utilized first
     (build_candidate_osds). Legal: host and OSD not forbidden, used fewer
-    than max_uses times, currently below below_util (if given), and
-    projected at or below max_target_util with the shard added. Lowest
-    projection wins, then lowest id.
+    than max_uses times (if given), currently below below_util (if given),
+    and projected at or below max_target_util with the shard added.
 
-    Records nothing; the caller updates projection and uses.
+    The projection returned and ranked by is projection's, or, with final,
+    final's (where the target ends up), which must then be below
+    final_below (if given). Lowest wins, then lowest id.
+
+    Records nothing; the caller updates the projections and uses.
     """
     legal = []
     for candidate in pool:
@@ -481,12 +501,16 @@ def pick_target(
             continue
         if candidate in forbidden_osds:
             continue
-        if uses[candidate] >= max_uses:
+        if max_uses is not None and uses is not None and uses[candidate] >= max_uses:
             continue
         if below_util is not None and util >= below_util:
             continue
         projected = projection.utilization_after(candidate, size_bytes)
         if projected > max_target_util:
             continue
+        if final is not None:
+            projected = final.utilization(candidate, size_bytes)
+            if final_below is not None and projected >= final_below:
+                continue
         legal.append((projected, candidate))
     return min(legal) if legal else None

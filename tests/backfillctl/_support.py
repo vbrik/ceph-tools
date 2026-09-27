@@ -6,7 +6,7 @@ backfillctl/'s own directory is put on sys.path here too (the same thing
 backfillctl/__init__.py does when the package is imported, and what running
 it directly relies on), so a bare `import shared` below -- and the command
 modules' own `import shared` / `from shared import ...` -- resolve to the
-exact same module object (and likewise `placement`). That identity matters: tests that
+exact same module object (and likewise `placement` and `shed`). That identity matters: tests that
 mock.patch.object(shared, ...) need to be patching the module the code under
 test actually calls, not a separate `backfillctl.shared` copy. This is set up
 with an explicit sys.path.insert rather than an `import backfillctl` side
@@ -35,6 +35,7 @@ for path in (REPO_ROOT, BACKFILLCTL_DIR):
 import messages
 import placement
 import shared
+import shed
 
 # A live (non --load-state) run queries each shown PG's backfill position
 # with 'ceph pg query', over librados or the ceph CLI. No test may reach a real
@@ -61,6 +62,9 @@ __all__ = [
     "TEST_DATA",
     "FakeStore",
     "SyntheticCluster",
+    "check_own_moves_in_or_out",
+    "check_pairs_apply",
+    "check_reservation_cap",
     "flat",
     "messages",
     "osd_df_of",
@@ -71,6 +75,7 @@ __all__ = [
     "real_query_backfill_positions",
     "run_command",
     "shared",
+    "shed",
     "upmap_pairs",
 ]
 
@@ -354,3 +359,65 @@ class SyntheticCluster:
         if argv and not argv[0].startswith("--"):
             argv.insert(0, "--osds")
         return module.plan(parse_args(module, argv), FakeStore(self.snapshots()))
+
+
+def check_own_moves_in_or_out(test, result: "shed.ShedResult") -> None:
+    """Check, via test's asserts, that a run's moves take data off an OSD or
+    put data on it, never both.
+
+    Data leaves an OSD when a resident shard moves off it; a pin moves none.
+    """
+    pins = {m for m in result.moves if m.target_osd == m.acting_osd}
+    onto = {m.target_osd for m in result.moves if m not in pins}
+    off = {m.up_osd for m in result.moves if m.acting_osd == m.up_osd}
+    test.assertFalse(onto & off)
+    test.assertFalse(onto & set(result.sources))
+
+
+def replayed_cluster(fixture_dir: str | Path) -> "shed.Cluster":
+    """A fresh shed.Cluster of a capture, as a run starts from."""
+    store = shared.SnapshotStore(shed.SNAPSHOT_COMMANDS, load_dir=Path(fixture_dir))
+    return shed.Cluster(store, None)
+
+
+def check_pairs_apply(test, fixture_dir: str | Path, result: "shed.ShedResult") -> None:
+    """Check, via test's asserts, that pgremapper can apply each PG's pairs.
+
+    After folding into the PG's existing pairs (shared.fold_pairs), none may
+    chain; an existing pair whose 'from' is still in 'up' is stale.
+    """
+    cluster = replayed_cluster(fixture_dir)
+    pgs = {pg["pgid"]: pg for pg in cluster.pgs}
+    by_pg: dict[str, list] = {}
+    for m in result.moves:
+        by_pg.setdefault(m.pgid, []).append((m.up_osd, m.target_osd))
+    for pgid, ours in by_pg.items():
+        pg = pgs[pgid]
+        existing = [p for p in cluster.existing_pairs(pg) if p[0] not in pg["up"]]
+        rest, effective = shared.fold_pairs(existing, ours)
+        test.assertIsNone(shared.chain_link(rest + effective), pgid)
+
+
+def check_reservation_cap(
+    test, fixture_dir: str | Path, result: "shed.ShedResult"
+) -> None:
+    """Check, via test's asserts, that no target is reserved over the cap.
+
+    Replays the moves on the arrivals-only projection the cap applies to:
+    Ceph checks it when reserving the backfill, before any data leaves.
+    """
+    reservation = replayed_cluster(fixture_dir).reservation
+    for m in result.moves:
+        shard = placement.ArrivingShard(
+            m.pgid, m.shard, m.up_osd, m.acting_osd, [], m.size_bytes
+        )
+        if shed.is_pin(m):
+            reservation.cancel(shard)
+        elif m.acting_osd == m.up_osd:
+            reservation.add(m.target_osd, m.size_bytes)
+        else:
+            reservation.redirect(shard, m.target_osd)
+    for m in result.moves:
+        if not shed.is_pin(m):
+            util = reservation.utilization_after(m.target_osd, 0)
+            test.assertLessEqual(util, result.max_target_util + 1e-9, m)

@@ -49,9 +49,20 @@ Apply the proposals with `--pgremapper-mappings` and
 [pgremapper](https://github.com/digitalocean/pgremapper)'s `import-mappings`,
 which adds to a PG's existing upmap pairs. `ceph osd pg-upmap-items` replaces
 them all. The remapping commands assume the CRUSH failure domain is `host`.
-Entries from the cancel commands and `drain` also carry the table's `shard`,
-`role` (requested, companion, blocker) and `note`, for pruning with `jq`;
-pgremapper ignores them.
+Entries from the cancel commands, `drain` and `balance` also carry the
+table's `shard`, `role` (requested, companion, blocker) and `note`, for
+pruning with `jq`; pgremapper ignores them.
+
+`drain` and `balance` plan the same way. The fullest source OSD goes first,
+largest shard first, to the legal target that ends up least full. Their moves
+only take data off sources and put it on other OSDs. Backfills already in
+motion count in the projections, which treat them and every proposal as done,
+crediting data leaving an OSD. With a level, a target must also end up below
+the OSD it relieves, so no move raises the maximum (a blocker pinned back
+keeps its data where it is); in `balance`, also below the level. Both commands leave alone PGs that are
+degraded, undersized, recovering or peering, and PGs whose existing upmap
+pairs chain. Shards that would hold a moved PG in `backfill_toofull` are
+diverted or pinned back, including shards arriving on a source.
 
 pgremapper cannot apply chained pairs (A->B, B->C), which cancelling some EC
 backfills needs. The cancel commands leave such backfills running, and print
@@ -63,8 +74,8 @@ backfills needs. The cancel commands leave such backfills running, and print
 | `measure-rate [--interval SECONDS]` | How fast backfill destinations (UP OSDs) receive data: each copy's RATE (objects/s, MiB/s) and ETA, from two samples at least `--interval` (30) seconds apart; then the rates per destination OSD and host, and the total. Tables sort by destination host (`ceph1-2` before `ceph1-10`), OSD, PG and shard; `--sort-by` `obj/s` or `mib/s` puts the fastest first in all three, `progress` or `eta` the furthest along or soonest done copies. `--osds`/`--hosts` match the destination; `--pgs` as in `show-backfill`. `--save-state DIR` saves both samples for `--load-state DIR`. |
 | `show-pg-osds PGID...` | Acting and up OSDs of given PGs, per shard, with utilization, host, progress and upmap pairs. |
 | `divert-toofull` | Re-target shards stuck in `backfill_toofull` to the least-utilized legal OSDs, e.g. after an OSD failure piles its data onto its host's other OSDs. |
-| `drain --osds OSD... \| --hosts HOST... [--until-util PCT]` | Move every shard off OSDs or hosts, spread across the cluster rather than onto the same host; with `--until-util`, only until each OSD's projected utilization, crediting data leaving it, is below PCT. Also diverts or pins back shards that would hold the moved ones in `backfill_toofull`. Keep the OSDs up and in until empty (with `--until-util`, for as long as the upmaps should hold): marking them out voids the upmaps. |
-| `balance [--class CLASS] [--osds OSD... \| --min-source-util PCT]` | Lower a device class's highest OSD utilization by moving shards off the fullest OSDs onto the emptiest, without filling any target past its source. Stops once the maximum can't go lower (not a full balancer); `--max-moves` limits the batch. Turn off the upmap balancer while the backfills run. |
+| `drain --osds OSD... \| --hosts HOST... [--until-util PCT]` | Move every shard off OSDs or hosts, spread across the cluster rather than onto the same host; with `--until-util`, only until each OSD is projected below PCT. Keep the OSDs up and in until empty (with `--until-util`, for as long as the upmaps should hold): marking them out voids the upmaps. |
+| `balance [--class CLASS] [--osds OSD...] [--until-util PCT \| --max-deviation POINTS]` | Move shards off a device class's fullest OSDs onto the emptiest, until each is projected below a level: `--until-util`, or the class mean plus `--max-deviation` (2) points. Stderr names the OSDs left above it; apply, let the backfills finish, and re-run for more. Turn off the upmap balancer while the backfills run. |
 | `cancel-backfill [--osds OSD... [--pin-blockers]]` | Cancel backfills by pinning shards to where their data is: all of them, or those into given full OSDs to make room for others. |
 | `cancel-uphill` | Cancel backfills that move data to a more-utilized OSD. |
 | `save-state DIR` | Capture the cluster state the other commands read, anonymized, for replay with `--load-state DIR`, before or after the command. `measure-rate` saves its own. |
