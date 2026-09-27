@@ -24,6 +24,7 @@ from _support import (
     FakeStore,
     SyntheticCluster,
     parse_args,
+    placement,
     shared,
     upmap_pairs,
 )
@@ -447,6 +448,195 @@ class HostsTest(unittest.TestCase):
             self.assertEqual(cm.exception.code, 2)
 
 
+class UntilUtilTest(unittest.TestCase):
+    """--until-util: an OSD sheds shards while its final projection, with
+    departures credited, is at or above the level."""
+
+    def test_osd_stops_shedding_once_below_the_level(self):
+        # Largest first: 60 - 5 = 55% is not below 55, so the 4% shard goes
+        # too (51%); the 3% shard stays.
+        c = Cluster()
+        c.util[0] = 60.0
+        c.pg("1.0", [0, 10, 20], shard_pct=3)
+        c.pg("1.1", [0, 10, 20], shard_pct=5)
+        c.pg("1.2", [0, 10, 20], shard_pct=4)
+        result = c.plan(0, "--until-util", 55)
+        self.assertEqual([m.pgid for m in result.moves], ["1.1", "1.2"])
+        self.assertEqual((result.evacuee_count, result.kept_count), (3, 1))
+        self.assertEqual(result.unplaceable, [])
+        self.assertEqual(result.still_above, [])
+        self.assertEqual(result.until_util, 55.0)
+
+    def test_osd_already_below_the_level_sheds_nothing(self):
+        result = Cluster().pg("1.0", [0, 10, 20]).plan(0, "--until-util", 60)
+        self.assertEqual(result.moves, [])
+        self.assertEqual((result.evacuee_count, result.kept_count), (1, 1))
+
+    def test_each_drained_osd_stops_on_its_own(self):
+        c = Cluster()
+        c.util[0] = 60.0  # above; osd.10 stays at 50%, below
+        c.pg("1.0", [0, 20, 30]).pg("1.1", [10, 21, 31])
+        result = c.plan(0, 10, "--until-util", 55)
+        self.assertEqual([m.up_osd for m in result.moves], [0])
+        self.assertEqual(result.kept_count, 1)
+
+    def test_replicated_evacuee_is_credited_too(self):
+        c = Cluster()
+        c.util[0] = 56.0
+        c.pg("2.0", [0, 10, 20], shard_pct=2).pg("2.1", [0, 11, 21], shard_pct=1)
+        result = c.plan(0, "--until-util", 55)
+        self.assertEqual(pairs(result)[0][:3], ("2.0", "-", 0))
+        self.assertEqual(len(result.moves), 1)
+
+    def test_data_already_leaving_is_credited(self):
+        c = Cluster()
+        c.util[0] = 60.0
+        c.pg("1.9", [41, 11, 21], [0, 11, 21], shard_pct=6)  # 54% once done
+        c.pg("1.0", [0, 10, 20])
+        result = c.plan(0, "--until-util", 55)
+        self.assertEqual(result.moves, [])
+        self.assertEqual(result.kept_count, 1)
+
+    def test_shard_arriving_on_a_drained_osd_counts_towards_it(self):
+        c = Cluster()
+        c.util[0] = 54.5  # + 1% arriving: 55.5%, at or above 55
+        c.pg("1.0", [0, 10, 20], [41, 10, 20])
+        self.assertEqual(len(c.plan(0, "--until-util", 55).moves), 1)
+        c.util[0] = 53.5  # 54.5% with it: below, so it keeps arriving
+        self.assertEqual(c.plan(0, "--until-util", 55).moves, [])
+
+    def test_arriving_shard_ceph_would_refuse_moves_despite_the_level(self):
+        # osd.0 ends at 80.5% once 1.9 leaves, below 85, but reserving
+        # 1.0's backfill sees 90.5%, over backfillfull_ratio.
+        c = Cluster()
+        c.util[0] = 89.5
+        c.pg("1.9", [41, 11, 21], [0, 11, 21], shard_pct=10)
+        c.pg("1.0", [0, 10, 20], [31, 10, 20])
+        result = c.plan(0, "--until-util", 85)
+        self.assertEqual(pairs(result)[0][:3], ("1.0", 0, 0))
+        self.assertEqual(result.kept_count, 0)
+        self.assertEqual(
+            result.moves[0].note,
+            "below --until-util, but osd.0 projected at 90.5%, at or over "
+            "backfillfull_ratio, which would stall the PG",
+        )
+
+    def test_resident_shard_is_kept_however_full_its_osd(self):
+        # No backfill onto osd.0 to refuse: the data is already there.
+        c = Cluster()
+        c.util[0] = 95.0
+        c.pg("1.9", [41, 11, 21], [0, 11, 21], shard_pct=20)
+        c.pg("1.0", [0, 10, 20])
+        self.assertEqual(c.plan(0, "--until-util", 85).kept_count, 1)
+
+    def test_kept_shard_pinned_as_a_companion_is_not_counted_kept(self):
+        # As in BlockerTest's companion case: pinning blocker shard 1 back to
+        # osd.21 needs shard 2, kept on drained osd.20, pinned back to osd.11.
+        c = Cluster(default_util=95.0)
+        c.util[0] = 70.0
+        c.util[1] = 10.0
+        c.util[20] = 50.0
+        result = c.pg("1.0", [0, 10, 20], [0, 21, 11]).plan(0, 20, "--until-util", 60)
+        self.assertIn(("1.0", 2, 20, 11), pairs(result))
+        self.assertEqual(result.kept_count, 0)
+
+    def test_pin_back_onto_a_drained_osd_below_the_level_is_allowed(self):
+        # As in BlockerTest: shard 1 is leaving drained osd.20 for full
+        # osd.10. osd.20 ends at 49%, 50% with the shard pinned back.
+        c = Cluster(default_util=95.0)
+        c.util[1] = 10.0
+        c.util[20] = 50.0
+        c.pg("1.0", [0, 10, 30], [0, 20, 30])
+        result = c.plan(0, 20, "--until-util", 60)
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 1), ("1.0", 1, 10, 20)])
+        self.assertEqual(result.stuck_pgs, [])
+
+    def test_pin_back_that_would_reach_the_level_is_refused(self):
+        c = Cluster(default_util=95.0)
+        c.util[1] = 10.0
+        c.util[20] = 59.5  # 58.5% once the shard leaves, 59.5% if pinned
+        c.pg("1.0", [0, 10, 30], [0, 20, 30])
+        self.assertEqual(c.plan(0, 20, "--until-util", 59).stuck_pgs, ["1.0"])
+        self.assertEqual(c.plan(0, 20, "--until-util", 60).stuck_pgs, [])
+
+    def test_osd_left_above_the_level_is_reported(self):
+        c = Cluster(default_util=95.0)  # no room anywhere
+        c.util[0] = 70.0
+        result = c.pg("1.0", [0, 10, 20]).plan(0, "--until-util", 60)
+        self.assertEqual(len(result.unplaceable), 1)
+        self.assertEqual(result.still_above, [(0, 70.0)])
+
+    def test_without_it_everything_moves(self):
+        c = Cluster()
+        c.pg("1.0", [0, 10, 20]).pg("1.1", [0, 11, 21])
+        result = c.plan(0)
+        self.assertEqual(len(result.moves), 2)
+        self.assertEqual(
+            (result.until_util, result.kept_count, result.still_above), (None, 0, [])
+        )
+
+    def test_refuses_a_ratio(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            parse_args(dr, ["--osds", "0", "--until-util", "0.7"])
+        self.assertIn("not a ratio", err.getvalue())
+
+    def rendered(self, cluster: Cluster, *argv) -> str:
+        """render()'s stderr for plan(*argv), whitespace collapsed."""
+        argv = [str(a) for a in argv]
+        result = cluster.plan(*argv)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            dr.render(result, parse_args(dr, ["--osds", *argv]))
+        return " ".join(err.getvalue().split())
+
+    def test_summary_names_the_level_and_the_shards_left(self):
+        c = Cluster()
+        c.util[0] = 60.0
+        c.pg("1.0", [0, 10, 20], shard_pct=6).pg("1.1", [0, 11, 21])
+        text = self.rendered(c, 0, "--until-util", 55)
+        self.assertIn("Draining osd.0 to below --until-util 55%:", text)
+        self.assertIn(
+            "Proposed 1 move(s) off the drained OSDs, 0 unplaceable, 1 left in "
+            "place (their OSD is below --until-util);",
+            text,
+        )
+        self.assertNotIn("stay at or above", text)
+
+    def test_summary_names_osds_left_above_the_level(self):
+        c = Cluster(default_util=95.0)
+        c.util[0] = 70.0
+        text = self.rendered(c.pg("1.0", [0, 10, 20]), 0, "--until-util", 60)
+        self.assertIn(
+            "Drained OSDs projected to stay at or above --until-util 60%: "
+            "osd.0 (70.0%).",
+            text,
+        )
+
+    def test_osd_without_a_size_is_named_as_drained_in_full(self):
+        c = Cluster().pg("1.0", [0, 10, 20])
+        snapshots = c.snapshots()
+        for node in snapshots["osd_df"]["nodes"]:
+            if node["id"] == 0:
+                node["kb"] = 0
+        args = parse_args(dr, ["--osds", "0", "--until-util", "60"])
+        result = dr.plan(args, FakeStore(snapshots))
+        self.assertEqual((len(result.moves), result.kept_count), (1, 0))
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            dr.render(result, args)
+        self.assertIn(
+            "No size in 'ceph osd df', so drained in full despite --until-util: osd.0.",
+            " ".join(err.getvalue().split()),
+        )
+
+    def test_summary_without_it_is_unchanged(self):
+        text = self.rendered(Cluster().pg("1.0", [0, 10, 20]), 0)
+        self.assertIn("Draining osd.0: 1 shard(s)", text)
+        self.assertIn("Proposed 1 move(s) off the drained OSDs, 0 unplaceable;", text)
+        self.assertNotIn("--until-util", text)
+
+
 class OutputTest(unittest.TestCase):
     def result(self):
         c = Cluster()
@@ -593,11 +783,11 @@ class FixtureInvariants:
             by_pg.setdefault(m.pgid, []).append(m)
         return by_pg
 
-    def test_every_evacuee_is_moved_or_unplaceable(self):
+    def test_every_evacuee_is_moved_unplaceable_or_kept(self):
         r = self.result
         moved = sum(m.up_osd in self.OSDS for m in r.moves)
         self.assertGreater(moved, 0)
-        self.assertEqual(moved + len(r.unplaceable), r.evacuee_count)
+        self.assertEqual(moved + len(r.unplaceable) + r.kept_count, r.evacuee_count)
 
     def test_no_target_is_drained_or_over_the_cap(self):
         # Covers pins too: none may send data back onto a drained OSD.
@@ -633,6 +823,39 @@ class Ceph1FixtureTest(FixtureInvariants, unittest.TestCase):
     """A calm cluster: nothing over the cap, so evacuees only."""
 
     ARGV = ("--osds", "418", "511")
+
+
+class Ceph1UntilUtilFixtureTest(FixtureInvariants, unittest.TestCase):
+    """The calm cluster, drained only to below 72% (from about 75%)."""
+
+    ARGV = ("--osds", "418", "511", "--until-util", "72")
+
+    def test_each_osd_sheds_only_while_at_or_above_the_level(self):
+        # Largest first, so an OSD's last move is its smallest: before it,
+        # the OSD was still at or above the level.
+        r = self.result
+        self.assertGreater(r.kept_count, 0)
+        self.assertEqual(r.still_above, [])
+        args = parse_args(dr, list(self.ARGV), load_state=str(self.FIXTURE_DIR))
+        store = shared.SnapshotStore.from_args(args, dict(dr.SNAPSHOT_COMMANDS))
+        pools = shared.fetch_pools(store)
+        profiles = shared.fetch_ec_profiles(store)
+        for osd in self.OSDS:
+            with self.subTest(osd=osd):
+                sizes = [
+                    placement.shard_size_bytes(
+                        self.pgs[m.pgid],
+                        pools[shared.pgid_pool_id(m.pgid)],
+                        profiles,
+                    )
+                    for m in r.moves
+                    if m.up_osd == osd
+                ]
+                self.assertTrue(sizes)
+                capacity = r.osd_df[osd]["kb"] * shared.KIB
+                final = r.final_util[osd]
+                self.assertLess(final, 72)
+                self.assertGreaterEqual(final + min(sizes) / capacity * 100, 72)
 
 
 class Ceph2EmergencyFixtureTest(FixtureInvariants, unittest.TestCase):

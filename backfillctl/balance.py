@@ -60,6 +60,7 @@ from messages import (
     targets_clause,
 )
 from placement import (
+    FinalUsage,
     FullRatios,
     MappedShard,
     PgPlacement,
@@ -68,13 +69,12 @@ from placement import (
     build_candidate_osds,
     ec_pool_ids_from,
     fetch_full_ratios,
-    find_arriving_shards,
     find_mapped_shards,
     positive_int,
+    project_usage,
     raw_crush_osds,
     resolve_max_target_util,
     shard_size_bytes,
-    usage_and_capacity,
 )
 from shared import (
     HelpFormatter,
@@ -100,7 +100,6 @@ from shared import (
     print_table,
     print_upmap_pairs,
     real_osd_set,
-    slot,
     utilization_pct,
 )
 
@@ -222,59 +221,9 @@ def is_settled(pg: dict) -> bool:
     return "active" in flags and not flags & UNSETTLED_FLAGS
 
 
-def departing_osds(pg: dict, is_ec: bool) -> list[int]:
-    """Return the OSDs a copy of the PG is leaving: in 'acting', not 'up'.
-
-    EC slots are compared by position, replicated sets as sets. An EC shard
-    whose up slot is empty stays: it has nowhere to go.
-    """
-    up, acting = pg["up"], pg["acting"]
-    if is_ec:
-        return [
-            osd
-            for i in range(len(acting))
-            if (osd := slot(acting, i)) is not None and slot(up, i) not in (None, osd)
-        ]
-    return sorted(real_osd_set(acting) - real_osd_set(up))
-
-
 # ---------------------------------------------------------------------------
 # Projection and target selection
 # ---------------------------------------------------------------------------
-
-
-class FinalUsage:
-    """What each OSD will hold once every backfill in motion and every move completes.
-
-    Unlike ProjectedUsage, data leaving an OSD is credited. This is the figure
-    balancing is about: it ranks sources and targets. The --max-target-util
-    cap still uses ProjectedUsage, since Ceph checks a target when reserving
-    the backfill, before the source frees any space.
-    """
-
-    def __init__(
-        self,
-        osd_df: dict[int, dict],
-        arriving: Iterable[tuple[int, int]],
-        departing: Iterable[tuple[int, int]],
-    ):
-        """arriving and departing: (OSD, bytes) of each shard in motion."""
-        self._used, self._capacity = usage_and_capacity(osd_df)
-        for osd_id, size in arriving:
-            if osd_id in self._used:
-                self._used[osd_id] += size
-        for osd_id, size in departing:
-            if osd_id in self._used:
-                self._used[osd_id] -= size
-
-    def utilization(self, osd_id: int, extra_bytes: int = 0) -> float:
-        """Return the OSD's final utilization (percent) with extra_bytes more."""
-        return (self._used[osd_id] + extra_bytes) / self._capacity[osd_id] * 100
-
-    def move(self, from_osd: int, to_osd: int, size_bytes: int) -> None:
-        """Record that size_bytes will end up on to_osd instead of from_osd."""
-        self._used[from_osd] -= size_bytes
-        self._used[to_osd] += size_bytes
 
 
 class Move(NamedTuple):
@@ -489,15 +438,9 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> BalanceResult:
         )
 
     # Every shard in motion, cluster-wide.
-    arriving, departing = [], []
-    for pg in pgs:
-        if pg["up"] == pg["acting"]:
-            continue
-        is_ec, size = pg_info(pg)
-        arriving.extend(find_arriving_shards(pg, is_ec, size))
-        departing.extend((o, size) for o in departing_osds(pg, is_ec))
-    reservation = ProjectedUsage(osd_df, arriving)
-    final = FinalUsage(osd_df, ((s.up_osd, s.size_bytes) for s in arriving), departing)
+    reservation, final = project_usage(
+        osd_df, ((pg, *pg_info(pg)) for pg in pgs if pg["up"] != pg["acting"])
+    )
 
     check_osds_exist("--osds", args.osds or [], osd_df)
     sources, qualified = select_sources(

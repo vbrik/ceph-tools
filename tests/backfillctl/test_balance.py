@@ -131,19 +131,19 @@ class SourcesFromClusterTest(unittest.TestCase):
 class DepartingOsdsTest(unittest.TestCase):
     def test_ec_slot_moving_departs_its_acting_osd(self):
         pg = {"up": [4, 2, 3], "acting": [1, 2, 3]}
-        self.assertEqual(bal.departing_osds(pg, True), [1])
+        self.assertEqual(placement.departing_osds(pg, True), [1])
 
     def test_ec_shard_with_empty_up_slot_stays(self):
         pg = {"up": [NONE, 2, 3], "acting": [1, 2, 3]}
-        self.assertEqual(bal.departing_osds(pg, True), [])
+        self.assertEqual(placement.departing_osds(pg, True), [])
 
     def test_ec_empty_acting_slot_departs_nothing(self):
         pg = {"up": [4, 2, 3], "acting": [NONE, 2, 3]}
-        self.assertEqual(bal.departing_osds(pg, True), [])
+        self.assertEqual(placement.departing_osds(pg, True), [])
 
     def test_replicated_compares_sets(self):
         pg = {"up": [3, 2, 4], "acting": [1, 2, 3]}
-        self.assertEqual(bal.departing_osds(pg, False), [1])
+        self.assertEqual(placement.departing_osds(pg, False), [1])
 
 
 class IsSettledTest(unittest.TestCase):
@@ -164,7 +164,7 @@ class IsSettledTest(unittest.TestCase):
 
 class FinalUsageTest(unittest.TestCase):
     def test_arrivals_added_departures_credited(self):
-        final = bal.FinalUsage(
+        final = placement.FinalUsage(
             osd_df_of({1: 50.0, 2: 50.0}), [(1, 10 * PCT)], [(2, 5 * PCT)]
         )
         self.assertEqual(final.utilization(1), 60.0)
@@ -172,9 +172,24 @@ class FinalUsageTest(unittest.TestCase):
         self.assertEqual(final.utilization(2, 3 * PCT), 48.0)
 
     def test_move(self):
-        final = bal.FinalUsage(osd_df_of({1: 50.0, 2: 50.0}), [], [])
+        final = placement.FinalUsage(osd_df_of({1: 50.0, 2: 50.0}), [], [])
         final.move(1, 2, 10 * PCT)
         self.assertEqual((final.utilization(1), final.utilization(2)), (40.0, 60.0))
+
+    def test_project_usage_credits_departures_in_final_only(self):
+        pg = {"pgid": "1.0", "up": [4, 2, 3], "acting": [1, 2, 3]}
+        osd_df = osd_df_of({1: 50.0, 2: 50.0, 3: 50.0, 4: 50.0})
+        reservation, final = placement.project_usage(osd_df, [(pg, True, 10 * PCT)])
+        self.assertEqual(reservation.utilization_after(4, 0), 60.0)
+        self.assertEqual(reservation.utilization_after(1, 0), 50.0)
+        self.assertEqual((final.utilization(4), final.utilization(1)), (60.0, 40.0))
+
+    def test_move_skips_an_osd_without_a_capacity(self):
+        final = placement.FinalUsage(osd_df_of({1: 50.0}), [], [])
+        final.move(1, 99, 10 * PCT)
+        final.move(99, 1, 5 * PCT)
+        self.assertEqual(final.utilization(1), 45.0)
+        self.assertFalse(final.knows(99))
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +207,7 @@ class PickTargetTest(unittest.TestCase):
             osd_df,
             {o: f"h{o}" for o in utils},
             reservation=placement.ProjectedUsage(osd_df, arriving),
-            final=bal.FinalUsage(
+            final=placement.FinalUsage(
                 osd_df, ((s.up_osd, s.size_bytes) for s in arriving), departing
             ),
             max_uses=max_uses,
