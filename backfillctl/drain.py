@@ -47,7 +47,6 @@ balancer off' while the drain runs. Assumes the CRUSH failure domain is host.
 """
 
 import argparse
-from typing import NamedTuple
 
 from messages import (
     blockers_clause,
@@ -66,6 +65,7 @@ from shared import (
     check_osds_exist,
     host_osds,
     parse_osd,
+    short_hosts,
 )
 from shed import (
     SNAPSHOT_COMMANDS,
@@ -75,7 +75,6 @@ from shed import (
     print_moves,
     print_notes,
     print_outcome,
-    print_pgremapper_mappings,
     shed,
     unsized_sources,
 )
@@ -109,14 +108,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     return parser
 
 
-class DrainResult(NamedTuple):
-    """What plan() decided, for render() to print."""
-
-    shed: ShedResult
-    hosts: list[str]  # with --hosts, the (short) host names; else empty
-
-
-def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
+def plan(args: argparse.Namespace, store: SnapshotStore) -> ShedResult:
     """Fetch the cluster state and work out where each shard goes.
 
     Exits on an unknown OSD or host, an invalid --max-target-util, or a pool
@@ -128,18 +120,14 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DrainResult:
     else:
         check_osds_exist("--osds", args.osds, cluster.osd_df)
         drained = set(args.osds)
-    return DrainResult(
-        shed(cluster, drained, args.until_util),
-        sorted({h.split(".")[0] for h in args.hosts or []}),
-    )
+    return shed(cluster, drained, args.until_util)
 
 
-def render(result: DrainResult, args: argparse.Namespace) -> None:
-    """Print result: proposals on stdout in the format args asks for, notes on stderr."""
-    r = result.shed
+def render(r: ShedResult, args: argparse.Namespace) -> None:
+    """Print r: proposals on stdout in the format args asks for, notes on stderr."""
     osds = osd_list(r.sources)
-    if result.hosts:
-        osds = f"host(s) {', '.join(result.hosts)} ({osds})"
+    if args.hosts:
+        osds = f"host(s) {', '.join(short_hosts(args.hosts))} ({osds})"
     leaving = r.leaving_count
     left_alone = left_alone_clause(r.unsettled_pgs, r.chained_pgs)
     if not r.mapped_count:
@@ -153,8 +141,7 @@ def render(result: DrainResult, args: argparse.Namespace) -> None:
             + (f"; {leaving} already moving off." if leaving else ".")
             + left_alone
         )
-        if args.pgremapper_mappings:
-            print_pgremapper_mappings([])
+        print_moves(r, args)
         return
     to_level = (
         "" if r.level is None else f" to below --until-util {level_text(r.level)}"

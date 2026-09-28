@@ -62,6 +62,7 @@ __all__ = [
     "TEST_DATA",
     "FakeStore",
     "SyntheticCluster",
+    "check_one_shard_per_host",
     "check_own_moves_in_or_out",
     "check_pairs_apply",
     "check_reservation_cap",
@@ -73,9 +74,11 @@ __all__ = [
     "placement",
     "plan_from_state",
     "real_query_backfill_positions",
+    "replayed_cluster",
     "run_command",
     "shared",
     "shed",
+    "stderr_of",
     "upmap_pairs",
 ]
 
@@ -83,6 +86,14 @@ __all__ = [
 def flat(text: str) -> str:
     """Collapse whitespace, so a substring check survives stderr's line wrapping."""
     return " ".join(text.split())
+
+
+def stderr_of(fn, *args, **kwargs) -> str:
+    """Call fn and return what it printed on stderr, whitespace collapsed."""
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        fn(*args, **kwargs)
+    return flat(err.getvalue())
 
 
 def parse_args(
@@ -353,12 +364,28 @@ class SyntheticCluster:
             "pg_dump_pgs": self.pgs,
         }
 
-    def plan_with(self, module, *argv):
-        """Run module.plan() on this cluster; leading bare OSD ids go to --osds."""
+    @staticmethod
+    def argv(argv) -> list[str]:
+        """argv as strings; leading bare OSD ids go to --osds."""
         argv = [str(a) for a in argv]
         if argv and not argv[0].startswith("--"):
             argv.insert(0, "--osds")
-        return module.plan(parse_args(module, argv), FakeStore(self.snapshots()))
+        return argv
+
+    def plan_with(self, module, *argv):
+        """Run module.plan() on this cluster (see argv)."""
+        args = parse_args(module, self.argv(argv))
+        return module.plan(args, FakeStore(self.snapshots()))
+
+    def rendered_with(self, module, *argv) -> tuple[str, str]:
+        """Return (stdout, stderr with whitespace collapsed) of module.render()
+        for plan_with(module, *argv)."""
+        args = parse_args(module, self.argv(argv))
+        result = module.plan(args, FakeStore(self.snapshots()))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            module.render(result, args)
+        return out.getvalue(), flat(err.getvalue())
 
 
 def check_own_moves_in_or_out(test, result: "shed.ShedResult") -> None:
@@ -367,8 +394,7 @@ def check_own_moves_in_or_out(test, result: "shed.ShedResult") -> None:
 
     Data leaves an OSD when a resident shard moves off it; a pin moves none.
     """
-    pins = {m for m in result.moves if m.target_osd == m.acting_osd}
-    onto = {m.target_osd for m in result.moves if m not in pins}
+    onto = {m.target_osd for m in result.moves if not shed.is_pin(m)}
     off = {m.up_osd for m in result.moves if m.acting_osd == m.up_osd}
     test.assertFalse(onto & off)
     test.assertFalse(onto & set(result.sources))
@@ -378,6 +404,20 @@ def replayed_cluster(fixture_dir: str | Path) -> "shed.Cluster":
     """A fresh shed.Cluster of a capture, as a run starts from."""
     store = shared.SnapshotStore(shed.SNAPSHOT_COMMANDS, load_dir=Path(fixture_dir))
     return shed.Cluster(store, None)
+
+
+def check_one_shard_per_host(
+    test, fixture_dir: str | Path, result: "shed.ShedResult"
+) -> None:
+    """Check, via test's asserts, that each PG's new up set keeps one shard per host."""
+    pgs = {pg["pgid"]: pg for pg in replayed_cluster(fixture_dir).pgs}
+    new_up: dict[str, list] = {}
+    for m in result.moves:
+        up = new_up.setdefault(m.pgid, list(pgs[m.pgid]["up"]))
+        up[up.index(m.up_osd)] = m.target_osd
+    for pgid, up in new_up.items():
+        hosts = [result.osd_host[o] for o in up if shared.is_real_osd(o)]
+        test.assertEqual(len(hosts), len(set(hosts)), pgid)
 
 
 def check_pairs_apply(test, fixture_dir: str | Path, result: "shed.ShedResult") -> None:

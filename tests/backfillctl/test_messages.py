@@ -10,15 +10,7 @@ import contextlib
 import io
 import unittest
 
-from _support import REPO_ROOT, flat, messages, shared
-
-
-def stderr_of(fn, *args, **kwargs) -> str:
-    """Call fn and return what it printed on stderr, whitespace collapsed."""
-    err = io.StringIO()
-    with contextlib.redirect_stderr(err):
-        fn(*args, **kwargs)
-    return flat(err.getvalue())
+from _support import REPO_ROOT, flat, messages, shared, stderr_of
 
 
 class LeafModuleTest(unittest.TestCase):
@@ -244,14 +236,14 @@ class ShedTextTest(unittest.TestCase):
         text = stderr_of(
             messages.print_shed_outcome,
             "the sources",
-            2,
-            3 * 1024**2,
-            1,
-            4,
-            0,
-            1,
-            [],
-            ["1.2"],
+            moved=2,
+            moved_bytes=3 * 1024**2,
+            unplaceable=1,
+            kept=4,
+            diverted=0,
+            pinned=1,
+            stuck=[],
+            unexplained=["1.2"],
         )
         self.assertEqual(
             text,
@@ -260,9 +252,37 @@ class ShedTextTest(unittest.TestCase):
             "pinned back. PGs that will stay backfill_toofull: 0; for an "
             "unidentified reason: 1 (1.2). Their NOTE (JSON: 'note') says why.",
         )
-        text = stderr_of(messages.print_shed_outcome, "x", 0, 0, 0, None, 0, 0, [], [])
+        text = stderr_of(
+            messages.print_shed_outcome,
+            "x",
+            moved=0,
+            moved_bytes=0,
+            unplaceable=0,
+            kept=None,
+            diverted=0,
+            pinned=0,
+            stuck=[],
+            unexplained=[],
+        )
         self.assertNotIn("left in place", text)
         self.assertTrue(text.endswith("for an unidentified reason: 0."), text)
+
+    def test_shed_outcome_caps_the_pgs_named(self):
+        stuck = [f"1.{i:x}" for i in range(messages.MAX_NAMED + 2)]
+        text = stderr_of(
+            messages.print_shed_outcome,
+            "x",
+            moved=1,
+            moved_bytes=0,
+            unplaceable=0,
+            kept=None,
+            diverted=0,
+            pinned=0,
+            stuck=stuck,
+            unexplained=[],
+        )
+        self.assertIn(f"backfill_toofull: {len(stuck)} (1.0, ", text)
+        self.assertIn("1.9, and 2 more);", text)
 
     def test_still_above_names_the_fullest_and_counts_the_rest(self):
         above = [(o, 80.0 + o) for o in range(12)]

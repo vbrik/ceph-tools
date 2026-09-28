@@ -17,6 +17,7 @@ from _support import (
     TEST_DATA,
     FakeStore,
     SyntheticCluster,
+    check_one_shard_per_host,
     check_own_moves_in_or_out,
     check_pairs_apply,
     check_reservation_cap,
@@ -32,27 +33,20 @@ FIXTURE = TEST_DATA / "ceph1-backfills-stuck-at-100-pct"
 
 
 class Cluster(SyntheticCluster):
-    def plan(self, *argv) -> dr.DrainResult:
+    def plan(self, *argv) -> sh.ShedResult:
         """Run plan() on this cluster; leading bare OSD ids go to --osds."""
         return self.plan_with(dr, *argv)
 
     def rendered(self, *argv) -> tuple[str, str]:
-        """Return (stdout, stderr with whitespace collapsed) of render() for plan(*argv)."""
-        argv = [str(a) for a in argv]
-        result = self.plan(*argv)
-        if argv and not argv[0].startswith("--"):
-            argv.insert(0, "--osds")
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            dr.render(result, parse_args(dr, argv))
-        return out.getvalue(), flat(err.getvalue())
+        """render()'s (stdout, stderr) for plan(*argv)."""
+        return self.rendered_with(dr, *argv)
 
 
 class SourcesTest(unittest.TestCase):
     def test_osds_are_drained_in_full(self):
         c = Cluster()
         c.pg("1.0", [0, 10, 20]).pg("1.1", [0, 11, 21])
-        result = c.plan(0).shed
+        result = c.plan(0)
         self.assertEqual((result.sources, result.level), ([0], None))
         self.assertEqual(len(result.moves), 2)
 
@@ -62,17 +56,19 @@ class SourcesTest(unittest.TestCase):
         c.util[41] = 20.0
         c.pg("1.0", [0, 10, 20]).pg("1.1", [11, 21, 30])
         result = c.plan("--hosts", "h1")
-        self.assertEqual((result.shed.sources, result.hosts), ([10, 11], ["h1"]))
-        self.assertEqual({m.up_osd for m in result.shed.moves}, {10, 11})
-        self.assertFalse({Cluster.host(m.target_osd) for m in result.shed.moves} & {1})
+        self.assertEqual(result.sources, [10, 11])
+        self.assertEqual({m.up_osd for m in result.moves}, {10, 11})
+        self.assertFalse({Cluster.host(m.target_osd) for m in result.moves} & {1})
 
     def test_fully_qualified_name_matches_the_short_one(self):
-        result = Cluster().pg("1.0", [0, 10, 20]).plan("--hosts", "h1.example.org")
-        self.assertEqual((result.shed.sources, result.hosts), ([10, 11], ["h1"]))
+        c = Cluster().pg("1.0", [0, 10, 20])
+        self.assertEqual(c.plan("--hosts", "h1.example.org").sources, [10, 11])
+        _, err = c.rendered("--hosts", "h1.example.org")
+        self.assertIn("Draining host(s) h1 (osd.10, osd.11):", err)
 
     def test_several_hosts(self):
         result = Cluster().pg("1.0", [0, 10, 20]).plan("--hosts", "h0", "h1")
-        self.assertEqual(result.shed.sources, [0, 1, 10, 11])
+        self.assertEqual(result.sources, [0, 1, 10, 11])
 
     def test_host_of_mixed_classes_uses_targets_of_each_shards_class(self):
         c = Cluster()
@@ -80,13 +76,13 @@ class SourcesTest(unittest.TestCase):
         c.util[31] = 30.0  # the emptiest ssd
         c.util[40] = 20.0  # the emptiest hdd
         c.pg("1.0", [0, 10, 20]).pg("1.1", [1, 11, 21])
-        result = c.plan("--hosts", "h0").shed
+        result = c.plan("--hosts", "h0")
         self.assertEqual(
             [(m.up_osd, m.target_osd) for m in result.moves], [(0, 40), (1, 31)]
         )
 
     def test_until_util_sets_the_level(self):
-        result = Cluster().pg("1.0", [0, 10, 20]).plan(0, "--until-util", 60).shed
+        result = Cluster().pg("1.0", [0, 10, 20]).plan(0, "--until-util", 60)
         self.assertEqual((result.level, result.kept_count), (60.0, 1))
 
     def test_unknown_osd_is_an_error(self):
@@ -158,7 +154,7 @@ class ArgsTest(unittest.TestCase):
             }
         )
         result = dr.plan(parse_args(dr, ["--osds", "0"]), FakeStore(snapshots))
-        self.assertEqual(len(result.shed.moves), 1)
+        self.assertEqual(len(result.moves), 1)
 
     def test_removed_options_are_refused(self):
         for option in ("--max-target-uses", "--toofull-util"):
@@ -286,8 +282,7 @@ class FixtureInvariants:
     def setUpClass(cls):
         args = parse_args(dr, list(cls.ARGV), load_state=str(cls.FIXTURE_DIR))
         store = shared.SnapshotStore.from_args(args, dr.SNAPSHOT_COMMANDS)
-        cls.drain = dr.plan(args, store)
-        cls.result = cls.drain.shed
+        cls.result = dr.plan(args, store)
         cls.OSDS = set(cls.result.sources)
         cls.pgs = {pg["pgid"]: pg for pg in shared.fetch_pg_stats(store, "pg_dump_pgs")}
 
@@ -312,14 +307,7 @@ class FixtureInvariants:
         check_reservation_cap(self, self.FIXTURE_DIR, self.result)
 
     def test_new_up_sets_have_one_shard_per_host(self):
-        host_of = self.result.osd_host
-        for pgid, moves in self.by_pg().items():
-            up = list(self.pgs[pgid]["up"])
-            for m in moves:
-                up[up.index(m.up_osd)] = m.target_osd
-            real = [o for o in up if shared.is_real_osd(o)]
-            with self.subTest(pgid=pgid):
-                self.assertEqual(len({host_of[o] for o in real}), len(real))
+        check_one_shard_per_host(self, self.FIXTURE_DIR, self.result)
 
     def test_no_pg_has_chained_pairs(self):
         check_pairs_apply(self, self.FIXTURE_DIR, self.result)

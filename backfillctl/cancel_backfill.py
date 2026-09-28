@@ -59,7 +59,7 @@ from messages import (
     print_progress_note,
     stderr_para,
 )
-from placement import ProjectedUsage, find_arriving_shards
+from placement import ProjectedUsage, blocker_projection, find_arriving_shards
 from shared import (
     COLUMNS,
     KIB,
@@ -210,19 +210,6 @@ def find_arrivals(
     else:
         skipped.append(("-", "several replicas moving, pairing is ambiguous"))
     return pins, skipped
-
-
-def blocker_projection(
-    projection: ProjectedUsage, osd_id: int, backfillfull_pct: float
-) -> float | None:
-    """Return the OSD's projected utilization if a shard headed there blocks, else None.
-
-    See messages.blocking_reason. None also if the OSD's capacity is unknown.
-    """
-    if not projection.knows(osd_id):
-        return None
-    projected = projection.utilization_after(osd_id, 0)
-    return projected if projected >= backfillfull_pct else None
 
 
 def find_blockers(

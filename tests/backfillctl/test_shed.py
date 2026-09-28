@@ -20,7 +20,7 @@ import io
 import json
 import unittest
 
-from _support import NONE, FakeStore, SyntheticCluster, flat, shared
+from _support import NONE, FakeStore, SyntheticCluster, shared, stderr_of
 from _support import shed as sh
 
 
@@ -732,6 +732,23 @@ class BlockerTest(unittest.TestCase):
         self.assertEqual((result.pinned_count, result.stuck_pgs), (1, []))
         self.assertEqual(result.moves[0].note, "")
 
+    def test_move_re_placed_for_a_pin_that_still_fails_is_restored(self):
+        # Shard 0 first goes to osd.10, on h1 with shard 1's data (osd.11).
+        # Re-placed on osd.40, shard 1's pin is still refused (osd.11 is a
+        # source), so shard 0 goes back to osd.10, and osd.40 is free again:
+        # blocker shard 2 is diverted there.
+        c = Cluster(default_util=95.0)
+        for osd in (11, 30, 31):
+            c.classes[osd] = "ssd"
+        c.util[10], c.util[40] = 10.0, 20.0
+        result = c.pg("1.0", [0, 30, 50], [0, 11, 21]).shed(0, 11)
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 10), ("1.0", 2, 50, 40)])
+        self.assertEqual(result.stuck_pgs, ["1.0"])
+        self.assertIn(
+            "cannot pin: it would pin data back onto source osd.11",
+            result.moves[0].note,
+        )
+
     def test_move_with_nowhere_else_to_go_keeps_its_target(self):
         # As above, but osd.10 is the only hdd OSD with room: the PG is
         # reported stuck, and the move stays.
@@ -819,19 +836,13 @@ class OutputTest(unittest.TestCase):
             sh.print_pgremapper_mappings([])
         self.assertEqual(out.getvalue(), "[]\n")
 
-    def stderr(self, fn, *args) -> str:
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            fn(*args)
-        return flat(err.getvalue())
-
     def test_unplaceable_are_listed_when_emptying_counted_with_a_level(self):
         c = Cluster(default_util=95.0).pg("1.0", [0, 10, 20]).pg("1.1", [0, 11, 21])
-        text = self.stderr(sh.print_notes, c.shed(0), "source(s)")
+        text = stderr_of(sh.print_notes, c.shed(0), "source(s)")
         self.assertIn("cannot place 1.0 shard 0 off osd.0: no legal target", text)
         self.assertIn("ran out of room (--max-target-util), or", text)
         # An unreachable level can leave thousands: one line, not one each.
-        text = self.stderr(sh.print_notes, c.shed(0, level=60), "source(s)")
+        text = stderr_of(sh.print_notes, c.shed(0, level=60), "source(s)")
         self.assertNotIn("cannot place", text)
         self.assertIn(
             "NOTE: 2 shard(s) found no target at or below --max-target-util "
@@ -841,14 +852,14 @@ class OutputTest(unittest.TestCase):
         result = c.shed(0, level=60, level_class="hdd")
         self.assertIn(
             "below the level and their source.",
-            self.stderr(sh.print_notes, result, "source(s)"),
+            stderr_of(sh.print_notes, result, "source(s)"),
         )
-        self.assertEqual(self.stderr(sh.print_notes, Cluster().shed(0), "x"), "")
+        self.assertEqual(stderr_of(sh.print_notes, Cluster().shed(0), "x"), "")
 
     def test_notes_name_the_sources_left_above_and_stalled_pgs(self):
         c = Cluster(default_util=95.0)
         c.util[0] = 70.0
-        text = self.stderr(
+        text = stderr_of(
             sh.print_notes, c.pg("1.0", [0, 10, 20]).shed(0, level=60), "source(s)"
         )
         self.assertIn(
@@ -859,14 +870,14 @@ class OutputTest(unittest.TestCase):
         c.util[0] = 89.5
         c.pg("1.9", [41, 11, 21], [0, 11, 21], shard_pct=10)
         c.pg("1.0", [0, 10, 20], [31, 10, 20])
-        text = self.stderr(sh.print_notes, c.shed(0, level=85), "source(s)")
+        text = stderr_of(sh.print_notes, c.shed(0, level=85), "source(s)")
         self.assertIn("NOTE: 1 PG(s) have a shard backfilling onto a source", text)
 
     def test_outcome_counts_moves_pins_and_bytes(self):
         c = Cluster(default_util=95.0)
         c.util[1] = 10.0  # room for the source's shard only: the blocker is pinned
         result = c.pg("1.0", [0, 10, 20], [0, 11, 20]).shed(0)
-        text = self.stderr(sh.print_outcome, result, "the drained OSDs")
+        text = stderr_of(sh.print_outcome, result, "the drained OSDs")
         self.assertIn(
             "Proposed 1 move(s) off the drained OSDs, 9.8 MiB, 0 unplaceable;", text
         )
@@ -876,10 +887,10 @@ class OutputTest(unittest.TestCase):
         c = Cluster(default_util=95.0)
         c.util[1] = 10.0
         result = c.pg("1.0", [0, 10, 20], [0, NONE, 20]).shed(0)
-        text = self.stderr(sh.print_outcome, result, "the drained OSDs")
+        text = stderr_of(sh.print_outcome, result, "the drained OSDs")
         self.assertIn("stay backfill_toofull: 1 (1.0);", text)
         self.assertIn("Their NOTE (JSON: 'note') says why.", text)
-        text = self.stderr(sh.print_outcome, self.result(), "the drained OSDs")
+        text = stderr_of(sh.print_outcome, self.result(), "the drained OSDs")
         self.assertIn("backfill_toofull: 0; for an unidentified reason: 0.", text)
         self.assertNotIn("NOTE (JSON", text)
 
@@ -890,7 +901,7 @@ class OutputTest(unittest.TestCase):
         c.util[0], c.util[11] = 50.0, 10.0
         c.pg("1.0", [0, 10, 20], [41, 10, 20], shard_pct=40)
         result = c.shed(0, 10, level=60)
-        text = self.stderr(sh.print_outcome, result, "the sources")
+        text = stderr_of(sh.print_outcome, result, "the sources")
         self.assertIn("Proposed 1 move(s) off the sources, 390.6 MiB,", text)
         self.assertIn("0 blocking shard(s) diverted, 1 pinned back.", text)
 

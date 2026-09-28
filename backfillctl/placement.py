@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""Choosing target OSDs for shards; shared by divert-toofull and shed (drain, balance).
+"""Choosing target OSDs for shards; shared by divert-toofull and shed
+(drain, balance).
 
-A target is the legal OSD of the shard's device class with the lowest
-projected utilization (pick_target): what it will reserve (ProjectedUsage),
-or, for shed, where it ends up (FinalUsage). Also: finding shards in motion or on given OSDs, where each OSD ends up
-(FinalUsage), tracking a PG's up set as moves are proposed (PgPlacement),
-and the cluster's full ratios.
+A target is a legal OSD (target_projection) of the shard's device class:
+divert-toofull takes the one projected least utilized with the shard added
+(pick_target, ProjectedUsage), shed the one that ends up least utilized
+(FinalUsage). Also: finding shards in motion or on given OSDs, where each
+OSD ends up (FinalUsage), tracking a PG's up set as moves are proposed
+(PgPlacement), and the cluster's full ratios.
 """
 
 import argparse
@@ -462,6 +464,40 @@ class PgPlacement:
         self.forbidden_osds.add(to_osd)
 
 
+def blocker_projection(
+    projection: ProjectedUsage, osd_id: int, backfillfull_pct: float
+) -> float | None:
+    """Return the OSD's projected utilization if a shard headed there blocks, else None.
+
+    See messages.blocking_reason. None also if the OSD's capacity is unknown.
+    """
+    if not projection.knows(osd_id):
+        return None
+    projected = projection.utilization_after(osd_id, 0)
+    return projected if projected >= backfillfull_pct else None
+
+
+def target_projection(
+    candidate: int,
+    size_bytes: int,
+    *,
+    forbidden_hosts: set[str | None],
+    forbidden_osds: set[int],
+    osd_host: dict[int, str],
+    projection: ProjectedUsage,
+    max_target_util: float,
+) -> float | None:
+    """Return candidate's projection with a shard of size_bytes, if it may take it.
+
+    None if not legal: host or OSD forbidden, or projected over
+    max_target_util with the shard added.
+    """
+    if osd_host.get(candidate) in forbidden_hosts or candidate in forbidden_osds:
+        return None
+    projected = projection.utilization_after(candidate, size_bytes)
+    return projected if projected <= max_target_util else None
+
+
 def pick_target(
     pool: list[int],
     size_bytes: int,
@@ -471,25 +507,19 @@ def pick_target(
     osd_host: dict[int, str],
     osd_df: dict[int, dict],
     projection: ProjectedUsage,
+    uses: Counter[int],
+    max_uses: int,
     max_target_util: float,
-    uses: Counter[int] | None = None,
-    max_uses: int | None = None,
     below_util: float | None = None,
-    final: FinalUsage | None = None,
-    final_below: float | None = None,
 ) -> tuple[float, int] | None:
     """Return (projected utilization, OSD) of the best legal target, or None.
 
     pool: candidates of the shard's class, least-utilized first
-    (build_candidate_osds). Legal: host and OSD not forbidden, used fewer
-    than max_uses times (if given), currently below below_util (if given),
-    and projected at or below max_target_util with the shard added.
+    (build_candidate_osds). Legal: target_projection, used fewer than
+    max_uses times, and currently below below_util (if given). Lowest
+    projection wins, then lowest id.
 
-    The projection returned and ranked by is projection's, or, with final,
-    final's (where the target ends up), which must then be below
-    final_below (if given). Lowest wins, then lowest id.
-
-    Records nothing; the caller updates the projections and uses.
+    Records nothing; the caller updates projection and uses.
     """
     legal = []
     for candidate in pool:
@@ -497,20 +527,19 @@ def pick_target(
         # Sorted, and projections never fall below current: the rest are over.
         if util > max_target_util:
             break
-        if osd_host.get(candidate) in forbidden_hosts:
-            continue
-        if candidate in forbidden_osds:
-            continue
-        if max_uses is not None and uses is not None and uses[candidate] >= max_uses:
+        if uses[candidate] >= max_uses:
             continue
         if below_util is not None and util >= below_util:
             continue
-        projected = projection.utilization_after(candidate, size_bytes)
-        if projected > max_target_util:
-            continue
-        if final is not None:
-            projected = final.utilization(candidate, size_bytes)
-            if final_below is not None and projected >= final_below:
-                continue
-        legal.append((projected, candidate))
+        projected = target_projection(
+            candidate,
+            size_bytes,
+            forbidden_hosts=forbidden_hosts,
+            forbidden_osds=forbidden_osds,
+            osd_host=osd_host,
+            projection=projection,
+            max_target_util=max_target_util,
+        )
+        if projected is not None:
+            legal.append((projected, candidate))
     return min(legal) if legal else None

@@ -338,6 +338,7 @@ def blockers_clause(nearfull_pct: float) -> str:
 
 def print_shed_outcome(
     off: str,
+    *,
     moved: int,
     moved_bytes: int,
     unplaceable: int,
@@ -354,7 +355,7 @@ def print_shed_outcome(
     """
 
     def pg_list(pgids: list[str]) -> str:
-        return f"{len(pgids)} ({', '.join(pgids)})" if pgids else "0"
+        return f"{len(pgids)} ({named_list(pgids)})" if pgids else "0"
 
     left = (
         "" if kept is None else f", {kept} left in place (their OSD is below the level)"

@@ -59,10 +59,11 @@ only take data off sources and put it on other OSDs. Backfills already in
 motion count in the projections, which treat them and every proposal as done,
 crediting data leaving an OSD. With a level, a target must also end up below
 the OSD it relieves, so no move raises the maximum (a blocker pinned back
-keeps its data where it is); in `balance`, also below the level. Both commands leave alone PGs that are
-degraded, undersized, recovering or peering, and PGs whose existing upmap
-pairs chain. Shards that would hold a moved PG in `backfill_toofull` are
-diverted or pinned back, including shards arriving on a source.
+keeps its data where it is); in `balance`, also below the level. Both commands
+leave alone PGs that are degraded, undersized, recovering or peering, and PGs
+whose existing upmap pairs chain. Shards that would hold a moved PG in
+`backfill_toofull` are diverted or pinned back, including shards arriving on a
+source.
 
 pgremapper cannot apply chained pairs (A->B, B->C), which cancelling some EC
 backfills needs. The cancel commands leave such backfills running, and print

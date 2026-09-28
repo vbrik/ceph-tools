@@ -670,12 +670,18 @@ def check_osds_exist(option: str, osds: Iterable[int], osd_df: dict[int, dict]) 
         sys.exit(f"ERROR: {option}: not in 'ceph osd df': " + osd_list(unknown))
 
 
+def short_hosts(hosts: Iterable[str]) -> list[str]:
+    """Return the short names of hosts, sorted: 'ceph1' for 'ceph1.example.org'."""
+    return sorted({h.split(".")[0] for h in hosts})
+
+
 def host_osds(hosts: Iterable[str], osd_host: dict[int, str]) -> set[int]:
     """Return every OSD of the given --hosts, exiting if a host has none.
 
-    Hosts match by short name, so 'ceph1.example.org' matches 'ceph1'.
+    Hosts match by short name (short_hosts), so 'ceph1.example.org' matches
+    'ceph1'.
     """
-    wanted = {h.split(".")[0] for h in hosts}
+    wanted = set(short_hosts(hosts))
     osds = {o for o, h in osd_host.items() if h in wanted}
     missing = sorted(wanted - {osd_host[o] for o in osds})
     if missing:

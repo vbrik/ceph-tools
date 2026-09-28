@@ -41,7 +41,8 @@ PG is backfill_toofull now, at or above nearfull_ratio (Ceph may count more
 than the projection sees), a source included. Such a blocker is diverted if
 there is room, otherwise pinned back to its acting OSD with companions, as in
 cancel-backfill (resolve_blockers). If the pin clashes with a move of the same
-PG onto the acting OSD's host, that move is placed elsewhere first. A pin may
+PG onto the acting OSD's host, that move is placed elsewhere, provided the pin
+then succeeds. A pin may
 leave its acting OSD above the level, or the class's maximum higher: the data
 stays, as Ceph refuses its departure anyway. A pin onto a source is refused
 unless the source stays below the level. A blocker in a PG with no proposed
@@ -51,6 +52,7 @@ move holds nothing up, and is only reported: its stall predates the run.
 import argparse
 import heapq
 import math
+from bisect import bisect_left, insort
 from collections import Counter
 from functools import cached_property
 from typing import NamedTuple
@@ -73,23 +75,24 @@ from placement import (
     MappedShard,
     PgPlacement,
     ProjectedUsage,
+    blocker_projection,
     build_candidate_osds,
     ec_pool_ids_from,
     fetch_full_ratios,
     find_arriving_shards,
     find_mapped_shards,
     osd_class,
-    pick_target,
     project_usage,
     raw_crush_osds,
     resolve_max_target_util,
     shard_size_bytes,
+    target_projection,
 )
 from shared import (
+    KIB,
     NOT_APPLICABLE,
     ROLE_BLOCKER,
     ROLE_REQUESTED,
-    UNKNOWN_HOST,
     SnapshotStore,
     chain_link,
     check_host_failure_domain,
@@ -153,7 +156,7 @@ def level_pct(text: str) -> float:
     return value
 
 
-def add_until_util_arg(parser: "argparse._ActionsContainer") -> None:
+def add_until_util_arg(parser: argparse._ActionsContainer) -> None:
     """Add --until-util, worded the same for drain and balance."""
     parser.add_argument(
         "--until-util",
@@ -249,13 +252,13 @@ class Move(NamedTuple):
     """One proposed upmap pair, and why it is proposed."""
 
     pgid: str
-    shard: "int | str"  # EC shard index, or '-' for replicated pools
+    shard: int | str  # EC shard index, or '-' for replicated pools
     acting_osd: int | None  # where the shard's data is now
     up_osd: int  # the 'from' of the pair
     target_osd: int  # the 'to' of the pair
     size_bytes: int
-    up_projected: float | None  # FinalUsage once everything is done
-    target_projected: float | None  # likewise; None for pins
+    up_projected: float | None = None  # FinalUsage once everything is done
+    target_projected: float | None = None  # likewise; None for pins
     note: str = ""
     role: str = ROLE_REQUESTED  # blockers and their companions: ROLE_BLOCKER
 
@@ -272,15 +275,10 @@ class PgState(PgPlacement):
         super().__init__(pg, is_ec, size_bytes, raw)
         # Moving onto an acting OSD would be a pin, not a move.
         self.forbidden_osds |= real_osd_set(pg["acting"])
-        self.avoid_hosts: set[str] = set()  # see Planner.make_room_to_pin
-        self.changed: set[int | str] = set()  # EC slots / replica OSDs moved
+        self.changed: set[int | str] = set()  # keys (key()) of the shards moved
         self.moves: list[Move] = []
 
-    def forbidden_hosts(self, moving_osd: int, osd_host: dict[int, str]) -> set:
-        """PgPlacement's, and avoid_hosts."""
-        return super().forbidden_hosts(moving_osd, osd_host) | self.avoid_hosts
-
-    def key(self, shard: "MappedShard | ArrivingShard | Move") -> "int | str":
+    def key(self, shard: MappedShard | ArrivingShard) -> int | str:
         """The shard's key in changed: EC slot, or replica's up OSD."""
         return shard.shard if self.is_ec else shard.up_osd
 
@@ -290,7 +288,7 @@ class PgState(PgPlacement):
 
     def add_move(
         self,
-        shard: "MappedShard | ArrivingShard",
+        shard: MappedShard | ArrivingShard,
         target: int,
         note: str = "",
         role: str = ROLE_REQUESTED,
@@ -298,16 +296,14 @@ class PgState(PgPlacement):
         """Record a move of shard to target; projections are filled in later."""
         self.moves.append(
             Move(
-                self.pg["pgid"],
-                shard.shard,
-                shard.acting_osd,
-                shard.up_osd,
-                target,
-                self.size_bytes,
-                None,
-                None,
-                note,
-                role,
+                pgid=self.pg["pgid"],
+                shard=shard.shard,
+                acting_osd=shard.acting_osd,
+                up_osd=shard.up_osd,
+                target_osd=target,
+                size_bytes=self.size_bytes,
+                note=note,
+                role=role,
             )
         )
 
@@ -327,7 +323,32 @@ class Planner:
         self.sources = sources
         self.level = level
         self.level_class = level_class
-        self.candidates = build_candidate_osds(cluster.osd_df, exclude=sources)
+        final, osd_df = cluster.final, cluster.osd_df
+        # Each class's candidates as (final projection, OSD), kept in order
+        # as moves change them (reorder), and the largest capacity: see place.
+        self.order: dict[str, list[tuple[float, int]]] = {}
+        self.max_capacity: dict[str, int] = {}
+        self.order_key: dict[int, tuple[str, tuple[float, int]]] = {}
+        for cls, osds in build_candidate_osds(osd_df, exclude=sources).items():
+            self.order[cls] = sorted((final.utilization(o), o) for o in osds)
+            self.max_capacity[cls] = max(osd_df[o]["kb"] * KIB for o in osds)
+            for key in self.order[cls]:
+                self.order_key[key[1]] = cls, key
+
+    def move_final(self, from_osd: int, to_osd: int, size_bytes: int) -> None:
+        """FinalUsage.move, keeping the candidates in order: every change goes here."""
+        self.cluster.final.move(from_osd, to_osd, size_bytes)
+        for osd in (from_osd, to_osd):
+            if osd not in self.order_key:
+                continue
+            cls, key = self.order_key[osd]
+            order = self.order[cls]
+            i = bisect_left(order, key)
+            assert order[i] == key, (osd, key)
+            del order[i]
+            key = self.cluster.final.utilization(osd), osd
+            insort(order, key)
+            self.order_key[osd] = cls, key
 
     def is_below_level(self, osd_id: int, extra_bytes: int = 0) -> bool:
         """True if osd_id's final projection, with extra_bytes more, is below the level.
@@ -343,9 +364,17 @@ class Planner:
         )
 
     def place(
-        self, state: PgState, shard: "MappedShard | ArrivingShard"
+        self,
+        state: PgState,
+        shard: MappedShard | ArrivingShard,
+        avoid_host: str | None = None,
     ) -> tuple[float, int] | None:
-        """Return (final projection, OSD) of the best legal target, or None."""
+        """Return (final projection, OSD) of the best legal target, or None.
+
+        avoid_host is forbidden too. Candidates are tried in final
+        projection order, so the search stops at the first that could not
+        beat the best found, or reach below the guards.
+        """
         c = self.cluster
         cls = osd_class(c.osd_df, shard.up_osd)
         below = None
@@ -355,21 +384,44 @@ class Planner:
                 below = c.final.utilization(shard.up_osd, -shard.size_bytes)
             if cls is not None and cls == self.level_class:
                 below = self.level if below is None else min(below, self.level)
-        return pick_target(
-            self.candidates.get(cls, []),
-            shard.size_bytes,
-            forbidden_hosts=state.forbidden_hosts(shard.up_osd, c.osd_host),
-            forbidden_osds=state.forbidden_osds,
-            osd_host=c.osd_host,
-            osd_df=c.osd_df,
-            projection=c.reservation,
-            max_target_util=c.max_target_util,
-            final=c.final,
-            final_below=below,
-        )
+        forbidden_hosts = state.forbidden_hosts(shard.up_osd, c.osd_host)
+        if avoid_host is not None:
+            forbidden_hosts.add(avoid_host)
+        # A candidate's projection with the shard is at least bound: its own
+        # plus what the shard adds to the largest OSD (less rounding).
+        bump = shard.size_bytes / self.max_capacity.get(cls, 1) * 100 - 1e-9
+        best = None
+        for util, osd in self.order.get(cls, []):
+            bound = util + bump
+            # The reservation is never below the final projection.
+            if (
+                bound > c.max_target_util
+                or (below is not None and bound >= below)
+                or (best is not None and bound > best[0])
+            ):
+                break
+            if (
+                target_projection(
+                    osd,
+                    shard.size_bytes,
+                    forbidden_hosts=forbidden_hosts,
+                    forbidden_osds=state.forbidden_osds,
+                    osd_host=c.osd_host,
+                    projection=c.reservation,
+                    max_target_util=c.max_target_util,
+                )
+                is None
+            ):
+                continue
+            projected = c.final.utilization(osd, shard.size_bytes)
+            if below is not None and projected >= below:
+                continue
+            if best is None or (projected, osd) < best:
+                best = projected, osd
+        return best
 
     def commit(
-        self, state: PgState, shard: "MappedShard | ArrivingShard", target: int
+        self, state: PgState, shard: MappedShard | ArrivingShard, target: int
     ) -> None:
         """Record in the projections and state that shard goes to target."""
         c = self.cluster
@@ -378,38 +430,42 @@ class Planner:
         else:
             # Still arriving on its up OSD: that backfill is cancelled.
             c.reservation.redirect(shard, target)
-        c.final.move(shard.up_osd, target, shard.size_bytes)
+        self.move_final(shard.up_osd, target, shard.size_bytes)
         state.retarget(shard.up_osd, target)
         state.changed.add(state.key(shard))
 
     def uncommit(self, state: PgState, shard: MappedShard, target: int) -> None:
-        """Undo commit(state, shard, target). target stays forbidden."""
+        """Undo commit(state, shard, target), which place() chose.
+
+        So target was not forbidden before: it no longer is.
+        """
         c = self.cluster
         c.reservation.add(target, -shard.size_bytes)
         if shard.acting_osd != shard.up_osd and c.reservation.knows(shard.up_osd):
             c.reservation.add(shard.up_osd, shard.size_bytes)
-        c.final.move(target, shard.up_osd, shard.size_bytes)
-        state.new_up[state.new_up.index(target)] = shard.up_osd
+        self.move_final(target, shard.up_osd, shard.size_bytes)
+        state.retarget(target, shard.up_osd)
+        state.forbidden_osds.discard(target)
         state.changed.discard(state.key(shard))
 
     def is_blocker(
-        self, shard: "ArrivingShard | MappedShard", toofull_now: bool
+        self, shard: ArrivingShard | MappedShard, toofull_now: bool
     ) -> str | None:
         """Return why the shard arriving on its up OSD blocks its PG, or None.
 
         It blocks if that OSD is projected at or over backfillfull_ratio
-        (messages.blocking_reason, as in cancel-backfill) or, with toofull_now,
-        is at or above nearfull_ratio now: Ceph may count more than the
-        projection sees. The reason names the OSD.
+        (placement.blocker_projection, as in cancel-backfill) or, with
+        toofull_now, is at or above nearfull_ratio now: Ceph may count more
+        than the projection sees. The reason names the OSD.
         """
         c = self.cluster
         osd_id = shard.up_osd
         if not c.reservation.knows(osd_id):
             return None
-        projected = c.reservation.utilization_after(osd_id, 0)
-        now = c.osd_df[osd_id].get("utilization")
-        if projected >= c.ratios.backfillfull:
+        projected = blocker_projection(c.reservation, osd_id, c.ratios.backfillfull)
+        if projected is not None:
             return blocking_reason(osd_id, projected)
+        now = c.osd_df[osd_id].get("utilization")
         if toofull_now and now is not None and now >= c.ratios.nearfull:
             return (
                 f"osd.{osd_id} now {now:.1f}% >= nearfull_ratio "
@@ -434,64 +490,88 @@ class Planner:
         return chain_link(rest + effective) is not None
 
     def try_pin(
-        self, state: PgState, blocker: "ArrivingShard | MappedShard"
-    ) -> tuple[list[tuple["int | str", int, int]], str | None]:
-        """Return the (shard, from, to) pins that cancel blocker's backfill, or ([], why not).
+        self, state: PgState, blocker: ArrivingShard | MappedShard
+    ) -> tuple[list[ArrivingShard], str | None]:
+        """Return the pins that cancel blocker's backfill, or ([], why not).
 
-        blocker is arriving on its up OSD. Its own pin comes first, then
+        blocker is arriving on its up OSD. Each pin is a shard arriving on
+        its up OSD, to send back to its acting OSD: blocker's own first, then
         companions. Refused, besides the reasons close_pins gives, if a pin
         would land on a source (unless it stays below the level), undo a move
         proposed in this run, or chain (pgremapper cannot apply chains).
         """
-        pg = state.pg
-        acting = pg["acting"]
+        pgid, size = state.pg["pgid"], state.size_bytes
         osd_host = self.cluster.osd_host
-        if state.is_ec:
-            if blocker.acting_osd is None:
-                return [], "no acting OSD"
-            pins, why = close_pins(
-                state.new_up, acting, {blocker.shard: blocker.acting_osd}, osd_host
+        if blocker.acting_osd is None and not state.is_ec:
+            blocker = blocker._replace(acting_osd=self.replica_source(state, blocker))
+        if blocker.acting_osd is None:
+            return (
+                [],
+                "no acting OSD" if state.is_ec else "replica pairing is ambiguous",
             )
-            if why is not None:
-                return [], why
-            moves = [(s, state.new_up[s], a) for s, a in pins.items()]
+        if state.is_ec:
+            slots, why = close_pins(
+                state.new_up,
+                state.pg["acting"],
+                {blocker.shard: blocker.acting_osd},
+                osd_host,
+            )
+            pins = [
+                ArrivingShard(pgid, s, state.new_up[s], a, [], size)
+                for s, a in slots.items()
+            ]
         else:
-            up_set, acting_set = real_osd_set(pg["up"]), real_osd_set(acting)
-            departing = acting_set - up_set
-            # Other sources' replicas are redirected, not paired.
-            arriving = (up_set - acting_set) - (self.sources - {blocker.up_osd})
-            if len(departing) != 1 or len(arriving) != 1:
-                return [], "replica pairing is ambiguous"
-            (to_osd,) = departing
-            why = pin_replica(state.new_up, blocker.up_osd, to_osd, osd_host)
-            if why is not None:
-                return [], why
-            moves = [("-", blocker.up_osd, to_osd)]
+            why = pin_replica(
+                state.new_up, blocker.up_osd, blocker.acting_osd, osd_host
+            )
+            pins = [
+                ArrivingShard(pgid, "-", blocker.up_osd, blocker.acting_osd, [], size)
+            ]
+        if why is not None:
+            return [], why
 
         pinned_back: Counter[int] = Counter()  # bytes kept on each source
-        for s, from_osd, to_osd in moves:
-            if to_osd in self.sources:
-                pinned_back[to_osd] += state.size_bytes
-                if not self.is_below_level(to_osd, pinned_back[to_osd]):
+        for pin in pins:
+            if pin.acting_osd in self.sources:
+                pinned_back[pin.acting_osd] += size
+                if not self.is_below_level(pin.acting_osd, pinned_back[pin.acting_osd]):
                     level = (
                         ""
                         if self.level is None
                         else f", taking it to the {level_text(self.level)} level "
                         "or above"
                     )
-                    return [], f"it would pin data back onto source osd.{to_osd}{level}"
-            if (s if state.is_ec else from_osd) in state.changed:
+                    return [], (
+                        f"it would pin data back onto source osd.{pin.acting_osd}{level}"
+                    )
+            if state.key(pin) in state.changed:
                 return [], "it would undo a move proposed in this run"
-        if self.chains(state, [(f, t) for _, f, t in moves]):
+        if self.chains(state, [(p.up_osd, p.acting_osd) for p in pins]):
             return [], "the PG's pairs would chain, which pgremapper cannot apply"
-        return moves, None
+        return pins, None
 
-    def make_room_to_pin(self, state: PgState, blocker: ArrivingShard) -> bool:
-        """Re-place the move of the PG onto the host of blocker's acting OSD.
+    def replica_source(
+        self, state: PgState, blocker: ArrivingShard | MappedShard
+    ) -> int | None:
+        """Return the acting OSD blocker's replica comes from, or None if unclear.
 
-        That move keeps blocker from being pinned back there. Return True
-        if it now goes elsewhere (the host stays avoided for the PG), False
-        if there is no such move or no other target, leaving it as it was.
+        As placement's pairing (one departing, one arriving), but other
+        sources' arriving replicas are this run's to redirect: not counted.
+        """
+        up, acting = real_osd_set(state.pg["up"]), real_osd_set(state.pg["acting"])
+        departing = acting - up
+        arriving = (up - acting) - (self.sources - {blocker.up_osd})
+        return next(iter(departing)) if len(departing) == len(arriving) == 1 else None
+
+    def try_pin_elsewhere(
+        self, state: PgState, blocker: ArrivingShard | MappedShard
+    ) -> tuple[list[ArrivingShard], str | None]:
+        """Pin blocker back once the PG's move onto its acting OSD's host goes elsewhere.
+
+        That move keeps blocker from being pinned back there. It is
+        re-placed with the host forbidden and the pin tried again; if
+        either fails, the move is left as it was. Return try_pin's result,
+        or ([], None) if there is no such move or no other target for it.
         """
         host = self.cluster.osd_host.get(blocker.acting_osd)
         clash = next(
@@ -505,41 +585,39 @@ class Planner:
             None,
         )
         if host is None or clash is None:
-            return False
+            return [], None
         i, move = clash
         shard = MappedShard(
             move.pgid, move.shard, move.up_osd, move.acting_osd, move.size_bytes
         )
         self.uncommit(state, shard, move.target_osd)
-        state.avoid_hosts.add(host)
-        picked = self.place(state, shard)
-        if picked is None:
-            state.avoid_hosts.discard(host)
-            self.commit(state, shard, move.target_osd)
-            return False
-        self.commit(state, shard, picked[1])
-        state.moves[i] = move._replace(target_osd=picked[1])
-        return True
+        picked = self.place(state, shard, avoid_host=host)
+        pins, why = [], None
+        if picked is not None:
+            self.commit(state, shard, picked[1])
+            state.moves[i] = move._replace(target_osd=picked[1])
+            pins, why = self.try_pin(state, blocker)
+            if pins:
+                return pins, None
+            self.uncommit(state, shard, picked[1])
+        self.commit(state, shard, move.target_osd)
+        state.moves[i] = move
+        return pins, why
 
-    def pin(
-        self, state: PgState, pins: list[tuple["int | str", int, int]], note: str
-    ) -> None:
+    def pin(self, state: PgState, pins: list[ArrivingShard], note: str) -> None:
         """Record try_pin's pins of a blocker: its own with note, then its companions."""
         c = self.cluster
-        for k, (s, from_osd, to_osd) in enumerate(pins):
-            pinned = ArrivingShard(
-                state.pg["pgid"], s, from_osd, to_osd, [], state.size_bytes
-            )
-            c.reservation.cancel(pinned)
-            c.final.move(from_osd, to_osd, state.size_bytes)
-            state.new_up[state.new_up.index(from_osd)] = to_osd
-            state.changed.add(s if state.is_ec else from_osd)
+        for k, pin in enumerate(pins):
+            c.reservation.cancel(pin)
+            self.move_final(pin.up_osd, pin.acting_osd, pin.size_bytes)
+            state.retarget(pin.up_osd, pin.acting_osd)
+            state.changed.add(state.key(pin))
             if k:
-                note = companion_note(pins[0][0], of_blocker=True)
-            state.add_move(pinned, to_osd, note, ROLE_BLOCKER)
+                note = companion_note(pins[0].shard, of_blocker=True)
+            state.add_move(pin, pin.acting_osd, note, ROLE_BLOCKER)
 
 
-def shard_key(shard: "MappedShard | ArrivingShard") -> int:
+def shard_key(shard: MappedShard | ArrivingShard) -> int:
     """Order a PG's shards: EC by shard index, replicated by up OSD."""
     return shard.shard if isinstance(shard.shard, int) else shard.up_osd
 
@@ -646,8 +724,9 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
             diverted += 1
             continue
         pins, why = planner.try_pin(state, sibling)
-        if not pins and planner.make_room_to_pin(state, sibling):
-            pins, why = planner.try_pin(state, sibling)
+        if not pins:
+            pins, why_elsewhere = planner.try_pin_elsewhere(state, sibling)
+            why = why_elsewhere or why
         if not pins:
             stuck_reasons.append(
                 f"shard {sibling.shard} -> {blocking} (cannot pin: {why})"
@@ -656,7 +735,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
         planner.pin(state, pins, blocker_note("pinned, no room to divert", blocking))
         pinned += 1
 
-    # make_room_to_pin may have re-placed a requested move.
+    # try_pin_elsewhere may have re-placed a requested move.
     requested = [m for m in state.moves if m.role == ROLE_REQUESTED]
     if stuck_reasons:
         verdict, note = STUCK, "PG stays toofull: " + "; ".join(stuck_reasons)
@@ -700,12 +779,17 @@ class ShedResult(NamedTuple):
     # Each source's final projection; sources without a capacity figure
     # are absent.
     final_util: dict[int, float]
-    # With a level, the sources whose final_util is at or above it, in id order.
-    still_above: list[tuple[int, float]]
     max_target_util: float
     ratios: FullRatios
     osd_df: dict[int, dict]
     osd_host: dict[int, str]
+
+    @property
+    def still_above(self) -> list[tuple[int, float]]:
+        """With a level, the (source, final_util) at or above it, in id order."""
+        if self.level is None:
+            return []
+        return [(o, u) for o, u in self.final_util.items() if u >= self.level]
 
     @property
     def requested(self) -> list[Move]:
@@ -820,9 +904,6 @@ def shed(
         for m in moves
     ]
     final_util = {o: final.utilization(o) for o in sorted(sources) if final.knows(o)}
-    still_above = (
-        [] if level is None else [(o, u) for o, u in final_util.items() if u >= level]
-    )
     return ShedResult(
         sources=sorted(sources),
         level=level,
@@ -840,7 +921,6 @@ def shed(
         unexplained_pgs=unexplained_pgs,
         stalled_pgs=sorted(stalled, key=pgid_sort_key),
         final_util=final_util,
-        still_above=still_above,
         max_target_util=cluster.max_target_util,
         ratios=cluster.ratios,
         osd_df=cluster.osd_df,
@@ -891,7 +971,7 @@ def format_row(
         up_cells[2],
         *target_cells[:2],
         format_projection(move.target_projected),
-        osd_host.get(move.target_osd, UNKNOWN_HOST),
+        target_cells[2],
         move.note,
     ]
 
@@ -925,14 +1005,14 @@ def print_outcome(result: ShedResult, off: str) -> None:
     r = result
     print_shed_outcome(
         off,
-        len(r.requested),
-        r.moved_bytes,
-        len(r.unplaceable),
-        None if r.level is None else r.kept_count,
-        r.diverted_count,
-        r.pinned_count,
-        r.stuck_pgs,
-        r.unexplained_pgs,
+        moved=len(r.requested),
+        moved_bytes=r.moved_bytes,
+        unplaceable=len(r.unplaceable),
+        kept=None if r.level is None else r.kept_count,
+        diverted=r.diverted_count,
+        pinned=r.pinned_count,
+        stuck=r.stuck_pgs,
+        unexplained=r.unexplained_pgs,
     )
 
 

@@ -27,12 +27,15 @@ from _support import (
     TEST_DATA,
     FakeStore,
     SyntheticCluster,
+    check_one_shard_per_host,
     check_own_moves_in_or_out,
-    flat,
+    check_pairs_apply,
+    check_reservation_cap,
     osd_df_of,
     parse_args,
     placement,
     plan_from_state,
+    replayed_cluster,
     shared,
 )
 from _support import shed as sh
@@ -46,15 +49,8 @@ class Cluster(SyntheticCluster):
         return self.plan_with(bal, *argv)
 
     def rendered(self, *argv) -> tuple[str, str]:
-        """Return (stdout, stderr with whitespace collapsed) of render() for plan(*argv)."""
-        argv = [str(a) for a in argv]
-        result = self.plan(*argv)
-        if argv and not argv[0].startswith("--"):
-            argv.insert(0, "--osds")
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            bal.render(result, parse_args(bal, argv))
-        return out.getvalue(), flat(err.getvalue())
+        """render()'s (stdout, stderr) for plan(*argv)."""
+        return self.rendered_with(bal, *argv)
 
 
 def pairs(result: bal.BalanceResult) -> list[tuple[str, object, int, int]]:
@@ -443,40 +439,26 @@ class FixtureInvariantTest(unittest.TestCase):
         self.assertLessEqual(result.max_after[0], before)
 
         r = result.shed
-        sources = set(r.sources)
-        pgs = {
-            pg["pgid"]: pg
-            for pg in shared.extract_pg_stats(
-                json.loads((TEST_DATA / fixture / "pg_dump_pgs.json").read_text()),
-                "pg dump",
-            )
-        }
-        upmaps = shared.fetch_upmap_items(
-            shared.SnapshotStore.from_args(
-                parse_args(bal, [], load_state=str(TEST_DATA / fixture)),
-                bal.SNAPSHOT_COMMANDS,
-            )
-        )
-        new_up = {pgid: list(pg["up"]) for pgid, pg in pgs.items()}
+        fixture_dir = TEST_DATA / fixture
         check_own_moves_in_or_out(self, r)
+        check_pairs_apply(self, fixture_dir, r)
+        check_reservation_cap(self, fixture_dir, r)
+        check_one_shard_per_host(self, fixture_dir, r)
+        cluster = replayed_cluster(fixture_dir)
+        pgs = {pg["pgid"]: pg for pg in cluster.pgs}
+        sources = set(r.sources)
         for m in r.moves:
-            pg = pgs[m.pgid]
-            if m.target_osd != m.acting_osd:  # a pin may land on a source
-                self.assertNotIn(m.target_osd, sources)
-            if m.role == shared.ROLE_REQUESTED and m.target_osd != m.acting_osd:
+            if sh.is_pin(m):  # a pin may land on a source
+                continue
+            self.assertNotIn(m.target_osd, sources)
+            if m.role == shared.ROLE_REQUESTED:
                 self.assertIn(m.up_osd, sources)
-                self.assertNotIn(m.target_osd, pg["acting"])
-                self.assertNotIn(m.target_osd, pg["up"])
-                # No chains with the PG's existing pairs.
-                self.assertNotIn(
-                    m.target_osd, {p["from"] for p in upmaps.get(m.pgid, [])}
-                )
+                self.assertNotIn(m.target_osd, pgs[m.pgid]["acting"])
+                self.assertNotIn(m.target_osd, pgs[m.pgid]["up"])
+                # Nor in the raw CRUSH mapping: Ceph drops such an upmap.
+                existing = cluster.existing_pairs(pgs[m.pgid])
+                self.assertNotIn(m.target_osd, {f for f, _ in existing})
                 self.assertLess(m.target_projected, r.level)
-            up = new_up[m.pgid]
-            up[up.index(m.up_osd)] = m.target_osd
-        for m in r.moves:
-            hosts = [r.osd_host[o] for o in new_up[m.pgid] if shared.is_real_osd(o)]
-            self.assertEqual(len(hosts), len(set(hosts)), m.pgid)
 
     def test_a_busy_cluster_gets_relieved(self):
         result, trace = self.traced["ceph1-resumed-backfills-exact-progress"]
@@ -495,7 +477,7 @@ class FixtureInvariantTest(unittest.TestCase):
             {
                 m.target_osd
                 for m in result.shed.moves
-                if m.role == shared.ROLE_BLOCKER and m.target_osd == m.acting_osd
+                if m.role == shared.ROLE_BLOCKER and sh.is_pin(m)
             },
         )
 

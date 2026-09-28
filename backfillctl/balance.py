@@ -74,7 +74,6 @@ from shed import (
     print_moves,
     print_notes,
     print_outcome,
-    print_pgremapper_mappings,
     shed,
 )
 
@@ -205,8 +204,7 @@ def render(result: BalanceResult, args: argparse.Namespace) -> None:
     )
     if not r.sources:
         stderr_para(f"No {cls} OSD is at or above the level: nothing to move.")
-        if args.pgremapper_mappings:
-            print_pgremapper_mappings([])
+        print_moves(r, args)
         return
     stderr_para(
         f"Targets: the other {cls} OSDs, "
