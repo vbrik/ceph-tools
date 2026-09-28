@@ -3,24 +3,19 @@
 Two kinds of bug drive what is tested here, both of which read as
 plausible output rather than as an obvious failure.
 
-The table's column layout: the columns are grouped under the PG set they
-come from (ACTING/UP/TARGET) and ordered along the shard's path, so a row
-that silently drifts out of that order still looks like a valid proposal.
-
-The two safety thresholds: --toofull-util keeps shards that were never
+Which shards are diverted: --toofull-util keeps shards that were never
 blocked from being diverted (backfill_toofull is a property of the PG, not
-of each shard arriving on it), and --max-target-util caps a target's
-projected utilization (and may not exceed backfillfull_ratio, which Ceph
-refuses to backfill past). Both default to the cluster's own ratios, so the
-tests check the defaults are read from the capture, and the cluster-sized
-fixture is checked by invariant -- no target projected above the cap, no
-shard diverted off an OSD below nearfull_ratio.
+of each shard arriving on it). Degraded PGs are diverted too (an out OSD
+leaves them so); PGs whose existing upmap pairs chain are not.
 
-Target reuse: an OSD may take several shards (--max-target-uses), each one
-sized from its PG and projected onto the OSD until --max-target-util would
-be exceeded. The unit tests use round numbers (an OSD of 1,000,000 KiB, so
-that 25% is an exact byte count) so the projection arithmetic is exact and
-the cap boundary can be pinned without float slack.
+Where they go: targets are chosen by shed.Planner, as in drain and balance
+(its rules are tested in test_shed.py), with the relief rule on: a target
+must end up below the OSD it relieves. --max-target-util caps a target's
+reservation projection, which counts every backfill in motion, and may not
+exceed backfillfull_ratio. Both thresholds default to the cluster's own
+ratios, so the tests check the defaults are read from the capture, and the
+cluster-sized fixture is checked by invariant. The order shards are served
+in (fullest acting OSD first) is divert's own, tested on divert() alone.
 """
 
 import contextlib
@@ -29,11 +24,11 @@ import json
 import math
 import pathlib
 import random
-import re
 import shutil
 import tempfile
 import unittest
-from collections import Counter
+from collections import Counter, defaultdict
+from types import SimpleNamespace
 from typing import ClassVar
 
 from _support import (
@@ -42,6 +37,10 @@ from _support import (
     PCT,
     TEST_DATA,
     FakeStore,
+    SyntheticCluster,
+    check_one_shard_per_host,
+    check_pairs_apply,
+    check_reservation_cap,
     flat,
     messages,
     osd_df_of,
@@ -51,153 +50,12 @@ from _support import (
     run_command,
     shared,
     stderr_of,
+    upmap_pairs,
 )
 
 from backfillctl import divert_toofull as dt
 
-# The column labels in order, as print_table's label line splits: the OSD/UTIL/
-# HOST triple of ACTING and UP, then TARGET's, which adds the projection.
-LABELS = (
-    ["PGID", "SHARD"] + ["OSD", "UTIL", "HOST"] * 2 + ["OSD", "UTIL", "PROJ", "HOST"]
-)
-
-# A real row: the shard's data is on osd.406, the stalled backfill is aimed
-# at osd.882 (whose host is too full), and osd.898 is the proposal (62.9%
-# once this shard has been added to it).
-OSD_HOST = {406: "host32", 882: "host50", 898: "host51"}
-OSD_DF = {
-    406: {"id": 406, "utilization": 89.9, "device_class": "hdd"},
-    882: {"id": 882, "utilization": 69.1, "device_class": "hdd"},
-    898: {"id": 898, "utilization": 61.7, "device_class": "hdd"},
-}
-
-
-def make_proposal(acting_osd=406):
-    shard = placement.ArrivingShard(
-        pgid="19.2",
-        shard=0,
-        up_osd=882,
-        acting_osd=acting_osd,
-        up_set=[882, 111, 222],
-    )
-    return dt.Proposal(shard, 898, "host51", 61.7, 62.9)
-
-
-class FormatRowTest(unittest.TestCase):
-    def test_row_matches_column_order(self):
-        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
-        self.assertEqual(
-            row,
-            [
-                "19.2",
-                "0",
-                "406",
-                "89.9%",
-                "host32",
-                "882",
-                "69.1%",
-                "host50",
-                "898",
-                "61.7%",
-                "62.9%",
-                "host51",
-            ],
-        )
-
-    def test_row_length_tracks_columns(self):
-        # Guards against a column being added to COLUMNS (or to the row)
-        # without the other side following.
-        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
-        self.assertEqual(len(row), len(dt.COLUMNS))
-
-    def test_unknown_acting_osd_renders_as_none_and_dashes(self):
-        # The usual out-OSD case: the slot the shard is coming from reads as
-        # CRUSH_ITEM_NONE, so neither its utilization nor its host exists.
-        row = dt.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF)
-        cells = dict(zip(dt.COLUMNS, row))
-        self.assertEqual(cells[("ACTING", "OSD")], "none")
-        self.assertEqual(cells[("ACTING", "UTIL")], shared.NOT_APPLICABLE)
-        self.assertEqual(cells[("ACTING", "HOST")], shared.NOT_APPLICABLE)
-        # The up side is still fully known — that is the whole premise.
-        self.assertEqual(cells[("UP", "OSD")], "882")
-        self.assertEqual(cells[("UP", "UTIL")], "69.1%")
-
-
-def table_lines(rows):
-    """Return the lines print_table writes for rows."""
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        shared.print_table(dt.COLUMNS, rows)
-    return buf.getvalue().splitlines()
-
-
-class PrintTableTest(unittest.TestCase):
-    def test_header_is_two_lines_with_each_group_named_once(self):
-        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
-        group_line, label_line, _ = table_lines([row])
-        self.assertEqual(re.findall(r"[A-Z]+", group_line), ["ACTING", "UP", "TARGET"])
-        self.assertEqual(label_line.split(), LABELS)
-
-    def test_group_span_covers_exactly_its_own_columns(self):
-        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
-        group_line, label_line, data_line = table_lines([row])
-        spans = list(re.finditer(r"-+ [A-Z]+ -+", group_line))
-        osd_starts = [m.start() for m in re.finditer("OSD", label_line)]
-        self.assertEqual([m.start() for m in spans], osd_starts)
-        # A span ends a group separator before the next group's first column,
-        # and the last one at the end of the data row.
-        gap = len(shared.GROUP_SEP)
-        self.assertEqual(
-            [m.end() for m in spans[:2]], [start - gap for start in osd_starts[1:]]
-        )
-        self.assertEqual(spans[2].end(), len(data_line))
-        # The name is centered: dashes on both sides.
-        for m in spans:
-            self.assertTrue(m.group().startswith("-") and m.group().endswith("-"))
-
-    def test_ungrouped_columns_have_a_blank_group_line(self):
-        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
-        group_line, label_line, _ = table_lines([row])
-        pgid_and_shard = label_line.index("OSD")
-        self.assertEqual(group_line[:pgid_and_shard], " " * pgid_and_shard)
-
-    def test_groups_are_set_apart_by_a_wider_gap_than_columns_within_one(self):
-        row = dt.format_row(make_proposal(), OSD_HOST, OSD_DF)
-        _, _, data_line = table_lines([row])
-        # Data cells fill their columns exactly, so the gaps read off directly:
-        # 2 spaces within a group, 4 between groups (and after SHARD).
-        self.assertRegex(data_line, r"406 {2}89\.9% {2}host32")
-        self.assertRegex(data_line, r"host32 {4}882")
-        self.assertRegex(data_line, r"host50 {4}898")
-        # SHARD's cell '0' is padded to the 5-char label, then the 4-space gap.
-        self.assertRegex(data_line, r" 0 {8}406")
-
-    def test_no_trailing_whitespace(self):
-        # Narrow cells (unknown acting OSD) and a blank final group cell
-        # must not leave padding on any line.
-        row = dt.format_row(make_proposal(acting_osd=None), OSD_HOST, OSD_DF)
-        for line in table_lines([row]):
-            self.assertEqual(line, line.rstrip())
-
-    def test_columns_widen_to_fit_the_widest_cell(self):
-        rows = [
-            dt.format_row(make_proposal(), OSD_HOST, OSD_DF),
-            ["19.1ce0"] + dt.format_row(make_proposal(), OSD_HOST, OSD_DF)[1:],
-        ]
-        lines = table_lines(rows)
-        # The widest PGID ('19.1ce0') pushes every line's SHARD column right.
-        self.assertTrue(lines[1].startswith("PGID     SHARD"))
-        self.assertEqual({line.index("406") for line in lines[2:]}, {18})
-
-    def test_column_and_row_widths_agree(self):
-        # Every cell of the group line and label line must be a column of
-        # the same table as the data rows.
-        rows = [dt.format_row(make_proposal(), OSD_HOST, OSD_DF)]
-        _, label_line, data_line = table_lines(rows)
-        self.assertEqual(len(dt.COLUMNS), len(rows[0]))
-        self.assertEqual(
-            len(label_line.split()), len(data_line.split()), (label_line, data_line)
-        )
+TOOFULL = "active+remapped+backfill_toofull"
 
 
 class FindArrivingShardsTest(unittest.TestCase):
@@ -380,8 +238,8 @@ class BuildCandidateOsdsTest(unittest.TestCase):
         self.assertEqual(placement.build_candidate_osds(df), {})
 
     def test_osd_without_a_capacity_figure_is_excluded(self):
-        # ProjectedUsage cannot track it, so offering it would crash the
-        # run in assign_targets.
+        # The projections cannot track it, so offering it would crash the
+        # planner.
         self.assertEqual(placement.build_candidate_osds(self.df(kb=0)), {})
         df = self.df()
         del df[1]["kb"]
@@ -400,379 +258,6 @@ class BuildCandidateOsdsTest(unittest.TestCase):
             12: base | {"id": 12, "utilization": 50.0},
         }
         self.assertEqual(placement.build_candidate_osds(df), {"hdd": [11, 12, 10]})
-
-
-class PrintTableEdgeCaseTest(unittest.TestCase):
-    def test_empty_rows_prints_just_the_header(self):
-        # render() guards this today, but the star-args width form used to
-        # raise TypeError here rather than degrade gracefully.
-        group_line, label_line = table_lines([])
-        self.assertEqual(re.findall(r"[A-Z]+", group_line), ["ACTING", "UP", "TARGET"])
-        self.assertEqual(label_line.split(), LABELS)
-
-
-def proposals_from_readme(fixture):
-    """Return the 'Expected proposals' block of a fixture README as tuples.
-
-    Each is (pgid, shard, acting OSD, up OSD, target OSD), as strings, the
-    acting OSD 'none' when unknown. Pulling the expected proposals out of the
-    README, rather than duplicating them here, is what keeps the two from
-    drifting apart.
-    """
-    lines = (TEST_DATA / fixture / "README.txt").read_text().splitlines()
-    # The heading wraps onto further lines before the indented block.
-    start = next(i for i, ln in enumerate(lines) if ln.startswith("Expected proposals"))
-    block = []
-    for line in lines[start:]:
-        if line.startswith("  "):
-            block.append(tuple(line.split()))
-        elif block:
-            break
-    return block
-
-
-def proposal_tuple(p):
-    """p in the form proposals_from_readme returns."""
-    acting = "none" if p.shard.acting_osd is None else str(p.shard.acting_osd)
-    return (
-        p.shard.pgid,
-        str(p.shard.shard),
-        acting,
-        str(p.shard.up_osd),
-        str(p.target_osd),
-    )
-
-
-def fixture_plan(fixture, *argv):
-    """Return plan()'s DivertResult for a fixture under test-data."""
-    return plan_from_state(dt, TEST_DATA / fixture, *argv)
-
-
-def copy_without_pool(fixture: str, pool_id: int, tmp: str) -> pathlib.Path:
-    """Copy fixture into directory tmp minus pool_id's 'pool ls detail' entry.
-
-    Returns the copy's path.
-    """
-    dst = pathlib.Path(tmp) / "fixture"
-    shutil.copytree(TEST_DATA / fixture, dst)
-    path = dst / "pool_ls_detail.json"
-    pools = json.loads(path.read_text())
-    path.write_text(json.dumps([p for p in pools if p["pool_id"] != pool_id]))
-    return dst
-
-
-def remap_triples(proposals):
-    """The (pgid, up OSD, target OSD) of each proposal, as '<pgid> <up> <target>'."""
-    return [f"{p.shard.pgid} {p.shard.up_osd} {p.target_osd}" for p in proposals]
-
-
-CEPH2_FIXTURE = "divert-toofull-ceph2-util-emergency-2-new-hosts"
-
-# What the fixture's README.txt documents, and what the thresholds buy:
-# 1513 arriving shards, 976 of them plausibly blocked. With the defaults each
-# of the 900 up/in OSDs may take up to 5 shards while its projected
-# utilization -- counting every shard already arriving on it, the stuck ones
-# included until they are diverted -- stays at or below the default cap of
-# backfillfull_ratio - 1, and shards are placed fullest acting OSD first,
-# which places 52 of the 976. Asserted as counts and invariants
-# rather than an exact 52-row table, which would be unreadable in a README.
-CEPH2_ARRIVING = 1513
-CEPH2_STUCK = 976
-CEPH2_CANDIDATES = 900
-CEPH2_MAX_USES = 5
-CEPH2_PROPOSED = 52
-CEPH2_UNPLACEABLE = 924
-# --max-target-uses 1: one shard per OSD, but projected like the rest, so
-# not one per candidate, as before the projection existed.
-CEPH2_SINGLE_USE_PROPOSED = 26
-CEPH2_SINGLE_USE_UNPLACEABLE = 950
-CEPH2_NEARFULL = 85.0
-CEPH2_BACKFILLFULL = 91.0
-# Ceph refuses on a target's projected usage, so the default cap keeps one
-# point of margin below backfillfull_ratio.
-CEPH2_MAX_TARGET_UTIL = CEPH2_BACKFILLFULL - 1
-# Proposals when the cap is instead set to backfillfull_ratio itself: targets
-# may be projected right up to the ratio, with no margin.
-CEPH2_NO_MARGIN_PROPOSED = 199
-
-# With both thresholds at their loosest (--toofull-util 0, cap at
-# backfillfull_ratio) the tool used to propose every usable hdd OSD (822),
-# 342 of them already past backfillfull_ratio. The projection now keeps every
-# target at or below the cap.
-CEPH2_UNCAPPED_PROPOSED = 210
-
-
-class PrintOutcomeTest(unittest.TestCase):
-    def capture(self, unplaceable):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            dt.print_outcome(5, unplaceable)
-        return err.getvalue()
-
-    def test_names_each_unplaceable_shard_then_the_caveat(self):
-        shards = [
-            placement.ArrivingShard("19.1", 3, 31, 7, [31]),
-            placement.ArrivingShard("7.2", "-", 40, None, [40]),
-        ]
-        text = self.capture(shards)
-        self.assertIn("Proposed 5 move(s); 2 shard(s) could not be placed.", flat(text))
-        # One indented item per shard, after the summary (wrapping aside),
-        # then the caveat.
-        items, caveat = flat(text).split(" NOTE: ")
-        self.assertIn("greedy placement", caveat)
-        items = items.split(" cannot place ")[1:]
-        self.assertEqual(
-            items,
-            [
-                "19.1 shard 3 (headed for osd.31): no legal target",
-                "7.2 shard - (headed for osd.40): no legal target",
-            ],
-        )
-
-    def test_no_caveat_or_list_when_everything_is_placed(self):
-        text = self.capture([])
-        self.assertIn("0 shard(s) could not be placed.", flat(text))
-        self.assertNotIn("NOTE:", text)
-        self.assertNotIn("cannot place", text)
-
-
-def proposal(pgid, up_osd, target_osd, shard=0):
-    """A Proposal with just enough fields set for the pgremapper-mappings tests."""
-    ds = placement.ArrivingShard(pgid, shard, up_osd, None, [up_osd])
-    return dt.Proposal(ds, target_osd, "h", 50.0, 55.0)
-
-
-class PgremapperMappingsOutputTest(unittest.TestCase):
-    def proposals(self):
-        return [
-            proposal("19.14cd", 232, 337, shard=5),
-            proposal("19.14cd", 896, 614, shard=8),
-            proposal("7.1", 5, 6, shard="-"),
-        ]
-
-    def printed(self, proposals):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            dt.print_pgremapper_mappings(proposals)
-        return out.getvalue()
-
-    def test_is_a_json_array_of_pgid_and_mapping_entries(self):
-        self.assertEqual(
-            json.loads(self.printed(self.proposals())),
-            [
-                {"pgid": "19.14cd", "mapping": {"from": 232, "to": 337}},
-                {"pgid": "19.14cd", "mapping": {"from": 896, "to": 614}},
-                {"pgid": "7.1", "mapping": {"from": 5, "to": 6}},
-            ],
-        )
-
-    def test_empty_list_prints_a_valid_empty_json_array(self):
-        self.assertEqual(self.printed([]), "[]\n")
-
-    def test_one_entry_per_line_so_it_is_easy_to_read_and_prune(self):
-        lines = self.printed(self.proposals()).splitlines()
-        self.assertEqual(lines[0], "[")
-        self.assertEqual(lines[-1], "]")
-        self.assertEqual(len(lines), 2 + 3)
-        self.assertTrue(lines[1].endswith(","))
-        self.assertFalse(lines[-2].endswith(","))  # valid JSON: no trailing comma
-
-    def test_a_single_entry_has_no_comma(self):
-        self.assertEqual(
-            json.loads(self.printed(self.proposals()[:1])),
-            [{"pgid": "19.14cd", "mapping": {"from": 232, "to": 337}}],
-        )
-
-
-class FixturePlanTest(unittest.TestCase):
-    """plan() on the small fixtures, checked against their READMEs."""
-
-    def test_osd457_down_proposals_match_readme(self):
-        fixture = "divert-toofull-osd457-down"
-        result = fixture_plan(fixture)
-        self.assertEqual(
-            [proposal_tuple(p) for p in result.proposals],
-            proposals_from_readme(fixture),
-        )
-        self.assertEqual((result.toofull_pg_count, result.arriving_count), (1, 1))
-
-    def test_existing_upmap_chain_proposals_match_readme(self):
-        fixture = "divert-toofull-osd263-existing-upmap-chain"
-        result = fixture_plan(fixture)
-        self.assertEqual(
-            [proposal_tuple(p) for p in result.proposals],
-            proposals_from_readme(fixture),
-        )
-        self.assertEqual(result.unplaceable, [])
-
-    def test_no_backfill_toofull_pgs_proposes_nothing(self):
-        result = fixture_plan("divert-toofull-nominal-synthetic")
-        self.assertEqual((result.proposals, result.unplaceable), ([], []))
-
-    def test_default_thresholds_come_from_the_clusters_own_ratios(self):
-        # osd457-down has backfillfull_ratio 0.90, ceph2 has it raised to
-        # 0.91: the caps must track the capture, not a constant. The target
-        # cap is backfillfull_ratio minus one point.
-        for fixture, nearfull, max_target in [
-            ("divert-toofull-osd457-down", 85, 89),
-            (CEPH2_FIXTURE, 85, 90),
-        ]:
-            with self.subTest(fixture=fixture):
-                # Ceph keeps the ratios as float32, so 0.85 reads back as
-                # 85.0000024%.
-                result = fixture_plan(fixture)
-                self.assertAlmostEqual(result.toofull_util, nearfull, places=3)
-                self.assertAlmostEqual(result.max_target_util, max_target, places=3)
-
-
-class FixtureReplayTest(unittest.TestCase):
-    """End-to-end --load-state runs: how run() prints what plan() decides."""
-
-    def run_proc(self, fixture, *extra):
-        return run_command(dt, *extra, load_state=TEST_DATA / fixture, check=True)
-
-    def run_script(self, fixture, *extra):
-        return self.run_proc(fixture, *extra).stdout.rstrip("\n")
-
-    def test_existing_upmap_row_is_unmarked_and_has_no_upmap_column(self):
-        # The UP OSD is a plain 'osd.N' even when it is the 'to' of an
-        # existing pair; pgremapper handles that case itself.
-        out = self.run_script("divert-toofull-osd263-existing-upmap-chain")
-        self.assertNotIn("*", out)
-        self.assertNotIn("EXISTING_UPMAPS", out)
-
-    def test_pgremapper_mappings_lists_existing_upmap_rows_like_any_other(self):
-        # 19.bd5's existing pair is 625->263, so 263 is a 'to': the entry must
-        # still map 'from' 263 to the target, for 'pgremapper import-mappings'
-        # to rewrite that pair's 'to'.
-        proc = self.run_proc(
-            "divert-toofull-osd263-existing-upmap-chain", "--pgremapper-mappings"
-        )
-        entries = json.loads(proc.stdout)
-        self.assertEqual(len(entries), 6)
-        self.assertIn({"pgid": "19.bd5", "mapping": {"from": 263, "to": 842}}, entries)
-        self.assertEqual(proc.stderr.count("NOTE"), 1)  # the balancer's, only
-
-    def test_pgremapper_mappings_emits_up_osd_not_acting_osd(self):
-        # 'pgremapper import-mappings' takes the upmap's 'from', which is the
-        # UP OSD. Emitting the ACTING OSD here would remap the wrong OSD, and
-        # the table would still look right.
-        fixture = "divert-toofull-osd457-down"
-        out = self.run_script(fixture, "--pgremapper-mappings")
-        self.assertEqual(
-            json.loads(out), [{"pgid": "19.21f", "mapping": {"from": 625, "to": 849}}]
-        )
-
-    def test_no_backfill_toofull_pgs_prints_nothing_on_stdout(self):
-        self.assertEqual(self.run_script("divert-toofull-nominal-synthetic"), "")
-
-    def test_no_backfill_toofull_pgs_prints_an_empty_json_array(self):
-        self.assertEqual(
-            self.run_script(
-                "divert-toofull-nominal-synthetic", "--pgremapper-mappings"
-            ),
-            "[]",
-        )
-
-    def test_balancer_note_closes_a_run_with_proposals(self):
-        note = stderr_of(messages.print_balancer_note)
-        for extra in ((), ("--pgremapper-mappings",)):
-            with self.subTest(extra=extra):
-                err = flat(self.run_proc("divert-toofull-osd457-down", *extra).stderr)
-                self.assertTrue(err.endswith(note), err)
-
-    def test_no_balancer_note_without_proposals(self):
-        for fixture, extra in (
-            ("divert-toofull-nominal-synthetic", ()),
-            # No room anywhere: the one stuck shard is unplaceable.
-            ("divert-toofull-osd457-down", ("--max-target-util", "2")),
-        ):
-            with self.subTest(fixture=fixture):
-                err = self.run_proc(fixture, *extra).stderr
-                self.assertNotIn("balancer", err)
-
-    def test_default_thresholds_are_reported_on_stderr(self):
-        err = flat(self.run_proc("divert-toofull-osd457-down").stderr)
-        self.assertIn("--toofull-util 85%", err)
-        self.assertIn("--max-target-util 89%", err)
-
-
-class PgsFlagTest(unittest.TestCase):
-    """--pgs restricts the run to shards of the named PG(s) only."""
-
-    FIXTURE = "divert-toofull-osd263-existing-upmap-chain"
-
-    def plan(self, *argv):
-        return fixture_plan(self.FIXTURE, *argv)
-
-    def test_only_the_named_pg_is_proposed(self):
-        result = self.plan("--pgs", "19.bd5")
-        self.assertEqual(remap_triples(result.proposals), ["19.bd5 263 842"])
-        self.assertEqual(result.pgs_filter, shared.PgidFilter(1, 1, []))
-        self.assertEqual(result.toofull_pg_count, 1)
-
-    def test_several_named_pgs_are_all_kept(self):
-        # Targets are not pinned here: with only two of the six PGs in play,
-        # the greedy assignment (see assign_targets) can pick a different
-        # target than the full run does, since room is contended
-        # differently. Only which PGs got a proposal is guaranteed.
-        result = self.plan("--pgs", "19.bd5", "19.7be")
-        self.assertEqual({p.shard.pgid for p in result.proposals}, {"19.bd5", "19.7be"})
-        self.assertEqual(result.toofull_pg_count, 2)
-
-    def test_id_that_matches_nothing_is_reported_and_yields_no_proposals(self):
-        result = self.plan("--pgs", "19.zzz")
-        self.assertEqual(result.proposals, [])
-        self.assertEqual(result.pgs_filter, shared.PgidFilter(1, 0, ["19.zzz"]))
-        self.assertEqual(result.toofull_pg_count, 0)
-
-    def test_a_mix_of_matching_and_unmatched_ids_reports_both(self):
-        result = self.plan("--pgs", "19.bd5", "19.zzz")
-        self.assertEqual(remap_triples(result.proposals), ["19.bd5 263 842"])
-        self.assertEqual(result.pgs_filter, shared.PgidFilter(2, 1, ["19.zzz"]))
-
-    def test_no_pgs_flag_considers_every_pg(self):
-        result = self.plan()
-        self.assertEqual(len(result.proposals), 6)
-        self.assertIsNone(result.pgs_filter)
-
-
-class NothingToDivertTest(unittest.TestCase):
-    def test_no_toofull_pg_among_pgs_says_so_and_prints_no_table(self):
-        for extra, out_text in (([], ""), (["--pgremapper-mappings"], "[]\n")):
-            with self.subTest(extra=extra):
-                proc = run_ceph2("--pgs", "1.0", *extra)
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                self.assertEqual(proc.stdout, out_text)
-                self.assertIn("No backfill_toofull PGs among --pgs.", proc.stderr)
-                self.assertNotIn("Targets:", proc.stderr)
-
-
-class PrintPgsFilterTest(unittest.TestCase):
-    """divert-toofull's --pgs note (the shared print_pgid_filter)."""
-
-    def test_printed_even_when_planning_then_exits(self):
-        # A typo in --pgs can be what trips a later error, so the note naming
-        # it must not wait for render(), which an exit never reaches.
-        with tempfile.TemporaryDirectory() as tmp:
-            dst = copy_without_pool("divert-toofull-osd457-down", 19, tmp)
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
-                plan_from_state(dt, dst, "--pgs", "19.21f", "19.zzz")
-        self.assertIn("pool id(s) 19", str(ctx.exception))
-        self.assertIn(
-            "are backfill_toofull and will be the only ones considered; 1 matched "
-            "nothing (not backfill_toofull, or a typo): 19.zzz.",
-            flat(err.getvalue()),
-        )
-
-    def test_printed_only_with_pgs(self):
-        # The note goes to stderr, ahead of the summary, only under --pgs.
-        fixture = TEST_DATA / "divert-toofull-osd263-existing-upmap-chain"
-        for extra, shown in [((), False), (("--pgs", "19.zzz"), True)]:
-            with self.subTest(extra=extra):
-                proc = run_command(dt, *extra, load_state=fixture, check=True)
-                self.assertEqual("--pgs:" in proc.stderr, shown)
 
 
 def stuck(pgid, up_osd=1, up_set=None, size_pct=0, shard=0, acting=None):
@@ -864,355 +349,125 @@ class SourcePressureTest(unittest.TestCase):
 
 class ShardSizeTest(unittest.TestCase):
     PROFILES: ClassVar[dict[str, dict]] = {"k8m2": {"k": "8", "m": "2"}}
+    EC_POOL: ClassVar[dict] = {
+        "pool_id": 1,
+        "type": shared.POOL_TYPE_ERASURE,
+        "erasure_code_profile": "k8m2",
+    }
 
     @staticmethod
     def pg(num_bytes):
         return {"pgid": "1.0", "stat_sum": {"num_bytes": num_bytes}}
 
-    def test_ec_shard_is_one_kth_of_the_pg(self):
-        pool = {
-            "pool_id": 1,
-            "type": shared.POOL_TYPE_ERASURE,
-            "erasure_code_profile": "k8m2",
-        }
-        self.assertEqual(
-            placement.shard_size_bytes(self.pg(800), pool, self.PROFILES), 100
+    def size(self, num_bytes, pool=None):
+        return placement.shard_size_bytes(
+            self.pg(num_bytes), pool or self.EC_POOL, self.PROFILES
         )
+
+    def test_ec_shard_is_one_kth_of_the_pg(self):
+        self.assertEqual(self.size(800), 100)
 
     def test_ec_shard_size_rounds_up(self):
-        pool = {
-            "pool_id": 1,
-            "type": shared.POOL_TYPE_ERASURE,
-            "erasure_code_profile": "k8m2",
-        }
-        self.assertEqual(
-            placement.shard_size_bytes(self.pg(17), pool, self.PROFILES), 3
-        )
+        self.assertEqual(self.size(17), 3)
 
     def test_empty_ec_pg_has_empty_shards(self):
-        pool = {
-            "pool_id": 1,
-            "type": shared.POOL_TYPE_ERASURE,
-            "erasure_code_profile": "k8m2",
-        }
-        self.assertEqual(placement.shard_size_bytes(self.pg(0), pool, self.PROFILES), 0)
+        self.assertEqual(self.size(0), 0)
 
     def test_replica_is_the_whole_pg(self):
         pool = {"pool_id": 1, "type": 1, "erasure_code_profile": ""}
-        self.assertEqual(
-            placement.shard_size_bytes(self.pg(800), pool, self.PROFILES), 800
-        )
+        self.assertEqual(self.size(800, pool), 800)
 
     def test_unknown_profile_is_refused_rather_than_guessed(self):
-        pool = {
-            "pool_id": 1,
-            "type": shared.POOL_TYPE_ERASURE,
-            "erasure_code_profile": "gone",
-        }
+        pool = self.EC_POOL | {"erasure_code_profile": "gone"}
         with self.assertRaises(SystemExit) as cm:
-            placement.shard_size_bytes(self.pg(800), pool, self.PROFILES)
+            self.size(800, pool)
         self.assertIn("'gone'", str(cm.exception))
 
 
-class PositiveIntTest(unittest.TestCase):
-    def test_accepts_one_and_up(self):
-        self.assertEqual(placement.positive_int("1"), 1)
-        self.assertEqual(placement.positive_int("12"), 12)
-
-    def test_rejects_zero_negative_and_non_numbers(self):
-        import argparse
-
-        for text in ("0", "-3"):
-            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
-                placement.positive_int(text)
-        with self.assertRaises(ValueError):
-            placement.positive_int("many")
+# ---------------------------------------------------------------------------
+# divert(): the order shards are served in
+# ---------------------------------------------------------------------------
 
 
-class RecordingProjection(placement.ProjectedUsage):
-    """A ProjectedUsage that notes which shards were placed, in placement order."""
+class RecordingPlanner:
+    """Stands in for shed.Planner in divert(): records the order shards are placed.
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.placed: list[str] = []
+    Every shard gets a target but those of PGs in refuse, and those after
+    the first room (if given) shards placed.
+    """
 
-    def redirect(self, shard, target_osd):
+    def __init__(self, acting_utils, refuse=(), room=None):
+        self.cluster = SimpleNamespace(osd_df=osd_df_of(acting_utils))
+        self.refuse = set(refuse)
+        self.room = room
+        self.placed: list[str] = []  # PG ids, in the order placed
+
+    def place(self, state, shard):
+        full = self.room is not None and len(self.placed) >= self.room
+        return None if full or shard.pgid in self.refuse else (0.0, 99)
+
+    def commit(self, state, shard, target):
         self.placed.append(shard.pgid)
-        super().redirect(shard, target_osd)
 
 
-class AssignTargetsTest(unittest.TestCase):
-    """assign_targets: legality rules for a shard's target OSD."""
+def divert_order(shards, acting_utils, **kwargs):
+    """Run divert() with a RecordingPlanner; return (placed PG ids, unplaceable ids)."""
+    planner = RecordingPlanner(acting_utils, **kwargs)
+    states = defaultdict(lambda: SimpleNamespace(add_move=lambda shard, target: None))
+    unplaceable = dt.divert(planner, states, shards)
+    return planner.placed, [s.pgid for s in unplaceable]
 
-    HOSTS: ClassVar[dict[int, str]] = {1: "h1", 2: "h2", 3: "h3", 4: "h4", 5: "h2"}
 
-    def assign(
-        self,
-        utils,
-        candidates,
-        shards=None,
-        *,
-        arriving=None,
-        max_uses=5,
-        max_target_util=91.0,
-    ):
-        shards = shards or [stuck("1.0")]
-        # By default the shards being placed are all there is arriving.
-        arriving = shards if arriving is None else arriving
-        df = osd_df_of(utils)
-        projection = RecordingProjection(df, list(arriving))
-        self.placed = projection.placed  # PG ids, in the order placed
-        return dt.assign_targets(
-            shards,
-            {"hdd": candidates},
-            self.HOSTS,
-            df,
-            {},
-            projection=projection,
-            max_uses=max_uses,
-            max_target_util=max_target_util,
-        )
-
-    def targets(self, proposals):
-        return [p.target_osd for p in proposals]
-
-    def test_target_fuller_than_up_osd_is_rejected(self):
-        proposals, unplaceable = self.assign({1: 86.0, 2: 87.0}, [2])
-        self.assertEqual(proposals, [])
-        self.assertEqual(len(unplaceable), 1)
-
-    def test_target_with_equal_utilization_is_rejected(self):
-        proposals, unplaceable = self.assign({1: 86.0, 2: 86.0}, [2])
-        self.assertEqual(proposals, [])
-        self.assertEqual(len(unplaceable), 1)
-
-    def test_fuller_candidate_is_skipped_for_a_later_emptier_one(self):
-        # Candidates are normally sorted ascending, but the rule must not
-        # depend on that: skip the offender, don't give up on the shard.
-        proposals, _ = self.assign({1: 86.0, 2: 88.0, 3: 85.0}, [2, 3])
-        self.assertEqual(self.targets(proposals), [3])
-
-    def test_unknown_up_utilization_imposes_no_limit(self):
-        proposals, _ = self.assign({1: None, 2: 89.0}, [2])
-        self.assertEqual(self.targets(proposals), [2])
-
-    def test_rejected_candidate_stays_available_for_a_fuller_up_osd(self):
-        # A skipped candidate must not be used up: the next shard, arriving
-        # on a fuller OSD, can still take it.
-        shards = [stuck("1.0", up_osd=1), stuck("1.1", up_osd=3)]
-        proposals, unplaceable = self.assign({1: 86.0, 2: 88.0, 3: 90.0}, [2], shards)
-        self.assertEqual(
-            [(p.shard.pgid, p.target_osd) for p in proposals], [("1.1", 2)]
-        )
-        self.assertEqual([s.pgid for s in unplaceable], ["1.0"])
-
-    # -- reuse ---------------------------------------------------------------
-
-    def test_target_is_reused_up_to_the_limit(self):
-        shards = [stuck(f"1.{i}") for i in range(4)]
-        proposals, unplaceable = self.assign(
-            {1: 95.0, 2: 50.0}, [2], shards, max_uses=3
-        )
-        self.assertEqual(self.targets(proposals), [2, 2, 2])
-        self.assertEqual([s.pgid for s in unplaceable], ["1.3"])
-
-    def test_limit_of_one_gives_every_target_a_single_shard(self):
-        shards = [stuck(f"1.{i}") for i in range(3)]
-        proposals, unplaceable = self.assign(
-            {1: 95.0, 2: 50.0, 3: 51.0}, [2, 3], shards, max_uses=1
-        )
-        self.assertEqual(self.targets(proposals), [2, 3])
-        self.assertEqual(len(unplaceable), 1)
-
-    def test_the_limit_is_per_osd_not_per_run(self):
-        shards = [stuck(f"1.{i}") for i in range(4)]
-        proposals, _ = self.assign(
-            {1: 95.0, 2: 50.0, 3: 51.0}, [2, 3], shards, max_uses=2
-        )
-        self.assertEqual(sorted(self.targets(proposals)), [2, 2, 3, 3])
-
-    def test_a_pg_still_cannot_use_one_host_twice(self):
-        # Reuse is across PGs; within one PG the host exclusion still holds,
-        # and osd.5 shares host h2 with osd.2.
-        up_set = [1, 3]
-        shards = [stuck("1.0", 1, up_set, shard=0), stuck("1.0", 3, up_set, shard=1)]
-        proposals, unplaceable = self.assign(
-            {1: 95.0, 2: 50.0, 3: 95.0, 5: 51.0}, [2, 5], shards
-        )
-        self.assertEqual(self.targets(proposals), [2])
-        self.assertEqual(len(unplaceable), 1)
-
-    # -- projection ----------------------------------------------------------
-
-    def test_a_target_stops_being_used_when_the_next_shard_would_fill_it(self):
-        # 40% -> 65% -> 90%, and a third 25% would make 115%.
-        shards = [stuck(f"1.{i}", size_pct=25) for i in range(3)]
-        proposals, unplaceable = self.assign(
-            {1: 99.0, 2: 40.0}, [2], shards, max_target_util=95.0
-        )
-        self.assertEqual(self.targets(proposals), [2, 2])
-        self.assertEqual([p.target_projected for p in proposals], [90.0, 90.0])
-        self.assertEqual([s.pgid for s in unplaceable], ["1.2"])
-
-    def test_the_proposal_reports_current_and_projected_utilization(self):
-        (proposal,), _ = self.assign(
-            {1: 99.0, 2: 40.0}, [2], [stuck("1.0", size_pct=25)]
-        )
-        self.assertEqual(proposal.target_utilization, 40.0)
-        self.assertEqual(proposal.target_projected, 65.0)
-
-    def test_every_row_of_a_target_reports_its_projection_once_all_are_placed(self):
-        # 40% + 10% + 20% + 30% = 100%, the same in all three rows, though the
-        # first placed (1.1, 20%) saw only 60% when it was chosen.
-        shards = [
-            stuck("1.0", acting=6, size_pct=10),
-            stuck("1.1", acting=7, size_pct=20),
-            stuck("1.2", acting=8, size_pct=30),
-        ]
-        proposals, _ = self.assign(
-            {1: 99.0, 2: 40.0, 6: 80.0, 7: 90.0, 8: 85.0},
-            [2],
-            shards,
-            max_target_util=100.0,
-        )
-        self.assertEqual(self.placed, ["1.1", "1.2", "1.0"])
-        self.assertEqual([p.target_projected for p in proposals], [100.0] * 3)
-
-    def test_each_target_reports_its_own_projection(self):
-        shards = [stuck(f"1.{i}", size_pct=10) for i in range(3)]
-        proposals, _ = self.assign(
-            {1: 99.0, 2: 50.0, 3: 55.0}, [2, 3], shards, max_uses=2
-        )
-        self.assertEqual(self.targets(proposals), [2, 3, 2])
-        self.assertEqual([p.target_projected for p in proposals], [70.0, 65.0, 70.0])
-
-    def test_projecting_exactly_to_the_cap_is_allowed_and_beyond_is_refused(self):
-        # 50% + 25% is exactly 75%: "not exceed", so allowed at 75, refused
-        # for a cap just below.
-        shard = [stuck("1.0", size_pct=25)]
-        allowed, _ = self.assign({1: 99.0, 2: 50.0}, [2], shard, max_target_util=75.0)
-        self.assertEqual(self.targets(allowed), [2])
-        refused, unplaceable = self.assign(
-            {1: 99.0, 2: 50.0}, [2], shard, max_target_util=74.5
-        )
-        self.assertEqual((refused, len(unplaceable)), ([], 1))
-
-    def test_a_target_already_above_the_cap_is_refused_even_for_an_empty_shard(self):
-        # Projection can only go up, so this is what the old current-utilization
-        # pre-filter used to catch.
-        refused, unplaceable = self.assign(
-            {1: 99.0, 2: 80.0}, [2], max_target_util=75.0
-        )
-        self.assertEqual((refused, len(unplaceable)), ([], 1))
-
-    def test_a_shard_too_big_for_every_candidate_is_unplaceable_even_below_the_cap(
-        self,
-    ):
-        # 89% is a fine target for a zero-size shard, not for a 5% one.
-        proposals, unplaceable = self.assign(
-            {1: 99.0, 2: 89.0}, [2], [stuck("1.0", size_pct=5)]
-        )
-        self.assertEqual((proposals, len(unplaceable)), ([], 1))
-
-    def test_shards_of_different_sizes_are_each_projected_by_their_own_size(self):
-        shards = [stuck("1.0", size_pct=30), stuck("1.1", size_pct=10)]
-        proposals, _ = self.assign({1: 99.0, 2: 40.0}, [2], shards)
-        self.assertEqual([p.target_projected for p in proposals], [80.0, 80.0])
-
-    def test_the_least_projected_candidate_wins_and_load_spreads(self):
-        # 2 and 3 alternate as each takes 10% and overtakes the other.
-        shards = [stuck(f"1.{i}", size_pct=10) for i in range(4)]
-        proposals, _ = self.assign({1: 99.0, 2: 50.0, 3: 55.0}, [2, 3], shards)
-        self.assertEqual(self.targets(proposals), [2, 3, 2, 3])
-
-    def test_a_bigger_emptier_osd_after_the_move_beats_a_smaller_one(self):
-        # Equal current utilization, but the shard is a smaller fraction of
-        # the OSD with more capacity, so that one ends up emptier.
-        df = osd_df_of({1: 99.0, 2: 50.0, 3: 50.0})
-        df[3]["kb"] *= 2
-        df[3]["kb_used"] *= 2
-        shards = [stuck("1.0", size_pct=20)]
-        proposals, _ = dt.assign_targets(
-            shards,
-            {"hdd": [2, 3]},
-            self.HOSTS,
-            df,
-            {},
-            projection=placement.ProjectedUsage(df, shards),
-            max_uses=5,
-            max_target_util=91.0,
-        )
-        self.assertEqual(self.targets(proposals), [3])
-
-    def test_ties_go_to_the_lower_osd_id(self):
-        proposals, _ = self.assign({1: 99.0, 2: 50.0, 3: 50.0}, [3, 2])
-        self.assertEqual(self.targets(proposals), [2])
-
-    # -- order ---------------------------------------------------------------
-
+class DivertOrderTest(unittest.TestCase):
     def test_the_fullest_acting_osd_is_served_first(self):
-        # Room for one shard only, and the earlier shard's acting OSD is the
-        # emptier one: the later shard takes it.
-        shards = [
-            stuck("1.0", acting=6, size_pct=10),
-            stuck("1.1", acting=7, size_pct=10),
-        ]
-        proposals, unplaceable = self.assign(
-            {1: 99.0, 2: 50.0, 6: 80.0, 7: 90.0}, [2], shards, max_uses=1
-        )
-        self.assertEqual([p.shard.pgid for p in proposals], ["1.1"])
-        self.assertEqual([s.pgid for s in unplaceable], ["1.0"])
+        shards = [stuck("1.0", acting=6), stuck("1.1", acting=7)]
+        placed, unplaceable = divert_order(shards, {6: 80.0, 7: 90.0}, room=1)
+        self.assertEqual((placed, unplaceable), (["1.1"], ["1.0"]))
 
     def test_priority_rotates_as_a_placed_shard_relieves_its_acting_osd(self):
         # osd.6 (90%) holds two shards, osd.7 (85%) one, each 10%. Placing one
         # of osd.6's drops it to 80%, below osd.7, so the order is 6, 7, 6 and
-        # not 6, 6, 7, all of it going to osd.2.
+        # not 6, 6, 7.
         shards = [
             stuck("1.0", acting=6, size_pct=10),
             stuck("1.1", acting=6, size_pct=10),
             stuck("1.2", acting=7, size_pct=10),
         ]
-        proposals, _ = self.assign({1: 99.0, 2: 10.0, 6: 90.0, 7: 85.0}, [2], shards)
-        self.assertEqual(self.placed, ["1.0", "1.2", "1.1"])
-        self.assertEqual(self.targets(proposals), [2, 2, 2])
+        placed, _ = divert_order(shards, {6: 90.0, 7: 85.0})
+        self.assertEqual(placed, ["1.0", "1.2", "1.1"])
+
+    def test_an_unplaced_shard_does_not_relieve_its_acting_osd(self):
+        # 1.0 finds no target, so osd.6 stays at 90% and 1.1 still goes
+        # before osd.7's.
+        shards = [
+            stuck("1.0", acting=6, size_pct=10),
+            stuck("1.1", acting=6, size_pct=10),
+            stuck("1.2", acting=7, size_pct=10),
+        ]
+        placed, unplaceable = divert_order(shards, {6: 90.0, 7: 85.0}, refuse={"1.0"})
+        self.assertEqual((placed, unplaceable), (["1.1", "1.2"], ["1.0"]))
 
     def test_a_shard_with_no_known_acting_osd_goes_last(self):
-        shards = [stuck("1.0", size_pct=10), stuck("1.1", acting=6, size_pct=10)]
-        proposals, unplaceable = self.assign(
-            {1: 99.0, 2: 50.0, 6: 60.0}, [2], shards, max_uses=1
-        )
-        self.assertEqual([p.shard.pgid for p in proposals], ["1.1"])
-        self.assertEqual([s.pgid for s in unplaceable], ["1.0"])
+        shards = [stuck("1.0"), stuck("1.1", acting=6)]
+        placed, _ = divert_order(shards, {6: 60.0}, room=1)
+        self.assertEqual(placed, ["1.1"])
 
     def test_ties_keep_the_order_given(self):
-        # Same acting OSD utilization, and so equally pressing: first come.
-        shards = [
-            stuck("1.0", acting=6, size_pct=10),
-            stuck("1.1", acting=7, size_pct=10),
-        ]
-        proposals, _ = self.assign(
-            {1: 99.0, 2: 50.0, 6: 90.0, 7: 90.0}, [2], shards, max_uses=1
-        )
-        self.assertEqual([p.shard.pgid for p in proposals], ["1.0"])
+        shards = [stuck("1.0", acting=6), stuck("1.1", acting=7)]
+        placed, _ = divert_order(shards, {6: 90.0, 7: 90.0}, room=1)
+        self.assertEqual(placed, ["1.0"])
 
-    def test_results_come_back_in_the_order_given(self):
-        shards = [
-            stuck("1.0", acting=6, size_pct=10),
-            stuck("1.1", acting=7, size_pct=10),
-            stuck("1.2", acting=8, size_pct=10),
-        ]
-        proposals, _ = self.assign(
-            {1: 99.0, 2: 50.0, 3: 51.0, 6: 80.0, 7: 90.0, 8: 85.0}, [2, 3], shards
+    def test_unplaceable_come_back_in_the_order_given(self):
+        shards = [stuck(f"1.{i}", acting=a) for i, a in enumerate((6, 7, 8))]
+        _, unplaceable = divert_order(
+            shards, {6: 80.0, 7: 90.0, 8: 85.0}, refuse={"1.0", "1.1", "1.2"}
         )
-        self.assertEqual([p.shard.pgid for p in proposals], ["1.0", "1.1", "1.2"])
+        self.assertEqual(unplaceable, ["1.0", "1.1", "1.2"])
 
     def test_the_queue_per_acting_osd_ranks_like_picking_the_best_shard_overall(self):
-        # assign_targets ranks queues of shards per acting OSD in a heap. That
-        # must be the same as, each turn, taking the best of all shards: check
-        # it against that naive definition on random input full of ties. All
-        # shards fit on osd.2, which takes each one's size in turn, so the
-        # order in which the projection sees them redirected is the placement
-        # order.
+        # divert() ranks queues of shards per acting OSD in a heap. That must
+        # be the same as, each turn, taking the best of all shards: check it
+        # against that naive definition on random input full of ties.
         rng = random.Random(20260920)
         for trial in range(200):
             n = rng.randint(1, 40)
@@ -1234,106 +489,599 @@ class AssignTargetsTest(unittest.TestCase):
             while pending:
                 i = min(
                     pending,
-                    key=lambda i: (
-                        -used.get(shards[i].acting_osd, -math.inf),
-                        i,
-                    ),
+                    key=lambda i: (-used.get(shards[i].acting_osd, -math.inf), i),
                 )
                 pending.remove(i)
-                expected.append(i)
+                expected.append(f"1.{i}")
                 if shards[i].acting_osd is not None:
                     used[shards[i].acting_osd] -= shards[i].size_bytes / PCT
 
-            _, unplaceable = self.assign(
-                {1: 99.0, 2: 0.0, **acting_utils}, [2], shards, max_uses=n
-            )
+            placed, unplaceable = divert_order(shards, acting_utils)
             self.assertEqual(unplaceable, [], trial)
-            actual = [int(pgid.split(".")[1]) for pgid in self.placed]
-            self.assertEqual(actual, expected, trial)
+            self.assertEqual(placed, expected, trial)
 
-    def test_placing_a_shard_does_not_free_room_on_its_acting_osd_as_a_target(self):
-        # osd.2 is both the acting OSD of the first shard and a target for the
-        # second. Its space frees only once the backfill finishes, so it is
-        # not credited to the target-side projection: 50% + 10% = 60%.
-        shards = [
-            stuck("1.0", acting=2, size_pct=10),
-            stuck("1.1", up_osd=3, up_set=[3], size_pct=10),
-        ]
-        proposals, _ = self.assign(
-            {1: 99.0, 2: 50.0, 3: 99.0, 4: 40.0}, [2, 4], shards, max_uses=1
-        )
-        by_pg = {p.shard.pgid: p for p in proposals}
-        self.assertEqual(by_pg["1.0"].target_osd, 4)
-        self.assertEqual(by_pg["1.1"].target_osd, 2)
-        self.assertEqual(by_pg["1.1"].target_projected, 60.0)
 
-    def test_a_shard_left_alone_reduces_the_room_on_its_osd(self):
-        left_alone = [stuck("9.9", up_osd=2, size_pct=20)]
-        shard = [stuck("1.0", size_pct=10)]
-        # 50% + 20% (already on its way) + 10% = 80%
-        with_it, _ = self.assign(
-            {1: 99.0, 2: 50.0},
-            [2],
-            shard,
-            arriving=shard + left_alone,
-            max_target_util=85.0,
-        )
-        self.assertEqual(with_it[0].target_projected, 80.0)
-        # ... which leaves no room under a 75% ratio, where 60% alone would.
-        refused, _ = self.assign(
-            {1: 99.0, 2: 50.0},
-            [2],
-            shard,
-            arriving=shard + left_alone,
-            max_target_util=75.0,
-        )
-        self.assertEqual(refused, [])
-        alone, _ = self.assign({1: 99.0, 2: 50.0}, [2], shard, max_target_util=75.0)
-        self.assertEqual(self.targets(alone), [2])
+# ---------------------------------------------------------------------------
+# plan(): which shards, and where, on a synthetic cluster
+# ---------------------------------------------------------------------------
 
-    def test_an_osds_own_unplaceable_stuck_shard_still_counts_against_it(self):
-        # osd.2 is a candidate for osd.1's shard but is itself the arriving
-        # OSD of a stuck shard that nothing emptier can take (osd.3 is
-        # fuller), so that shard still lands there: 50% + 20% + 10% = 80%, not
-        # 60%. (osd.3 would be 78% + 10% = 88%, so osd.2 still wins.)
-        own = stuck("9.9", up_osd=2, size_pct=20)
-        shard = stuck("1.0", up_osd=1, size_pct=10)
-        proposals, unplaceable = self.assign(
-            {1: 99.0, 2: 50.0, 3: 78.0}, [2, 3], [own, shard]
+
+class Cluster(SyntheticCluster):
+    """SyntheticCluster (six hosts h0..h5, OSDs host*10 + j; nearfull 85%,
+    backfillfull 90%, so --max-target-util 89%) with backfill_toofull PGs."""
+
+    def toofull(self, pgid, up, acting, **kwargs):
+        """Add a backfill_toofull PG."""
+        return self.pg(pgid, up, acting, state=TOOFULL, **kwargs)
+
+    def divert(self, *argv) -> dt.DivertResult:
+        return self.plan_with(dt, *argv)
+
+
+def targets(result):
+    """The (pgid, shard, up OSD, target OSD) of each move."""
+    return [(m.pgid, m.shard, m.up_osd, m.target_osd) for m in result.moves]
+
+
+class PlanTest(unittest.TestCase):
+    """A stuck EC shard 0 of PG 1.0 arriving on osd.0 (h0), its siblings on
+    h1 and h2."""
+
+    def cluster(self, up_util=88.0, **utils):
+        c = Cluster()
+        c.util[0] = up_util
+        for osd, util in utils.items():
+            c.util[int(osd.removeprefix("osd"))] = util
+        return c
+
+    def test_stuck_shard_goes_to_the_least_utilized_legal_osd(self):
+        c = self.cluster(osd31=40.0)
+        result = c.toofull("1.0", [0, 10, 20], [1, 10, 20]).divert()
+        self.assertEqual(targets(result), [("1.0", 0, 0, 31)])
+        self.assertEqual((result.stuck_count, result.unplaceable), (1, []))
+
+    def test_shard_arriving_below_toofull_util_is_left_alone(self):
+        c = self.cluster(up_util=80.0)
+        result = c.toofull("1.0", [0, 10, 20], [1, 10, 20]).divert()
+        self.assertEqual((result.moves, result.left_alone_count), ([], 1))
+        lowered = c.divert("--toofull-util", "80")
+        self.assertEqual(len(lowered.moves), 1)
+
+    def test_degraded_pg_is_diverted(self):
+        # The out-OSD case: the shard's acting slot is empty, the PG degraded.
+        c = self.cluster(osd31=40.0)
+        c.pg("1.0", [0, 10, 20], [NONE, 10, 20], state=TOOFULL + "+degraded")
+        (move,) = c.divert().moves
+        self.assertEqual((move.acting_osd, move.target_osd), (None, 31))
+
+    def test_the_up_osds_own_host_is_allowed(self):
+        # osd.1 shares h0 with osd.0, which the shard leaves.
+        c = self.cluster(osd1=40.0)
+        result = c.toofull("1.0", [0, 10, 20], [NONE, 10, 20]).divert()
+        self.assertEqual(targets(result), [("1.0", 0, 0, 1)])
+
+    def test_hosts_of_the_pgs_other_shards_are_excluded(self):
+        c = self.cluster(osd11=10.0, osd21=10.0, osd31=40.0)
+        result = c.toofull("1.0", [0, 10, 20], [1, 10, 20]).divert()
+        self.assertEqual(targets(result), [("1.0", 0, 0, 31)])
+
+    def test_acting_osds_are_not_targets(self):
+        # osd.1 holds the shard's data: moving there would be a pin.
+        c = self.cluster(osd1=10.0, osd31=40.0)
+        result = c.toofull("1.0", [0, 10, 20], [1, 10, 20]).divert()
+        self.assertEqual(targets(result), [("1.0", 0, 0, 31)])
+
+    def test_two_stuck_shards_of_a_pg_get_distinct_hosts(self):
+        # osd.30 and osd.31 share h3: only one of the two shards may go there.
+        c = self.cluster(osd10=88.0, osd30=30.0, osd31=31.0)
+        result = c.toofull("1.0", [0, 10, 20], [1, 11, 20]).divert()
+        hosts = {Cluster.host(m.target_osd) for m in result.moves}
+        self.assertEqual((len(result.moves), len(hosts)), (2, 2))
+
+    def test_target_must_end_below_the_osd_it_relieves(self):
+        # osd.0 at 86% ends at 86% without the 2% shard. Every other OSD is
+        # at 85%, so would end at 87%: under the 89% cap, but above osd.0.
+        c = Cluster(default_util=85.0)
+        c.util[0] = 86.0
+        c.toofull("1.0", [0, 10, 20], [1, 10, 20], shard_pct=2.0)
+        self.assertEqual(c.divert().moves, [])
+        c.util[31] = 83.0  # ends at 85%
+        self.assertEqual(targets(c.divert()), [("1.0", 0, 0, 31)])
+
+    def test_cap_counts_every_backfill_in_motion(self):
+        # osd.31 ends up emptiest (40%: 30% arriving, 30% leaving), but a
+        # 20% shard would reserve it at 90%, over the 89% cap. The PGs moving
+        # data on and off it are not backfill_toofull.
+        c = self.cluster(osd31=40.0)
+        c.pg("1.1", [31, 40, 50], [NONE, 40, 50], shard_pct=30.0)
+        c.pg("1.2", [21, 40, 50], [31, 40, 50], shard_pct=30.0)
+        c.toofull("1.0", [0, 10, 20], [NONE, 10, 20], shard_pct=20.0)
+        self.assertEqual(targets(c.divert()), [("1.0", 0, 0, 1)])
+        c.pgs = [pg for pg in c.pgs if pg["pgid"] != "1.1"]
+        self.assertEqual(targets(c.divert()), [("1.0", 0, 0, 31)])
+
+    def test_pg_whose_upmap_pairs_chain_is_left_alone(self):
+        c = self.cluster(osd31=40.0)
+        c.upmaps.append(
+            {
+                "pgid": "1.0",
+                "mappings": [{"from": 41, "to": 40}, {"from": 40, "to": 20}],
+            }
         )
+        c.toofull("1.0", [0, 10, 20], [1, 10, 20])
+        result = c.toofull("1.1", [0, 11, 21], [1, 11, 21]).divert()
+        self.assertEqual(targets(result), [("1.1", 0, 0, 31)])
+        self.assertEqual(result.chained_pgs, 1)
+
+    def test_unplaceable_shard_whose_osd_stays_over_backfillfull(self):
+        # No room anywhere, and osd.0 is reserved at 93% with the shard.
+        c = Cluster(default_util=89.0)
+        c.util[0] = 92.0
+        result = c.toofull("1.0", [0, 10, 20], [1, 10, 20]).divert()
         self.assertEqual(
-            [(p.shard.pgid, p.target_osd, p.target_projected) for p in proposals],
-            [("1.0", 2, 80.0)],
-        )
-        self.assertEqual([s.pgid for s in unplaceable], ["9.9"])
-
-    def test_an_osds_own_stuck_shard_stops_counting_once_it_is_diverted(self):
-        # Same, but osd.4 is emptier than osd.2 so its own shard is diverted
-        # there first: osd.2 is back to 50% and takes the next shard at 60%
-        # (osd.4 would be 40% + 20% + 10% = 70%).
-        own = stuck("9.9", up_osd=2, size_pct=20)
-        shard = stuck("1.0", up_osd=1, size_pct=10)
-        proposals, _ = self.assign(
-            {1: 99.0, 2: 50.0, 3: 90.0, 4: 40.0}, [2, 4], [own, shard]
-        )
-        self.assertEqual(
-            [(p.shard.pgid, p.target_osd, p.target_projected) for p in proposals],
-            [("9.9", 4, 60.0), ("1.0", 2, 60.0)],
+            ([s.pgid for s in result.unplaceable], result.fitting), (["1.0"], [])
         )
 
-    def test_the_order_of_shards_matters_to_what_looks_full(self):
-        # The reverse order of the test above: osd.2's own shard has not been
-        # diverted yet when osd.1's shard is placed, so osd.2 still carries it
-        # and osd.4 (60% + 10%) wins instead. Conservative, and documented.
-        own = stuck("9.9", up_osd=2, size_pct=20)
-        shard = stuck("1.0", up_osd=1, size_pct=10)
-        proposals, _ = self.assign(
-            {1: 99.0, 2: 50.0, 3: 90.0, 4: 40.0}, [2, 4], [shard, own]
-        )
+    def test_shard_whose_osd_has_room_once_its_siblings_go_is_left(self):
+        # osd.0 (86%) has two 2% shards arriving: 90%, at backfillfull_ratio.
+        # Once one is diverted to osd.31 (83% -> 85%), osd.0 is reserved at
+        # 88%, and would end at 86% without the other, below any target.
+        c = Cluster(default_util=85.0)
+        c.util[0], c.util[31] = 86.0, 83.0
+        c.toofull("1.0", [0, 10, 20], [1, 10, 20], shard_pct=2.0)
+        c.toofull("1.1", [0, 11, 21], [1, 11, 21], shard_pct=2.0)
+        result = c.divert()
+        self.assertEqual(len(result.moves), 1)
+        self.assertEqual(result.unplaceable, [])
+        ((shard, util),) = result.fitting
+        self.assertEqual(shard.up_osd, 0)
+        self.assertAlmostEqual(util, 88.0)
+
+    def test_shard_whose_osd_no_move_relieves_is_unplaceable(self):
+        # osd.0 is reserved at 88% with the shard, below backfillfull_ratio,
+        # but Ceph refuses it now and no move changes that.
+        c = Cluster(default_util=89.0)
+        c.util[0] = 87.0
+        result = c.toofull("1.0", [0, 10, 20], [1, 10, 20]).divert()
+        self.assertEqual(result.moves, [])
         self.assertEqual(
-            [(p.shard.pgid, p.target_osd, p.target_projected) for p in proposals],
-            [("1.0", 4, 70.0), ("9.9", 4, 70.0)],
+            ([s.pgid for s in result.unplaceable], result.fitting), (["1.0"], [])
         )
+
+    def test_no_stuck_shard_projects_nothing(self):
+        # A PG in motion in a pool 'pool ls detail' does not list would make
+        # the projections exit; without a stuck shard they are not needed.
+        c = self.cluster(up_util=80.0)
+        c.toofull("1.0", [0, 10, 20], [1, 10, 20])
+        c.pg("9.0", [30, 40, 50], [31, 40, 50])
+        result = c.divert()
+        self.assertEqual((result.stuck_count, result.moves), (0, []))
+        with self.assertRaises(SystemExit):
+            c.divert("--toofull-util", "80")
+
+    def test_a_target_may_not_rise_above_an_osd_it_relieved(self):
+        # osd.51 (72%) takes 1.0's 5% shard off osd.0 (85% -> 80%): 77%. 1.1's
+        # shard off osd.10 (93% -> 88%) would take osd.51 to 82%: below
+        # osd.10, but above osd.0. Every other OSD is at 88%, so over the cap,
+        # but osd.0, on a host of 1.1's.
+        c = Cluster(default_util=88.0)
+        c.util |= {0: 80.0, 1: 95.0, 11: 90.0, 51: 72.0}
+        c.toofull("1.0", [0, 20, 30], [1, 20, 30], shard_pct=5.0)
+        c.toofull("1.1", [10, 1, 30], [11, 1, 30], shard_pct=5.0)
+        result = c.divert("--toofull-util", "80")
+        self.assertEqual(targets(result), [("1.0", 0, 0, 51)])
+        self.assertEqual([s.pgid for s in result.unplaceable], ["1.1"])
+        c.util[51] = 60.0  # 65%, then 70%: below both
+        self.assertEqual(len(c.divert("--toofull-util", "80").moves), 2)
+
+    def test_an_osd_may_not_drop_below_a_target_it_sent_data_to(self):
+        # osd.0 (86%) has two 5% shards arriving: 96%. 1.0's goes to osd.51
+        # (84% -> 89%; osd.41 is on a host of 1.0's), leaving osd.0 at 91%.
+        # 1.1's could go to osd.41 (80% -> 85%), but would leave osd.0 at 86%,
+        # below osd.51.
+        c = Cluster(default_util=88.0)
+        c.util |= {0: 86.0, 1: 95.0, 41: 80.0, 51: 84.0}
+        c.toofull("1.0", [0, 40, 20], [1, 40, 20], shard_pct=5.0)
+        c.toofull("1.1", [0, 10, 30], [1, 10, 30], shard_pct=5.0)
+        result = c.divert()
+        self.assertEqual(targets(result), [("1.0", 0, 0, 51)])
+        self.assertEqual([s.pgid for s in result.unplaceable], ["1.1"])
+
+    def test_moves_are_in_pg_then_shard_order(self):
+        # Shard 1's acting OSD is fuller, so it is placed first.
+        c = self.cluster(osd10=88.0, osd11=95.0, osd30=30.0, osd40=40.0)
+        c.toofull("1.1", [30, 41, 51], [30, 40, 51])
+        result = c.toofull("1.0", [0, 10, 20], [1, 11, 20]).divert()
+        self.assertEqual(
+            [(m.pgid, m.shard) for m in result.moves], [("1.0", 0), ("1.0", 1)]
+        )
+
+    def test_rows_of_a_target_show_its_projection_once_all_are_placed(self):
+        # osd.51 (10%) takes both 1% shards: 12% in both rows.
+        c = self.cluster(osd10=88.0, osd51=10.0)
+        c.toofull("1.0", [0, 20, 30], [1, 20, 30])
+        result = c.toofull("1.1", [10, 20, 30], [11, 20, 30]).divert()
+        self.assertEqual([m.target_osd for m in result.moves], [51, 51])
+        self.assertEqual({round(m.target_projected, 6) for m in result.moves}, {12.0})
+
+
+class RenderTest(unittest.TestCase):
+    def test_summary_names_the_rules_and_the_chained_pgs(self):
+        c = Cluster()
+        c.util[0], c.util[31] = 88.0, 40.0
+        c.upmaps.append(
+            {
+                "pgid": "1.1",
+                "mappings": [{"from": 41, "to": 40}, {"from": 40, "to": 21}],
+            }
+        )
+        c.toofull("1.0", [0, 10, 20], [1, 10, 20])
+        c.toofull("1.1", [0, 11, 21], [1, 11, 21])
+        _, err = c.rendered_with(dt)
+        self.assertIn(
+            "PGs left alone: " + messages.chained_text(1) + ". Targets: ", err
+        )
+        self.assertIn(messages.RELIEVE_CLAUSE.lstrip(", "), err)
+        self.assertIn("Proposed 1 move(s); 0 shard(s) could not be placed.", err)
+
+    def test_left_shards_are_named_apart_from_the_unplaceable(self):
+        c = Cluster(default_util=85.0)
+        c.util[0], c.util[31] = 86.0, 83.0
+        c.toofull("1.0", [0, 10, 20], [1, 10, 20], shard_pct=2.0)
+        c.toofull("1.1", [0, 11, 21], [1, 11, 21], shard_pct=2.0)
+        _, err = c.rendered_with(dt)
+        self.assertIn("0 shard(s) could not be placed.", err)
+        self.assertIn(
+            "1 more got no target, but the moves off the OSD each is headed for "
+            "take it below backfillfull_ratio 90%, so Ceph may take them as they "
+            "are: 1.1 shard 0 (osd.0 88.0%).",
+            err,
+        )
+        self.assertNotIn("greedy placement", err)
+
+    def test_unplaceable_note_names_the_relief_rule(self):
+        c = Cluster(default_util=89.0)
+        c.util[0] = 92.0
+        c.toofull("1.0", [0, 10, 20], [1, 10, 20])
+        _, err = c.rendered_with(dt)
+        self.assertIn("cannot place 1.0 shard 0 (headed for osd.0)", err)
+        self.assertIn(flat(messages.unplaceable_note("the OSD it was headed for")), err)
+
+
+# ---------------------------------------------------------------------------
+# Captures
+# ---------------------------------------------------------------------------
+
+
+def proposals_from_readme(fixture):
+    """Return the 'Expected proposals' block of a fixture README as tuples.
+
+    Each is (pgid, shard, acting OSD, up OSD, target OSD), as strings, the
+    acting OSD 'none' when unknown. Pulling the expected proposals out of the
+    README, rather than duplicating them here, is what keeps the two from
+    drifting apart.
+    """
+    lines = (TEST_DATA / fixture / "README.txt").read_text().splitlines()
+    # The heading wraps onto further lines before the indented block.
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("Expected proposals"))
+    block = []
+    for line in lines[start:]:
+        if line.startswith("  "):
+            block.append(tuple(line.split()))
+        elif block:
+            break
+    return block
+
+
+def move_tuple(m):
+    """m in the form proposals_from_readme returns."""
+    acting = "none" if m.acting_osd is None else str(m.acting_osd)
+    return (m.pgid, str(m.shard), acting, str(m.up_osd), str(m.target_osd))
+
+
+def fixture_plan(fixture, *argv):
+    """Return plan()'s DivertResult for a fixture under test-data."""
+    return plan_from_state(dt, TEST_DATA / fixture, *argv)
+
+
+def copy_without_pool(fixture: str, pool_id: int, tmp: str) -> pathlib.Path:
+    """Copy fixture into directory tmp minus pool_id's 'pool ls detail' entry.
+
+    Returns the copy's path.
+    """
+    dst = pathlib.Path(tmp) / "fixture"
+    shutil.copytree(TEST_DATA / fixture, dst)
+    path = dst / "pool_ls_detail.json"
+    pools = json.loads(path.read_text())
+    path.write_text(json.dumps([p for p in pools if p["pool_id"] != pool_id]))
+    return dst
+
+
+def remap_triples(moves):
+    """The (pgid, up OSD, target OSD) of each move, as '<pgid> <up> <target>'."""
+    return [f"{m.pgid} {m.up_osd} {m.target_osd}" for m in moves]
+
+
+OSD457 = "divert-toofull-osd457-down"
+OSD263 = "divert-toofull-osd263-existing-upmap-chain"
+NOMINAL = "divert-toofull-nominal-synthetic"
+CHAINED = "ceph2-cancel-backfill-chained-pairs-upmap"
+CEPH2_FIXTURE = "divert-toofull-ceph2-util-emergency-2-new-hosts"
+
+# What the ceph2 fixture's README.txt documents: 1513 arriving shards, 976
+# of them plausibly blocked, 40 placed, fullest acting OSD first. The rest
+# are unplaceable, or headed for an OSD the 40 take below
+# backfillfull_ratio. Asserted as counts and invariants rather than an exact
+# 40-row table, which would be unreadable in a README.
+CEPH2_ARRIVING = 1513
+CEPH2_STUCK = 976
+CEPH2_CANDIDATES = 900
+CEPH2_PROPOSED = 40
+CEPH2_UNPLACEABLE = 934
+CEPH2_FITTING = 2
+CEPH2_NEARFULL = 85.0
+CEPH2_BACKFILLFULL = 91.0
+# Ceph refuses on a target's projected usage, so the default cap keeps one
+# point of margin below backfillfull_ratio.
+CEPH2_MAX_TARGET_UTIL = CEPH2_BACKFILLFULL - 1
+# Proposals when the cap is instead set to backfillfull_ratio itself: targets
+# may be projected right up to the ratio, with no margin.
+CEPH2_NO_MARGIN_PROPOSED = 114
+# With both thresholds at their loosest (--toofull-util 0, cap at
+# backfillfull_ratio): still no target past backfillfull_ratio.
+CEPH2_UNCAPPED_PROPOSED = 117
+
+
+class PrintOutcomeTest(unittest.TestCase):
+    def outcome(self, unplaceable=(), fitting=()):
+        result = SimpleNamespace(
+            moves=[None] * 5,
+            unplaceable=list(unplaceable),
+            fitting=list(fitting),
+            ratios=placement.FullRatios(85.0, 90.0),
+        )
+        return stderr_of(dt.print_outcome, result)
+
+    def test_names_each_unplaceable_shard_then_the_caveat(self):
+        text = self.outcome(
+            [
+                placement.ArrivingShard("19.1", 3, 31, 7, [31]),
+                placement.ArrivingShard("7.2", "-", 40, None, [40]),
+            ]
+        )
+        self.assertIn("Proposed 5 move(s); 2 shard(s) could not be placed.", text)
+        items, caveat = text.split(" NOTE: ")
+        self.assertIn("the OSD it was headed for", caveat)
+        self.assertEqual(
+            items.split(" cannot place ")[1:],
+            [
+                "19.1 shard 3 (headed for osd.31): no legal target",
+                "7.2 shard - (headed for osd.40): no legal target",
+            ],
+        )
+
+    def test_no_caveat_or_list_when_everything_is_placed(self):
+        text = self.outcome()
+        self.assertIn("0 shard(s) could not be placed.", text)
+        self.assertNotIn("NOTE:", text)
+        self.assertNotIn("cannot place", text)
+        self.assertNotIn("got no target", text)
+
+    def test_left_shards_are_named_with_their_osds_projection(self):
+        text = self.outcome(fitting=[(stuck("19.1", up_osd=31, shard=3), 88.44)])
+        self.assertIn("1 more got no target", text)
+        self.assertTrue(text.endswith(": 19.1 shard 3 (osd.31 88.4%)."), text)
+
+
+class FixturePlanTest(unittest.TestCase):
+    """plan() on the small fixtures, checked against their READMEs."""
+
+    def test_osd457_down_proposals_match_readme(self):
+        result = fixture_plan(OSD457)
+        self.assertEqual(
+            [move_tuple(m) for m in result.moves], proposals_from_readme(OSD457)
+        )
+        self.assertEqual((result.toofull_pg_count, result.arriving_count), (1, 1))
+
+    def test_existing_upmap_chain_proposals_match_readme(self):
+        result = fixture_plan(OSD263)
+        self.assertEqual(
+            [move_tuple(m) for m in result.moves], proposals_from_readme(OSD263)
+        )
+        self.assertEqual(result.unplaceable, [])
+
+    def test_the_last_shard_to_osd263_is_left_as_it_has_room(self):
+        # See the fixture's README: once the other five are diverted.
+        ((shard, util),) = fixture_plan(OSD263).fitting
+        self.assertEqual((shard.pgid, shard.shard, shard.up_osd), ("19.d85", 9, 263))
+        self.assertLess(util, 90.0)
+
+    def test_no_backfill_toofull_pgs_proposes_nothing(self):
+        result = fixture_plan(NOMINAL)
+        self.assertEqual((result.moves, result.unplaceable), ([], []))
+
+    def test_pgs_whose_existing_pairs_chain_are_left_alone(self):
+        # 19.3a4 (890->110, 110->753) and 19.5fd (889->19, 19->669).
+        result = fixture_plan(CHAINED)
+        self.assertEqual(result.chained_pgs, 2)
+        self.assertFalse({m.pgid for m in result.moves} & {"19.3a4", "19.5fd"})
+        self.assertTrue(result.moves)
+
+    def test_default_thresholds_come_from_the_clusters_own_ratios(self):
+        # osd457-down has backfillfull_ratio 0.90, ceph2 has it raised to
+        # 0.91: the caps must track the capture, not a constant. The target
+        # cap is backfillfull_ratio minus one point.
+        for fixture, nearfull, max_target in [
+            (OSD457, 85, 89),
+            (CEPH2_FIXTURE, 85, 90),
+        ]:
+            with self.subTest(fixture=fixture):
+                # Ceph keeps the ratios as float32, so 0.85 reads back as
+                # 85.0000024%.
+                result = fixture_plan(fixture)
+                self.assertAlmostEqual(result.toofull_util, nearfull, places=3)
+                self.assertAlmostEqual(result.max_target_util, max_target, places=3)
+
+    def test_every_capture_keeps_the_placement_invariants(self):
+        # Every capture with PGs: pgremapper can apply the pairs, no PG uses
+        # a host twice, and no target is reserved over the cap.
+        for fixture in sorted(TEST_DATA.iterdir()):
+            if not (fixture / "pg_dump_pgs.json").exists():
+                continue
+            with self.subTest(fixture=fixture.name):
+                result = plan_from_state(dt, fixture)
+                check_pairs_apply(self, fixture, result)
+                check_one_shard_per_host(self, fixture, result)
+                check_reservation_cap(self, fixture, result)
+                for m in result.moves:
+                    self.assertLess(m.target_projected, m.up_projected, m)
+
+
+class FixtureReplayTest(unittest.TestCase):
+    """End-to-end --load-state runs: how run() prints what plan() decides."""
+
+    def run_proc(self, fixture, *extra):
+        return run_command(dt, *extra, load_state=TEST_DATA / fixture, check=True)
+
+    def run_script(self, fixture, *extra):
+        return self.run_proc(fixture, *extra).stdout.rstrip("\n")
+
+    def test_table_has_shed_s_columns_and_shows_an_out_acting_osd_as_none(self):
+        header, labels, row = self.run_script(OSD457).splitlines()
+        self.assertEqual(header.split()[1::3], ["ACTING", "UP", "TARGET"])
+        self.assertEqual(labels.split()[:3], ["PGID", "SHARD", "SIZE"])
+        self.assertEqual(labels.split()[-1], "NOTE")
+        self.assertEqual(row.split()[4:7], ["none", "-", "-"])
+
+    def test_pgremapper_mappings_lists_existing_upmap_rows_like_any_other(self):
+        # 19.bd5's existing pair is 625->263, so 263 is a 'to': the entry must
+        # still map 'from' 263 to the target, for 'pgremapper import-mappings'
+        # to rewrite that pair's 'to'.
+        proc = self.run_proc(OSD263, "--pgremapper-mappings")
+        entries = upmap_pairs(proc.stdout)
+        self.assertEqual(len(entries), 5)
+        self.assertIn({"pgid": "19.bd5", "mapping": {"from": 263, "to": 842}}, entries)
+        self.assertEqual(proc.stderr.count("NOTE"), 1)  # the balancer's, only
+
+    def test_pgremapper_mappings_emits_up_osd_not_acting_osd(self):
+        # 'pgremapper import-mappings' takes the upmap's 'from', which is the
+        # UP OSD. Emitting the ACTING OSD here would remap the wrong OSD, and
+        # the table would still look right.
+        (entry,) = json.loads(self.run_script(OSD457, "--pgremapper-mappings"))
+        self.assertEqual(
+            entry,
+            {
+                "pgid": "19.21f",
+                "mapping": {"from": 625, "to": 849},
+                "shard": 7,
+                "role": shared.ROLE_REQUESTED,
+                "note": "",
+            },
+        )
+
+    def test_no_backfill_toofull_pgs_prints_nothing_on_stdout(self):
+        self.assertEqual(self.run_script(NOMINAL), "")
+
+    def test_no_backfill_toofull_pgs_prints_an_empty_json_array(self):
+        self.assertEqual(self.run_script(NOMINAL, "--pgremapper-mappings"), "[]")
+
+    def test_balancer_note_closes_a_run_with_proposals(self):
+        note = stderr_of(messages.print_balancer_note)
+        for extra in ((), ("--pgremapper-mappings",)):
+            with self.subTest(extra=extra):
+                err = flat(self.run_proc(OSD457, *extra).stderr)
+                self.assertTrue(err.endswith(note), err)
+
+    def test_no_balancer_note_without_proposals(self):
+        for fixture, extra in (
+            (NOMINAL, ()),
+            # No room anywhere: the one stuck shard is unplaceable.
+            (OSD457, ("--max-target-util", "2")),
+        ):
+            with self.subTest(fixture=fixture):
+                err = self.run_proc(fixture, *extra).stderr
+                self.assertNotIn("balancer", err)
+
+    def test_default_thresholds_are_reported_on_stderr(self):
+        err = flat(self.run_proc(OSD457).stderr)
+        self.assertIn("--toofull-util 85%", err)
+        self.assertIn("--max-target-util 89%", err)
+
+
+class PgsFlagTest(unittest.TestCase):
+    """--pgs restricts the run to shards of the named PG(s) only."""
+
+    def plan(self, *argv):
+        return fixture_plan(OSD263, *argv)
+
+    def test_only_the_named_pg_is_proposed(self):
+        result = self.plan("--pgs", "19.bd5")
+        self.assertEqual(remap_triples(result.moves), ["19.bd5 263 842"])
+        self.assertEqual(result.pgs_filter, shared.PgidFilter(1, 1, []))
+        self.assertEqual(result.toofull_pg_count, 1)
+
+    def test_several_named_pgs_are_all_kept(self):
+        # Targets are not pinned here: with only two of the six PGs in play,
+        # room is contended differently than in the full run. Only which PGs
+        # got a proposal is guaranteed.
+        result = self.plan("--pgs", "19.bd5", "19.7be")
+        self.assertEqual({m.pgid for m in result.moves}, {"19.bd5", "19.7be"})
+        self.assertEqual(result.toofull_pg_count, 2)
+
+    def test_id_that_matches_nothing_is_reported_and_yields_no_proposals(self):
+        result = self.plan("--pgs", "19.zzz")
+        self.assertEqual(result.moves, [])
+        self.assertEqual(result.pgs_filter, shared.PgidFilter(1, 0, ["19.zzz"]))
+        self.assertEqual(result.toofull_pg_count, 0)
+
+    def test_a_mix_of_matching_and_unmatched_ids_reports_both(self):
+        result = self.plan("--pgs", "19.bd5", "19.zzz")
+        self.assertEqual(remap_triples(result.moves), ["19.bd5 263 842"])
+        self.assertEqual(result.pgs_filter, shared.PgidFilter(2, 1, ["19.zzz"]))
+
+    def test_no_pgs_flag_considers_every_pg(self):
+        result = self.plan()
+        self.assertEqual(len(result.moves) + len(result.fitting), 6)
+        self.assertIsNone(result.pgs_filter)
+
+
+class NothingToDivertTest(unittest.TestCase):
+    def test_no_toofull_pg_among_pgs_says_so_and_prints_no_table(self):
+        for extra, out_text in (([], ""), (["--pgremapper-mappings"], "[]\n")):
+            with self.subTest(extra=extra):
+                proc = run_ceph2("--pgs", "1.0", *extra)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, out_text)
+                self.assertIn("No backfill_toofull PGs among --pgs.", proc.stderr)
+                self.assertNotIn("Targets:", proc.stderr)
+
+
+class PrintPgsFilterTest(unittest.TestCase):
+    """divert-toofull's --pgs note (the shared print_pgid_filter)."""
+
+    def test_printed_even_when_planning_then_exits(self):
+        # A typo in --pgs can be what trips a later error, so the note naming
+        # it must not wait for render(), which an exit never reaches.
+        with tempfile.TemporaryDirectory() as tmp:
+            dst = copy_without_pool(OSD457, 19, tmp)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                plan_from_state(dt, dst, "--pgs", "19.21f", "19.zzz")
+        self.assertIn("pool id(s) 19", str(ctx.exception))
+        self.assertIn(
+            "are backfill_toofull and will be the only ones considered; 1 matched "
+            "nothing (not backfill_toofull, or a typo): 19.zzz.",
+            flat(err.getvalue()),
+        )
+
+    def test_printed_only_with_pgs(self):
+        # The note goes to stderr, ahead of the summary, only under --pgs.
+        for extra, shown in [((), False), (("--pgs", "19.zzz"), True)]:
+            with self.subTest(extra=extra):
+                proc = run_command(
+                    dt, *extra, load_state=TEST_DATA / OSD263, check=True
+                )
+                self.assertEqual("--pgs:" in proc.stderr, shown)
 
 
 def run_ceph2(*extra, check=True):
@@ -1354,141 +1102,109 @@ class Ceph2FixtureInvariantTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.result = fixture_plan(CEPH2_FIXTURE)
-        cls.proposals = cls.result.proposals
+        cls.moves = cls.result.moves
 
     def util(self, osd_id):
         return self.result.osd_df[osd_id]["utilization"]
 
-    def test_proposal_and_unplaceable_counts_match_the_readme(self):
-        self.assertEqual(len(self.proposals), CEPH2_PROPOSED)
+    def test_move_and_leftover_counts_match_the_readme(self):
+        self.assertEqual(len(self.moves), CEPH2_PROPOSED)
         self.assertEqual(len(self.result.unplaceable), CEPH2_UNPLACEABLE)
+        self.assertEqual(len(self.result.fitting), CEPH2_FITTING)
 
     def test_shard_counts_match_the_readme(self):
         self.assertEqual(self.result.arriving_count, CEPH2_ARRIVING)
         self.assertEqual(self.result.stuck_count, CEPH2_STUCK)
         self.assertEqual(self.result.left_alone_count, CEPH2_ARRIVING - CEPH2_STUCK)
+        leftovers = len(self.result.unplaceable) + len(self.result.fitting)
+        self.assertEqual(len(self.moves) + leftovers, CEPH2_STUCK)
 
     def test_every_usable_osd_is_a_candidate(self):
         self.assertEqual(
             sum(map(len, self.result.candidates.values())), CEPH2_CANDIDATES
         )
 
-    def test_no_target_is_projected_above_the_default_cap(self):
+    def test_no_target_is_reserved_above_the_default_cap(self):
         # The headline invariant: every one of these remaps can actually
         # complete. Before --max-target-util defaulted, 342 could not.
-        over = [p for p in self.proposals if p.target_projected > CEPH2_MAX_TARGET_UTIL]
-        self.assertEqual(over, [])
+        check_reservation_cap(self, TEST_DATA / CEPH2_FIXTURE, self.result)
+        self.assertAlmostEqual(self.result.max_target_util, CEPH2_MAX_TARGET_UTIL, 3)
 
     def test_default_cap_keeps_a_margin_below_backfillfull(self):
         # Capping at backfillfull_ratio itself lets targets be projected
         # into the last point below it. Pin that the margin is what keeps
         # them out, not merely that the cap is below the ratio.
-        proposals = fixture_plan(
+        moves = fixture_plan(
             CEPH2_FIXTURE, "--max-target-util", f"{CEPH2_BACKFILLFULL:g}"
-        ).proposals
-        self.assertEqual(len(proposals), CEPH2_NO_MARGIN_PROPOSED)
-        in_margin = [p for p in proposals if CEPH2_MAX_TARGET_UTIL < p.target_projected]
+        ).moves
+        self.assertEqual(len(moves), CEPH2_NO_MARGIN_PROPOSED)
+        in_margin = [m for m in moves if CEPH2_MAX_TARGET_UTIL < m.target_projected]
         self.assertTrue(in_margin)
 
     def test_no_shard_is_diverted_off_a_healthy_osd(self):
         # The two new hosts sit around 70% and are absorbing shards, not
         # blocking them; diverting off them wasted targets.
-        under = [
-            p for p in self.proposals if self.util(p.shard.up_osd) < CEPH2_NEARFULL
-        ]
+        under = [m for m in self.moves if self.util(m.up_osd) < CEPH2_NEARFULL]
         self.assertEqual(under, [])
 
     def test_the_new_empty_hosts_receive_shards_instead_of_losing_them(self):
-        targets = {p.target_host for p in self.proposals}
+        targets = {self.result.osd_host[m.target_osd] for m in self.moves}
         self.assertTrue({"host50", "host51"} <= targets)
 
-    def test_every_target_is_strictly_emptier_than_the_osd_it_replaces(self):
-        not_emptier = [
-            p
-            for p in self.proposals
-            if self.util(p.target_osd) >= self.util(p.shard.up_osd)
-        ]
-        self.assertEqual(not_emptier, [])
+    def test_every_target_ends_up_below_the_osd_it_relieves(self):
+        for m in self.moves:
+            self.assertLess(m.target_projected, m.up_projected, m)
 
-    def test_no_target_is_used_more_than_the_default_limit(self):
-        uses = Counter(p.target_osd for p in self.proposals)
-        self.assertEqual(max(uses.values()), CEPH2_MAX_USES)
+    def test_no_target_takes_more_than_five(self):
+        # What --max-target-uses 5 used to cap; the relief rule now does.
+        uses = Counter(m.target_osd for m in self.moves)
+        self.assertLessEqual(max(uses.values()), 5)
 
     def test_targets_are_reused(self):
-        # 52 shards land on 27 of the 900 candidates: some are reused.
-        targets = {p.target_osd for p in self.proposals}
-        self.assertLess(len(targets), len(self.proposals))
-        self.assertLessEqual(len(targets), CEPH2_CANDIDATES)
+        targets = {m.target_osd for m in self.moves}
+        self.assertLess(len(targets), len(self.moves))
 
-    def test_projection_stays_within_the_cap_and_is_one_figure_per_target(self):
-        # Proposals are in PG order, not the order shards were placed in, so
+    def test_projection_is_one_figure_per_target(self):
+        # Moves are in PG order, not the order shards were placed in, so
         # the rows of an OSD cannot show its projection growing: all of them
         # show the final one, above its current utilization.
         projections = {}
-        for p in self.proposals:
-            self.assertGreater(p.target_projected, p.target_utilization)
-            self.assertLessEqual(p.target_projected, CEPH2_MAX_TARGET_UTIL)
-            projections.setdefault(p.target_osd, []).append(p.target_projected)
+        for m in self.moves:
+            self.assertGreater(m.target_projected, self.util(m.target_osd))
+            projections.setdefault(m.target_osd, set()).add(m.target_projected)
         for osd, values in projections.items():
             with self.subTest(osd=osd):
-                self.assertEqual(len(set(values)), 1)
+                self.assertEqual(len(values), 1)
 
-    def test_proposals_are_in_pg_order_whatever_order_shards_were_placed_in(self):
-        keys = [(dt.pgid_sort_key(p.shard.pgid), p.shard.shard) for p in self.proposals]
+    def test_moves_are_in_pg_order_whatever_order_shards_were_placed_in(self):
+        keys = [(shared.pgid_sort_key(m.pgid), m.shard) for m in self.moves]
         self.assertEqual(keys, sorted(keys))
 
     def test_only_shards_on_the_fullest_acting_osds_get_the_scarce_room(self):
         # 578 of the 976 stuck shards have an acting OSD at or above
         # backfillfull_ratio and there is room for only 52, so every placed
         # shard should come from one. (In PG order far fewer did.)
-        below = [
-            p
-            for p in self.proposals
-            if self.util(p.shard.acting_osd) < CEPH2_BACKFILLFULL
-        ]
+        below = [m for m in self.moves if self.util(m.acting_osd) < CEPH2_BACKFILLFULL]
         self.assertEqual(below, [])
 
-    def test_single_use_gives_every_osd_at_most_one_shard(self):
-        result = fixture_plan(CEPH2_FIXTURE, "--max-target-uses", "1")
-        self.assertEqual(len(result.proposals), CEPH2_SINGLE_USE_PROPOSED)
-        self.assertEqual(len(result.unplaceable), CEPH2_SINGLE_USE_UNPLACEABLE)
-        targets = {p.target_osd for p in result.proposals}
-        self.assertEqual(len(targets), len(result.proposals))
-
-    def test_a_higher_limit_places_at_least_as_many(self):
-        # The projection, not the count, becomes the constraint: 10 barely
-        # beats 5 because the OSDs run out of room first.
-        counts = [
-            len(fixture_plan(CEPH2_FIXTURE, "--max-target-uses", n).proposals)
-            for n in ("1", "2", "5", "10")
-        ]
-        self.assertEqual(counts, sorted(counts))
-        self.assertLess(counts[0], counts[-1])
-
-    def test_no_target_is_on_a_host_already_in_its_pgs_up_set(self):
-        osd_host = self.result.osd_host
-        for p in self.proposals:
-            up_hosts = {osd_host[o] for o in p.shard.up_set if o in osd_host}
-            self.assertNotIn(p.target_host, up_hosts)
+    def test_pairs_apply_and_no_pg_uses_a_host_twice(self):
+        check_pairs_apply(self, TEST_DATA / CEPH2_FIXTURE, self.result)
+        check_one_shard_per_host(self, TEST_DATA / CEPH2_FIXTURE, self.result)
 
     def test_loosest_thresholds_still_never_target_past_backfillfull(self):
-        # Opting out of the thresholds used to re-open targets that re-wedge on
-        # arrival (93 of them), with a warning. The loosest cap allowed is
-        # backfillfull_ratio itself, so nothing is doomed any more.
-        proposals = fixture_plan(
+        # The loosest cap allowed is backfillfull_ratio itself, so no target
+        # re-wedges on arrival.
+        result = fixture_plan(
             CEPH2_FIXTURE,
             "--toofull-util",
             "0",
             "--max-target-util",
             f"{CEPH2_BACKFILLFULL:g}",
-        ).proposals
-        self.assertEqual(len(proposals), CEPH2_UNCAPPED_PROPOSED)
-        for p in proposals:
-            self.assertLess(p.target_utilization, CEPH2_BACKFILLFULL)
-            self.assertLessEqual(p.target_projected, CEPH2_BACKFILLFULL)
-
-    def test_a_cap_equal_to_backfillfull_is_accepted(self):
-        fixture_plan(CEPH2_FIXTURE, "--max-target-util", f"{CEPH2_BACKFILLFULL:g}")
+        )
+        self.assertEqual(len(result.moves), CEPH2_UNCAPPED_PROPOSED)
+        for m in result.moves:
+            self.assertLess(self.util(m.target_osd), CEPH2_BACKFILLFULL)
+            self.assertLessEqual(m.target_projected, CEPH2_BACKFILLFULL)
 
 
 class Ceph2FixtureOutputTest(unittest.TestCase):
@@ -1497,7 +1213,7 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.proc = run_ceph2()
-        cls.proposals = fixture_plan(CEPH2_FIXTURE).proposals
+        cls.moves = fixture_plan(CEPH2_FIXTURE).moves
 
     def test_the_counts_are_reported_on_stderr(self):
         err = flat(self.proc.stderr)
@@ -1506,33 +1222,29 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
             "could not be placed",
             err,
         )
+        self.assertIn(f"{CEPH2_FITTING} more got no target", err)
         self.assertIn(
             f"{CEPH2_ARRIVING} arriving shard(s), of which {CEPH2_STUCK} on an OSD", err
         )
         skipped = CEPH2_ARRIVING - CEPH2_STUCK
         self.assertIn(f"({skipped} left alone as not the blocker)", err)
 
-    def test_the_table_has_a_row_per_proposal(self):
+    def test_the_table_has_a_row_per_move(self):
         group_and_label_lines = 2
         self.assertEqual(
-            len(self.proc.stdout.splitlines()),
-            group_and_label_lines + CEPH2_PROPOSED,
+            len(self.proc.stdout.splitlines()), group_and_label_lines + CEPH2_PROPOSED
         )
 
-    def test_non_positive_limit_is_refused(self):
-        for value in ("0", "-1", "many"):
-            with self.subTest(value=value):
-                proc = run_ceph2("--max-target-uses", value, check=False)
-                self.assertEqual(proc.returncode, 2)
-                self.assertIn("--max-target-uses", proc.stderr)
-
-    def test_the_limit_and_ratio_are_reported_on_stderr(self):
-        err = flat(self.proc.stderr)
-        self.assertIn(f"--max-target-uses {CEPH2_MAX_USES}", err)
+    def test_the_cap_and_ratio_are_reported_on_stderr(self):
         self.assertIn(
             f"--max-target-util {CEPH2_MAX_TARGET_UTIL:g}% (backfillfull_ratio 91%)",
-            err,
+            flat(self.proc.stderr),
         )
+
+    def test_max_target_uses_is_gone(self):
+        proc = run_ceph2("--max-target-uses", "5", check=False)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("unrecognized arguments: --max-target-uses", proc.stderr)
 
     def test_a_cap_above_backfillfull_is_an_error(self):
         # 100 used to mean "no cap"; it must now fail rather than be honored.
@@ -1566,14 +1278,11 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
                     parse_args(dt, argv)
                 self.assertIn("not a ratio", err.getvalue())
 
-    def test_pgremapper_mappings_mode_prints_the_planned_proposals(self):
-        entries = json.loads(run_ceph2("--pgremapper-mappings").stdout)
+    def test_pgremapper_mappings_mode_prints_the_planned_moves(self):
+        entries = upmap_pairs(run_ceph2("--pgremapper-mappings").stdout)
         expected = [
-            {
-                "pgid": p.shard.pgid,
-                "mapping": {"from": p.shard.up_osd, "to": p.target_osd},
-            }
-            for p in self.proposals
+            {"pgid": m.pgid, "mapping": {"from": m.up_osd, "to": m.target_osd}}
+            for m in self.moves
         ]
         self.assertEqual(entries, expected)
 
@@ -1581,11 +1290,7 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
         err = flat(self.proc.stderr)
         self.assertEqual(err.count("could not be placed"), 1)
         self.assertIn(f"{CEPH2_UNPLACEABLE} shard(s) could not be placed.", err)
-        self.assertIn(
-            "NOTE: targets ran out of room (--max-target-util, --max-target-uses), "
-            "or the greedy placement missed some",
-            err,
-        )
+        self.assertIn(flat(messages.unplaceable_note("the OSD it was headed for")), err)
         # No per-shard '<pgid>:<shard>' list, however long the tail is.
         self.assertNotRegex(self.proc.stderr, r"\d+\.\w+:[\d-]+, ")
 
@@ -1594,7 +1299,6 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
         self.assertIn(
             f"{CEPH2_UNPLACEABLE} shard(s) could not be placed", flat(proc.stderr)
         )
-        self.assertNotRegex(proc.stderr, r"\d+\.\w+:[\d-]+, ")
         # Stdout stays parseable: only the JSON array.
         self.assertNotIn("could not be placed", proc.stdout)
 
@@ -1607,7 +1311,7 @@ class UnknownPoolTest(unittest.TestCase):
         # diff the pool's EC shards as interchangeable replicas — both
         # failures produce plausible-looking rows.
         with tempfile.TemporaryDirectory() as tmp:
-            dst = copy_without_pool("divert-toofull-osd457-down", 19, tmp)
+            dst = copy_without_pool(OSD457, 19, tmp)
             proc = run_command(dt, load_state=dst)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("pool id(s) 19", proc.stderr)

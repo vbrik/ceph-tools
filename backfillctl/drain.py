@@ -50,6 +50,7 @@ or it may undo them. Assumes the CRUSH failure domain is host.
 import argparse
 
 from messages import (
+    RELIEVE_CLAUSE,
     blockers_clause,
     left_alone_clause,
     level_text,
@@ -142,7 +143,7 @@ def render(r: ShedResult, args: argparse.Namespace) -> None:
             + (f"; {leaving} already moving off." if leaving else ".")
             + left_alone
         )
-        print_moves(r, args)
+        print_moves(r.moves, r.osd_host, r.osd_df, args)
         return
     to_level = (
         "" if r.level is None else f" to below --until-util {level_text(r.level)}"
@@ -151,12 +152,12 @@ def render(r: ShedResult, args: argparse.Namespace) -> None:
         f"Draining {osds}{to_level}: {r.mapped_count} shard(s) mapped to them "
         f"({leaving} more already moving off). Targets: "
         + targets_clause(r.max_target_util, r.ratios.backfillfull)
-        + ("" if r.level is None else ", ending up below the OSD they relieve")
+        + ("" if r.level is None else RELIEVE_CLAUSE)
         + ". "
         + blockers_clause(r.ratios.nearfull)
         + left_alone
     )
-    print_moves(r, args)
+    print_moves(r.moves, r.osd_host, r.osd_df, args)
     print_outcome(r, "the drained OSDs")
     if r.level is not None and (unsized := unsized_sources(r)):
         stderr_para(

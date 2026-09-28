@@ -194,13 +194,6 @@ class PinFooterTest(unittest.TestCase):
 class PlacementTextTest(unittest.TestCase):
     def test_targets_clause(self):
         self.assertEqual(
-            messages.targets_clause(90.0, 91.5, 5),
-            "up to --max-target-uses 5 shard(s) each, projected at or below "
-            "--max-target-util 90% (backfillfull_ratio 91.5%)",
-        )
-
-    def test_targets_clause_without_a_use_cap(self):
-        self.assertEqual(
             messages.targets_clause(90.0, 91.5),
             "projected at or below --max-target-util 90% (backfillfull_ratio 91.5%)",
         )
@@ -214,16 +207,21 @@ class PlacementTextTest(unittest.TestCase):
             text,
             "cannot place 19.1 shard 3 (headed for osd.31): no legal target "
             "cannot place 7.2 shard - off osd.4: no legal target "
-            + flat(messages.unplaceable_note("--max-target-util, --max-target-uses")),
-        )
-
-    def test_unplaceable_note_names_the_limits_given(self):
-        text = stderr_of(
-            messages.print_unplaceable,
-            iter([("7.2", "-", "off osd.4")]),
-            "--max-target-util",
+            + flat(messages.unplaceable_note()),
         )
         self.assertIn("ran out of room (--max-target-util), or", text)
+
+    def test_unplaceable_note_names_the_guards_given(self):
+        text = stderr_of(
+            messages.print_unplaceable,
+            iter([("7.2", "-", "(headed for osd.4)")]),
+            "the OSD it was headed for",
+        )
+        self.assertIn(
+            "no target at or below --max-target-util would end up below the OSD "
+            "it was headed for, or",
+            text,
+        )
 
     def test_nothing_when_everything_is_placed(self):
         self.assertEqual(stderr_of(messages.print_unplaceable, iter([])), "")
@@ -239,6 +237,9 @@ class ShedTextTest(unittest.TestCase):
         self.assertEqual(messages.named_list(["a", "b"]), "a, b")
         items = [str(i) for i in range(messages.MAX_NAMED + 3)]
         self.assertTrue(messages.named_list(items).endswith(", 9, and 3 more"))
+
+    def test_chained_text_is_shared_by_left_alone_clause(self):
+        self.assertIn(messages.chained_text(2), messages.left_alone_clause(1, 2))
 
     def test_left_alone_clause(self):
         self.assertEqual(messages.left_alone_clause(0, 0), "")

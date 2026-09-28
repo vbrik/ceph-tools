@@ -56,7 +56,7 @@ from messages import (
     stderr_para,
     targets_clause,
 )
-from placement import add_max_target_util_arg, build_candidate_osds
+from placement import add_max_target_util_arg
 from shared import (
     HelpFormatter,
     SnapshotStore,
@@ -80,8 +80,9 @@ from shed import (
 DEFAULT_CLASS = "hdd"
 
 # How far above the class mean the default level is, in percentage points.
-# The mean itself is out of reach: shards are too coarse for every source to
-# get below it while every target stays below it.
+# 0 asks for utilization as even as the shards allow: they are too coarse for
+# every source to get below the mean while every target stays below it, so
+# a run reports sources left at or above it.
 DEFAULT_MAX_DEVIATION = 0
 
 
@@ -140,7 +141,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> BalanceResult:
     --max-target-util, or a pool it cannot analyze safely.
     """
     cluster = Cluster(store, args.max_target_util)
-    candidates = build_candidate_osds(cluster.osd_df)
+    candidates = cluster.candidates
     class_osds = candidates.get(args.osd_class)
     if not class_osds:
         sys.exit(
@@ -204,7 +205,7 @@ def render(result: BalanceResult, args: argparse.Namespace) -> None:
     )
     if not r.sources:
         stderr_para(f"No {cls} OSD is at or above the level: nothing to move.")
-        print_moves(r, args)
+        print_moves(r.moves, r.osd_host, r.osd_df, args)
         return
     stderr_para(
         f"Targets: the other {cls} OSDs, "
@@ -212,7 +213,7 @@ def render(result: BalanceResult, args: argparse.Namespace) -> None:
         + ", ending up below the level and their source. "
         + blockers_clause(r.ratios.nearfull)
     )
-    print_moves(r, args)
+    print_moves(r.moves, r.osd_host, r.osd_df, args)
     print_outcome(r, "the sources")
     (before, before_osd), (after, after_osd) = result.max_before, result.max_after
     stderr_para(

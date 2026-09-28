@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Move shards off source OSDs until each is below a level: the engine behind
-drain and balance.
+drain and balance. divert-toofull places its shards with the same Planner.
 
 The two commands differ only in the sources and the level they pass (drain:
 the OSDs asked for, emptied unless given --until-util; balance: a device
@@ -24,12 +24,17 @@ A legal target is up and in, of the shard's device class, not a source, not
 in the PG's up or acting set or raw CRUSH mapping, not on a host the PG's
 other shards use (the shard's own host is fine), and at or below
 --max-target-util counting arrivals only (ProjectedUsage: Ceph checks when it
-reserves the backfill, before the source frees anything). With a level, it
-must also end up below the OSD it relieves, so that no move raises the
-maximum or ping-pongs, and, in the level's device class if it has one
-(balance), below the level, so that no move pushes another OSD to it. Emptying
-an OSD may need fuller targets, so without a level neither applies. The
-target that ends up least utilized wins.
+reserves the backfill, before the source frees anything), and its pairs must
+not chain with the PG's others. With a level, it must also end up below the
+OSD it relieves, so that no move raises the maximum or ping-pongs, and, in the
+level's device class if it has one (balance), below the level, so that no move
+pushes another OSD to it. Emptying an OSD may need fuller targets, so without a
+level neither applies. The target that ends up least utilized wins.
+
+Ending up below the OSD it relieves holds for the whole run (and in
+divert-toofull, which always applies it), not just when a move is chosen: no
+later move may take a target to or above an OSD it relieved, or an OSD to or
+below one of its targets. Pins are exempt.
 
 Left alone: PGs that are not settled (UNSETTLED_FLAGS), since remapping them
 slows recovery, and PGs whose existing upmap pairs chain, which pgremapper
@@ -53,7 +58,7 @@ import argparse
 import heapq
 import math
 from bisect import bisect_left, insort
-from collections import Counter
+from collections import Counter, defaultdict
 from functools import cached_property
 from typing import NamedTuple
 
@@ -168,6 +173,11 @@ def add_until_util_arg(parser: argparse._ActionsContainer) -> None:
     )
 
 
+def is_toofull(pg: dict) -> bool:
+    """True if the PG is backfill_toofull now."""
+    return "backfill_toofull" in pg["state"].split("+")
+
+
 def is_settled(pg: dict) -> bool:
     """True if the PG is active and none of its UNSETTLED_FLAGS are set."""
     flags = set(pg["state"].split("+"))
@@ -205,6 +215,11 @@ class Cluster:
         return fetch_pg_stats(self.store, "pg_dump_pgs")
 
     @cached_property
+    def candidates(self) -> dict[str, list[int]]:
+        """Usable target OSDs per device class (placement.build_candidate_osds)."""
+        return build_candidate_osds(self.osd_df)
+
+    @cached_property
     def _projections(self) -> tuple[ProjectedUsage, FinalUsage]:
         """Every backfill in motion, projected; exits on an unknown pool."""
         in_motion = [pg for pg in self.pgs if pg["up"] != pg["acting"]]
@@ -230,6 +245,11 @@ class Cluster:
         return pool_id in self.ec_pool_ids, shard_size_bytes(
             pg, self.pools[pool_id], self.ec_profiles
         )
+
+    def pg_state(self, pg: dict) -> "PgState":
+        """Return a PgState of the PG, as yet unchanged; its pool must be known."""
+        raw = raw_crush_osds(pg["up"], self.upmap_items.get(pg["pgid"], []))
+        return PgState(pg, *self.pg_info(pg), raw)
 
     def existing_pairs(self, pg: dict) -> list[tuple[int, int]]:
         """Return the PG's existing upmap pairs, as (from, to)."""
@@ -283,10 +303,6 @@ class PgState(PgPlacement):
         """The shard's key in changed: EC slot, or replica's up OSD."""
         return shard.shard if self.is_ec else shard.up_osd
 
-    def is_toofull(self) -> bool:
-        """True if the PG is backfill_toofull now."""
-        return "backfill_toofull" in self.pg["state"].split("+")
-
     def add_move(
         self,
         shard: MappedShard | ArrivingShard,
@@ -318,19 +334,34 @@ class Planner:
         sources: set[int],
         level: float | None,
         level_class: str | None,
+        *,
+        relieve: bool,
     ):
-        """level_class: the device class whose targets must stay below level."""
+        """level_class: the device class whose targets must stay below level.
+
+        relieve: a target must end up below the OSD it relieves, once every
+        move is done (highest_target, lowest_relieved).
+        """
         self.cluster = cluster
         self.sources = sources
         self.level = level
         self.level_class = level_class
+        self.relieve = relieve
+        # The committed moves, both ways: the OSDs each target relieved, and
+        # the targets each relieved OSD sent data to (counted, as a pair may
+        # repeat).
+        self.relieved: defaultdict[int, Counter[int]] = defaultdict(Counter)
+        self.sent_to: defaultdict[int, Counter[int]] = defaultdict(Counter)
         final, osd_df = cluster.final, cluster.osd_df
         # Each class's candidates as (final projection, OSD), kept in order
         # as moves change them (reorder), and the largest capacity: see place.
         self.order: dict[str, list[tuple[float, int]]] = {}
         self.max_capacity: dict[str, int] = {}
         self.order_key: dict[int, tuple[str, tuple[float, int]]] = {}
-        for cls, osds in build_candidate_osds(osd_df, exclude=sources).items():
+        for cls, all_osds in cluster.candidates.items():
+            osds = [o for o in all_osds if o not in sources]
+            if not osds:
+                continue
             self.order[cls] = sorted((final.utilization(o), o) for o in osds)
             self.max_capacity[cls] = max(osd_df[o]["kb"] * KIB for o in osds)
             for key in self.order[cls]:
@@ -379,12 +410,13 @@ class Planner:
         c = self.cluster
         cls = osd_class(c.osd_df, shard.up_osd)
         below = None
-        if self.level is not None:
-            if c.final.knows(shard.up_osd):
-                # Strictly below: equal would leave the maximum where it is.
-                below = c.final.utilization(shard.up_osd, -shard.size_bytes)
-            if cls is not None and cls == self.level_class:
-                below = self.level if below is None else min(below, self.level)
+        if self.relieve and c.final.knows(shard.up_osd):
+            # Strictly below: equal would leave the maximum where it is.
+            below = c.final.utilization(shard.up_osd, -shard.size_bytes)
+            if below <= self.highest_target(shard.up_osd):
+                return None
+        if self.level is not None and cls is not None and cls == self.level_class:
+            below = self.level if below is None else min(below, self.level)
         forbidden_hosts = state.forbidden_hosts(shard.up_osd, c.osd_host)
         if avoid_host is not None:
             forbidden_hosts.add(avoid_host)
@@ -417,9 +449,38 @@ class Planner:
             projected = c.final.utilization(osd, shard.size_bytes)
             if below is not None and projected >= below:
                 continue
-            if best is None or (projected, osd) < best:
-                best = projected, osd
+            if best is not None and (projected, osd) >= best:
+                continue
+            if self.relieve and projected >= self.lowest_relieved(osd):
+                continue
+            if self.chains(state, [(shard.up_osd, osd)]):
+                continue
+            best = projected, osd
         return best
+
+    def highest_target(self, osd_id: int) -> float:
+        """Return the highest final projection of the targets osd_id sent data to.
+
+        -inf if none (or none has a capacity figure). With relieve, moving
+        more off osd_id must leave it above this.
+        """
+        final = self.cluster.final
+        return max(
+            (final.utilization(t) for t in self.sent_to[osd_id] if final.knows(t)),
+            default=-math.inf,
+        )
+
+    def lowest_relieved(self, osd_id: int) -> float:
+        """Return the lowest final projection of the OSDs target osd_id relieved.
+
+        inf if none (or none has a capacity figure). With relieve, moving
+        more onto osd_id must leave it below this.
+        """
+        final = self.cluster.final
+        return min(
+            (final.utilization(u) for u in self.relieved[osd_id] if final.knows(u)),
+            default=math.inf,
+        )
 
     def commit(
         self, state: PgState, shard: MappedShard | ArrivingShard, target: int
@@ -432,6 +493,8 @@ class Planner:
             # Still arriving on its up OSD: that backfill is cancelled.
             c.reservation.redirect(shard, target)
         self.move_final(shard.up_osd, target, shard.size_bytes)
+        self.relieved[target][shard.up_osd] += 1
+        self.sent_to[shard.up_osd][target] += 1
         state.retarget(shard.up_osd, target)
         state.changed.add(state.key(shard))
 
@@ -445,6 +508,13 @@ class Planner:
         if shard.acting_osd != shard.up_osd and c.reservation.knows(shard.up_osd):
             c.reservation.add(shard.up_osd, shard.size_bytes)
         self.move_final(target, shard.up_osd, shard.size_bytes)
+        for counts, key in (
+            (self.relieved[target], shard.up_osd),
+            (self.sent_to[shard.up_osd], target),
+        ):
+            counts[key] -= 1
+            if not counts[key]:
+                del counts[key]
         state.retarget(target, shard.up_osd)
         state.forbidden_osds.discard(target)
         state.changed.discard(state.key(shard))
@@ -592,17 +662,20 @@ class Planner:
             move.pgid, move.shard, move.up_osd, move.acting_osd, move.size_bytes
         )
         self.uncommit(state, shard, move.target_osd)
+        # Out of the PG's moves while re-placed, so chains() does not see it.
+        del state.moves[i]
         picked = self.place(state, shard, avoid_host=host)
         pins, why = [], None
         if picked is not None:
             self.commit(state, shard, picked[1])
-            state.moves[i] = move._replace(target_osd=picked[1])
+            state.moves.insert(i, move._replace(target_osd=picked[1]))
             pins, why = self.try_pin(state, blocker)
             if pins:
                 return pins, None
             self.uncommit(state, shard, picked[1])
+            del state.moves[i]
         self.commit(state, shard, move.target_osd)
-        state.moves[i] = move
+        state.moves.insert(i, move)
         return pins, why
 
     def pin(self, state: PgState, pins: list[ArrivingShard], note: str) -> None:
@@ -692,7 +765,7 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
     - UNEXPLAINED: the PG is backfill_toofull now, but no sibling is a
       blocker and no moved shard was arriving on a source.
     """
-    toofull_now = state.is_toofull()
+    toofull_now = is_toofull(state.pg)
     requested = list(state.moves)
     # What a blocker would hold up, e.g. 'shard 9 leaving osd.231'.
     held_up = " and ".join(
@@ -756,6 +829,27 @@ def resolve_blockers(planner: Planner, state: PgState) -> tuple[int, int, str | 
         return diverted, pinned, None
     state.moves = [m._replace(note=note) if m in requested else m for m in state.moves]
     return diverted, pinned, verdict
+
+
+def project_moves(cluster: Cluster, moves: list[Move]) -> list[Move]:
+    """Return moves with their UP and TARGET final projections filled in.
+
+    Call once everything is placed, so that the rows of one OSD agree. A
+    pin's data stays where it is, so its target has no projection; nor has
+    an OSD without a capacity figure.
+    """
+    final = cluster.final
+
+    def projected(osd_id: int) -> float | None:
+        return final.utilization(osd_id) if final.knows(osd_id) else None
+
+    return [
+        m._replace(
+            up_projected=projected(m.up_osd),
+            target_projected=None if is_pin(m) else projected(m.target_osd),
+        )
+        for m in moves
+    ]
 
 
 class ShedResult(NamedTuple):
@@ -847,13 +941,12 @@ def shed(
 
     states: dict[str, PgState] = {}
     by_source: dict[int, list[MappedShard]] = {s: [] for s in sources}
-    for pg, is_ec, size, found in movable:
-        raw = raw_crush_osds(pg["up"], cluster.upmap_items.get(pg["pgid"], []))
-        states[pg["pgid"]] = PgState(pg, is_ec, size, raw)
+    for pg, *_, found in movable:
+        states[pg["pgid"]] = cluster.pg_state(pg)
         for shard in found:
             by_source[shard.up_osd].append(shard)
 
-    planner = Planner(cluster, sources, level, level_class)
+    planner = Planner(cluster, sources, level, level_class, relieve=level is not None)
     left = shed_sources(planner, states, by_source)
 
     diverted = pinned = 0
@@ -885,31 +978,18 @@ def shed(
         if (
             not state.moves
             and shard.acting_osd != shard.up_osd
-            and planner.is_blocker(shard, state.is_toofull())
+            and planner.is_blocker(shard, is_toofull(state.pg))
         ):
             stalled.add(shard.pgid)
     unplaceable.sort(key=lambda s: (pgid_sort_key(s.pgid), shard_key(s)))
 
     final = cluster.final
-
-    def projected(osd_id: int) -> float | None:
-        return final.utilization(osd_id) if final.knows(osd_id) else None
-
-    # Once everything is placed, so that the rows of one OSD agree. A pin's
-    # data stays where it is, so its target has no projection.
-    moves = [
-        m._replace(
-            up_projected=projected(m.up_osd),
-            target_projected=None if is_pin(m) else projected(m.target_osd),
-        )
-        for m in moves
-    ]
     final_util = {o: final.utilization(o) for o in sorted(sources) if final.knows(o)}
     return ShedResult(
         sources=sorted(sources),
         level=level,
         level_class=level_class,
-        moves=moves,
+        moves=project_moves(cluster, moves),
         unplaceable=unplaceable,
         mapped_count=sum(len(shards) for *_, shards in movable),
         kept_count=kept,
@@ -990,15 +1070,17 @@ def print_pgremapper_mappings(moves: list[Move]) -> None:
     )
 
 
-def print_moves(result: ShedResult, args: argparse.Namespace) -> None:
+def print_moves(
+    moves: list[Move],
+    osd_host: dict[int, str],
+    osd_df: dict[int, dict],
+    args: argparse.Namespace,
+) -> None:
     """Print the moves on stdout, in the format args asks for."""
     if args.pgremapper_mappings:
-        print_pgremapper_mappings(result.moves)
-    elif result.moves:
-        print_table(
-            COLUMNS,
-            [format_row(m, result.osd_host, result.osd_df) for m in result.moves],
-        )
+        print_pgremapper_mappings(moves)
+    elif moves:
+        print_table(COLUMNS, [format_row(m, osd_host, osd_df) for m in moves])
 
 
 def print_outcome(result: ShedResult, off: str) -> None:
@@ -1028,8 +1110,7 @@ def print_notes(result: ShedResult, which: str) -> None:
     """
     if result.level is None:
         print_unplaceable(
-            ((s.pgid, s.shard, f"off osd.{s.up_osd}") for s in result.unplaceable),
-            "--max-target-util",
+            (s.pgid, s.shard, f"off osd.{s.up_osd}") for s in result.unplaceable
         )
     else:
         print_still_above(which, result.level, result.still_above)

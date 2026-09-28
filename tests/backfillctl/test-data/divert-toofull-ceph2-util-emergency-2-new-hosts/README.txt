@@ -52,21 +52,25 @@ thresholds, and it is the capture that exposed the two bugs they fix.
     the ratio once the shard is on it. It may not exceed backfillfull_ratio;
     a higher value (100 included) is an error.
 
-Expected results with the default settings (--toofull-util 85,
---max-target-util 90, both derived from this cluster's own ratios, and
---max-target-uses 5):
+Expected results with the default settings (--toofull-util 85 and
+--max-target-util 90, both derived from this cluster's own ratios):
 
   808 backfill_toofull PGs, 808 with newly-arriving shards
   1513 arriving shards, 976 at or above --toofull-util, 537 left alone
   candidate target OSDs: hdd=822, ssd=78
-  52 remaps proposed, 924 unplaceable
-  52 shards go to 27 distinct OSDs; none is used more than 5 times
-  no proposed target projected above --max-target-util, counting the
-    shards already sent to it and every shard arriving on it (the 537
-    left-alone ones, and the stuck ones until they are diverted; a shard is
-    ~184 GB, 0.93% of an OSD, so an OSD near the cap has room for only a few)
+  40 remaps proposed, 934 unplaceable, and 2 left without a target on an OSD
+    the 40 take below backfillfull_ratio
+  40 shards go to 26 distinct OSDs, at most 5 each
+  no proposed target reserved above --max-target-util, counting every shard
+    arriving on it (the 537 left-alone ones, and the stuck ones until they
+    are diverted; a shard is ~184 GB, 0.93% of an OSD, so an OSD near the
+    cap has room for only a few)
   (so none is projected within a point of backfillfull_ratio)
   no diverted shard arriving on an OSD below nearfull_ratio
+  every target ends up below the OSD it relieves, once all 40 complete
+
+This capture holds only the backfill_toofull PGs, so the arrivals counted
+are theirs; a live run counts every backfill in motion.
 
 Counting the stuck shards on the OSD they are headed for matters here: many
 of the candidates are themselves the arriving OSD of a stuck shard, and that
@@ -75,27 +79,20 @@ order-dependent, and errs on the safe side.
 
 Shards are placed fullest ACTING OSD first, re-ranked as each placement
 relieves its source. 578 of the 976 stuck shards have an acting OSD at or
-above backfillfull_ratio and there is room for only 52, so every placed
+above backfillfull_ratio and there is room for only 40, so every placed
 shard comes from one (the least full acting OSD among them is at 92.4%),
-spread over 45 distinct acting OSDs rather than piled onto a few.
-
-The count limit is not what runs out: --max-target-uses 2 places 37, 5
-places 52, 10 places 54, because the projection is. --max-target-uses 1
-gives every OSD at most one shard:
-
-  backfillctl divert-toofull --load-state . --max-target-uses 1
-  -> 26 remaps proposed, 950 unplaceable
+spread over 38 distinct acting OSDs rather than piled onto a few.
 
 Raising the cap to backfillfull_ratio itself admits targets projected right
 up to the ratio, with no margin:
 
   backfillctl divert-toofull --load-state . --max-target-util 91
-  -> 199 remaps proposed, 777 unplaceable
+  -> 114 remaps proposed, 856 unplaceable, 6 left
 
-The table is 52 rows, too long to quote here the way the small fixtures
+The table is 40 rows, too long to quote here the way the small fixtures
 do, so the test asserts those counts and invariants instead of an exact
 table (see Ceph2FixtureInvariantTest in
-test_divert_toofull.py). The 924 unplaceable shards
+test_divert_toofull.py). The 934 unplaceable shards
 are counted on stderr after the table, without a reason: the heuristic found
 no target for them, which does not prove none exists.
 
@@ -105,12 +102,8 @@ is an error), and what the invariant test guards against regressing past:
 
   backfillctl divert-toofull --load-state . \
       --toofull-util 0 --max-target-util 91
-  -> 210 remaps proposed, 1303 unplaceable, none projected past backfillfull
-
-(With one use per OSD and no projection this was 573 remaps proposed, 940
-unplaceable, 93 targets past backfillfull; before the "target strictly
-emptier than the arriving OSD" rule, 822 remaps, 691 unplaceable, 342 past
-backfillfull.)
+  -> 117 remaps proposed, 1373 unplaceable, 23 left, none projected past
+     backfillfull
 
 Replay this fixture directly (no live cluster, no fake `ceph` needed) with:
 

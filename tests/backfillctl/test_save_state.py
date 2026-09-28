@@ -24,7 +24,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import TEST_DATA, FakeStore, parse_args, shared
+from _support import TEST_DATA, FakeStore, parse_args, plan_from_state, shared
 
 from backfillctl import cancel_backfill as cb
 from backfillctl import divert_toofull as dt
@@ -214,9 +214,7 @@ class CrossSubcommandFixtureTest(unittest.TestCase):
         self.assertEqual(len(pgs), 688)
 
     def test_divert_toofull_filters_for_backfill_toofull(self):
-        store = FakeStore(self.load())
-        pgs = dt.fetch_backfill_toofull_pg_stats(store)
-        self.assertEqual(len(pgs), 585)
+        self.assertEqual(plan_from_state(dt, FIXTURE).toofull_pg_count, 585)
 
     def test_one_directory_serves_a_second_subcommand_it_was_not_captured_for(self):
         # This fixture's README documents its capture as a

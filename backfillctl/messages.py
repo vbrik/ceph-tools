@@ -260,41 +260,45 @@ def print_pin_footer(
 # ---------------------------------------------------------------------------
 
 
-def unplaceable_note(limits: str) -> str:
+def unplaceable_note(guards: str | None = None) -> str:
     """Say what to do about shards no target was found for.
 
-    limits names what held the targets back, e.g. '--max-target-util'.
+    guards, if given, says what a target also had to end up below.
     """
+    held_back = (
+        "targets ran out of room (--max-target-util)"
+        if guards is None
+        else f"no target at or below --max-target-util would end up below {guards}"
+    )
     return (
-        f"NOTE: targets ran out of room ({limits}), or the greedy placement "
-        "missed some. Apply these, let them finish, then re-run."
+        f"NOTE: {held_back}, or the greedy placement missed some. Apply these, let "
+        "them finish, then re-run."
     )
 
 
-def targets_clause(
-    max_target_util: float,
-    backfillfull_pct: float,
-    max_target_uses: int | None = None,
-) -> str:
+# Appended to targets_clause when a target must end up below its source.
+RELIEVE_CLAUSE = ", ending up below the OSD they relieve"
+
+
+def targets_clause(max_target_util: float, backfillfull_pct: float) -> str:
     """Return the limits every move target is held to, as a clause."""
-    uses = (
-        ""
-        if max_target_uses is None
-        else f"up to --max-target-uses {max_target_uses} shard(s) each, "
-    )
     return (
-        f"{uses}projected at or below --max-target-util {max_target_util:g}% "
+        f"projected at or below --max-target-util {max_target_util:g}% "
         f"(backfillfull_ratio {backfillfull_pct:g}%)"
     )
 
 
+def chained_text(count: int) -> str:
+    """Count the PGs left alone as their existing upmap pairs chain."""
+    return f"{count} whose upmap pairs chain (A->B, B->C), which pgremapper would break"
+
+
 def print_unplaceable(
-    shards: Iterable[tuple[str, "int | str", str]],
-    limits: str = "--max-target-util, --max-target-uses",
+    shards: Iterable[tuple[str, "int | str", str]], guards: str | None = None
 ) -> None:
     """List on stderr the (pgid, shard, where) no target was found for, and what to do.
 
-    where says where the shard is moving, e.g. '(headed for osd.31)'; limits,
+    where says where the shard is moving, e.g. '(headed for osd.31)'; guards,
     as in unplaceable_note. Prints nothing if shards is empty.
     """
     items = [
@@ -303,7 +307,7 @@ def print_unplaceable(
     ]
     if items:
         stderr_items(items)
-        stderr_para(unplaceable_note(limits))
+        stderr_para(unplaceable_note(guards))
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +337,7 @@ def left_alone_clause(unsettled: int, chained: int) -> str:
         return ""
     return (
         f" PGs left alone: {unsettled} not active, or degraded, undersized, "
-        "recovering or peering (re-run once they settle); "
-        f"{chained} whose upmap pairs chain (A->B, B->C), which pgremapper "
-        "would break."
+        f"recovering or peering (re-run once they settle); {chained_text(chained)}."
     )
 
 

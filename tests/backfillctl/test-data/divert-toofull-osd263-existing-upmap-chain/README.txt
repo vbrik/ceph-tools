@@ -31,16 +31,20 @@ validation would silently drop, since 263 was never CRUSH's own pick).
 Verified against the live cluster: running the script reports 6
 backfill_toofull PGs cluster-wide, 6 arriving shards, all 6 at or above the
 default --toofull-util (osd.263 is at 87.6%, this cluster's
-nearfull_ratio is 85%), and 0 unplaceable. Every proposed target clears the
-default --max-target-util of 89%: each is at 86.9-87.0% now and projected
-to reach 87.7% once its shard has landed.
+nearfull_ratio is 85%). Every proposed target clears the default
+--max-target-util of 89%: each is at 86.9-87.0% now and projected to reach
+87.7% once its shard has landed.
+
+Five are diverted, and 0 are unplaceable. The sixth, 19.d85 shard 9, is
+left headed for osd.263: with the other five gone, osd.263 is projected at
+88.4%, below backfillfull_ratio, and would end up at 87.55% without it,
+below every target once it has the shard (the relief rule).
 
 Expected proposals, one per line as PGID SHARD ACTING_OSD UP_OSD TARGET_OSD
 (checked by the tests against what the script plans):
 
   19.7be   1  863  263  837
   19.bd5   8  625  263  842
-  19.d85   9  189  263  850
   19.118a  2  618  263  839
   19.122e  7  487  263  813
   19.1ce0  0  723  263  829
@@ -55,10 +59,10 @@ reference, the PGs' pg_upmap_items pairs were:
   19.122e  866->356,487->263                        (263 is a 'to')
   19.1ce0  655->454,575->831,723->263               (263 is a 'to')
 
---pgremapper-mappings still maps 'from' 263 for all six, e.g. {"pgid":
+--pgremapper-mappings still maps 'from' 263 for all five, e.g. {"pgid":
 "19.bd5", "mapping": {"from": 263, "to": 842}}. 'pgremapper import-mappings'
 turns that into a rewrite of the existing 625->263 pair to 625->842 for the
-four 'to' PGs, and adds a fresh pair for the other two.
+four 'to' PGs, and adds a fresh pair for 19.7be.
 
 Use this fixture to exercise the raw-CRUSH-mapping path end-to-end. For the
 plain "found something to divert" path see divert-toofull-osd457-down/; for

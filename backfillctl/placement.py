@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: MIT
-"""Choosing target OSDs for shards; shared by divert-toofull and shed
-(drain, balance).
+"""Building blocks for choosing target OSDs for shards (shed.Planner, used by
+drain, balance and divert-toofull).
 
-A target is a legal OSD (target_projection) of the shard's device class:
-divert-toofull takes the one projected least utilized with the shard added
-(pick_target, ProjectedUsage), shed the one that ends up least utilized
-(FinalUsage). Also: finding shards in motion or on given OSDs, where each
-OSD ends up (FinalUsage), tracking a PG's up set as moves are proposed
-(PgPlacement), and the cluster's full ratios.
+A target is a legal OSD (target_projection) of the shard's device class.
+Also: finding shards in motion or on given OSDs, what each OSD will hold
+once the backfills are reserved (ProjectedUsage) and once they complete
+(FinalUsage), tracking a PG's up set as moves are proposed (PgPlacement),
+and the cluster's full ratios.
 """
 
 import argparse
 import sys
-from collections import Counter
 from collections.abc import Iterable
 from typing import NamedTuple, Protocol
 
@@ -30,27 +28,18 @@ from shared import (
 DEFAULT_NEARFULL_RATIO = 0.85
 DEFAULT_BACKFILLFULL_RATIO = 0.90
 
-DEFAULT_MAX_TARGET_USES = 5
-
 
 # ---------------------------------------------------------------------------
 # CLI helpers
 # ---------------------------------------------------------------------------
 
 
-def positive_int(text: str) -> int:
-    """argparse type: an integer of at least 1."""
-    value = int(text)
-    if value < 1:
-        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
-    return value
-
-
 def add_toofull_util_arg(parser: argparse.ArgumentParser):
     """Add --toofull-util (divert-toofull).
 
     Ceph reports backfill_toofull per PG, not per shard, so this guesses
-    which shard was refused; shed makes the same guess at nearfull_ratio.
+    which shard was refused; shed's blockers make the same guess at
+    nearfull_ratio.
     """
     parser.add_argument(
         "--toofull-util",
@@ -74,17 +63,6 @@ def add_max_target_util_arg(parser: argparse.ArgumentParser):
         metavar="PERCENT",
         help="Cap on a target's projected utilization (default: "
         "backfillfull_ratio - 1; at most backfillfull_ratio).",
-    )
-
-
-def add_max_target_uses_arg(parser: argparse.ArgumentParser):
-    """Add --max-target-uses (divert-toofull)."""
-    parser.add_argument(
-        "--max-target-uses",
-        type=positive_int,
-        default=DEFAULT_MAX_TARGET_USES,
-        metavar="N",
-        help="Maximum shards per target OSD (default: %(default)s).",
     )
 
 
@@ -496,50 +474,3 @@ def target_projection(
         return None
     projected = projection.utilization_after(candidate, size_bytes)
     return projected if projected <= max_target_util else None
-
-
-def pick_target(
-    pool: list[int],
-    size_bytes: int,
-    *,
-    forbidden_hosts: set[str | None],
-    forbidden_osds: set[int],
-    osd_host: dict[int, str],
-    osd_df: dict[int, dict],
-    projection: ProjectedUsage,
-    uses: Counter[int],
-    max_uses: int,
-    max_target_util: float,
-    below_util: float | None = None,
-) -> tuple[float, int] | None:
-    """Return (projected utilization, OSD) of the best legal target, or None.
-
-    pool: candidates of the shard's class, least-utilized first
-    (build_candidate_osds). Legal: target_projection, used fewer than
-    max_uses times, and currently below below_util (if given). Lowest
-    projection wins, then lowest id.
-
-    Records nothing; the caller updates projection and uses.
-    """
-    legal = []
-    for candidate in pool:
-        util = osd_df[candidate]["utilization"]
-        # Sorted, and projections never fall below current: the rest are over.
-        if util > max_target_util:
-            break
-        if uses[candidate] >= max_uses:
-            continue
-        if below_util is not None and util >= below_util:
-            continue
-        projected = target_projection(
-            candidate,
-            size_bytes,
-            forbidden_hosts=forbidden_hosts,
-            forbidden_osds=forbidden_osds,
-            osd_host=osd_host,
-            projection=projection,
-            max_target_util=max_target_util,
-        )
-        if projected is not None:
-            legal.append((projected, candidate))
-    return min(legal) if legal else None

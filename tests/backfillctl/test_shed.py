@@ -113,6 +113,16 @@ class TargetTest(unittest.TestCase):
         result = c.pg("1.0", [0, 10, 20]).shed(0)
         self.assertEqual(pairs(result), [("1.0", 0, 0, 41)])
 
+    def test_target_whose_pair_would_chain_is_skipped(self):
+        # A stale pair 31->40 (neither in 'up') leaves 31 out of the raw
+        # mapping, but 0->31 would chain with it: pgremapper cannot apply that.
+        c = Cluster()
+        c.util[31] = 10.0
+        c.util[41] = 20.0
+        c.upmaps.append({"pgid": "1.0", "mappings": [{"from": 31, "to": 40}]})
+        result = c.pg("1.0", [0, 10, 20]).shed(0)
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 41)])
+
     def test_osd_with_data_leaving_is_preferred_where_it_ends_up_emptiest(self):
         # osd.41 is fuller now, but ends at 5% once its 25% leaves.
         c = Cluster()
@@ -280,6 +290,17 @@ class LevelTest(unittest.TestCase):
         self.assertEqual((result.mapped_count, result.kept_count), (3, 1))
         self.assertEqual((result.unplaceable, result.still_above), ([], []))
         self.assertEqual(result.final_util, {0: 51.0})
+
+    def test_source_may_not_drop_below_a_target_it_sent_data_to(self):
+        # 1.0's 10% shard goes to osd.51 (45% -> 55%; h4 is 1.0's), leaving
+        # osd.0 at 60%. 1.1's could go to osd.41 (20% -> 30%), but would
+        # leave osd.0 at 50%, below osd.51. The rest have no room.
+        c = Cluster(default_util=88.0)
+        c.util |= {0: 70.0, 41: 20.0, 51: 45.0}
+        c.pg("1.0", [0, 40, 20], shard_pct=10).pg("1.1", [0, 10, 30], shard_pct=10)
+        result = c.shed(0, level=40)
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 51)])
+        self.assertEqual([s.pgid for s in result.unplaceable], ["1.1"])
 
     def test_source_already_below_the_level_sheds_nothing(self):
         result = Cluster().pg("1.0", [0, 10, 20]).shed(0, level=60)

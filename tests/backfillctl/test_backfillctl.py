@@ -273,7 +273,7 @@ class RunCommandTest(unittest.TestCase):
         fixture = TEST_DATA / "divert-toofull-osd457-down"
         for argv in (
             [],  # stderr paragraphs, and a table
-            ["--max-target-uses", "0"],  # an argparse error, naming the program
+            ["--max-target-util", "-5"],  # an argparse error, naming the program
         ):
             with self.subTest(argv=argv):
                 real = run_backfillctl(

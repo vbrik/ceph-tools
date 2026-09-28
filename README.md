@@ -51,9 +51,9 @@ which adds to a PG's existing upmap pairs. `ceph osd pg-upmap-items` replaces
 them all. Turn off the upmap balancer (`ceph balancer off`) for as long as
 the upmaps should hold, or it may undo them; the commands remind you on
 stderr. The remapping commands assume the CRUSH failure domain is `host`.
-Entries from the cancel commands, `drain` and `balance` also carry the
-table's `shard`, `role` (requested, companion, blocker) and `note`, for
-pruning with `jq`; pgremapper ignores them.
+Entries from the cancel commands, `divert-toofull`, `drain` and `balance`
+also carry the table's `shard`, `role` (requested, companion, blocker) and
+`note`, for pruning with `jq`; pgremapper ignores them.
 
 `drain` and `balance` plan the same way. The fullest source OSD goes first,
 largest shard first, to the legal target that ends up least full. Their moves
@@ -67,6 +67,11 @@ whose existing upmap pairs chain. Shards that would hold a moved PG in
 `backfill_toofull` are diverted or pinned back, including shards arriving on a
 source.
 
+`divert-toofull` chooses targets by the same rules, each ending up below the
+OSD it relieves, and serves the fullest acting OSD first. It does not divert
+or pin blocking siblings. It leaves alone PGs whose upmap pairs chain, but
+not degraded ones: an out OSD leaves them so.
+
 pgremapper cannot apply chained pairs (A->B, B->C), which cancelling some EC
 backfills needs. The cancel commands leave such backfills running, and print
 `ceph osd pg-upmap-items` commands that would cancel them too.
@@ -76,7 +81,7 @@ backfills needs. The cancel commands leave such backfills running, and print
 | `show-backfill` | What is moving: acting and up OSDs, type, progress and state, per moving EC shard or replica. Filter with `--osds`, `--pgs` and `--hosts`. |
 | `measure-rate [--interval SECONDS]` | How fast backfill destinations (UP OSDs) receive data: each copy's RATE (objects/s, MiB/s) and ETA, from two samples at least `--interval` (30) seconds apart; then the rates per destination OSD and host, and the total. Tables sort by destination host (`ceph1-2` before `ceph1-10`), OSD, PG and shard; `--sort-by` `obj/s` or `mib/s` puts the fastest first in all three, `progress` or `eta` the furthest along or soonest done copies. `--osds`/`--hosts` match the destination; `--pgs` as in `show-backfill`. `--save-state DIR` saves both samples for `--load-state DIR`. |
 | `show-pg-osds PGID...` | Acting and up OSDs of given PGs, per shard, with utilization, host, progress and upmap pairs. |
-| `divert-toofull` | Re-target shards stuck in `backfill_toofull` to the least-utilized legal OSDs, e.g. after an OSD failure piles its data onto its host's other OSDs. |
+| `divert-toofull` | Re-target shards stuck in `backfill_toofull` to the legal OSDs that end up least full, e.g. after an OSD failure piles its data onto its host's other OSDs. |
 | `drain --osds OSD... \| --hosts HOST... [--until-util PCT]` | Move every shard off OSDs or hosts, spread across the cluster rather than onto the same host; with `--until-util`, only until each OSD is projected below PCT. Keep the OSDs up and in until empty (with `--until-util`, for as long as the upmaps should hold): marking them out voids the upmaps. |
 | `balance [--class CLASS] [--osds OSD...] [--until-util PCT \| --max-deviation POINTS]` | Move shards off a device class's fullest OSDs onto the emptiest, until each is projected below a level: `--until-util`, or the class mean plus `--max-deviation` (0) points. Stderr names the OSDs left above it; apply, let the backfills finish, and re-run for more. |
 | `cancel-backfill [--osds OSD... [--pin-blockers]]` | Cancel backfills by pinning shards to where their data is: all of them, or those into given full OSDs to make room for others. |

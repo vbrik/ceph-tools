@@ -12,18 +12,22 @@ this is a guess, and shards arriving on emptier OSDs are left alone. The
 target is the OSD that ends up least utilized among those that:
 
 - are up and in, of the same device class;
-- are on a host the PG does not use, and not in its CRUSH mapping;
-- are emptier than the OSD the shard was heading for;
-- stay at or below --max-target-util, counting the shards already arriving
-  there and those proposed in this run;
-- have taken fewer than --max-target-uses shards.
+- are on a host the PG's other shards do not use, and not in its up or
+  acting set or CRUSH mapping;
+- stay at or below --max-target-util, counting every backfill in motion and
+  the proposals, but not data leaving (Ceph checks before any is freed);
+- end up below the OSD the shard was heading for, once all proposals
+  complete.
 
-Shards whose data sits on the fullest OSD are placed first. If room runs
-out, apply the proposals, let them finish and run again.
+Utilization here is projected (PROJ in the table): what an OSD will hold
+once every backfill in motion and every proposal completes, crediting data
+leaving it. Shards whose data sits on the fullest OSD are placed first. If
+room runs out, apply the proposals, let them finish and run again. PGs
+whose existing upmap pairs chain are left alone, and no proposal makes a
+PG's pairs chain: pgremapper would break them.
 
 Table groups: ACTING is where the data is ('none' if its OSD is out), UP
-where the stalled backfill is headed, TARGET the proposed OSD. PROJ is the
-target's projected utilization once all proposals complete.
+where the stalled backfill is headed, TARGET the proposed OSD.
 
 Apply the output with pgremapper, not 'ceph osd pg-upmap-items', which
 replaces a PG's whole upmap entry:
@@ -39,10 +43,13 @@ or it may undo them. Assumes the CRUSH failure domain is host.
 import argparse
 import heapq
 import math
-from collections import Counter, deque
+from collections import deque
 from typing import NamedTuple
 
 from messages import (
+    RELIEVE_CLAUSE,
+    chained_text,
+    named_list,
     print_balancer_note,
     print_pgid_filter,
     print_unplaceable,
@@ -52,24 +59,14 @@ from messages import (
 from placement import (
     ArrivingShard,
     FullRatios,
-    ProjectedUsage,
-    add_max_target_uses_arg,
     add_max_target_util_arg,
     add_toofull_util_arg,
-    build_candidate_osds,
-    ec_pool_ids_from,
-    fetch_full_ratios,
+    blocker_projection,
     find_arriving_shards,
-    osd_class,
-    pick_target,
-    raw_crush_osds,
-    resolve_max_target_util,
     resolve_toofull_util,
-    shard_size_bytes,
     usage_and_capacity,
 )
 from shared import (
-    UNKNOWN_HOST,
     HelpFormatter,
     PgidFilter,
     SnapshotStore,
@@ -77,52 +74,19 @@ from shared import (
     add_pgremapper_mappings_arg,
     check_host_failure_domain,
     check_known_pools,
-    fetch_crush_rules,
-    fetch_ec_profiles,
-    fetch_osd_df,
-    fetch_osd_hosts,
-    fetch_pg_stats,
-    fetch_pools,
-    fetch_upmap_items,
-    is_real_osd,
-    osd_cells,
-    osd_columns,
-    pgid_pool_id,
     pgid_sort_key,
-    print_table,
-    print_upmap_pairs,
 )
-
-# Live runs read pg_ls_backfill_toofull; --load-state filters pg_dump_pgs
-# instead (see fetch_backfill_toofull_pg_stats).
-SNAPSHOT_COMMANDS: dict[str, list[str]] = {
-    "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
-    "osd_df": ["ceph", "osd", "df", "--format", "json"],
-    "osd_dump": ["ceph", "osd", "dump", "--format", "json"],
-    "pool_ls_detail": ["ceph", "osd", "pool", "ls", "detail", "--format", "json"],
-    "crush_rule_dump": ["ceph", "osd", "crush", "rule", "dump", "--format", "json"],
-    "pg_ls_backfill_toofull": [
-        "ceph",
-        "pg",
-        "ls",
-        "backfill_toofull",
-        "--format",
-        "json",
-    ],
-    "pg_dump_pgs": ["ceph", "pg", "dump", "pgs", "--format", "json"],
-}
-
-
-def fetch_backfill_toofull_pg_stats(store: SnapshotStore) -> list[dict]:
-    """Return the backfill_toofull PGs, live or from a capture."""
-    if store.load_dir is None:
-        return fetch_pg_stats(store, "pg_ls_backfill_toofull")
-    return [
-        pg
-        for pg in fetch_pg_stats(store, "pg_dump_pgs")
-        if "backfill_toofull" in pg["state"].split("+")
-    ]
-
+from shed import (
+    SNAPSHOT_COMMANDS,
+    Cluster,
+    Move,
+    PgState,
+    Planner,
+    is_toofull,
+    print_moves,
+    project_moves,
+    shard_key,
+)
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -138,7 +102,6 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     )
     add_toofull_util_arg(parser)
     add_max_target_util_arg(parser)
-    add_max_target_uses_arg(parser)
     parser.add_argument(
         "--pgs",
         nargs="+",
@@ -202,8 +165,9 @@ class SourcePressure:
     shard's backfill can finish, freeing its acting OSD, so relieve() lowers
     that OSD's figure and priority rotates between OSDs.
 
-    Kept apart from ProjectedUsage: the space frees only after the backfill,
-    while Ceph checks targets at reservation.
+    Kept apart from the planner's projections: ProjectedUsage never credits
+    data leaving (Ceph checks targets at reservation), and FinalUsage
+    credits all of it, stuck or not.
     """
 
     def __init__(self, osd_df: dict[int, dict]):
@@ -222,37 +186,19 @@ class SourcePressure:
             self._used[shard.acting_osd] -= shard.size_bytes
 
 
-class Proposal(NamedTuple):
-    shard: ArrivingShard
-    target_osd: int
-    target_host: str
-    target_utilization: float  # current, from 'ceph osd df'
-    target_projected: float  # once all proposals have completed, in any row
-
-
-def assign_targets(
+def divert(
+    planner: Planner,
+    states: dict[str, PgState],
     shards: list[ArrivingShard],
-    candidates: dict[str, list[int]],
-    osd_host: dict[int, str],
-    osd_df: dict[int, dict],
-    upmap_items: dict[str, list[dict]],
-    *,
-    projection: ProjectedUsage,
-    max_uses: int,
-    max_target_util: float,
-) -> tuple[list[Proposal], list[ArrivingShard]]:
-    """Greedily give each stuck shard a target (see pick_target).
+) -> list[ArrivingShard]:
+    """Give each stuck shard the best legal target (Planner.place); return the rest.
 
     Each turn takes the shard whose acting OSD is fullest (SourcePressure);
-    ties and unknown acting OSDs go in the order given. A target must also be
-    emptier than the shard's UP OSD. Returns (proposals, unplaceable) in the
-    order given; each proposal carries its target's final projection.
+    ties and unknown acting OSDs go in the order given. Moves are recorded
+    in states (and the planner's projections); the shards left without a
+    target are returned in the order given.
     """
-    uses: Counter[int] = Counter()
-    pressure = SourcePressure(osd_df)
-    # Hosts each PG uses, including targets proposed so far.
-    blocked_hosts: dict[str, set[str]] = {}
-    proposed: dict[int, int] = {}  # shard index -> target OSD
+    pressure = SourcePressure(planner.cluster.osd_df)
     unplaceable = set()
 
     # Placing a shard changes only its acting OSD's priority, so shards are
@@ -272,122 +218,76 @@ def assign_targets(
         queue = queues[acting]
         queue.popleft()
         shard = shards[i]
-
-        if shard.pgid not in blocked_hosts:
-            blocked_hosts[shard.pgid] = {
-                osd_host.get(o) for o in shard.up_set if is_real_osd(o)
-            }
-        forbidden_hosts = blocked_hosts[shard.pgid]
-        raw = raw_crush_osds(shard.up_set, upmap_items.get(shard.pgid, []))
-        # See raw_crush_osds for why 'up' alone is not enough.
-        forbidden_osds = raw | {o for o in shard.up_set if is_real_osd(o)}
-
-        # Same device class only; an unknown class leaves it unplaceable.
-        pool = candidates.get(osd_class(osd_df, shard.up_osd), [])
-        # A target must be emptier than the UP OSD (if its utilization is known).
-        picked = pick_target(
-            pool,
-            shard.size_bytes,
-            forbidden_hosts=forbidden_hosts,
-            forbidden_osds=forbidden_osds,
-            osd_host=osd_host,
-            osd_df=osd_df,
-            projection=projection,
-            uses=uses,
-            max_uses=max_uses,
-            max_target_util=max_target_util,
-            below_util=osd_df.get(shard.up_osd, {}).get("utilization"),
-        )
-
+        state = states[shard.pgid]
+        picked = planner.place(state, shard)
         if picked:
-            _, target = picked
-            projection.redirect(shard, target)
+            planner.commit(state, shard, picked[1])
+            state.add_move(shard, picked[1])
             pressure.relieve(shard)
-            uses[target] += 1
-            forbidden_hosts.add(osd_host.get(target))
-            proposed[i] = target
         else:
             unplaceable.add(i)
-
         # Requeue: placing may have lowered the queue's rank.
         if queue:
             heapq.heappush(
                 heap, (-pressure.utilization(shards[queue[0]]), queue[0], acting)
             )
 
-    # Final projections, including shards placed later.
-    return (
-        [
-            Proposal(
-                shards[i],
-                proposed[i],
-                osd_host.get(proposed[i], UNKNOWN_HOST),
-                osd_df[proposed[i]]["utilization"],
-                projection.utilization_after(proposed[i], 0),
-            )
-            for i in sorted(proposed)
-        ],
-        [shards[i] for i in sorted(unplaceable)],
-    )
+    return [shards[i] for i in sorted(unplaceable)]
 
 
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
-# (group, label), along the shard's path: ACTING (data now), UP (stalled
-# destination), TARGET (proposed). PROJ: the target's final projection.
-COLUMNS = [
-    ("", "PGID"),
-    ("", "SHARD"),
-    *osd_columns("ACTING"),
-    *osd_columns("UP"),
-    ("TARGET", "OSD"),
-    ("TARGET", "UTIL"),
-    ("TARGET", "PROJ"),
-    ("TARGET", "HOST"),
-]
+
+def split_left(
+    cluster: Cluster, left: list[ArrivingShard], moves: list[Move]
+) -> tuple[list[ArrivingShard], list[tuple[ArrivingShard, float]]]:
+    """Split the shards divert() left into (unplaceable, (shard, projection) that fit).
+
+    A shard fits if moves take other shards off its UP OSD, and leave that
+    OSD's reservation projection below backfillfull_ratio: Ceph may then
+    take it as it is, and any target would end up fuller (the relief rule).
+    A shard on an OSD no move relieves is unplaceable: Ceph refuses it now.
+    """
+    unplaceable, fitting = [], []
+    reservation, backfillfull = cluster.reservation, cluster.ratios.backfillfull
+    relieved = {m.up_osd for m in moves}
+    for shard in left:
+        if (
+            shard.up_osd in relieved
+            and reservation.knows(shard.up_osd)
+            and blocker_projection(reservation, shard.up_osd, backfillfull) is None
+        ):
+            fitting.append((shard, reservation.utilization_after(shard.up_osd, 0)))
+        else:
+            unplaceable.append(shard)
+    return unplaceable, fitting
 
 
-def format_row(
-    proposal: Proposal,
-    osd_host: dict[int, str],
-    osd_df: dict[int, dict],
-) -> list[str]:
-    shard = proposal.shard
-    return [
-        shard.pgid,
-        str(shard.shard),
-        *osd_cells(osd_df, osd_host, shard.acting_osd),
-        *osd_cells(osd_df, osd_host, shard.up_osd),
-        str(proposal.target_osd),
-        f"{proposal.target_utilization:.1f}%",
-        f"{proposal.target_projected:.1f}%",
-        proposal.target_host,
-    ]
-
-
-def print_outcome(proposed: int, unplaceable: list[ArrivingShard]) -> None:
+def print_outcome(result: "DivertResult") -> None:
     """Report on stderr how many shards were placed, and name those that were not."""
+    r = result
     stderr_para(
-        f"Proposed {proposed} move(s); {len(unplaceable)} shard(s) could not be placed."
+        f"Proposed {len(r.moves)} move(s); {len(r.unplaceable)} shard(s) could "
+        "not be placed."
     )
     print_unplaceable(
-        (s.pgid, s.shard, f"(headed for osd.{s.up_osd})") for s in unplaceable
+        ((s.pgid, s.shard, f"(headed for osd.{s.up_osd})") for s in r.unplaceable),
+        "the OSD it was headed for",
     )
-
-
-def print_pgremapper_mappings(proposals: list[Proposal]) -> None:
-    """Print the proposals as JSON for 'pgremapper import-mappings'.
-
-    A JSON array, one {pgid, mapping: {from: UP, to: TARGET}} per line.
-
-    Dry runs of pgremapper 1.0.0 showed import-mappings applies all of a PG's
-    pairs as one change and keeps its existing pairs. When UP is itself the
-    'to' of an existing pair, it rewrites that pair; a new pair from UP would
-    be silently dropped, since Ceph only honors a 'from' CRUSH chose.
-    """
-    print_upmap_pairs((p.shard.pgid, p.shard.up_osd, p.target_osd) for p in proposals)
+    if r.fitting:
+        named = named_list(
+            [
+                f"{s.pgid} shard {s.shard} (osd.{s.up_osd} {u:.1f}%)"
+                for s, u in r.fitting
+            ]
+        )
+        stderr_para(
+            f"{len(r.fitting)} more got no target, but the moves off the OSD "
+            "each is headed for take it below backfillfull_ratio "
+            f"{r.ratios.backfillfull:g}%, so Ceph may take them as they are: {named}."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -398,14 +298,17 @@ def print_pgremapper_mappings(proposals: list[Proposal]) -> None:
 class DivertResult(NamedTuple):
     """What plan() decided, for render() to print."""
 
-    proposals: list[Proposal]  # in PG, then shard, order
-    unplaceable: list[ArrivingShard]
+    moves: list[Move]  # in PG, then shard, order
+    unplaceable: list[ArrivingShard]  # likewise
+    # Left without a target, with their UP OSD's projection: see split_left.
+    fitting: list[tuple[ArrivingShard, float]]
     toofull_pg_count: int  # backfill_toofull PGs considered (after --pgs)
     pgs_with_shards: int  # of those, the ones with a newly-arriving shard
     arriving_count: int  # arriving shards in all
     stuck_count: int  # arriving on an OSD at or above toofull_util
     left_alone_count: int  # arriving on an OSD below it: not the blocker
-    candidates: dict[str, list[int]]  # see build_candidate_osds
+    chained_pgs: int  # PGs with a stuck shard, left alone as their pairs chain
+    candidates: dict[str, list[int]]  # see Cluster.candidates
     toofull_util: float
     max_target_util: float
     ratios: FullRatios
@@ -417,22 +320,14 @@ class DivertResult(NamedTuple):
 def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
     """Fetch the cluster state and work out what to divert where.
 
-    Exits if a PG cannot be analyzed safely. The --pgs note is printed
-    first, so it shows even then.
+    Exits on an invalid --max-target-util, or if a PG cannot be analyzed
+    safely; the --pgs note is printed before the latter, so it shows even
+    then. Without stuck shards, the PGs in motion are not projected: an
+    unrelated one cannot make the run exit.
     """
-    osd_host = fetch_osd_hosts(store)
-    osd_df = fetch_osd_df(store)
-    upmap_items = fetch_upmap_items(store)
-    pools_by_id = fetch_pools(store)
-    pools = list(pools_by_id.values())
-    ec_pool_ids = ec_pool_ids_from(pools)
-    toofull_pgs = fetch_backfill_toofull_pg_stats(store)
-    crush_rules = fetch_crush_rules(store)
-    ec_profiles = fetch_ec_profiles(store)
-
-    ratios = fetch_full_ratios(store)
-    toofull_util = resolve_toofull_util(args.toofull_util, ratios)
-    max_target_util = resolve_max_target_util(args.max_target_util, ratios)
+    cluster = Cluster(store, args.max_target_util)
+    toofull_util = resolve_toofull_util(args.toofull_util, cluster.ratios)
+    toofull_pgs = [pg for pg in cluster.pgs if is_toofull(pg)]
 
     pgs_filter = None
     if args.pgs:
@@ -447,104 +342,91 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> DivertResult:
         )
 
     toofull_pgids = [pg["pgid"] for pg in toofull_pgs]
-    check_known_pools(toofull_pgids, pools_by_id, "backfill_toofull PGs")
+    check_known_pools(toofull_pgids, cluster.pools, "backfill_toofull PGs")
     check_host_failure_domain(
-        toofull_pgids, pools_by_id, crush_rules, "backfill_toofull PGs"
+        toofull_pgids, cluster.pools, cluster.crush_rules, "backfill_toofull PGs"
     )
 
     arriving = []
     pgs_with_shards = 0
     for pg in toofull_pgs:
-        pool_id = pgid_pool_id(pg["pgid"])
-        found = find_arriving_shards(
-            pg,
-            pool_id in ec_pool_ids,
-            shard_size_bytes(pg, pools_by_id[pool_id], ec_profiles),
-        )
+        found = find_arriving_shards(pg, *cluster.pg_info(pg))
         arriving.extend(found)
         pgs_with_shards += bool(found)
-    shards, not_full_enough = select_stuck_shards(arriving, osd_df, toofull_util)
-    shards.sort(
-        key=lambda s: (
-            pgid_sort_key(s.pgid),
-            s.shard if isinstance(s.shard, int) else -1,
-        )
-    )
+    stuck, not_full_enough = select_stuck_shards(arriving, cluster.osd_df, toofull_util)
 
-    candidates = build_candidate_osds(osd_df)
-    projection = ProjectedUsage(osd_df, arriving)
-    proposals, unplaceable = assign_targets(
-        shards,
-        candidates,
-        osd_host,
-        osd_df,
-        upmap_items,
-        projection=projection,
-        max_uses=args.max_target_uses,
-        max_target_util=max_target_util,
+    by_pgid = {pg["pgid"]: pg for pg in toofull_pgs}
+    chained = {s.pgid for s in stuck if cluster.pairs_chain(by_pgid[s.pgid])}
+    shards = sorted(
+        (s for s in stuck if s.pgid not in chained),
+        key=lambda s: (pgid_sort_key(s.pgid), shard_key(s)),
     )
+    states = {s.pgid: cluster.pg_state(by_pgid[s.pgid]) for s in shards}
+
+    moves, unplaceable, fitting = [], [], []
+    if shards:
+        planner = Planner(cluster, set(), None, None, relieve=True)
+        left = divert(planner, states, shards)
+        moves = sorted(
+            (m for state in states.values() for m in state.moves),
+            key=lambda m: (pgid_sort_key(m.pgid), shard_key(m)),
+        )
+        unplaceable, fitting = split_left(cluster, left, moves)
+        moves = project_moves(cluster, moves)
     return DivertResult(
-        proposals=proposals,
+        moves=moves,
         unplaceable=unplaceable,
+        fitting=fitting,
         toofull_pg_count=len(toofull_pgs),
         pgs_with_shards=pgs_with_shards,
         arriving_count=len(arriving),
-        stuck_count=len(shards),
+        stuck_count=len(stuck),
         left_alone_count=len(not_full_enough),
-        candidates=candidates,
+        chained_pgs=len(chained),
+        candidates=cluster.candidates,
         toofull_util=toofull_util,
-        max_target_util=max_target_util,
-        ratios=ratios,
+        max_target_util=cluster.max_target_util,
+        ratios=cluster.ratios,
         pgs_filter=pgs_filter,
-        osd_df=osd_df,
-        osd_host=osd_host,
+        osd_df=cluster.osd_df,
+        osd_host=cluster.osd_host,
     )
 
 
 def render(result: DivertResult, args: argparse.Namespace) -> None:
     """Print result: proposals on stdout in the format args asks for, notes on stderr."""
-    # Notes go to stderr, keeping stdout parseable.
-    if not result.toofull_pg_count:
-        among = " among --pgs" if result.pgs_filter is not None else ""
+    r = result
+    if not r.toofull_pg_count:
+        among = " among --pgs" if r.pgs_filter is not None else ""
         stderr_para(f"No backfill_toofull PGs{among}.")
-        if args.pgremapper_mappings:
-            print_pgremapper_mappings([])
+        print_moves([], r.osd_host, r.osd_df, args)
         return
-    osd_df = result.osd_df
-    max_target_util = result.max_target_util
     by_class = ", ".join(
-        f"{cls}={sum(osd_df[o]['utilization'] <= max_target_util for o in osds)}"
+        f"{cls}={sum(r.osd_df[o]['utilization'] <= r.max_target_util for o in osds)}"
         f"/{len(osds)}"
-        for cls, osds in sorted(result.candidates.items())
+        for cls, osds in sorted(r.candidates.items())
+    )
+    chained = (
+        f" PGs left alone: {chained_text(r.chained_pgs)}." if r.chained_pgs else ""
     )
     stderr_para(
-        f"{result.toofull_pg_count} backfill_toofull PG(s), "
-        f"{result.pgs_with_shards} with arriving shards. "
-        f"{result.arriving_count} arriving shard(s), of which "
-        f"{result.stuck_count} on an OSD at or above --toofull-util "
-        f"{result.toofull_util:g}% ({result.left_alone_count} left alone as "
-        "not the blocker)."
+        f"{r.toofull_pg_count} backfill_toofull PG(s), "
+        f"{r.pgs_with_shards} with arriving shards. "
+        f"{r.arriving_count} arriving shard(s), of which "
+        f"{r.stuck_count} on an OSD at or above --toofull-util "
+        f"{r.toofull_util:g}% ({r.left_alone_count} left alone as "
+        "not the blocker)." + chained
     )
     stderr_para(
         "Targets: "
-        + targets_clause(
-            max_target_util, result.ratios.backfillfull, args.max_target_uses
-        )
-        + ". Candidates "
-        f"under that now / in all, per device class: {by_class or 'none'}."
+        + targets_clause(r.max_target_util, r.ratios.backfillfull)
+        + RELIEVE_CLAUSE
+        + ". Candidates under that now / in all, per device class: "
+        f"{by_class or 'none'}."
     )
-
-    proposals, unplaceable = result.proposals, result.unplaceable
-    if args.pgremapper_mappings:
-        print_pgremapper_mappings(proposals)
-    elif proposals:
-        print_table(
-            COLUMNS,
-            [format_row(p, result.osd_host, osd_df) for p in proposals],
-        )
-
-    print_outcome(len(proposals), unplaceable)
-    if proposals:
+    print_moves(r.moves, r.osd_host, r.osd_df, args)
+    print_outcome(r)
+    if r.moves:
         print_balancer_note()
 
 

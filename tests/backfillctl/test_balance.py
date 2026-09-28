@@ -70,15 +70,17 @@ class LevelTest(unittest.TestCase):
         c.util[0] = 80.0  # the class mean: (11 * 50 + 80) / 12 = 52.5%
         return c.pg("1.0", [0, 10, 20])
 
-    def test_default_is_the_class_mean_plus_max_deviation(self):
+    def test_default_is_the_class_mean(self):
+        # As even as possible, though the mean itself is out of reach.
         result = self.cluster().plan()
-        self.assertEqual((result.mean, result.shed.level), (52.5, 54.5))
+        self.assertEqual(bal.DEFAULT_MAX_DEVIATION, 0)
+        self.assertEqual((result.mean, result.shed.level), (52.5, 52.5))
         self.assertEqual(result.shed.sources, [0])
         self.assertEqual(pairs(result), [("1.0", 0, 0, 1)])  # own host allowed
 
     def test_max_deviation(self):
         self.assertEqual(self.cluster().plan("--max-deviation", 0.5).shed.level, 53.0)
-        self.assertEqual(self.cluster().plan("--max-deviation", 0).shed.level, 52.5)
+        self.assertEqual(self.cluster().plan("--max-deviation", 2).shed.level, 54.5)
 
     def test_until_util_overrides(self):
         result = self.cluster().plan("--until-util", 70)
@@ -123,11 +125,11 @@ class LevelTest(unittest.TestCase):
 class SourcesTest(unittest.TestCase):
     def test_osds_are_the_sources_even_below_the_level(self):
         c = Cluster().pg("1.0", [0, 10, 20])
-        result = c.plan(0)
+        result = c.plan(0, "--max-deviation", 2)
         self.assertEqual(result.shed.sources, [0])
         self.assertEqual((result.shed.moves, result.shed.kept_count), ([], 1))
         c.util[0] = 80.0
-        self.assertEqual(pairs(c.plan(0)), [("1.0", 0, 0, 1)])
+        self.assertEqual(pairs(c.plan(0, "--max-deviation", 2)), [("1.0", 0, 0, 1)])
 
     def test_osds_not_in_the_class_are_named(self):
         c = Cluster()
@@ -167,7 +169,7 @@ class SourcesTest(unittest.TestCase):
         self.assertIn("hdd", str(cm.exception))
 
     def test_no_osd_at_or_above_the_level(self):
-        result = Cluster().pg("1.0", [0, 10, 20]).plan()
+        result = Cluster().pg("1.0", [0, 10, 20]).plan("--max-deviation", 2)
         self.assertEqual((result.shed.sources, result.shed.moves), ([], []))
 
     def test_other_classes_are_neither_sources_targets_nor_the_max(self):
@@ -267,7 +269,7 @@ class PlanTest(unittest.TestCase):
         c = Cluster()
         c.util[0] = 80.0
         c.util[31] = 10.0
-        result = c.pg("1.0", [0, 10, 20]).plan()
+        result = c.pg("1.0", [0, 10, 20]).plan("--max-deviation", 2)
         self.assertEqual(pairs(result), [("1.0", 0, 0, 31)])
         self.assertEqual(result.max_before, (80.0, 0))
         self.assertEqual(result.max_after, (79.0, 0))
@@ -304,10 +306,10 @@ class PlanTest(unittest.TestCase):
         c = Cluster()
         c.util[0] = 80.0
         c.pg("1.0", [0, 10, 20], shard_pct=5.0)
-        result = c.plan()
+        result = c.plan("--max-deviation", 2)
         self.assertEqual((result.shed.moves, len(result.shed.unplaceable)), ([], 1))
         c.util[31] = 49.0  # (11 * 50 + 80 - 1) / 12 + 2 = 54.42%; 54% after
-        self.assertEqual(pairs(c.plan()), [("1.0", 0, 0, 31)])
+        self.assertEqual(pairs(c.plan("--max-deviation", 2)), [("1.0", 0, 0, 31)])
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +324,7 @@ class RenderTest(unittest.TestCase):
         return c.pg("1.0", [0, 10, 20]).pg("2.0", [10, 0, 20])
 
     def test_table_and_summary(self):
-        out, err = self.cluster().rendered()
+        out, err = self.cluster().rendered("--max-deviation", 2)
         lines = out.splitlines()
         self.assertEqual(
             lines[1].split(),
@@ -370,7 +372,11 @@ class RenderTest(unittest.TestCase):
     def test_no_sources_says_so(self):
         for argv, out_text in (([], ""), (["--pgremapper-mappings"], "[]\n")):
             with self.subTest(argv=argv):
-                out, err = Cluster().pg("1.0", [0, 10, 20]).rendered(*argv)
+                out, err = (
+                    Cluster()
+                    .pg("1.0", [0, 10, 20])
+                    .rendered("--max-deviation", 2, *argv)
+                )
                 self.assertEqual(out, out_text)
                 self.assertTrue(
                     err.endswith(
@@ -400,14 +406,14 @@ class FixtureInvariantTest(unittest.TestCase):
         cls.traced = {fixture: cls.run_traced(fixture) for fixture in cls.FIXTURES}
 
     @staticmethod
-    def run_traced(fixture):
+    def run_traced(fixture, *argv):
         """Return (result, [(the class max after each change, made by a move?)]).
 
         Traced at FinalUsage.move, so pins count too: they cancel a departure
         Ceph is refusing, which may leave the acting OSD fuller than projected.
         """
         store = shared.SnapshotStore.from_args(
-            parse_args(bal, [], load_state=str(TEST_DATA / fixture)),
+            parse_args(bal, list(argv), load_state=str(TEST_DATA / fixture)),
             bal.SNAPSHOT_COMMANDS,
         )
         candidates = placement.build_candidate_osds(shared.fetch_osd_df(store))
@@ -431,7 +437,7 @@ class FixtureInvariantTest(unittest.TestCase):
             mock.patch.object(placement.FinalUsage, "move", traced_move),
             mock.patch.object(sh.Planner, "commit", traced_commit),
         ):
-            result = plan_from_state(bal, TEST_DATA / fixture)
+            result = plan_from_state(bal, TEST_DATA / fixture, *argv)
         return result, trace
 
     def test_invariants(self):
@@ -460,6 +466,8 @@ class FixtureInvariantTest(unittest.TestCase):
             if sh.is_pin(m):  # a pin may land on a source
                 continue
             self.assertNotIn(m.target_osd, sources)
+            # The relief rule, once everything is placed.
+            self.assertLess(m.target_projected, m.up_projected, m)
             if m.role == shared.ROLE_REQUESTED:
                 self.assertIn(m.up_osd, sources)
                 self.assertNotIn(m.target_osd, pgs[m.pgid]["acting"])
@@ -476,8 +484,11 @@ class FixtureInvariantTest(unittest.TestCase):
 
     def test_a_pin_may_leave_its_acting_osd_above_the_level(self):
         # A blocker leaving for a full OSD, pinned back, stays where it is:
-        # there, the class max. Refusing the pin would leave the PG stuck.
-        result, trace = self.traced["divert-toofull-ceph2-util-emergency-2-new-hosts"]
+        # there, the class max. Refusing the pin would leave the PG stuck. At
+        # the default level, a source left above it is the max instead.
+        result, trace = self.run_traced(
+            "divert-toofull-ceph2-util-emergency-2-new-hosts", "--max-deviation", "2"
+        )
         self.assertTrue(any(not by_move for _, by_move in trace))
         util, osd = result.max_after
         self.assertGreater(util, result.shed.level)
