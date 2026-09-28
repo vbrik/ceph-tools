@@ -82,7 +82,7 @@ DEFAULT_CLASS = "hdd"
 # How far above the class mean the default level is, in percentage points.
 # The mean itself is out of reach: shards are too coarse for every source to
 # get below it while every target stays below it.
-DEFAULT_MAX_DEVIATION = 2.0
+DEFAULT_MAX_DEVIATION = 0
 
 
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
