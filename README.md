@@ -36,7 +36,7 @@ Some scripts default to site-specific pool names (`cephfs.default.meta`,
 
 ## Tools
 
-### RADOS / OSD
+### PGs, backfill and OSDs
 
 #### backfillctl
 
@@ -67,49 +67,14 @@ Commands for inspecting and steering PG backfills. Run it as
 
 - `save-state`: capture the cluster state, anonymized, for `--load-state`.
 
-The Remap and Cancel commands only print upmap proposals; they change nothing.
-Apply the proposals with `--pgremapper-mappings` and
-[pgremapper](https://github.com/digitalocean/pgremapper)'s `import-mappings`,
-which adds to a PG's existing upmap pairs. `ceph osd pg-upmap-items` replaces
-them all. Turn off the upmap balancer (`ceph balancer off`) for as long as
-the upmaps should hold, or it may undo them; the commands remind you on
-stderr. The remapping commands assume the CRUSH failure domain is `host`.
-Entries from the cancel commands, `divert-toofull`, `drain` and `balance`
-also carry the table's `shard`, `role` (requested, companion, blocker) and
-`note`, for pruning with `jq`; pgremapper ignores them.
-
-`drain` and `balance` plan the same way. The fullest source OSD goes first,
-largest shard first, to the legal target that ends up least full. Their moves
-only take data off sources and put it on other OSDs. Backfills already in
-motion count in the projections, which treat them and every proposal as done,
-crediting data leaving an OSD. With a level, a target must also end up below
-the OSD it relieves, so no move raises the maximum (a blocker pinned back
-keeps its data where it is); in `balance`, also below the level. Both commands
-leave alone PGs that are degraded, undersized, recovering or peering, and PGs
-whose existing upmap pairs chain. Shards that would hold a moved PG in
-`backfill_toofull` are diverted or pinned back, including shards arriving on a
-source. Keep drained OSDs up and in for as long as the upmaps should hold:
-marking them out voids the upmaps. `balance` names on stderr the OSDs it
-leaves above the level; apply, let the backfills finish, and re-run for more.
-
-`divert-toofull` chooses targets by the same rules, each ending up below the
-OSD it relieves, and serves the fullest acting OSD first. It does not divert
-or pin blocking siblings. It leaves alone PGs whose upmap pairs chain, but
-not degraded ones: an out OSD leaves them so.
-
-pgremapper cannot apply chained pairs (A->B, B->C), which cancelling some EC
-backfills needs. The cancel commands leave such backfills running, and print
-`ceph osd pg-upmap-items` commands that would cancel them too.
-
-PROGRESS is computed from each backfill target's position (`last_backfill` in
-`ceph pg query`), one query per PG shown. Ceph's misplaced/degraded counters
-are only a fallback, marked `~`: after re-peering they can read ~100% for a
-backfill a third done.
-
-`measure-rate`'s MiB/s is what lands on the destination OSDs. For EC pools
-this is less than the recovery rate in `ceph status`, which counts each
-recovered object once, at its full size: for a PG moving one shard, Ceph shows
-k times the MiB/s, at the same objects/s.
+The Remap and Cancel commands change nothing; they print upmap proposals.
+Apply them with [pgremapper](https://github.com/digitalocean/pgremapper)'s
+`import-mappings` (see `--pgremapper-mappings`), which, unlike
+`ceph osd pg-upmap-items`, keeps a PG's existing upmap pairs. Turn off the
+upmap balancer (`ceph balancer off`) for as long as the upmaps should hold,
+and keep drained OSDs up and in: marking them out voids the upmaps. The
+remapping commands assume the CRUSH failure domain is `host`. `balance`
+works in rounds: apply, let the backfills finish, and re-run.
 
 Shell completion via [shtab](https://docs.iterative.ai/shtab/), from the repo
 root:
@@ -123,82 +88,46 @@ complete -F _shtab_backfillctl backfillctl backfillctl.py  # also for backfillct
 #### Other
 
 - **`scrub-all-pgs-that-need-it.py`**: Scrub and deep-scrub every PG that
-  `ceph health detail` lists under `PG_NOT_SCRUBBED` / `PG_NOT_DEEP_SCRUBBED`,
-  via `ceph tell osd.<primary>`. This works around a broken
+  `ceph health detail` reports as overdue, working around a broken
   `ceph pg (deep-)scrub`. It acts immediately; there is no dry run.
-
 - **`find-large-omap-objects.sh`**: List PGs with objects flagged for large
   omap.
-
-- **`external/upmap-remapped.py`** (third-party, from
+- **`external/upmap-remapped.py`** (third-party,
   [cernceph/ceph-scripts](https://github.com/cernceph/ceph-scripts/blob/master/tools/upmap/upmap-remapped.py)):
-  Print upmap commands that make all remapped PGs `active+clean` by pinning
-  data where it is, so the `upmap` balancer can unwind the movement
-  gradually. Use it around disruptive changes (new hosts, CRUSH changes)
-  with `norebalance` set. `--ignore-backfilling` skips PGs already
-  backfilling. This copy predates upstream fixes to its no-`rados` fallback.
-  `external/upmap-remapped.py [--ignore-backfilling]`
-
+  Pin all remapped PGs where their data is, so the `upmap` balancer can
+  unwind the movement gradually. Handy around new hosts or CRUSH changes.
+  This copy predates upstream fixes to its no-`rados` fallback.
 - **`external/pgremapper-v1.0.0-linux-amd64`** (prebuilt,
   [digitalocean/pgremapper](https://github.com/digitalocean/pgremapper)):
   Control PG backfill and remapping with upmaps, without CRUSH changes.
 
 ### CephFS clients and MDS
 
-- **`cephfs/client-id-to-host`**: Resolve a CephFS client session ID to
-  hostname and IP.
-  `cephfs/client-id-to-host <client-id>`
-
-- **`cephfs/client-inodes.py`**: Show the paths of the inodes (delegated,
-  completed-request, preallocated) held by a client session. Reads
-  `client ls` JSON from a file or stdin, or queries MDS ranks live (all
-  active ranks, or `--rank`).
-  `cephfs/client-inodes.py [--meta-pool POOL] [--data-pool POOL] [--rank RANK] <client> [file|-]`
-
 - **`cephfs/top.py`**: `top`-style live view of CephFS client load across MDS
-  ranks (request rate, caps, leases, in-flight requests), sortable and
-  filterable by column.
-  `cephfs/top.py [-r RANK] [-n N] [-s COLUMNS] [--hide COLUMNS] [--cache-ttl SECONDS] [--cache-file PATH] [--full-mount-point]`
-
-- **`cephfs/mds-ops-pretty.py`**: Readable rendering of
-  `ceph tell mds.X dump_{blocked,historic,ops_in_flight}`, queried live from
-  every active rank (or `--mds-rank`), or read with `--json-file`. Resolves
-  inodes to paths and client IDs to hosts and users, caching lookups on disk
-  (see `--help`).
-  `cephfs/mds-ops-pretty.py dump_ops_in_flight [options]`
-
+  ranks: request rate, caps, leases, in-flight requests.
+- **`cephfs/mds-ops-pretty.py`**: Readable MDS ops (`dump_ops_in_flight`,
+  `dump_blocked`, `dump_historic`), with inodes resolved to paths and clients
+  to hosts and users.
+- **`cephfs/client-inodes.py`**: Paths of the inodes a client session holds.
+- **`cephfs/client-id-to-host`**: Resolve a client session ID to hostname and
+  IP.
+- **`cephfs/inode-to-path`**: Resolve a hex inode number to its path.
 - **`cephfs/dir-tree-pins.sh`**: List directories pinned to each MDS rank.
-
-- **`cephfs/inode-to-path`**: Resolve a hex inode number to its path via the
-  backtrace xattr.
-  `cephfs/inode-to-path <inode-hex>`
 
 ### CephFS trees (on a mounted filesystem)
 
-These read CephFS recursive statistics (`ceph.dir.rbytes`, `ceph.dir.rfiles`,
-`ceph.dir.rctime`, …) off a mount. They need read access to the directories,
-not cluster credentials.
+These read CephFS recursive statistics (`ceph.dir.*` xattrs) off a mount,
+so they are fast on huge trees and need only read access, not cluster
+credentials.
 
-- **`cephfs/du`**: Size of paths (`ceph.dir.rbytes` for directories), in
-  human-readable units.
-  `cephfs/du <path> [path...]`
-
+- **`cephfs/du`**: Size of files and directories, without walking the tree.
 - **`cephfs/find-growing-dirs.py`**: Find the fastest-growing subtree without
-  walking the tree: sample the children's `ceph.dir.rbytes` twice, descend
-  into the top grower, repeat.
-  `cephfs/find-growing-dirs.py [--interval SECONDS] [--depth N] [--top N] [--workers N] <root>`
-
-- **`cephfs/find-recent-rctime.py`**: Find files and directories with `ctime`
-  at or after a date, pruning subtrees by `ceph.dir.rctime`. Much faster
-  than `find -newer`. `--parents` prints only the matches' parent
-  directories.
-  `cephfs/find-recent-rctime.py --min-ctime DATE [--relative] [--parents] [--threads NUM] <path>`
-
-- **`cephfs/cephfs-find-wide-dirs`**: Find directories holding many files,
-  using `ceph.dir.files` / `ceph.dir.rfiles`. Prebuilt x86-64 Linux binary;
-  source at
+  walking the tree.
+- **`cephfs/find-recent-rctime.py`**: Find files and directories changed
+  since a date; much faster than `find -newer`.
+- **`cephfs/cephfs-find-wide-dirs`**: Find directories holding many files.
+  Prebuilt x86-64 Linux binary; source at
   [vbrik/cephfs-find-wide-dirs](https://github.com/vbrik/cephfs-find-wide-dirs).
-  `cephfs/cephfs-find-wide-dirs --min-num-files NUMBER [--threads NUMBER] <path>`
 
 ## Tests
 
