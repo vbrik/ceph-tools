@@ -121,36 +121,22 @@ credentials.
 
 ## Tests
 
-Standard library `unittest`; `pytest tests` also works. Neither test group
-has an `__init__.py`, so `unittest discover` won't find them from `tests/`
-itself; run each group directly:
+No test needs a cluster; many replay anonymized cluster captures from
+`tests/backfillctl/test-data/`. Run each group separately (`pytest tests`
+also works):
 
 ```
 python3 -m unittest discover -s tests/backfillctl
 python3 -m unittest discover -s tests/cephfs
 ```
 
-No test needs a cluster. Each `backfillctl` command is split into `plan()`,
-which returns a typed result, and `render()`, which prints it. Logic tests
-assert on the result, and output tests on the rendering. Text that more
-than one command prints is in `backfillctl/messages.py`. Many tests replay
-cluster captures in `tests/backfillctl/test-data/` (mostly real, anonymized)
-through `--load-state`. Each capture's `README.txt` documents its scenario
-and the expected result, which the tests check.
-
-### Coverage
-
-With [coverage.py](https://coverage.readthedocs.io/) 7.10 or later, run
-each group under `coverage`, then merge the results:
+For coverage, with [coverage.py](https://coverage.readthedocs.io/) 7.10+:
 
 ```
 coverage run -m unittest discover -s tests/backfillctl
 coverage run -m unittest discover -s tests/cephfs
 coverage combine && coverage report    # or: coverage html
 ```
-
-`.coveragerc` measures branches and the commands tests run as subprocesses.
-Scripts without tests count at 0% in the total. `external/` is not measured.
 
 ## License
 
