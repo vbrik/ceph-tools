@@ -136,7 +136,7 @@ class SourcesTest(unittest.TestCase):
         c.classes[40] = "ssd"
         with self.assertRaises(SystemExit) as cm:
             c.plan(0, 40)
-        self.assertIn("not up and in OSDs of this device class", str(cm.exception))
+        self.assertIn("not among the up and in hdd OSDs", str(cm.exception))
         self.assertIn("osd.40", str(cm.exception))
         self.assertNotIn("osd.0,", str(cm.exception))
 
@@ -335,8 +335,8 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(lines[2].split()[:2], ["1.0", "0"])
         self.assertIn(
             "Balancing hdd to below 54.5% (the class mean 52.5% + --max-deviation 2). "
-            "Sources: 1 of 12 up and in hdd OSD(s), at or above it; 2 shard(s) on "
-            "them can move (0 more already moving off).",
+            "Sources: 1 of 12 up and in hdd OSD(s), at or above it; 2 shard(s) "
+            "mapped to them (0 more already moving off).",
             err,
         )
         self.assertIn("Proposed 2 move(s) off the sources, 19.5 MiB,", err)

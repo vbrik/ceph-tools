@@ -378,7 +378,8 @@ def print_shed_outcome(
         f"Proposed {moved} move(s) off {off}, {format_bytes(moved_bytes)}, "
         f"{unplaceable} unplaceable{left}; {diverted} blocking shard(s) diverted, "
         f"{pinned} pinned back. PGs that will stay backfill_toofull: "
-        f"{pg_list(stuck)}; for an unidentified reason: {pg_list(unexplained)}"
+        f"{pg_list(stuck)}; backfill_toofull now, blocker unidentified: "
+        f"{pg_list(unexplained)}"
         + (". Their NOTE (JSON: 'note') says why." if stuck or unexplained else ".")
     )
 
@@ -417,7 +418,8 @@ def print_stalled(pgids: list[str]) -> None:
     """
     if pgids:
         stderr_para(
-            f"NOTE: {len(pgids)} PG(s) have a shard backfilling onto a source "
-            "that Ceph refuses (backfill_toofull), left as it is: "
-            f"{named_list(pgids)}. See divert-toofull or cancel-backfill."
+            f"NOTE: {len(pgids)} PG(s) with no proposed move have a shard "
+            "backfilling onto a source too full to take it (backfill_toofull), "
+            f"and are left as they are: {named_list(pgids)}. See divert-toofull "
+            "or cancel-backfill."
         )

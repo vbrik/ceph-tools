@@ -85,7 +85,7 @@ from shed import (
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "drain",
-        help="Move all PG shards off given OSDs or hosts.",
+        help="Propose upmaps that move all PG shards off given OSDs or hosts.",
         description=__doc__,
         formatter_class=HelpFormatter,
     )

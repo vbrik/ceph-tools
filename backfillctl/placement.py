@@ -61,8 +61,8 @@ def add_max_target_util_arg(parser: argparse.ArgumentParser):
         "--max-target-util",
         type=shared.utilization_pct,
         metavar="PERCENT",
-        help="Cap on a target's projected utilization (default: "
-        "backfillfull_ratio - 1; at most backfillfull_ratio).",
+        help="Cap on a target's projected utilization (default: 1 point below "
+        "backfillfull_ratio, which is also the maximum).",
     )
 
 

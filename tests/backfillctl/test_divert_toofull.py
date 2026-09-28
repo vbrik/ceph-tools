@@ -1224,10 +1224,10 @@ class Ceph2FixtureOutputTest(unittest.TestCase):
         )
         self.assertIn(f"{CEPH2_FITTING} more got no target", err)
         self.assertIn(
-            f"{CEPH2_ARRIVING} arriving shard(s), of which {CEPH2_STUCK} on an OSD", err
+            f"{CEPH2_ARRIVING} arriving shard(s), {CEPH2_STUCK} of them on an OSD", err
         )
         skipped = CEPH2_ARRIVING - CEPH2_STUCK
-        self.assertIn(f"({skipped} left alone as not the blocker)", err)
+        self.assertIn(f"the other {skipped}, taken not to be the refused ones", err)
 
     def test_the_table_has_a_row_per_move(self):
         group_and_label_lines = 2

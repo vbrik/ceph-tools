@@ -17,23 +17,26 @@ The interval starts once the first sample is complete, and is timed per PG
 query, so every row is measured over at least --interval seconds.
 
 '~' marks a RATE and ETA from Ceph's counters, which are as unreliable as the
-PROGRESS they come from. RATE is '-' for a copy that started moving (or was
-re-targeted) during the interval, whose progress came from its backfill
-position in one sample and the counters in the other, or went down (restarted,
-or counters reset).
+PROGRESS they come from. RATE is '-' for a copy that:
 
-Two more tables sum the rates per UP OSD and per host of the first. COPIES
-counts every row, with a RATE or not. All three tables sort by host, in human
-order ('ceph1-2' before 'ceph1-10'), then OSD, PG and shard; --sort-by obj/s
-or mib/s sorts them all fastest first, progress and eta just the copies.
+- started moving (or was re-targeted) during the interval;
+- has progress from its backfill position in one sample and from the counters
+  in the other;
+- went backwards (restarted, or counters reset).
+
+Two more tables sum the rates per UP OSD and per UP host. COPIES counts every
+row, with a RATE or not. All three tables sort by host, in human order
+('ceph1-2' before 'ceph1-10'), then OSD, PG and shard. --sort-by obj/s or
+mib/s sorts all three fastest first; progress (furthest along) and eta
+(soonest done) sort just the copies.
 
 Copies without a destination (a replica dropped outright) are left out, and
 so, unless --all, are those of PGs neither backfilling nor recovering
 (e.g. waiting or too full); they have nothing to measure.
---osds and --hosts keep rows whose UP OSD they match; --pgs keeps rows of the
-given PGs. --save-state DIR also saves both samples, anonymized, for replay
-with --load-state DIR; a 'save-state' capture holds just one, so it can't be
-replayed here.
+
+--save-state DIR also saves both samples, anonymized, for replay with
+--load-state DIR. A 'save-state' capture holds just one sample, so it can't
+be replayed here.
 """
 
 import argparse
@@ -148,7 +151,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         help="Sort by UP host (then OSD, PG, shard), fastest rate, or the "
         "copies by most progress or soonest ETA (default: %(default)s).",
     )
-    sb.add_filter_args(parser)
+    sb.add_filter_args(parser, up_only=True)
     parser.add_argument(
         "--all",
         action="store_true",
@@ -828,7 +831,7 @@ def print_totals(rows: list[RateRow]) -> None:
     lo, hi = min(r.seconds for r in rates), max(r.seconds for r in rates)
     span = f"{lo:.1f} s" if round(lo, 1) == round(hi, 1) else f"{lo:.1f}-{hi:.1f} s"
     of = (
-        f" of the {len(rates)} copy movement(s) with one"
+        f" of the {len(rates)} measured copy movement(s)"
         if len(rates) < len(rows)
         else ""
     )
@@ -845,7 +848,10 @@ def print_no_rates(rows: list[RateRow], gone: int) -> None:
     }
     clauses = [f"{n} {NO_RATE_REASONS[reason]}" for reason, n in counts.items() if n]
     if clauses:
-        stderr_para(f"RATE is '-' for copy movements that: {'; '.join(clauses)}.")
+        stderr_para(
+            f"RATE is '-' for {sum(counts.values())} copy movement(s): "
+            f"{'; '.join(clauses)}."
+        )
     if gone:
         stderr_para(
             f"{gone} copy movement(s) of the first sample finished or were "
@@ -892,7 +898,7 @@ def render(result: RatesResult) -> None:
 
 def run(args: argparse.Namespace) -> None:
     if args.load_state and args.save_state:
-        sys.exit("ERROR: --save-state and --load-state are exclusive.")
+        sys.exit("ERROR: --save-state and --load-state are mutually exclusive.")
     save_dir = resolve_save_dir(args.save_state) if args.save_state else None
     store = SnapshotStore.from_args(
         args, SNAPSHOT_COMMANDS, save_dir=save_dir, anonymize=anonymize_static

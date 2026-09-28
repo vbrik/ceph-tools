@@ -29,6 +29,7 @@ OSD to the level (a blocker pinned back keeps its data where it is, even above
 the level). A blocker of another device class, in a PG whose CRUSH rule spans
 classes, need only end up below the OSD it relieves. Shards still backfilling
 onto a source are redirected.
+
 Left alone, and counted on stderr: PGs that are not active, or are degraded,
 undersized, recovering or peering, and PGs whose existing upmap pairs chain.
 As in drain, a shard of a moved PG that would hold it in backfill_toofull is
@@ -89,7 +90,7 @@ DEFAULT_MAX_DEVIATION = 0
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "balance",
-        help="Move data off the fullest OSDs of a device class.",
+        help="Propose upmaps that move data off a device class's fullest OSDs.",
         description=__doc__,
         formatter_class=HelpFormatter,
     )
@@ -114,7 +115,7 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         type=percentage_points,
         default=DEFAULT_MAX_DEVIATION,
         metavar="POINTS",
-        help="Without --until-util, the level is the class mean plus this "
+        help="Set the level to the class mean plus this many percentage points "
         "(default: %(default)g).",
     )
     add_max_target_util_arg(parser)
@@ -153,8 +154,8 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> BalanceResult:
         bad = sorted(set(args.osds) - set(class_osds))
         if bad:
             sys.exit(
-                "ERROR: --osds: not up and in OSDs of this device class, with "
-                "a utilization: " + osd_list(bad)
+                f"ERROR: --osds: not among the up and in {args.osd_class} OSDs "
+                "with a size and utilization in 'ceph osd df': " + osd_list(bad)
             )
     # Only now the PG dump: the projections need it.
     final = cluster.final
@@ -199,7 +200,7 @@ def render(result: BalanceResult, args: argparse.Namespace) -> None:
     stderr_para(
         f"Balancing {cls} to below {describe_level(result, args)}. Sources: "
         f"{len(r.sources)} of {result.class_size} up and in {cls} OSD(s), "
-        f"{chosen}; {r.mapped_count} shard(s) on them can move "
+        f"{chosen}; {r.mapped_count} shard(s) mapped to them "
         f"({r.leaving_count} more already moving off)."
         + left_alone_clause(r.unsettled_pgs, r.chained_pgs)
     )

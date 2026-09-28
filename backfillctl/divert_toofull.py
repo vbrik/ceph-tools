@@ -26,8 +26,8 @@ room runs out, apply the proposals, let them finish and run again. PGs
 whose existing upmap pairs chain are left alone, and no proposal makes a
 PG's pairs chain: pgremapper would break them.
 
-Table groups: ACTING is where the data is ('none' if its OSD is out), UP
-where the stalled backfill is headed, TARGET the proposed OSD.
+Table groups: ACTING is where the data is ('none' if unknown, e.g. its OSD
+is out), UP where the stalled backfill is headed, TARGET the proposed OSD.
 
 Apply the output with pgremapper, not 'ceph osd pg-upmap-items', which
 replaces a PG's whole upmap entry:
@@ -96,7 +96,7 @@ from shed import (
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "divert-toofull",
-        help="Divert backfill_toofull PGs to emptier OSDs.",
+        help="Propose upmaps that re-target stuck backfill_toofull shards to emptier OSDs.",
         description=__doc__,
         formatter_class=HelpFormatter,
     )
@@ -412,17 +412,17 @@ def render(result: DivertResult, args: argparse.Namespace) -> None:
     stderr_para(
         f"{r.toofull_pg_count} backfill_toofull PG(s), "
         f"{r.pgs_with_shards} with arriving shards. "
-        f"{r.arriving_count} arriving shard(s), of which "
-        f"{r.stuck_count} on an OSD at or above --toofull-util "
-        f"{r.toofull_util:g}% ({r.left_alone_count} left alone as "
-        "not the blocker)." + chained
+        f"{r.arriving_count} arriving shard(s), {r.stuck_count} of them on an OSD "
+        f"at or above --toofull-util {r.toofull_util:g}%; the other "
+        f"{r.left_alone_count}, taken not to be the refused ones, are left alone."
+        + chained
     )
     stderr_para(
         "Targets: "
         + targets_clause(r.max_target_util, r.ratios.backfillfull)
         + RELIEVE_CLAUSE
-        + ". Candidates under that now / in all, per device class: "
-        f"{by_class or 'none'}."
+        + ". Candidate OSDs at or below --max-target-util now / in all, per "
+        f"device class: {by_class or 'none'}."
     )
     print_moves(r.moves, r.osd_host, r.osd_df, args)
     print_outcome(r)

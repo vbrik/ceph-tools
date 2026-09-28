@@ -4,10 +4,10 @@ Propose upmaps that cancel backfills: all of them, or with --osds those into
 the given OSDs.
 
 Each moving shard is pinned to the OSD that holds it now, so nothing moves.
-Ceph refuses a backfill whose target would be projected past
+Ceph refuses a backfill whose target would be projected at or over
 backfillfull_ratio, counting every backfill queued for that OSD, so
 cancelling backfills into a full OSD makes room for the ones you want.
-Without --osds, this freezes all data movement so you can let backfills
+Without --osds, this stops every backfill it can pin, so you can let them
 through selectively.
 
 Remove the entries of backfills you want to keep, or pass their PGs to
@@ -128,7 +128,7 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "cancel-backfill",
-        help="Cancel backfills (all, or into given OSDs).",
+        help="Propose upmaps that cancel backfills (all, or into given OSDs).",
         description=__doc__,
         formatter_class=HelpFormatter,
         # Hand-written: argparse cannot show that --pin-blockers needs --osds.
@@ -149,7 +149,8 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     parser.add_argument(
         "--pin-blockers",
         action="store_true",
-        help="Also pin blockers.",
+        help="Also pin blockers: shards that would hold a kept backfill in "
+        "backfill_toofull.",
     )
     add_exclude_pgs_arg(parser)
     add_pgremapper_mappings_arg(parser)

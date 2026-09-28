@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 """
-Capture the cluster state the other subcommands read into DIR, for replay
+Capture into DIR the cluster state the other subcommands read, for replay
 with '--load-state DIR', before or after the subcommand.
 
 One capture serves every subcommand but measure-rate, which saves its own
-two samples ('measure-rate --save-state DIR'). It includes a full 'ceph pg
-dump pgs' and the backfill positions of remapped PGs. It is anonymized (fsid,
-addresses, hostnames, pool and rule names) and trimmed to the fields the
-subcommands use, so it is safe to share.
+two samples ('measure-rate --save-state DIR'). It covers every PG ('ceph pg
+dump pgs') and the backfill positions of the remapped ones. It is anonymized
+(fsid, addresses, hostnames, pool and rule names), and its 'pg dump' and
+'osd dump' are trimmed to the fields the subcommands use, so it is safe to
+share.
 """
 
 import argparse

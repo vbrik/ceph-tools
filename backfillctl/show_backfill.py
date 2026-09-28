@@ -11,7 +11,7 @@ When a missing copy is being rebuilt, no OSD loses data, so ACTING shows the
 PG's primary, marked '*': the primary keeps its copy but does the work. UP
 reads 'none' for a replica dropped with nowhere to go.
 
-TYPE is recovery, backfill, or remapped (not started). PROGRESS is how far
+TYPE is recovery, backfill, recovery+backfill, or remapped (not started). PROGRESS is how far
 the row's target has got, from its backfill position in 'ceph pg query'.
 '~' marks a fallback on Ceph's per-PG counters, which can read far too high.
 
@@ -64,7 +64,7 @@ from shared import (
 # Footnote for the '*' after an ACTING primary (see MovementRow.primary_marked).
 PRIMARY_NOTE = (
     "* marks the PG's primary where no OSD loses a copy: it keeps its copy, "
-    "but drives the recovery."
+    "but drives the rebuild."
 )
 
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
@@ -97,15 +97,23 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
     return parser
 
 
-def add_filter_args(parser: argparse.ArgumentParser) -> None:
-    """Add the row filters --osds, --pgs and --hosts (see RowFilter)."""
+def add_filter_args(parser: argparse.ArgumentParser, *, up_only: bool = False) -> None:
+    """Add the row filters --osds, --pgs and --hosts (see RowFilter).
+
+    up_only: --osds and --hosts match a row's UP OSD only (RowFilter.apply).
+    """
+    osds_help, hosts_help = (
+        ("whose UP OSD is one of these", "whose UP OSD is on these hosts")
+        if up_only
+        else ("involving these OSDs", "involving the OSDs of these hosts")
+    )
     parser.add_argument(
         "--osds",
         nargs="+",
         type=parse_osd,
         default=[],
         metavar="OSD",
-        help="Show only rows involving these OSDs.",
+        help=f"Show only rows {osds_help}.",
     )
     parser.add_argument(
         "--pgs",
@@ -119,7 +127,7 @@ def add_filter_args(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         default=[],
         metavar="HOST",
-        help="Show only rows involving OSDs of these hosts.",
+        help=f"Show only rows {hosts_help}.",
     )
 
 

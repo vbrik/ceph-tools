@@ -90,7 +90,7 @@ SNAPSHOT_COMMANDS: dict[str, list[str]] = {
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "cancel-uphill",
-        help="Cancel backfills that move data to a fuller OSD.",
+        help="Propose upmaps that cancel backfills moving data to a fuller OSD.",
         description=__doc__,
         formatter_class=HelpFormatter,
     )
@@ -98,9 +98,9 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "--min-delta",
         type=percentage_points,
         default=1.0,
-        metavar="PERCENT",
-        help="Minimum utilization difference, in percentage points, for a "
-        "move to count as uphill (default: %(default)s).",
+        metavar="POINTS",
+        help="Count a move as uphill only if its destination is at least this "
+        "many percentage points more utilized (default: %(default)g).",
     )
     add_exclude_pgs_arg(parser)
     add_pgremapper_mappings_arg(parser)

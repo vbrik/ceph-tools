@@ -267,8 +267,9 @@ class ShedTextTest(unittest.TestCase):
             text,
             "Proposed 2 move(s) off the sources, 3.0 MiB, 1 unplaceable, 4 left in "
             "place (their OSD is below the level); 0 blocking shard(s) diverted, 1 "
-            "pinned back. PGs that will stay backfill_toofull: 0; for an "
-            "unidentified reason: 1 (1.2). Their NOTE (JSON: 'note') says why.",
+            "pinned back. PGs that will stay backfill_toofull: 0; "
+            "backfill_toofull now, blocker unidentified: 1 (1.2). Their NOTE "
+            "(JSON: 'note') says why.",
         )
         text = stderr_of(
             messages.print_shed_outcome,
@@ -283,7 +284,7 @@ class ShedTextTest(unittest.TestCase):
             unexplained=[],
         )
         self.assertNotIn("left in place", text)
-        self.assertTrue(text.endswith("for an unidentified reason: 0."), text)
+        self.assertTrue(text.endswith("blocker unidentified: 0."), text)
 
     def test_shed_outcome_caps_the_pgs_named(self):
         stuck = [f"1.{i:x}" for i in range(messages.MAX_NAMED + 2)]
@@ -330,9 +331,9 @@ class ShedTextTest(unittest.TestCase):
         text = stderr_of(messages.print_stalled, ["1.0", "2.a"])
         self.assertEqual(
             text,
-            "NOTE: 2 PG(s) have a shard backfilling onto a source that Ceph "
-            "refuses (backfill_toofull), left as it is: 1.0, 2.a. See "
-            "divert-toofull or cancel-backfill.",
+            "NOTE: 2 PG(s) with no proposed move have a shard backfilling onto "
+            "a source too full to take it (backfill_toofull), and are left as "
+            "they are: 1.0, 2.a. See divert-toofull or cancel-backfill.",
         )
         self.assertEqual(stderr_of(messages.print_stalled, []), "")
 

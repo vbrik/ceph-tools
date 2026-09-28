@@ -47,9 +47,8 @@ than the projection sees), a source included. Such a blocker is diverted if
 there is room, otherwise pinned back to its acting OSD with companions, as in
 cancel-backfill (resolve_blockers). If the pin clashes with a move of the same
 PG onto the acting OSD's host, that move is placed elsewhere, provided the pin
-then succeeds. A pin may
-leave its acting OSD above the level, or the class's maximum higher: the data
-stays, as Ceph refuses its departure anyway. A pin onto a source is refused
+then succeeds. A pin may leave its acting OSD above the level, or the class's
+maximum higher: the data stays, as Ceph refuses its departure anyway. A pin onto a source is refused
 unless the source stays below the level. A blocker in a PG with no proposed
 move holds nothing up, and is only reported: its stall predates the run.
 """
@@ -1100,12 +1099,12 @@ def print_outcome(result: ShedResult, off: str) -> None:
 
 
 def print_notes(result: ShedResult, which: str) -> None:
-    """Print on stderr what the run leaves undone, naming the sources which.
+    """Print on stderr what the run leaves undone; which names the sources.
 
-    The sources left above the level; the shards no target was found for:
-    emptying OSDs (no level), each is listed, while with a level (which an
-    unreachable one can leave thousands) they are counted; and the PGs left
-    in backfill_toofull as they were. Then, if anything moves, the balancer
+    That is: the sources left above the level; the shards no target was
+    found for, listed when emptying OSDs (no level) but only counted with a
+    level, as an unreachable one can leave thousands; and the PGs left in
+    backfill_toofull as they were. Then, if anything moves, the balancer
     advice.
     """
     if result.level is None:

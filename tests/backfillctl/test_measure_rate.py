@@ -720,7 +720,9 @@ class SaveReplayTest(unittest.TestCase):
             result = run_command(mr, "--save-state", Path(tmp, "x"), load_state=tmp)
             self.assertFalse(Path(tmp, "x").exists())
         self.assertEqual(1, result.returncode)
-        self.assertIn("--save-state and --load-state are exclusive", result.stderr)
+        self.assertIn(
+            "--save-state and --load-state are mutually exclusive", result.stderr
+        )
 
     def test_interval_must_be_positive(self):
         for bad in ("0", "-1", "nan", "inf", "1e400", "x"):
@@ -796,7 +798,7 @@ class RenderTest(unittest.TestCase):
         second = positions(0.625, 0.5)
         del second["5.5"]  # by the counters now: mixed, no rate
         _, err = self.render(two_samples(second=second).plan("--all"))
-        self.assertIn("Total RATE of the 2 copy movement(s) with one: 9 objects/s", err)
+        self.assertIn("Total RATE of the 2 measured copy movement(s): 9 objects/s", err)
 
     def test_counter_rates_are_marked_and_explained(self):
         # No positions: 27.1's shard by the counters, 20% -> 50% in 30 s.
@@ -822,7 +824,7 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(1, result.gone)
         _, err = self.render(result)
         self.assertIn(
-            "RATE is '-' for copy movements that: 1 started moving (or were "
+            "RATE is '-' for 3 copy movement(s): 1 started moving (or were "
             "re-targeted) during the interval; 1 had progress from a backfill "
             "position in one sample and the counters in the other; 1 went "
             "backwards (restarted, or counters reset).",

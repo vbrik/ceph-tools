@@ -892,7 +892,7 @@ class OutputTest(unittest.TestCase):
         c.pg("1.9", [41, 11, 21], [0, 11, 21], shard_pct=10)
         c.pg("1.0", [0, 10, 20], [31, 10, 20])
         text = stderr_of(sh.print_notes, c.shed(0, level=85), "source(s)")
-        self.assertIn("NOTE: 1 PG(s) have a shard backfilling onto a source", text)
+        self.assertIn("NOTE: 1 PG(s) with no proposed move have a shard", text)
 
     def test_outcome_counts_moves_pins_and_bytes(self):
         c = Cluster(default_util=95.0)
@@ -912,7 +912,9 @@ class OutputTest(unittest.TestCase):
         self.assertIn("stay backfill_toofull: 1 (1.0);", text)
         self.assertIn("Their NOTE (JSON: 'note') says why.", text)
         text = stderr_of(sh.print_outcome, self.result(), "the drained OSDs")
-        self.assertIn("backfill_toofull: 0; for an unidentified reason: 0.", text)
+        self.assertIn(
+            "backfill_toofull: 0; backfill_toofull now, blocker unidentified: 0.", text
+        )
         self.assertNotIn("NOTE (JSON", text)
 
     def test_outcome_counts_blocker_moves_off_a_source_apart(self):
