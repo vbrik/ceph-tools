@@ -43,8 +43,8 @@ Apply the output with pgremapper, which adds to a PG's existing upmap pairs:
 
 Pass pgremapper a file, not stdin: it prompts for confirmation.
 
-Consider 'ceph balancer off' while the pins are in place. Assumes the CRUSH
-failure domain is host.
+Turn off the upmap balancer ('ceph balancer off') for as long as the pins
+should hold, or it may undo them. Assumes the CRUSH failure domain is host.
 """
 
 import argparse

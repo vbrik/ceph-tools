@@ -31,9 +31,9 @@ replaces a PG's whole upmap entry:
     backfillctl divert-toofull --pgremapper-mappings > m.json
     pgremapper import-mappings m.json
 
-Pass pgremapper a file, not stdin: it prompts for confirmation. Consider
-'ceph balancer off' while the backfills run. Assumes the CRUSH failure
-domain is host.
+Pass pgremapper a file, not stdin: it prompts for confirmation. Turn off the
+upmap balancer ('ceph balancer off') for as long as the upmaps should hold,
+or it may undo them. Assumes the CRUSH failure domain is host.
 """
 
 import argparse
@@ -43,6 +43,7 @@ from collections import Counter, deque
 from typing import NamedTuple
 
 from messages import (
+    print_balancer_note,
     print_pgid_filter,
     print_unplaceable,
     stderr_para,
@@ -543,6 +544,8 @@ def render(result: DivertResult, args: argparse.Namespace) -> None:
         )
 
     print_outcome(len(proposals), unplaceable)
+    if proposals:
+        print_balancer_note()
 
 
 def run(args: argparse.Namespace) -> None:

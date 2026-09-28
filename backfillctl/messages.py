@@ -191,14 +191,23 @@ def warn_chains(chained: dict[str, list[tuple[int, int]]]) -> None:
         print(f"  ceph osd pg-upmap-items {pgid} {flat_pairs}", file=sys.stderr)
 
 
+# For any command that proposes upmaps.
+BALANCER_ADVICE = (
+    "turn off the upmap balancer ('ceph balancer off') for as long as these "
+    "upmaps should hold, or it may undo them."
+)
+
+
+def print_balancer_note() -> None:
+    """Print BALANCER_ADVICE on stderr, as a NOTE."""
+    stderr_para(f"NOTE: {BALANCER_ADVICE}")
+
+
 # ---------------------------------------------------------------------------
 # Pins: cancel-backfill, cancel-uphill
 # ---------------------------------------------------------------------------
 
-CANCEL_NOTE = (
-    "NOTE: cancelling a running backfill discards its progress. Consider "
-    "'ceph balancer off' while these are pinned."
-)
+CANCEL_NOTE = "NOTE: cancelling a running backfill discards its progress."
 
 
 def print_pin_summary(
@@ -235,12 +244,15 @@ def print_pin_summary(
 def print_pin_footer(
     chained: dict[str, list[tuple[int, int]]], extra_notes: Iterable[str] = ()
 ) -> None:
-    """Print a cancel command's closing notes: chained pins, extra_notes, the cost."""
+    """Print a cancel command's closing notes: chained pins, extra_notes, the
+    cost, the balancer advice.
+    """
     if chained:
         warn_chains(chained)
     for note in extra_notes:
         stderr_para(note)
     stderr_para(CANCEL_NOTE)
+    print_balancer_note()
 
 
 # ---------------------------------------------------------------------------

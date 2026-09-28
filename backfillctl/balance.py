@@ -40,8 +40,8 @@ apply the output, let the backfills finish and run again:
     backfillctl balance --pgremapper-mappings > m.json
     pgremapper import-mappings m.json
 
-Turn off the upmap balancer ('ceph balancer off') while the backfills run,
-or it may undo the moves. Assumes the CRUSH failure domain is host.
+Turn off the upmap balancer ('ceph balancer off') for as long as the upmaps
+should hold, or it may undo them. Assumes the CRUSH failure domain is host.
 """
 
 import argparse

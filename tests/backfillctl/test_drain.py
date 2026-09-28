@@ -22,8 +22,10 @@ from _support import (
     check_pairs_apply,
     check_reservation_cap,
     flat,
+    messages,
     parse_args,
     shared,
+    stderr_of,
 )
 from _support import shed as sh
 
@@ -230,6 +232,19 @@ class RenderTest(unittest.TestCase):
         c.pg("1.0", [0, 10, 20], state="active+undersized+degraded")
         _, err = c.pg("1.1", [0, 11, 21]).rendered(0)
         self.assertIn("PGs left alone: 1 not active, or degraded,", err)
+
+    def test_balancer_note_closes_a_run_that_moves_something(self):
+        note = stderr_of(messages.print_balancer_note)
+        for argv in ([0], [0, "--pgremapper-mappings"]):
+            with self.subTest(argv=argv):
+                _, err = Cluster().pg("1.0", [0, 10, 20]).rendered(*argv)
+                self.assertTrue(err.endswith(note), err)
+
+    def test_no_balancer_note_when_no_shard_is_placed(self):
+        c = Cluster(default_util=95.0).pg("1.0", [0, 10, 20])
+        self.assertEqual(c.plan(0).moves, [])
+        _, err = c.rendered(0)
+        self.assertNotIn("balancer", err)
 
     def test_nothing_to_drain_says_so(self):
         for argv, out_text in ((["0"], ""), (["0", "--pgremapper-mappings"], "[]\n")):

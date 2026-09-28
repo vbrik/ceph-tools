@@ -42,8 +42,9 @@ its evacuees:
     backfillctl drain --hosts host07 --pgremapper-mappings > m.json
     pgremapper import-mappings m.json
 
-balance works the same way on a device class's fullest OSDs. Consider 'ceph
-balancer off' while the drain runs. Assumes the CRUSH failure domain is host.
+balance works the same way on a device class's fullest OSDs. Turn off the
+upmap balancer ('ceph balancer off') for as long as the upmaps should hold,
+or it may undo them. Assumes the CRUSH failure domain is host.
 """
 
 import argparse

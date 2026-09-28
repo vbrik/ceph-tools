@@ -14,8 +14,9 @@ uphill once partly done. --min-delta filters out such small differences.
 
 A PG whose pins would chain is left out (see cancel-backfill).
 
-Apply the output as with cancel-backfill. Consider 'ceph balancer off' while
-the pins are in place. Assumes the CRUSH failure domain is host.
+Apply the output as with cancel-backfill. Turn off the upmap balancer ('ceph
+balancer off') for as long as the pins should hold, or it may undo them.
+Assumes the CRUSH failure domain is host.
 """
 
 import argparse

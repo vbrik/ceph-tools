@@ -31,12 +31,14 @@ from _support import (
     check_own_moves_in_or_out,
     check_pairs_apply,
     check_reservation_cap,
+    messages,
     osd_df_of,
     parse_args,
     placement,
     plan_from_state,
     replayed_cluster,
     shared,
+    stderr_of,
 )
 from _support import shed as sh
 
@@ -357,6 +359,13 @@ class RenderTest(unittest.TestCase):
                 ("2.0", {"from": 0, "to": 30}, shared.ROLE_REQUESTED),
             ],
         )
+
+    def test_balancer_note_closes_a_run_that_moves_something(self):
+        note = stderr_of(messages.print_balancer_note)
+        for argv in ([], ["--pgremapper-mappings"]):
+            with self.subTest(argv=argv):
+                _, err = self.cluster().rendered(*argv)
+                self.assertTrue(err.endswith(note), err)
 
     def test_no_sources_says_so(self):
         for argv, out_text in (([], ""), (["--pgremapper-mappings"], "[]\n")):

@@ -160,10 +160,20 @@ class PinSummaryTest(unittest.TestCase):
         )
 
 
-class PinFooterTest(unittest.TestCase):
-    def test_only_the_cost_of_cancelling_by_default(self):
+class BalancerNoteTest(unittest.TestCase):
+    def test_note_is_the_advice(self):
         self.assertEqual(
-            stderr_of(messages.print_pin_footer, {}), flat(messages.CANCEL_NOTE)
+            stderr_of(messages.print_balancer_note),
+            "NOTE: turn off the upmap balancer ('ceph balancer off') for as long "
+            "as these upmaps should hold, or it may undo them.",
+        )
+
+
+class PinFooterTest(unittest.TestCase):
+    def test_only_the_cost_of_cancelling_and_the_balancer_by_default(self):
+        self.assertEqual(
+            stderr_of(messages.print_pin_footer, {}),
+            flat(messages.CANCEL_NOTE) + " " + stderr_of(messages.print_balancer_note),
         )
 
     def test_chains_then_extra_notes_then_the_cost(self):
@@ -171,7 +181,14 @@ class PinFooterTest(unittest.TestCase):
             messages.print_pin_footer, {"19.9": [(7, 8)]}, ["NOTE: extra."]
         )
         self.assertLess(text.index("WARNING: the pins"), text.index("NOTE: extra."))
-        self.assertTrue(text.endswith("NOTE: extra. " + flat(messages.CANCEL_NOTE)))
+        self.assertTrue(
+            text.endswith(
+                "NOTE: extra. "
+                + flat(messages.CANCEL_NOTE)
+                + " "
+                + stderr_of(messages.print_balancer_note)
+            )
+        )
 
 
 class PlacementTextTest(unittest.TestCase):

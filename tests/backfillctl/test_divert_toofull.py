@@ -43,12 +43,14 @@ from _support import (
     TEST_DATA,
     FakeStore,
     flat,
+    messages,
     osd_df_of,
     parse_args,
     placement,
     plan_from_state,
     run_command,
     shared,
+    stderr_of,
 )
 
 from backfillctl import divert_toofull as dt
@@ -649,7 +651,7 @@ class FixtureReplayTest(unittest.TestCase):
         entries = json.loads(proc.stdout)
         self.assertEqual(len(entries), 6)
         self.assertIn({"pgid": "19.bd5", "mapping": {"from": 263, "to": 842}}, entries)
-        self.assertEqual(proc.stderr.count("NOTE"), 0)
+        self.assertEqual(proc.stderr.count("NOTE"), 1)  # the balancer's, only
 
     def test_pgremapper_mappings_emits_up_osd_not_acting_osd(self):
         # 'pgremapper import-mappings' takes the upmap's 'from', which is the
@@ -671,6 +673,23 @@ class FixtureReplayTest(unittest.TestCase):
             ),
             "[]",
         )
+
+    def test_balancer_note_closes_a_run_with_proposals(self):
+        note = stderr_of(messages.print_balancer_note)
+        for extra in ((), ("--pgremapper-mappings",)):
+            with self.subTest(extra=extra):
+                err = flat(self.run_proc("divert-toofull-osd457-down", *extra).stderr)
+                self.assertTrue(err.endswith(note), err)
+
+    def test_no_balancer_note_without_proposals(self):
+        for fixture, extra in (
+            ("divert-toofull-nominal-synthetic", ()),
+            # No room anywhere: the one stuck shard is unplaceable.
+            ("divert-toofull-osd457-down", ("--max-target-util", "2")),
+        ):
+            with self.subTest(fixture=fixture):
+                err = self.run_proc(fixture, *extra).stderr
+                self.assertNotIn("balancer", err)
 
     def test_default_thresholds_are_reported_on_stderr(self):
         err = flat(self.run_proc("divert-toofull-osd457-down").stderr)

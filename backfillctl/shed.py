@@ -62,6 +62,7 @@ from messages import (
     companion_note,
     format_bytes,
     level_text,
+    print_balancer_note,
     print_level_unplaceable,
     print_shed_outcome,
     print_stalled,
@@ -1022,7 +1023,8 @@ def print_notes(result: ShedResult, which: str) -> None:
     The sources left above the level; the shards no target was found for:
     emptying OSDs (no level), each is listed, while with a level (which an
     unreachable one can leave thousands) they are counted; and the PGs left
-    in backfill_toofull as they were.
+    in backfill_toofull as they were. Then, if anything moves, the balancer
+    advice.
     """
     if result.level is None:
         print_unplaceable(
@@ -1038,6 +1040,8 @@ def print_notes(result: ShedResult, which: str) -> None:
         )
         print_level_unplaceable(len(result.unplaceable), guards)
     print_stalled(result.stalled_pgs)
+    if result.moves:
+        print_balancer_note()
 
 
 def unsized_sources(result: ShedResult) -> list[int]:

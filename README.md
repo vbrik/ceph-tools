@@ -48,7 +48,9 @@ Commands that remap PGs only print upmap proposals; they change nothing.
 Apply the proposals with `--pgremapper-mappings` and
 [pgremapper](https://github.com/digitalocean/pgremapper)'s `import-mappings`,
 which adds to a PG's existing upmap pairs. `ceph osd pg-upmap-items` replaces
-them all. The remapping commands assume the CRUSH failure domain is `host`.
+them all. Turn off the upmap balancer (`ceph balancer off`) for as long as
+the upmaps should hold, or it may undo them; the commands remind you on
+stderr. The remapping commands assume the CRUSH failure domain is `host`.
 Entries from the cancel commands, `drain` and `balance` also carry the
 table's `shard`, `role` (requested, companion, blocker) and `note`, for
 pruning with `jq`; pgremapper ignores them.
@@ -76,7 +78,7 @@ backfills needs. The cancel commands leave such backfills running, and print
 | `show-pg-osds PGID...` | Acting and up OSDs of given PGs, per shard, with utilization, host, progress and upmap pairs. |
 | `divert-toofull` | Re-target shards stuck in `backfill_toofull` to the least-utilized legal OSDs, e.g. after an OSD failure piles its data onto its host's other OSDs. |
 | `drain --osds OSD... \| --hosts HOST... [--until-util PCT]` | Move every shard off OSDs or hosts, spread across the cluster rather than onto the same host; with `--until-util`, only until each OSD is projected below PCT. Keep the OSDs up and in until empty (with `--until-util`, for as long as the upmaps should hold): marking them out voids the upmaps. |
-| `balance [--class CLASS] [--osds OSD...] [--until-util PCT \| --max-deviation POINTS]` | Move shards off a device class's fullest OSDs onto the emptiest, until each is projected below a level: `--until-util`, or the class mean plus `--max-deviation` (2) points. Stderr names the OSDs left above it; apply, let the backfills finish, and re-run for more. Turn off the upmap balancer while the backfills run. |
+| `balance [--class CLASS] [--osds OSD...] [--until-util PCT \| --max-deviation POINTS]` | Move shards off a device class's fullest OSDs onto the emptiest, until each is projected below a level: `--until-util`, or the class mean plus `--max-deviation` (2) points. Stderr names the OSDs left above it; apply, let the backfills finish, and re-run for more. |
 | `cancel-backfill [--osds OSD... [--pin-blockers]]` | Cancel backfills by pinning shards to where their data is: all of them, or those into given full OSDs to make room for others. |
 | `cancel-uphill` | Cancel backfills that move data to a more-utilized OSD. |
 | `save-state DIR` | Capture the cluster state the other commands read, anonymized, for replay with `--load-state DIR`, before or after the command. `measure-rate` saves its own. |
