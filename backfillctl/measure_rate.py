@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """
 Measure the rates at which backfill destinations (UP OSDs) receive data:
-sample the movements show-backfill shows twice, at least --interval seconds
-apart, and give each copy's RATE and ETA.
+sample the backfilling and recovering movements twice, at least --interval
+seconds apart, and give each copy's RATE and ETA.
 
 RATE is objects and MiB per second arriving at the row's UP OSD, from how far
 its PROGRESS moved; MiB assume the PG's objects are of even size. ETA is the
@@ -27,11 +27,13 @@ counts every row, with a RATE or not. All three tables sort by host, in human
 order ('ceph1-2' before 'ceph1-10'), then OSD, PG and shard; --sort-by obj/s
 or mib/s sorts them all fastest first, progress and eta just the copies.
 
-Copies without a destination (a replica dropped outright) are left out.
+Copies without a destination (a replica dropped outright) are left out, and
+so, unless --all, are those of PGs neither backfilling nor recovering
+(e.g. waiting or too full); they have nothing to measure.
 --osds and --hosts keep rows whose UP OSD they match; --pgs keeps rows of the
-given PGs. --save-state DIR
-also saves both samples, anonymized, for replay with --load-state DIR; a
-'save-state' capture holds just one, so it can't be replayed here.
+given PGs. --save-state DIR also saves both samples, anonymized, for replay
+with --load-state DIR; a 'save-state' capture holds just one, so it can't be
+replayed here.
 """
 
 import argparse
@@ -97,8 +99,10 @@ SAMPLE_COMMANDS: dict[str, list[str]] = {
 }
 SAMPLE_DIRS = ("1", "2")
 
-# When each sample was read, in seconds from the first sample's PG dump:
-# {"samples": [{"dump": T, "queries": {pgid: T}}, ...]}.
+# When each sample was read, in seconds from the first sample's PG dump, and
+# whether the capture covers inactive PGs (--all; true if missing, as in
+# captures from before --all):
+# {"samples": [{"dump": T, "queries": {pgid: T}}, ...], "all": bool}.
 TIMES_FILE = "times.json"
 
 DEFAULT_INTERVAL = 30.0
@@ -145,6 +149,12 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "copies by most progress or soonest ETA (default: %(default)s).",
     )
     sb.add_filter_args(parser)
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Also show copies of PGs neither backfilling nor recovering "
+        "(e.g. waiting or too full).",
+    )
     state = parser.add_mutually_exclusive_group()
     state.add_argument(
         "--save-state",
@@ -189,13 +199,19 @@ class LiveSampler:
         store: SnapshotStore,
         interval: float,
         *,
+        with_inactive: bool = False,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         query: Callable[[set[str]], TimedPositions] = query_backfill_positions_timed,
     ):
-        """store serves SNAPSHOT_COMMANDS, anonymized by anonymize_static."""
+        """store serves SNAPSHOT_COMMANDS, anonymized by anonymize_static.
+
+        with_inactive (--all) is recorded in the capture: without it, the
+        samples lack the inactive PGs' positions, and maybe the second sample.
+        """
         self.store = store
         self.interval = interval
+        self.with_inactive = with_inactive
         self.clock, self.sleep, self.query = clock, sleep, query
         self.samples: list[Sample] = []
         self._sample_stores: list[SnapshotStore] = []
@@ -262,24 +278,39 @@ class LiveSampler:
                     },
                 }
             )
-        (self.store.save_dir / TIMES_FILE).write_text(json.dumps({"samples": times}))
+        (self.store.save_dir / TIMES_FILE).write_text(
+            json.dumps({"samples": times, "all": self.with_inactive})
+        )
 
 
 class ReplaySampler:
     """Replays the samples of a --save-state capture, in order."""
 
-    def __init__(self, store: SnapshotStore):
-        """store reads the capture's top directory; exits unless it has TIMES_FILE."""
+    def __init__(self, store: SnapshotStore, *, with_inactive: bool = False):
+        """store reads the capture's top directory.
+
+        Exits unless it has TIMES_FILE, and if with_inactive (--all) but the
+        capture was made without it. The reverse is fine: a capture with the
+        inactive PGs has all the others need.
+        """
         self.store = store
         path = Path(store.load_dir) / TIMES_FILE
         try:
-            self.times = json.loads(path.read_text())["samples"]
+            times = json.loads(path.read_text())
         except FileNotFoundError:
             sys.exit(
                 f"ERROR: --load-state: {store.load_dir} is not a measure-rate "
                 f"capture (no {TIMES_FILE}). Make one with 'measure-rate "
                 "--save-state DIR'."
             )
+        if with_inactive and not times.get("all", True):
+            sys.exit(
+                f"ERROR: --all: {store.load_dir} was captured without --all, so "
+                "it lacks the copies of PGs neither backfilling nor recovering. "
+                "Replay it without --all, or capture again with 'measure-rate "
+                "--all --save-state DIR'."
+            )
+        self.times = times["samples"]
         self.taken = 0
 
     def take(self, select: Select) -> Sample:
@@ -412,12 +443,8 @@ def rate_rows(
     second_rows: list[sb.MovementRow],
     pools: dict[int, dict],
     ec_profiles: dict[str, dict],
-) -> tuple[list[RateRow], int]:
-    """Return (second_rows with their rates, how many first_rows are gone).
-
-    A first row is gone if no second row has its key (row_key): it finished,
-    or was re-targeted.
-    """
+) -> list[RateRow]:
+    """Return second_rows with their rates since first_rows (NEW if not there)."""
     earlier = {row_key(r): r for r in first_rows}
     pgs = {pg["pgid"]: pg for pg in second.pg_stats}
     result = []
@@ -436,8 +463,18 @@ def rate_rows(
             else None
         )
         result.append(RateRow(row, *copy_rate(before, row, seconds, pg, shard_bytes)))
-    gone = len(earlier.keys() - {row_key(r) for r in second_rows})
-    return result, gone
+    return result
+
+
+def count_gone(
+    first_rows: list[sb.MovementRow], second_rows: list[sb.MovementRow]
+) -> int:
+    """Return how many first_rows no second row has the key (row_key) of.
+
+    Such a copy finished, or was re-targeted. second_rows must include the
+    copies --all would show, lest a copy that went back to waiting be counted.
+    """
+    return len({row_key(r) for r in first_rows} - {row_key(r) for r in second_rows})
 
 
 class Flow(NamedTuple):
@@ -579,6 +616,7 @@ class RatesResult(NamedTuple):
     osd_flows: list[FlowRow]  # per UP OSD of rows, sorted by --sort-by
     host_flows: list[FlowRow]  # per host of those (UNKNOWN_HOST if unknown), sorted too
     gone: int  # movements of the first sample the second no longer has
+    hidden: int  # rows of the last sample taken left out as inactive (see --all)
     pgs_filter: PgidFilter | None  # None without --pgs
     filter_options: tuple[str, ...]  # sb.RowFilter.options
     queried: int  # PGs whose positions were asked for, in either sample
@@ -590,8 +628,10 @@ class RatesResult(NamedTuple):
 def plan(args: argparse.Namespace, sampler: LiveSampler | ReplaySampler) -> RatesResult:
     """Take two samples of the filtered movements and measure their rates.
 
-    Movements without a destination are dropped before filtering. Skips the
-    second sample if the first has nothing to measure.
+    Movements without a destination are dropped before filtering. Unless
+    --all, those of inactive PGs (sb.is_active) are dropped after it, so
+    --pgs still counts them as matched, and aren't queried. Skips the second
+    sample if the first has nothing to measure.
     """
     store = sampler.store
     osd_df = fetch_osd_df(store)
@@ -604,10 +644,16 @@ def plan(args: argparse.Namespace, sampler: LiveSampler | ReplaySampler) -> Rate
         found = [r for r in sb.find_movements(pg_stats, pools) if r.up_osd is not None]
         return row_filter.apply(found, up_only=True)
 
-    def select(pg_stats: list[dict]) -> set[str]:
-        return {r.pgid for r in movements(pg_stats)[0]}
+    def shown(found: list[sb.MovementRow]) -> list[sb.MovementRow]:
+        return found if args.all else [r for r in found if sb.is_active(r.state)]
 
+    def select(pg_stats: list[dict]) -> set[str]:
+        return {r.pgid for r in shown(movements(pg_stats)[0])}
+
+    # Per sample: the sample, its filtered movements, and those shown, with
+    # progress.
     samples: list[Sample] = []
+    found: list[list[sb.MovementRow]] = []
     rows: list[list[sb.MovementRow]] = []
     for i in range(len(SAMPLE_DIRS)):
         if i:
@@ -615,15 +661,19 @@ def plan(args: argparse.Namespace, sampler: LiveSampler | ReplaySampler) -> Rate
                 break  # nothing to measure
             sampler.wait()
         sample = sampler.take(select)
-        found, pgs_filter = movements(sample.pg_stats)
+        filtered, pgs_filter = movements(sample.pg_stats)
         samples.append(sample)
-        rows.append(sb.with_progress(found, sample.pg_stats, pools, sample.positions))
+        found.append(filtered)
+        rows.append(
+            sb.with_progress(shown(filtered), sample.pg_stats, pools, sample.positions)
+        )
 
     measured, gone = [], 0
     if len(samples) == len(SAMPLE_DIRS):
-        measured, gone = rate_rows(
+        measured = rate_rows(
             samples[0], rows[0], samples[1], rows[1], pools, ec_profiles
         )
+        gone = count_gone(rows[0], found[1])
     measured.sort(key=sort_key(args.sort_by, osd_host))
     osd_flows = aggregate(measured, lambda osd: osd)
     osd_flows.sort(
@@ -638,6 +688,7 @@ def plan(args: argparse.Namespace, sampler: LiveSampler | ReplaySampler) -> Rate
         osd_flows,
         host_flows,
         gone,
+        len(found[-1]) - len(rows[-1]),
         pgs_filter,
         row_filter.options,
         len(queried),
@@ -802,6 +853,15 @@ def print_no_rates(rows: list[RateRow], gone: int) -> None:
         )
 
 
+def print_hidden(hidden: int) -> None:
+    """Say on stderr how many rows of inactive PGs are left out, if any."""
+    if hidden:
+        stderr_para(
+            f"Not shown: {hidden} copy movement(s) of PGs neither backfilling nor "
+            "recovering (e.g. waiting or too full); --all shows them."
+        )
+
+
 def render(result: RatesResult) -> None:
     """Print the rows as a table, then the OSD and host tables, the totals and
     the footnotes that apply."""
@@ -809,7 +869,8 @@ def render(result: RatesResult) -> None:
     if result.pgs_filter is not None:
         print_pgid_filter("--pgs", result.pgs_filter, "have movement", "not moving")
     if not rows:
-        print_no_movements(result.filter_options)
+        if not result.hidden:
+            print_no_movements(result.filter_options)
     else:
         print_table(
             COLUMNS, [format_row(r, result.osd_df, result.osd_host) for r in rows]
@@ -817,6 +878,7 @@ def render(result: RatesResult) -> None:
         print_flow_tables(result)
         print_movement_summary(len(rows), len({r.move.pgid for r in rows}))
         print_totals(rows)
+    print_hidden(result.hidden)
     print_no_rates(rows, result.gone)
     print_progress_note((r.move.progress_pct, r.move.progress_exact) for r in rows)
     if any(r.rate is not None and not r.rate.exact for r in rows):
@@ -836,9 +898,9 @@ def run(args: argparse.Namespace) -> None:
         args, SNAPSHOT_COMMANDS, save_dir=save_dir, anonymize=anonymize_static
     )
     if store.load_dir is not None:
-        sampler = ReplaySampler(store)
+        sampler = ReplaySampler(store, with_inactive=args.all)
     else:
-        sampler = LiveSampler(store, args.interval)
+        sampler = LiveSampler(store, args.interval, with_inactive=args.all)
     result = plan(args, sampler)
     render(result)
     sampler.save()

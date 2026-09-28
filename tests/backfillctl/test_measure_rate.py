@@ -2,9 +2,9 @@
 
 Rows, filters and progress are show-backfill's (test_show_backfill.py). Here:
 the rate arithmetic (copy_rate) and when there is no rate; matching rows
-across samples (rate_rows); the live sampler's order and timing, on a fake
-clock, so no test sleeps; saving a capture and replaying it; and the table
-and notes render() prints. FixtureReplayTest measures a real capture's rows
+across samples (rate_rows); leaving out copies of inactive PGs unless --all;
+the live sampler's order and timing, on a fake clock, so no test sleeps;
+saving a capture and replaying it; and the table and notes render() prints. FixtureReplayTest measures a real capture's rows
 against a second sample made from it.
 """
 
@@ -164,7 +164,12 @@ class Cluster:
         )
         store._cache.update(self.snapshots)
         self.last_sampler = mr.LiveSampler(
-            store, args.interval, clock=self.clock, sleep=self.sleep, query=self.query
+            store,
+            args.interval,
+            with_inactive=args.all,
+            clock=self.clock,
+            sleep=self.sleep,
+            query=self.query,
         )
         with (
             mock.patch.object(shared, "ceph_json", self.ceph_json),
@@ -287,38 +292,35 @@ class RateRowsTest(unittest.TestCase):
         )
 
     def test_exact_progress_is_timed_by_its_pgs_query(self):
-        (row,), gone = self.rates(
-            [self.row("27.1", 2, 10.0)], [self.row("27.1", 2, 50.0)]
-        )
-        self.assertEqual(0, gone)
+        (row,) = self.rates([self.row("27.1", 2, 10.0)], [self.row("27.1", 2, 50.0)])
         self.assertEqual(40.0, row.rate.seconds)  # 43 - 3, not the dumps' 30
 
     def test_counter_progress_is_timed_by_the_dump(self):
-        (row,), _ = self.rates(
+        (row,) = self.rates(
             [self.row("27.1", 2, 10.0, False)], [self.row("27.1", 2, 50.0, False)]
         )
         self.assertEqual(30.0, row.rate.seconds)
 
     def test_shard_bytes_are_the_pgs_over_k(self):
-        (row,), _ = self.rates([self.row("27.1", 2, 10.0)], [self.row("27.1", 2, 50.0)])
+        (row,) = self.rates([self.row("27.1", 2, 10.0)], [self.row("27.1", 2, 50.0)])
         # 1% of 1000 MiB a second: 40% in 40 s.
         self.assertAlmostEqual(10 * MIB, row.rate.bytes_per_s)
 
     def test_a_retargeted_copy_is_new_and_its_old_target_gone(self):
-        (row,), gone = self.rates(
-            [self.row("27.1", 2, 10.0)], [self.row("27.1", 5, 0.0)]
-        )
-        self.assertEqual((None, mr.NEW, 1), (row.rate, row.no_rate, gone))
+        first, second = [self.row("27.1", 2, 10.0)], [self.row("27.1", 5, 0.0)]
+        (row,) = self.rates(first, second)
+        self.assertEqual((None, mr.NEW), (row.rate, row.no_rate))
+        self.assertEqual(1, mr.count_gone(first, second))
 
     def test_shards_of_one_pg_are_matched_by_shard(self):
-        rows, gone = self.rates(
-            [self.row("27.1", 2, 10.0, shard=1), self.row("27.1", 2, 30.0, shard=3)],
-            [self.row("27.1", 2, 50.0, shard=3)],
-        )
-        self.assertEqual((1, 0.5), (gone, rows[0].rate.pct_per_s))  # (50-30)/40
+        first = [self.row("27.1", 2, 10.0, shard=1), self.row("27.1", 2, 30.0, shard=3)]
+        second = [self.row("27.1", 2, 50.0, shard=3)]
+        (row,) = self.rates(first, second)
+        self.assertEqual(0.5, row.rate.pct_per_s)  # (50-30)/40
+        self.assertEqual(1, mr.count_gone(first, second))
 
     def test_exact_progress_without_its_query_time_has_no_rate(self):
-        (row,), _ = self.rates(
+        (row,) = self.rates(
             [self.row("27.1", 2, 10.0)],
             [self.row("27.1", 2, 50.0)],
             second=self.sample(30.0, {}),
@@ -362,7 +364,7 @@ class LivePlanTest(unittest.TestCase):
         self.assertEqual([], two_samples().plan("--osds", "4").rows)
         for argv in (["--osds", "5"], ["--hosts", "h3"]):
             with self.subTest(argv=argv):
-                rows = two_samples().plan(*argv).rows
+                rows = two_samples().plan(*argv, "--all").rows
                 self.assertEqual(["5.5"], [r.move.pgid for r in rows])
 
     def test_copies_without_a_destination_are_dropped(self):
@@ -384,21 +386,21 @@ class LivePlanTest(unittest.TestCase):
         result = cluster.plan()
         row = by_pgid(result)["5.3"]
         self.assertFalse(row.move.progress_exact)
-        self.assertEqual((["5.3"], 3), (result.query_failed, result.queried))
+        self.assertEqual((["5.3"], 2), (result.query_failed, result.queried))
         err = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             mr.render(result)
         self.assertEqual(1, err.getvalue().count("'ceph pg query' failed"))
-        self.assertIn("failed for 1 of 3 PG(s) (5.3)", flat(err.getvalue()))
+        self.assertIn("failed for 1 of 2 PG(s) (5.3)", flat(err.getvalue()))
 
     def test_sort_by_eta_soonest_first_and_none_last(self):
         cluster = two_samples(second=positions(0.625, 0.875))
-        rows = cluster.plan("--sort-by", "eta").rows
+        rows = cluster.plan("--sort-by", "eta", "--all").rows
         # 5.3: 12 s (12.5% left at 37.5%/36 s), 27.1: 40 s; 5.5 isn't moving.
         self.assertEqual(["5.3", "27.1", "5.5"], [r.move.pgid for r in rows])
 
     def test_sorted_by_up_host_by_default(self):
-        rows = two_samples().plan().rows
+        rows = two_samples().plan("--all").rows
         # 27.1 -> osd.2 and 5.3 -> osd.3 on h2, 5.5 -> osd.5 on h3; not PG order.
         self.assertEqual(["27.1", "5.3", "5.5"], [r.move.pgid for r in rows])
 
@@ -407,12 +409,12 @@ class LivePlanTest(unittest.TestCase):
         for sort_by in ("obj/s", "mib/s", "progress"):
             with self.subTest(sort_by=sort_by):
                 cluster = two_samples(second=positions(0.625, 0.875))
-                rows = cluster.plan("--sort-by", sort_by).rows
+                rows = cluster.plan("--sort-by", sort_by, "--all").rows
                 self.assertEqual(["5.3", "27.1", "5.5"], [r.move.pgid for r in rows])
 
     def test_all_tables_sorted_by_host_in_human_order_by_default(self):
         # h2 -> n10 (osd.2, osd.3; 27.1, 5.3), h3 -> n9 (osd.5; 5.5).
-        result = human_hosts().plan()
+        result = human_hosts().plan("--all")
         self.assertEqual(["5.5", "27.1", "5.3"], [r.move.pgid for r in result.rows])
         self.assertEqual([5, 2, 3], [f.key for f in result.osd_flows])
         self.assertEqual(["n9", "n10"], [f.key for f in result.host_flows])
@@ -422,7 +424,7 @@ class LivePlanTest(unittest.TestCase):
         for sort_by in ("obj/s", "mib/s"):
             with self.subTest(sort_by=sort_by):
                 result = human_hosts(second=positions(0.625, 0.875)).plan(
-                    "--sort-by", sort_by
+                    "--sort-by", sort_by, "--all"
                 )
                 self.assertEqual([3, 2, 5], [f.key for f in result.osd_flows])
                 self.assertEqual(["n10", "n9"], [f.key for f in result.host_flows])
@@ -431,7 +433,7 @@ class LivePlanTest(unittest.TestCase):
         for sort_by in ("progress", "eta"):
             with self.subTest(sort_by=sort_by):
                 result = human_hosts(second=positions(0.625, 0.875)).plan(
-                    "--sort-by", sort_by
+                    "--sort-by", sort_by, "--all"
                 )
                 self.assertEqual(
                     ["5.3", "27.1", "5.5"], [r.move.pgid for r in result.rows]
@@ -447,6 +449,62 @@ class LivePlanTest(unittest.TestCase):
                 self.assertRaises(SystemExit),
             ):
                 parse_args(mr, ["--sort-by", sort_by])
+
+
+class InactivePgsTest(unittest.TestCase):
+    """Unless --all, copies of PGs neither backfilling nor recovering are left out."""
+
+    def test_left_out_and_not_queried_by_default(self):
+        cluster = two_samples()
+        result = cluster.plan()
+        self.assertEqual(["27.1", "5.3"], [r.move.pgid for r in result.rows])
+        self.assertEqual([{"27.1", "5.3"}] * 2, cluster.queried)
+        self.assertEqual([2, 3], [f.key for f in result.osd_flows])
+        self.assertEqual(["h2"], [f.key for f in result.host_flows])
+        self.assertEqual(1, result.hidden)
+
+    def test_all_shows_and_queries_them(self):
+        cluster = two_samples()
+        result = cluster.plan("--all")
+        self.assertIn("5.5", by_pgid(result))
+        self.assertEqual([{"27.1", "5.3", "5.5"}] * 2, cluster.queried)
+        self.assertEqual(0, result.hidden)
+
+    def test_a_copy_back_to_waiting_is_hidden_not_gone(self):
+        # 27.1 loses its reservation during the interval.
+        waiting = pg(
+            "27.1", [0, 2, 4, 1], [0, 3, 4, 1], "active+remapped+backfill_wait"
+        )
+        cluster = Cluster(
+            [
+                (PGS, positions(0.25, 0.5), {}),
+                ([waiting, *PGS[1:]], positions(0.25, 0.5), {}),
+            ]
+        )
+        result = cluster.plan()
+        self.assertEqual(["5.3"], [r.move.pgid for r in result.rows])
+        self.assertEqual((0, 2), (result.gone, result.hidden))
+
+    def test_a_copy_started_during_the_interval_is_new(self):
+        started = pg("5.5", [1, 5, 2], [1, 4, 2])
+        cluster = Cluster(
+            [
+                (PGS, positions(0.25, 0.5), {}),
+                ([*PGS[:2], started], positions(0.625, 0.5), {}),
+            ]
+        )
+        result = cluster.plan()
+        row = by_pgid(result)["5.5"]
+        self.assertEqual((None, mr.NEW), (row.rate, row.no_rate))
+        self.assertEqual((0, 0), (result.gone, result.hidden))
+
+    def test_pgs_counts_a_hidden_pg_as_matched(self):
+        cluster = two_samples()
+        result = cluster.plan("--pgs", "5.5")
+        self.assertEqual(
+            ([], 1, []), (result.rows, result.hidden, result.pgs_filter.unmatched)
+        )
+        self.assertEqual(["dump", "query"], cluster.events)  # nothing to measure
 
 
 SORT_OSD_HOST = {1: "b10", 2: "b2", 3: "b2"}  # osd.9's host is unknown
@@ -567,7 +625,7 @@ class AggregateTest(unittest.TestCase):
         self.assertEqual(mr.Flow(3, 3, 12.0, None, False), row.flow)
 
     def test_plan_gives_per_osd_and_per_host_flows(self):
-        result = two_samples().plan()
+        result = two_samples().plan("--all")
         self.assertEqual([2, 3, 5], [f.key for f in result.osd_flows])
         hosts = {f.key: f.flow for f in result.host_flows}
         self.assertEqual(["h2", "h3"], list(hosts))
@@ -588,16 +646,45 @@ class SaveReplayTest(unittest.TestCase):
                 {"1", "2", mr.TIMES_FILE, *(f"{k}.json" for k in mr.SNAPSHOT_COMMANDS)},
                 {p.name for p in capture.iterdir()},
             )
-            times = json.loads((capture / mr.TIMES_FILE).read_text())["samples"]
+            times = json.loads((capture / mr.TIMES_FILE).read_text())
             self.assertEqual(
-                {"dump": 30.0, "queries": {"27.1": 41.0, "5.3": 41.0, "5.5": 30.0}},
-                times[1],
+                {"dump": 30.0, "queries": {"27.1": 41.0, "5.3": 41.0}},
+                times["samples"][1],
             )
+            self.assertIs(False, times["all"])
             args = parse_args(mr, [], load_state=str(capture))
             with mock.patch.object(shared, "ceph_json", side_effect=AssertionError):
                 store = shared.SnapshotStore.from_args(args, mr.SNAPSHOT_COMMANDS)
                 replayed = mr.plan(args, mr.ReplaySampler(store))
         self.assertEqual(live.rows, replayed.rows)
+
+    def save(self, capture, cluster, *argv):
+        """Save cluster's samples, taken with argv, as capture."""
+        cluster.plan(*argv, save_dir=capture)
+        cluster.last_sampler.save()
+
+    def test_all_needs_a_capture_made_with_it(self):
+        # Every movement waits: without --all, one sample and no queries.
+        dump = [pg("5.5", [1, 5, 2], [1, 4, 2], "active+remapped+backfill_wait")]
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp)
+            self.save(capture, Cluster([(dump, {}, {}), (dump, {}, {})]))
+            self.assertFalse((capture / "2").exists())
+            result = run_command(mr, "--all", load_state=capture)
+            plain = run_command(mr, load_state=capture, check=True)
+        self.assertEqual(1, result.returncode)
+        self.assertIn("was captured without --all", flat(result.stderr))
+        self.assertIn("Not shown: 1 copy movement(s)", flat(plain.stderr))
+
+    def test_a_capture_made_with_all_replays_without_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp)
+            self.save(capture, two_samples(), "--all")
+            args = parse_args(mr, [], load_state=str(capture))
+            store = shared.SnapshotStore.from_args(args, mr.SNAPSHOT_COMMANDS)
+            replayed = mr.plan(args, mr.ReplaySampler(store))
+        self.assertEqual(two_samples().plan().rows, replayed.rows)
+        self.assertEqual(1, replayed.hidden)
 
     def test_a_sample_is_trimmed_like_a_save_state_capture(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -653,7 +740,7 @@ class RenderTest(unittest.TestCase):
         return out.getvalue(), flat(err.getvalue())
 
     def test_rate_columns_follow_progress_and_acting_is_gone(self):
-        out, _ = self.render(two_samples().plan())
+        out, _ = self.render(two_samples().plan("--all"))
         group_line, label_line, *lines = out.split("\n\n")[0].splitlines()
         self.assertRegex(group_line, r"^\s+-+ UP -+\s+-+ RATE -+$")
         self.assertRegex(
@@ -677,7 +764,7 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn("* marks", err)
 
     def test_osd_and_host_tables_follow_the_main_one(self):
-        out, _ = self.render(two_samples().plan())
+        out, _ = self.render(two_samples().plan("--all"))
         _, osds, hosts = (part.splitlines() for part in out.split("\n\n"))
         self.assertRegex(osds[0], r"^OSD\s+UTIL\s+HOST\s+COPIES\s+OBJ/S\s+MiB/S$")
         self.assertEqual(["2", "3", "5"], [ln.split()[0] for ln in osds[1:]])
@@ -697,7 +784,7 @@ class RenderTest(unittest.TestCase):
         self.assertRegex(hosts[-1], r"^h2\s+1\s+~10\s+~10\.0$")
 
     def test_totals_and_interval_on_stderr(self):
-        out, err = self.render(two_samples().plan())
+        out, err = self.render(two_samples().plan("--all"))
         self.assertIn("3 copy movement(s) across 3 PG(s).", err)
         self.assertIn(
             "Total RATE: 9 objects/s, 9.4 MiB/s, measured over 30.0-40.0 s.",
@@ -708,7 +795,7 @@ class RenderTest(unittest.TestCase):
     def test_totals_say_how_many_rows_they_cover_if_not_all(self):
         second = positions(0.625, 0.5)
         del second["5.5"]  # by the counters now: mixed, no rate
-        _, err = self.render(two_samples(second=second).plan())
+        _, err = self.render(two_samples(second=second).plan("--all"))
         self.assertIn("Total RATE of the 2 copy movement(s) with one: 9 objects/s", err)
 
     def test_counter_rates_are_marked_and_explained(self):
@@ -731,7 +818,7 @@ class RenderTest(unittest.TestCase):
         cluster = Cluster(
             [(PGS, positions(0.25, 0.5), {}), ([moved, *PGS[1:]], second, {})]
         )
-        result = cluster.plan()
+        result = cluster.plan("--all")
         self.assertEqual(1, result.gone)
         _, err = self.render(result)
         self.assertIn(
@@ -747,6 +834,26 @@ class RenderTest(unittest.TestCase):
     def test_no_movements(self):
         _, err = self.render(two_samples().plan("--pgs", "9.9"))
         self.assertIn("No PG movements match --pgs.", err)
+
+    def test_hidden_rows_are_counted_and_all_named(self):
+        out, err = self.render(two_samples().plan())
+        self.assertNotRegex(out, r"(?m)^5\.5 ")
+        self.assertIn(
+            "Not shown: 1 copy movement(s) of PGs neither backfilling nor recovering",
+            err,
+        )
+        self.assertIn("--all shows them", err)
+        self.assertIn("2 copy movement(s) across 2 PG(s).", err)
+
+    def test_all_hidden_is_not_no_movements(self):
+        out, err = self.render(two_samples().plan("--pgs", "5.5"))
+        self.assertEqual("", out)
+        self.assertIn("Not shown: 1 copy movement(s)", err)
+        self.assertNotIn("No PG movements", err)
+
+    def test_nothing_hidden_nothing_said(self):
+        _, err = self.render(two_samples().plan("--all"))
+        self.assertNotIn("Not shown", err)
 
     def test_format_duration(self):
         for seconds, text in (
@@ -768,6 +875,34 @@ class RenderTest(unittest.TestCase):
 FIXTURE_RESUMED = TEST_DATA / "ceph1-resumed-backfills-exact-progress"
 
 
+def two_sample_capture(capture: Path, fixture: Path, after: dict | None = None) -> None:
+    """Make capture a measure-rate capture sampling a save-state fixture twice, 30 s apart.
+
+    Both samples have the fixture's PG dump; the second has backfill
+    positions after, the fixture's (if any) if None.
+    """
+    for key in mr.SNAPSHOT_COMMANDS:
+        shutil.copy(fixture / f"{key}.json", capture)
+    path = fixture / shared.BACKFILL_POSITIONS_FILE
+    before = json.loads(path.read_text()) if path.exists() else {}
+    times = []
+    second = before if after is None else after
+    for name, positions_, t in (("1", before, 0.0), ("2", second, 30.0)):
+        sample = capture / name
+        sample.mkdir()
+        shutil.copy(fixture / "pg_dump_pgs.json", sample)
+        (sample / shared.BACKFILL_POSITIONS_FILE).write_text(json.dumps(positions_))
+        times.append({"dump": t, "queries": dict.fromkeys(before, t)})
+    (capture / mr.TIMES_FILE).write_text(json.dumps({"samples": times}))
+
+
+def replay(capture: Path, *argv) -> mr.RatesResult:
+    """Run plan() with argv on a replay of capture."""
+    args = parse_args(mr, list(argv), load_state=str(capture))
+    store = shared.SnapshotStore.from_args(args, mr.SNAPSHOT_COMMANDS)
+    return mr.plan(args, mr.ReplaySampler(store))
+
+
 class FixtureReplayTest(unittest.TestCase):
     """The real capture as the first sample, and a second 30 s later in which
     27.500's targets (at 6.6%, see the fixture's README.txt) got 10% further."""
@@ -775,15 +910,12 @@ class FixtureReplayTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        capture = Path(cls.tmp.name)
-        for key in mr.SNAPSHOT_COMMANDS:
-            shutil.copy(FIXTURE_RESUMED / f"{key}.json", capture)
         before = json.loads(
             (FIXTURE_RESUMED / shared.BACKFILL_POSITIONS_FILE).read_text()
         )
         pools = {
             p["pool_id"]: p
-            for p in json.loads((capture / "pool_ls_detail.json").read_text())
+            for p in json.loads((FIXTURE_RESUMED / "pool_ls_detail.json").read_text())
         }
         pg_num = pools[27]["pg_num"]
         after = {
@@ -797,24 +929,15 @@ class FixtureReplayTest(unittest.TestCase):
                 for peer, p in before["27.500"].items()
             },
         }
-        times = []
-        for name, positions_, t in (("1", before, 0.0), ("2", after, 30.0)):
-            sample = capture / name
-            sample.mkdir()
-            shutil.copy(FIXTURE_RESUMED / "pg_dump_pgs.json", sample)
-            (sample / shared.BACKFILL_POSITIONS_FILE).write_text(json.dumps(positions_))
-            times.append({"dump": t, "queries": dict.fromkeys(before, t)})
-        (capture / mr.TIMES_FILE).write_text(json.dumps({"samples": times}))
-        cls.capture = capture
+        cls.capture = Path(cls.tmp.name)
+        two_sample_capture(cls.capture, FIXTURE_RESUMED, after)
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
     def test_only_the_advanced_pg_moves(self):
-        args = parse_args(mr, [], load_state=str(self.capture))
-        store = shared.SnapshotStore.from_args(args, mr.SNAPSHOT_COMMANDS)
-        result = mr.plan(args, mr.ReplaySampler(store))
+        result = replay(self.capture)
         pgs = json.loads((FIXTURE_RESUMED / "pg_dump_pgs.json").read_text())["pg_stats"]
         objects = next(p for p in pgs if p["pgid"] == "27.500")["stat_sum"][
             "num_objects"
@@ -832,9 +955,7 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertEqual(0, result.gone)
 
     def test_every_osd_and_host_table_sums_to_the_total(self):
-        args = parse_args(mr, [], load_state=str(self.capture))
-        store = shared.SnapshotStore.from_args(args, mr.SNAPSHOT_COMMANDS)
-        result = mr.plan(args, mr.ReplaySampler(store))
+        result = replay(self.capture)
         total = sum(r.rate.objects_per_s for r in result.rows)
         self.assertGreater(total, 0)
         for flows in (result.osd_flows, result.host_flows):
@@ -850,6 +971,64 @@ class FixtureReplayTest(unittest.TestCase):
         self.assertIn("measured over 30.0 s", flat(result.stderr))
         self.assertNotIn("~", result.stdout)
         self.assertNotIn("Sampling again", result.stderr)
+
+
+class InactiveFixtureTest(unittest.TestCase):
+    """Real captures, sampled twice: one with a few backfill_wait PGs among
+    backfilling ones, one with backfill_toofull PGs only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.copies = {}  # {fixture: {active: copies with a destination}}
+        for name in (
+            "ceph2-just-added-ceph2-37",
+            "divert-toofull-ceph2-util-emergency-2-new-hosts",
+        ):
+            fixture, capture = TEST_DATA / name, Path(cls.tmp.name, name)
+            capture.mkdir()
+            two_sample_capture(capture, fixture)
+            pools = shared.fetch_pools(
+                shared.SnapshotStore(mr.SNAPSHOT_COMMANDS, load_dir=fixture)
+            )
+            dump = json.loads((fixture / "pg_dump_pgs.json").read_text())["pg_stats"]
+            rows = [r for r in sb.find_movements(dump, pools) if r.up_osd is not None]
+            cls.copies[name] = {
+                active: [r for r in rows if sb.is_active(r.state) == active]
+                for active in (True, False)
+            }
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def capture(self, name):
+        return Path(self.tmp.name, name)
+
+    def test_waiting_copies_are_hidden_unless_all(self):
+        name = "ceph2-just-added-ceph2-37"
+        active, waiting = self.copies[name][True], self.copies[name][False]
+        self.assertTrue(active and waiting)
+        result = replay(self.capture(name))
+        self.assertEqual(
+            sorted(map(mr.row_key, active)),
+            sorted(mr.row_key(r.move) for r in result.rows),
+        )
+        self.assertEqual((len(waiting), 0), (result.hidden, result.gone))
+        everything = replay(self.capture(name), "--all")
+        self.assertEqual(
+            (len(active) + len(waiting), 0), (len(everything.rows), everything.hidden)
+        )
+
+    def test_only_too_full_copies_say_so_and_skip_the_second_sample(self):
+        name = "divert-toofull-ceph2-util-emergency-2-new-hosts"
+        self.assertEqual([], self.copies[name][True])
+        blocked = len(self.copies[name][False])
+        result = run_command(mr, load_state=self.capture(name), check=True)
+        self.assertEqual("", result.stdout)
+        err = flat(result.stderr)
+        self.assertIn(f"Not shown: {blocked} copy movement(s)", err)
+        self.assertNotIn("No PG movements", err)
 
 
 class DrainCaptureTest(unittest.TestCase):
@@ -893,6 +1072,12 @@ class DrainCaptureTest(unittest.TestCase):
 
     def test_nothing_arrives_at_the_drained_host(self):
         self.assertNotIn("host28", {f.key for f in self.result.host_flows})
+
+    def test_a_capture_from_before_all_replays_with_it(self):
+        # Its times.json has no "all": it was sampled as --all samples now.
+        times = json.loads((self.FIXTURE / mr.TIMES_FILE).read_text())
+        self.assertNotIn("all", times)
+        self.assertEqual(self.result.rows, replay(self.FIXTURE, "--all").rows)
 
 
 if __name__ == "__main__":

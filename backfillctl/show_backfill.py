@@ -146,6 +146,18 @@ def movement_type(state: str) -> str:
     return "+".join(labels)
 
 
+# State flags of data moving now, not waiting for a reservation or blocked.
+_ACTIVE_FLAGS = {"backfilling", "recovering"}
+
+
+def is_active(state: str) -> bool:
+    """Return True if a PG in state is backfilling or recovering now.
+
+    False for one only waiting (*_wait), blocked (*_toofull) or not started.
+    """
+    return not _ACTIVE_FLAGS.isdisjoint(state.split("+"))
+
+
 class MovementRow(NamedTuple):
     """One row: a moving EC shard, or one replica of a replicated PG."""
 

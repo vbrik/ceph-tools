@@ -76,6 +76,31 @@ class MovementTypeTest(unittest.TestCase):
         self.assertEqual(pm.movement_type("active+remapped"), "remapped")
 
 
+class IsActiveTest(unittest.TestCase):
+    def test_backfilling_or_recovering_even_if_also_waiting(self):
+        for state in (
+            "active+remapped+backfilling",
+            "active+recovering+degraded",
+            "active+recovering+remapped+backfill_wait",
+            "active+recovery_wait+remapped+backfilling",
+        ):
+            with self.subTest(state):
+                self.assertTrue(pm.is_active(state))
+
+    def test_waiting_blocked_or_not_started(self):
+        for state in (
+            "active+remapped+backfill_wait",
+            "active+remapped+backfill_toofull",
+            "active+remapped+backfill_wait+backfill_toofull",
+            "active+recovery_wait+degraded",
+            "active+recovery_toofull+degraded",
+            "active+remapped",
+            "active+clean",
+        ):
+            with self.subTest(state):
+                self.assertFalse(pm.is_active(state))
+
+
 def pg(pgid, up, acting, state, **stat):
     return {
         "pgid": pgid,
