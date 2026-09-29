@@ -11,6 +11,9 @@ When a missing copy is being rebuilt, no OSD loses data, so ACTING shows the
 PG's primary, marked '*': the primary keeps its copy but does the work. UP
 reads 'none' for a replica dropped with nowhere to go.
 
+PROJ is the UP OSD's utilization once every backfill in motion is done (data
+leaving an OSD is credited); it ignores the filters below.
+
 TYPE is recovery, backfill, recovery+backfill, or remapped (not started). PROGRESS is how far
 the row's target has got, from its backfill position in 'ceph pg query'.
 '~' marks a fallback on Ceph's per-PG counters, which can read far too high.
@@ -31,6 +34,7 @@ from messages import (
     print_progress_note,
     stderr_para,
 )
+from placement import project_usage, shard_size_bytes
 from shared import (
     NOT_APPLICABLE,
     HelpFormatter,
@@ -39,15 +43,18 @@ from shared import (
     SnapshotStore,
     abbreviate_state,
     add_load_state_arg,
+    check_known_pools,
     check_osds_exist,
     copy_progress,
     ec_shard_moves,
     fetch_backfill_positions,
+    fetch_ec_profiles,
     fetch_osd_df,
     fetch_osd_hosts,
     fetch_pg_stats,
     fetch_pools,
     format_progress,
+    format_projection,
     host_osds,
     is_erasure,
     is_real_osd,
@@ -70,6 +77,7 @@ PRIMARY_NOTE = (
 SNAPSHOT_COMMANDS: dict[str, list[str]] = {
     "osd_tree": ["ceph", "osd", "tree", "--format", "json"],
     "osd_df": ["ceph", "osd", "df", "--format", "json"],
+    "osd_dump": ["ceph", "osd", "dump", "--format", "json"],
     "pool_ls_detail": ["ceph", "osd", "pool", "ls", "detail", "--format", "json"],
     "pg_dump_pgs": ["ceph", "pg", "dump", "pgs", "--format", "json"],
 }
@@ -179,6 +187,7 @@ class MovementRow(NamedTuple):
     # missing copy, shown with '*'; it loses nothing
     progress_pct: float | None = None  # set by with_progress
     progress_exact: bool = False  # from backfill positions, not counters
+    up_projected: float | None = None  # set by with_projection
 
 
 def replica_pairs(
@@ -337,6 +346,37 @@ def with_progress(
     return result
 
 
+def with_projection(
+    rows: list[MovementRow],
+    pg_stats: list[dict],
+    pools: dict[int, dict],
+    ec_profiles: dict[str, dict],
+    osd_df: dict[int, dict],
+) -> list[MovementRow]:
+    """Return rows with PROJ filled in: each row's UP OSD's final utilization.
+
+    The projection (placement.FinalUsage) counts every PG in motion in
+    pg_stats, not just the rows given, so filters don't change it. A dropped
+    replica (no UP OSD), or an OSD without a capacity, has none.
+    """
+    in_motion = [pg for pg in pg_stats if pg["up"] != pg["acting"]]
+    check_known_pools((pg["pgid"] for pg in in_motion), pools, "PGs in motion")
+    final = project_usage(
+        osd_df,
+        (
+            (pg, is_erasure(pool), shard_size_bytes(pg, pool, ec_profiles))
+            for pg in in_motion
+            for pool in [pools[pgid_pool_id(pg["pgid"])]]
+        ),
+    )[1]
+    return [
+        r._replace(up_projected=final.utilization(r.up_osd))
+        if r.up_osd is not None and final.knows(r.up_osd)
+        else r
+        for r in rows
+    ]
+
+
 class MovementsResult(NamedTuple):
     """What plan() found, for render() to print."""
 
@@ -358,6 +398,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
     rows, pgs_filter = row_filter.apply(find_movements(pg_stats, pools))
     positions = fetch_backfill_positions(store, {r.pgid for r in rows})
     rows = with_progress(rows, pg_stats, pools, positions)
+    rows = with_projection(rows, pg_stats, pools, fetch_ec_profiles(store), osd_df)
     rows.sort(key=SORT_KEYS[args.sort_by])
     return MovementsResult(rows, pgs_filter, row_filter.options, osd_df, osd_host)
 
@@ -367,12 +408,15 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
 # ---------------------------------------------------------------------------
 
 # (group, label). ACTING is where the copy is (or its '*' primary), UP where
-# CRUSH wants it.
+# CRUSH wants it. PROJ: the UP OSD's utilization once every backfill is done.
 COLUMNS = [
     ("", "PGID"),
     ("", "SHARD"),
     *osd_columns("ACTING"),
-    *osd_columns("UP"),
+    ("UP", "OSD"),
+    ("UP", "UTIL"),
+    ("UP", "PROJ"),
+    ("UP", "HOST"),
     ("", "TYPE"),
     ("", "PROGRESS"),
     ("", "STATE"),
@@ -386,6 +430,7 @@ def format_row(
 
     A '*' primary's UTIL is '-': it loses no data.
     """
+    up = osd_cells(osd_df, osd_host, row.up_osd)
     acting = osd_cells(
         osd_df, osd_host, row.acting_osd, row.acting_osd if row.primary_marked else None
     )
@@ -395,7 +440,9 @@ def format_row(
         row.pgid,
         str(row.shard),
         *acting,
-        *osd_cells(osd_df, osd_host, row.up_osd),
+        *up[:2],
+        format_projection(row.up_projected),
+        up[2],
         row.move_type,
         format_progress(row.progress_pct, row.progress_exact),
         abbreviate_state(row.state),

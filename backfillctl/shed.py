@@ -95,7 +95,6 @@ from placement import (
 )
 from shared import (
     KIB,
-    NOT_APPLICABLE,
     ROLE_BLOCKER,
     ROLE_REQUESTED,
     SnapshotStore,
@@ -111,6 +110,7 @@ from shared import (
     fetch_pools,
     fetch_upmap_items,
     fold_pairs,
+    format_projection,
     osd_cells,
     osd_columns,
     pgid_pool_id,
@@ -1030,10 +1030,6 @@ COLUMNS = [
     ("TARGET", "HOST"),
     ("", "NOTE"),
 ]
-
-
-def format_projection(value: float | None) -> str:
-    return NOT_APPLICABLE if value is None else f"{value:.1f}%"
 
 
 def format_row(

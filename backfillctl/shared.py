@@ -1039,6 +1039,11 @@ def format_utilization(osd_df: dict[int, dict], osd_id: int | None) -> str:
     return f"{util:.1f}%" if util is not None else "?"
 
 
+def format_projection(value: float | None) -> str:
+    """Format a projected utilization as 'NN.N%', '-' if there is none."""
+    return NOT_APPLICABLE if value is None else f"{value:.1f}%"
+
+
 def format_progress(pct: float | None, exact: bool = True) -> str:
     """Format a progress percentage, floored so only a finished copy reads 100%.
 

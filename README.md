@@ -37,7 +37,7 @@ Commands for inspecting and steering PG backfills. Run it as
 **Inspect**
 
 - `show-backfill`: what is moving, with the progress and state of each
-  moving shard or replica.
+  moving shard or replica, and the projected utilization of its target OSD.
 - `measure-rate`: how fast backfill destinations receive data, with ETAs.
 - `show-pg-osds`: where given PGs live, with hosts, utilization and upmaps.
 

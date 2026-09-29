@@ -108,7 +108,7 @@ def pg(pgid, up, acting, state, **stat):
         "acting": acting,
         "state": state,
         "acting_primary": acting[0],
-        "stat_sum": {"num_objects": 100, **stat},
+        "stat_sum": {"num_objects": 100, "num_bytes": 1000, **stat},
     }
 
 
@@ -156,11 +156,21 @@ SNAPSHOTS = {
         "stray": [{"id": 4, "type": "osd"}],
     },
     "osd_df": {
-        "nodes": [{"id": o, "utilization": u} for o, u in enumerate((10, 20, 70, 89))]
+        "nodes": [
+            {"id": o, "utilization": u, "kb": 100, "kb_used": u}
+            for o, u in enumerate((10, 20, 70, 89))
+        ]
     },
+    "osd_dump": {"erasure_code_profiles": {"ec": {"k": "2", "m": "2"}}},
     "pool_ls_detail": [
         {"pool_id": 5, "type": 1, "size": 3, "pg_num": 32},
-        {"pool_id": 27, "type": 3, "size": 4, "pg_num": 16},
+        {
+            "pool_id": 27,
+            "type": 3,
+            "size": 4,
+            "pg_num": 16,
+            "erasure_code_profile": "ec",
+        },
     ],
 }
 
@@ -204,7 +214,7 @@ class MainTest(unittest.TestCase):
         line = next(ln for ln in out.splitlines() if ln.startswith("27.10"))
         self.assertRegex(
             line,
-            r"^27\.10\s+1\s+3\s+89\.0%\s+ceph2\s+2\s+70\.0%\s+ceph2\s+backfill\s+~0%",
+            r"^27\.10\s+1\s+3\s+89\.0%\s+ceph2\s+2\s+70\.0%\s+70\.5%\s+ceph2\s+backfill\s+~0%",
         )
 
     def test_unknown_osds_are_an_error_not_an_empty_match(self):
@@ -219,7 +229,7 @@ class MainTest(unittest.TestCase):
         # utilization to one decimal, so 88.6% never reads as 89%.
         row = pm.MovementRow("1.0", 0, 3, 2, "backfill", "s")
         cells = pm.format_row(row, {3: {"utilization": 88.6}, 2: {}}, {3: "a", 2: "b"})
-        self.assertEqual(cells[2:8], ["3", "88.6%", "a", "2", "?", "b"])
+        self.assertEqual(cells[2:9], ["3", "88.6%", "a", "2", "?", "-", "b"])
         group_line, label_line, *_ = self.run_main().splitlines()
         self.assertRegex(group_line, r"^\s+-+ ACTING -+\s+-+ UP -+$")
         self.assertRegex(label_line, r"^PGID\s+SHARD\s+OSD\s+UTIL\s+HOST\s+OSD\s")
@@ -231,8 +241,41 @@ class MainTest(unittest.TestCase):
         self.assertEqual((None, True), (rows[1].progress_pct, rows[1].progress_exact))
         line = self.run_main(snapshots=snaps).splitlines()[-1]
         self.assertRegex(
-            line, r"^5\.2\s+-\s+2\s+70\.0%\s+ceph2\s+none\s+-\s+-\s+remapped\s+-\s"
+            line, r"^5\.2\s+-\s+2\s+70\.0%\s+ceph2\s+none\s+-\s+-\s+-\s+remapped\s+-\s"
         )
+
+    def test_proj_credits_leavers_and_counts_every_pg_in_motion(self):
+        # Shards are 1000 B (replicated) or 500 B (EC, k=2) on 100 KiB OSDs.
+        # osd.3 gains 5.3's replica and loses 27.10's shard: 89 + 0.98 - 0.49.
+        # osd.2 gets 27.10's shard and 5.1f's replica, and loses 5.3's.
+        proj = {r.pgid: r.up_projected for r in self.plan().rows}
+        self.assertAlmostEqual(89.49, proj["5.3"], places=2)
+        self.assertAlmostEqual(70.49, proj["27.10"], places=2)
+        # Filtering rows out leaves the projection alone.
+        (row,) = self.plan("--pgs", "5.3").rows
+        self.assertEqual(proj["5.3"], row.up_projected)
+
+    def test_proj_is_none_without_an_up_osd_or_a_capacity(self):
+        snaps = {**SNAPSHOTS, "pg_dump_pgs": [pg("5.2", [0, 3], [0, 1, 2], "active")]}
+        with_target, dropped = self.plan(snapshots=snaps).rows
+        self.assertIsNotNone(with_target.up_projected)
+        self.assertIsNone(dropped.up_projected)
+        snaps = {**SNAPSHOTS, "osd_df": {"nodes": [{"id": 2, "utilization": 70.0}]}}
+        self.assertTrue(
+            all(r.up_projected is None for r in self.plan(snapshots=snaps).rows)
+        )
+
+    def test_unknown_pool_of_a_pg_in_motion_is_an_error(self):
+        snaps = {**SNAPSHOTS, "pool_ls_detail": []}
+        with self.assertRaises(SystemExit) as cm:
+            self.plan(snapshots=snaps)
+        self.assertIn("pool id(s) 5, 27", str(cm.exception))
+
+    def test_ec_profile_without_k_is_an_error(self):
+        snaps = {**SNAPSHOTS, "osd_dump": {}}
+        with self.assertRaises(SystemExit) as cm:
+            self.plan(snapshots=snaps)
+        self.assertIn("size of its shards is unknown", str(cm.exception))
 
     def test_progress_denominator_counts_unassigned_shards(self):
         # 27.9: one shard moving plus one with no OSD anywhere = 2 copies to
@@ -320,7 +363,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(33.0, result.osd_df[4]["utilization"])
         self.assertNotIn(3, result.osd_df)
         out = self.run_main(snapshots=snaps)
-        self.assertRegex(out, r"\s3\s+\?\s+h2\s+4\s+33\.0%\s+h2\s")
+        self.assertRegex(out, r"\s3\s+\?\s+h2\s+4\s+33\.0%\s+-\s+h2\s")
 
     def test_no_movement(self):
         snaps = {**SNAPSHOTS, "pg_dump_pgs": [PGS[2]]}
