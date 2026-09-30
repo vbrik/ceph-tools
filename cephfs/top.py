@@ -236,14 +236,10 @@ COLUMN_NOTES = {
   recall_caps: caps the MDS has asked this client to release, minus those
     it has released since. Repeated asks add up, so it can exceed num_caps.
   release_caps: caps the client has released, whether asked to or not.
-  Both decay (60s half-life by default). The MDS recalls caps when its cache
-  is full, or the client holds too many or ones it isn't using. A high
-  recall_caps means the client isn't releasing them as fast as asked, which
-  keeps the MDS from shrinking its cache; MDS_CLIENT_RECALL fires above
-  mds_recall_warning_threshold if the client holds over
-  mds_min_caps_working_set caps. release_caps then tells a slow client
-  (high) from one not releasing at all (near 0, e.g. files held open or a
-  stuck client).
+  Both decay. A high recall_caps means the client isn't releasing them as
+  fast as asked, which keeps the MDS from shrinking its cache. release_caps
+  then tells a slow client (high) from one not releasing at all (near 0, e.g.
+  files held open or a stuck client).
 """.strip("\n"),
 }
 
