@@ -220,34 +220,46 @@ def print_table(columns, rows):
         print(render(r))
 
 
-COLUMN_NOTES = """
-Column notes:
-  num_completed_requests / num_completed_flushes: how many replies (to
-    requests / to cap flushes) the MDS is holding for this client because it
-    hasn't been acked yet. High/growing values mean the client is slow to
-    ack, which costs the MDS memory.
-
-  recall_caps / release_caps: how hard the MDS is asking this client to give
-    back capabilities vs. how many it's actually giving back. recall_caps
-    high with release_caps not keeping up means the client is holding onto
-    caps under MDS cache pressure, hurting the whole cluster.
-""".strip("\n")
+# Notes on easily misread columns: (columns covered) -> note text.
+COLUMN_NOTES = {
+    ("num_completed_requests", "num_completed_flushes"): """
+  num_completed_requests: finished requests the MDS still keeps a record of,
+    so one the client resends (e.g. after a reconnect) isn't run twice.
+  num_completed_flushes: the same, for cap flushes (metadata changes the
+    client wrote back).
+  With each new request/flush the client reports its oldest unfinished one,
+  and the MDS drops records older than that. Large or growing values mean
+  that oldest one isn't advancing (a stuck request/flush or a buggy client),
+  so records pile up in MDS memory, eventually raising MDS_CLIENT_OLDEST_TID.
+""".strip("\n"),
+    ("recall_caps", "release_caps"): """
+  recall_caps: caps the MDS has asked this client to release, minus those
+    it has released since. Repeated asks add up, so it can exceed num_caps.
+  release_caps: caps the client has released, whether asked to or not.
+  Both decay (60s half-life by default). The MDS recalls caps when its cache
+  is full, or the client holds too many or ones it isn't using. A high
+  recall_caps means the client isn't releasing them as fast as asked, which
+  keeps the MDS from shrinking its cache; MDS_CLIENT_RECALL fires above
+  mds_recall_warning_threshold if the client holds over
+  mds_min_caps_working_set caps. release_caps then tells a slow client
+  (high) from one not releasing at all (near 0, e.g. files held open or a
+  stuck client).
+""".strip("\n"),
+}
 
 
 def print_column_notes(columns):
-    """Print a short explanation of a few easily-confused column pairs.
+    """Print to stderr the COLUMN_NOTES groups that cover a visible column.
 
-    Only prints if at least one column from a given pair is visible, so the
-    notes don't show up for columns the user chose to --hide.
+    Prints nothing if every noted column is hidden.
     """
     shown = {c.name for c in columns}
-    pairs = [
-        {"num_completed_requests", "num_completed_flushes"},
-        {"recall_caps", "release_caps"},
-    ]
-    if any(shown & pair for pair in pairs):
-        print()
-        print(COLUMN_NOTES)
+    notes = [text for names, text in COLUMN_NOTES.items() if shown.intersection(names)]
+    if notes:
+        # Keep the notes after the table when stdout and stderr share a
+        # block-buffered destination (e.g. `> out 2>&1`).
+        sys.stdout.flush()
+        print("\nColumn notes:\n" + "\n\n".join(notes), file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
