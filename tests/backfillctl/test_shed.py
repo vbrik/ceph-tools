@@ -19,8 +19,20 @@ import contextlib
 import io
 import json
 import unittest
+from unittest import mock
 
-from _support import NONE, FakeStore, SyntheticCluster, shared, stderr_of
+from _support import (
+    NONE,
+    PCT,
+    FakeStore,
+    SyntheticCluster,
+    flat,
+    messages,
+    placement,
+    real_query_backfill_positions,
+    shared,
+    stderr_of,
+)
 from _support import shed as sh
 
 
@@ -29,8 +41,9 @@ class Cluster(SyntheticCluster):
         self, *sources, level=None, level_class=None, max_target_util=None
     ) -> sh.ShedResult:
         """Run shed() on this cluster, off sources, down to level."""
-        cluster = sh.Cluster(FakeStore(self.snapshots()), max_target_util)
-        return sh.shed(cluster, set(sources), level, level_class)
+        with self.store() as store:
+            cluster = sh.Cluster(store, max_target_util)
+            return sh.shed(cluster, set(sources), level, level_class)
 
 
 def pairs(result: sh.ShedResult) -> list[tuple[str, object, int, int]]:
@@ -231,6 +244,67 @@ class CapacityTest(unittest.TestCase):
         self.assertEqual(pairs(result), [("1.0", 0, 0, 31), ("1.1", 0, 0, 31)])
         self.assertEqual([m.target_projected for m in result.moves], [85.0, 85.0])
         self.assertEqual([m.up_projected for m in result.moves], [80.0, 80.0])
+
+
+class PartlyCopiedTest(unittest.TestCase):
+    """1.0's 10% shard 0 is arriving on source osd.0 from osd.41, half copied:
+    osd.0's 55% holds 5 points of it."""
+
+    def cluster(self) -> Cluster:
+        c = Cluster()
+        c.util[0] = 55.0
+        c.util[31] = 10.0
+        c.pg("1.0", [0, 10, 20], [41, 10, 20], shard_pct=10)
+        c.positions = {"1.0": {"0(0)": "08000000"}}
+        return c
+
+    def test_redirect_then_uncommit(self):
+        with self.cluster().store() as store:
+            cluster = sh.Cluster(store, None)
+            planner = sh.Planner(cluster, {0}, None, None, relieve=False)
+            state = cluster.pg_state(cluster.pgs[0])
+            shard = placement.MappedShard("1.0", 0, 0, 41, 10 * PCT)
+
+            def projections():
+                """(reservation, final) of osd.0, osd.31 and osd.41."""
+                return [
+                    (
+                        round(cluster.reservation.utilization_after(o, 0), 6),
+                        round(cluster.final.utilization(o), 6),
+                    )
+                    for o in (0, 31, 41)
+                ]
+
+            before = projections()
+            planner.commit(state, shard, 31)
+            redirected = projections()
+            planner.uncommit(state, shard, 31)
+            self.assertEqual(projections(), before)
+        self.assertEqual(before, [(60.0, 60.0), (10.0, 10.0), (50.0, 40.0)])
+        # osd.0 frees what it copied only once the PG settles: the
+        # reservation keeps it.
+        self.assertEqual(redirected, [(55.0, 50.0), (20.0, 20.0), (50.0, 40.0)])
+
+    def test_a_failed_query_says_the_projections_count_the_backfill_in_full(self):
+        failed = shared.TimedPositions({}, {}, ["1.0"])
+        store = FakeStore(self.cluster().snapshots(), load_dir=None)
+        with (
+            mock.patch.object(
+                shared, "query_backfill_positions", real_query_backfill_positions
+            ),
+            mock.patch.object(shared, "_query_positions", return_value=failed),
+        ):
+            cluster = sh.Cluster(store, None)
+            err = stderr_of(lambda: cluster.final)
+        self.assertIn("failed for 1 of 1 PG(s) (1.0)", err)
+        self.assertIn(flat(messages.PROJECTION_QUERY_EFFECT), err)
+        self.assertAlmostEqual(cluster.final.utilization(0), 65.0)
+
+    def test_the_copied_part_counts_once_against_the_level(self):
+        # osd.0 ends at 60% with the rest of the shard, below a 62% level:
+        # nothing to move. Counted twice, it would read 65%.
+        result = self.cluster().shed(0, level=62)
+        self.assertEqual(result.moves, [])
 
 
 class OrderTest(unittest.TestCase):

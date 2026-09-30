@@ -16,6 +16,7 @@ import json
 import sys
 
 from messages import (
+    PROGRESS_AND_PROJECTION_QUERY_EFFECT,
     stderr_para,
 )
 from shared import (
@@ -108,12 +109,15 @@ def run(args: argparse.Namespace) -> None:
     store = SnapshotStore(
         SNAPSHOT_COMMANDS, save_dir=save_dir, anonymize=anonymize_snapshots
     )
-    store.save()
-    # The cached dump, not the anonymized copy.
+    # The positions before the rest ('osd df' among it), so that kb_used holds
+    # all they count as copied: a replay may then overstate a target, never
+    # understate it (placement.with_copied). save() reuses this dump.
     pg_stats = extract_pg_stats(store.json("pg_dump_pgs"), "ceph pg dump pgs")
     positions = query_backfill_positions(
-        pg["pgid"] for pg in pg_stats if pg["up"] != pg["acting"]
+        (pg["pgid"] for pg in pg_stats if pg["up"] != pg["acting"]),
+        PROGRESS_AND_PROJECTION_QUERY_EFFECT,
     )
+    store.save()
     (save_dir / BACKFILL_POSITIONS_FILE).write_text(
         json.dumps(positions, separators=(",", ":"))
     )

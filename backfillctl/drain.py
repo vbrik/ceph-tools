@@ -15,8 +15,9 @@ With --until-util, an OSD sheds shards only while its projected utilization
 is at or above that level, and a target must end up below the OSD it relieves,
 though not necessarily below the level: relieving an overfull host may take
 fuller targets. This projection (PROJ) counts every backfill in motion and
-every proposal as done, crediting data leaving an OSD. The last move may take
-an OSD well below the level.
+every proposal as done, crediting data leaving an OSD; a backfill under way
+adds only what it has yet to copy, by its position in 'ceph pg query'. The
+last move may take an OSD well below the level.
 
 Left alone, and counted on stderr: PGs that are not active, or are degraded,
 undersized, recovering or peering (re-run once they settle), and PGs whose

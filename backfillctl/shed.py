@@ -9,11 +9,12 @@ below). Everything else is decided here, the same way for both.
 
 Utilization is projected (FinalUsage): what an OSD will hold once every
 backfill in motion and every proposal completes, crediting data leaving it.
-Each turn takes the source projected fullest and moves its largest shard
-that has a legal target (one still arriving on it is redirected). A source is
-done once it is below the level, or when none of its shards can go anywhere;
-the others carry on. Without a level, a source is done when it has no shards
-left.
+A backfill under way adds only what it has yet to copy (placement.with_copied),
+so every PG in motion is queried for its backfill position. Each turn takes
+the source projected fullest and moves its largest shard that has a legal
+target (one still arriving on it is redirected). A source is done once it is
+below the level, or when none of its shards can go anywhere; the others carry
+on. Without a level, a source is done when it has no shards left.
 
 The run's own moves take data off the sources and put it on other OSDs, never
 the reverse, so none of them makes an OSD read and write backfill data at
@@ -62,6 +63,7 @@ from functools import cached_property
 from typing import NamedTuple
 
 from messages import (
+    PROJECTION_QUERY_EFFECT,
     blocking_reason,
     companion_note,
     format_bytes,
@@ -102,6 +104,7 @@ from shared import (
     check_host_failure_domain,
     check_known_pools,
     close_pins,
+    fetch_backfill_positions,
     fetch_crush_rules,
     fetch_ec_profiles,
     fetch_osd_df,
@@ -220,10 +223,18 @@ class Cluster:
 
     @cached_property
     def _projections(self) -> tuple[ProjectedUsage, FinalUsage]:
-        """Every backfill in motion, projected; exits on an unknown pool."""
+        """Every backfill in motion, projected; exits on an unknown pool.
+
+        Queries the backfill position of every PG in motion.
+        """
         in_motion = [pg for pg in self.pgs if pg["up"] != pg["acting"]]
         check_known_pools((pg["pgid"] for pg in in_motion), self.pools, "PGs in motion")
-        return project_usage(self.osd_df, ((pg, *self.pg_info(pg)) for pg in in_motion))
+        positions = fetch_backfill_positions(
+            self.store, (pg["pgid"] for pg in in_motion), PROJECTION_QUERY_EFFECT
+        )
+        return project_usage(
+            self.osd_df, in_motion, self.pools, self.ec_profiles, positions
+        )
 
     @property
     def reservation(self) -> ProjectedUsage:
@@ -504,8 +515,8 @@ class Planner:
         """
         c = self.cluster
         c.reservation.add(target, -shard.size_bytes)
-        if shard.acting_osd != shard.up_osd and c.reservation.knows(shard.up_osd):
-            c.reservation.add(shard.up_osd, shard.size_bytes)
+        if shard.acting_osd != shard.up_osd:
+            c.reservation.uncancel(shard)
         self.move_final(target, shard.up_osd, shard.size_bytes)
         for counts, key in (
             (self.relieved[target], shard.up_osd),

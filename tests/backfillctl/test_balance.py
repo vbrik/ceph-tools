@@ -21,9 +21,12 @@ from typing import ClassVar
 from unittest import mock
 
 from _support import (
+    EC_POOL_DETAIL,
+    EC_PROFILES,
     KB,
     NONE,
     PCT,
+    REP_POOL_DETAIL,
     TEST_DATA,
     FakeStore,
     SyntheticCluster,
@@ -31,12 +34,15 @@ from _support import (
     check_own_moves_in_or_out,
     check_pairs_apply,
     check_reservation_cap,
+    flat,
+    mapped_share_pct,
     messages,
     osd_df_of,
     parse_args,
     placement,
     plan_from_state,
     replayed_cluster,
+    run_command,
     shared,
     stderr_of,
 )
@@ -232,9 +238,16 @@ class FinalUsageTest(unittest.TestCase):
         self.assertEqual((final.utilization(1), final.utilization(2)), (40.0, 60.0))
 
     def test_project_usage_credits_departures_in_final_only(self):
-        pg = {"pgid": "1.0", "up": [4, 2, 3], "acting": [1, 2, 3]}
+        pg = {
+            "pgid": "19.0",
+            "up": [4, 2, 3],
+            "acting": [1, 2, 3],
+            "stat_sum": {"num_bytes": 40 * PCT},  # 10% shards (k=4)
+        }
         osd_df = osd_df_of({1: 50.0, 2: 50.0, 3: 50.0, 4: 50.0})
-        reservation, final = placement.project_usage(osd_df, [(pg, True, 10 * PCT)])
+        reservation, final = placement.project_usage(
+            osd_df, [pg], {19: EC_POOL_DETAIL}, EC_PROFILES, {}
+        )
         self.assertEqual(reservation.utilization_after(4, 0), 60.0)
         self.assertEqual(reservation.utilization_after(1, 0), 50.0)
         self.assertEqual((final.utilization(4), final.utilization(1)), (60.0, 40.0))
@@ -257,6 +270,88 @@ class FinalUsageTest(unittest.TestCase):
         final = placement.FinalUsage(osd_df_of({1: 50.0}), [], [])
         with self.assertRaises(SystemExit):
             final.mean_utilization([99])
+
+
+class PartlyCopiedTest(unittest.TestCase):
+    """An arriving shard's part copied so far is in kb_used already: counted once.
+
+    19.0 (EC 4+2, pg_num 16) moves its 10% shard 0 from osd.1 to osd.4, whose
+    position 08000000 is halfway through the PG, so the 55% osd.4 uses
+    includes 5 points of it.
+    """
+
+    PG: ClassVar = {
+        "pgid": "19.0",
+        "up": [4, 2, 3],
+        "acting": [1, 2, 3],
+        "stat_sum": {"num_bytes": 40 * PCT},
+    }
+    SHARD = placement.ArrivingShard("19.0", 0, 4, 1, [], 10 * PCT)
+
+    def project(self, position: str | None = "08000000"):
+        osd_df = osd_df_of({1: 50.0, 2: 50.0, 3: 50.0, 4: 55.0})
+        positions = {} if position is None else {"19.0": {"4(0)": position}}
+        return placement.project_usage(
+            osd_df, [self.PG], {19: EC_POOL_DETAIL}, EC_PROFILES, positions
+        )
+
+    def test_only_the_part_still_to_come_is_added(self):
+        reservation, final = self.project()
+        self.assertAlmostEqual(reservation.utilization_after(4, 0), 60.0)
+        self.assertAlmostEqual(final.utilization(4), 60.0)
+        # The source keeps its whole copy until the backfill completes.
+        self.assertAlmostEqual(reservation.utilization_after(1, 0), 50.0)
+        self.assertAlmostEqual(final.utilization(1), 40.0)
+
+    def test_a_finished_copy_adds_nothing(self):
+        reservation, final = self.project("MAX")
+        self.assertAlmostEqual(reservation.utilization_after(4, 0), 55.0)
+        self.assertAlmostEqual(final.utilization(4), 55.0)
+
+    def test_no_known_position_adds_the_whole_shard(self):
+        # MIN; none; a key outside 19.0's range (its hash bits read 9, not 0).
+        for position in ("MIN", None, "98000000"):
+            with self.subTest(position):
+                reservation, final = self.project(position)
+                self.assertAlmostEqual(reservation.utilization_after(4, 0), 65.0)
+                self.assertAlmostEqual(final.utilization(4), 65.0)
+
+    def test_replica_positions_are_by_osd(self):
+        pg = {**self.PG, "pgid": "7.0", "stat_sum": {"num_bytes": 10 * PCT}}
+        osd_df = osd_df_of({1: 50.0, 2: 50.0, 3: 50.0, 4: 55.0})
+        pool = {**REP_POOL_DETAIL, "pg_num": 16}
+        reservation, _ = placement.project_usage(
+            osd_df, [pg], {7: pool}, EC_PROFILES, {"7.0": {"4": "08000000"}}
+        )
+        self.assertAlmostEqual(reservation.utilization_after(4, 0), 60.0)
+
+    def test_cancel_takes_off_only_the_part_still_to_come(self):
+        # The copied part is data leaving osd.4: the reservation never credits
+        # that. The shard is looked up, as pins and moves are built afresh.
+        reservation, _ = self.project()
+        reservation.cancel(self.SHARD)
+        self.assertAlmostEqual(reservation.utilization_after(4, 0), 55.0)
+        reservation.uncancel(self.SHARD)
+        self.assertAlmostEqual(reservation.utilization_after(4, 0), 60.0)
+
+    def test_redirect_puts_the_whole_shard_on_its_new_target(self):
+        reservation, _ = self.project()
+        mapped = placement.MappedShard("19.0", 0, 4, 1, 10 * PCT)
+        reservation.redirect(mapped, 2)
+        self.assertAlmostEqual(reservation.utilization_after(4, 0), 55.0)
+        self.assertAlmostEqual(reservation.utilization_after(2, 0), 60.0)
+
+    def test_an_osd_filled_by_copies_under_way_is_not_a_source(self):
+        # osd.41's 55% holds half of a 10% shard still arriving: it ends at
+        # 60%, below the level, where counting the shard in full gives 65%.
+        c = Cluster()
+        c.util[41] = 55.0
+        c.pg("1.9", [41, 11, 21], [51, 11, 21], shard_pct=10)
+        c.positions = {"1.9": {"41(0)": "98000000"}}
+        result = c.plan("--until-util", "62")
+        self.assertEqual(result.shed.sources, [])
+        c.positions = {}
+        self.assertEqual(c.plan("--until-util", "62").shed.sources, [41])
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +491,7 @@ class FixtureInvariantTest(unittest.TestCase):
 
     FIXTURES: ClassVar = [
         "ceph1-resumed-backfills-exact-progress",
+        "ceph2-37-filling-with-partial-backfills",
         "divert-toofull-ceph2-util-emergency-2-new-hosts",
         "divert-toofull-osd263-existing-upmap-chain",
     ]
@@ -500,6 +596,34 @@ class FixtureInvariantTest(unittest.TestCase):
                 if m.role == shared.ROLE_BLOCKER and sh.is_pin(m)
             },
         )
+
+
+class PartlyCopiedFixtureTest(unittest.TestCase):
+    """Backfills under way, on real captures.
+
+    FIXTURE: host37, added empty and half filled by balance. Counting the part
+    copied twice put its OSDs at 93-99.8% (see the fixture's README.txt).
+    """
+
+    FIXTURE = TEST_DATA / "ceph2-37-filling-with-partial-backfills"
+    NEW_HOST = range(900, 926)
+
+    def test_new_osds_end_up_where_their_shards_take_them(self):
+        final = replayed_cluster(self.FIXTURE).final
+        for osd, pct in mapped_share_pct(self.FIXTURE, self.NEW_HOST).items():
+            with self.subTest(osd=osd):
+                self.assertAlmostEqual(final.utilization(osd), pct, delta=1.0)
+
+    def test_the_new_host_is_not_a_source(self):
+        result = plan_from_state(bal, self.FIXTURE)
+        self.assertTrue(result.shed.sources)
+        self.assertFalse(set(result.shed.sources) & set(self.NEW_HOST))
+
+    def test_a_capture_without_positions_is_noted_once(self):
+        fixture = TEST_DATA / "divert-toofull-ceph2-util-emergency-2-new-hosts"
+        err = flat(run_command(bal, load_state=fixture, check=True).stderr)
+        self.assertEqual(1, err.count(f"has no {shared.BACKFILL_POSITIONS_FILE}"))
+        self.assertIn(flat(messages.PROJECTION_QUERY_EFFECT), err)
 
 
 if __name__ == "__main__":

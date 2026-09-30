@@ -961,7 +961,9 @@ class FixtureReplayTest(unittest.TestCase):
         entries = upmap_pairs(proc.stdout)
         self.assertEqual(len(entries), 5)
         self.assertIn({"pgid": "19.bd5", "mapping": {"from": 263, "to": 842}}, entries)
-        self.assertEqual(proc.stderr.count("NOTE"), 1)  # the balancer's, only
+        # The balancer's, and that the capture has no backfill positions; no more.
+        self.assertEqual(proc.stderr.count("NOTE"), 2)
+        self.assertIn("has no backfill_positions.json", proc.stderr)
 
     def test_pgremapper_mappings_emits_up_osd_not_acting_osd(self):
         # 'pgremapper import-mappings' takes the upmap's 'from', which is the

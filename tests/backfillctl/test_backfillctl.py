@@ -163,7 +163,8 @@ class LoadStateTest(unittest.TestCase):
             text=True,
             check=False,
         ).stdout
-        self.assertTrue(both.splitlines()[1].startswith("PGID"))
+        # A note on the input first: this capture has no backfill positions.
+        self.assertLess(both.index("has no backfill_positions"), both.index("PGID"))
         self.assertLess(both.rindex("act+"), both.index("copy movement(s)"))
 
     def test_missing_directory_is_reported(self):

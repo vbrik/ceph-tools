@@ -12,7 +12,8 @@ PG's primary, marked '*': the primary keeps its copy but does the work. UP
 reads 'none' for a replica dropped with nowhere to go.
 
 PROJ is the UP OSD's utilization once every backfill in motion is done (data
-leaving an OSD is credited); it ignores the filters below.
+leaving an OSD is credited, and a backfill under way adds only what it has yet
+to copy); it ignores the filters below.
 
 TYPE is recovery, backfill, recovery+backfill, or remapped (not started). PROGRESS is how far
 the row's target has got, from its backfill position in 'ceph pg query'.
@@ -28,13 +29,14 @@ from itertools import zip_longest
 from typing import NamedTuple
 
 from messages import (
+    PROGRESS_AND_PROJECTION_QUERY_EFFECT,
     print_movement_summary,
     print_no_movements,
     print_pgid_filter,
     print_progress_note,
     stderr_para,
 )
-from placement import project_usage, shard_size_bytes
+from placement import arriving_pgids, project_usage
 from shared import (
     NOT_APPLICABLE,
     HelpFormatter,
@@ -348,27 +350,20 @@ def with_progress(
 
 def with_projection(
     rows: list[MovementRow],
-    pg_stats: list[dict],
+    in_motion: list[dict],
     pools: dict[int, dict],
     ec_profiles: dict[str, dict],
     osd_df: dict[int, dict],
+    positions: dict[str, dict[str, str]],
 ) -> list[MovementRow]:
     """Return rows with PROJ filled in: each row's UP OSD's final utilization.
 
-    The projection (placement.FinalUsage) counts every PG in motion in
-    pg_stats, not just the rows given, so filters don't change it. A dropped
-    replica (no UP OSD), or an OSD without a capacity, has none.
+    The projection (placement.project_usage) counts every PG in motion, not
+    just the rows given, so filters don't change it. positions must cover the
+    PGs arriving on the rows' UP OSDs (arriving_pgids). A dropped replica (no
+    UP OSD), or an OSD without a capacity, has none.
     """
-    in_motion = [pg for pg in pg_stats if pg["up"] != pg["acting"]]
-    check_known_pools((pg["pgid"] for pg in in_motion), pools, "PGs in motion")
-    final = project_usage(
-        osd_df,
-        (
-            (pg, is_erasure(pool), shard_size_bytes(pg, pool, ec_profiles))
-            for pg in in_motion
-            for pool in [pools[pgid_pool_id(pg["pgid"])]]
-        ),
-    )[1]
+    final = project_usage(osd_df, in_motion, pools, ec_profiles, positions)[1]
     return [
         r._replace(up_projected=final.utilization(r.up_osd))
         if r.up_osd is not None and final.knows(r.up_osd)
@@ -396,9 +391,17 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> MovementsResult:
     pools = fetch_pools(store)
 
     rows, pgs_filter = row_filter.apply(find_movements(pg_stats, pools))
-    positions = fetch_backfill_positions(store, {r.pgid for r in rows})
+    in_motion = [pg for pg in pg_stats if pg["up"] != pg["acting"]]
+    check_known_pools((pg["pgid"] for pg in in_motion), pools, "PGs in motion")
+    # PROGRESS needs the rows' PGs; PROJ, those arriving on the rows' UP OSDs.
+    up_osds = {r.up_osd for r in rows if r.up_osd is not None}
+    pgids = {r.pgid for r in rows} | arriving_pgids(in_motion, pools, up_osds)
+    positions = fetch_backfill_positions(
+        store, pgids, PROGRESS_AND_PROJECTION_QUERY_EFFECT
+    )
     rows = with_progress(rows, pg_stats, pools, positions)
-    rows = with_projection(rows, pg_stats, pools, fetch_ec_profiles(store), osd_df)
+    ec_profiles = fetch_ec_profiles(store)
+    rows = with_projection(rows, in_motion, pools, ec_profiles, osd_df, positions)
     rows.sort(key=SORT_KEYS[args.sort_by])
     return MovementsResult(rows, pgs_filter, row_filter.options, osd_df, osd_host)
 

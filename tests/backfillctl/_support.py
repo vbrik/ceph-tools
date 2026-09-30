@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from unittest import mock
 
@@ -42,7 +43,7 @@ import shed
 # cluster, so that is stubbed out for every test to "no positions" (progress
 # from Ceph's counters). Tests of the query itself use the saved original.
 real_query_backfill_positions = shared.query_backfill_positions
-shared.query_backfill_positions = lambda pgids: {}
+shared.query_backfill_positions = lambda pgids, *effect: {}
 shared.query_backfill_positions_timed = lambda pgids: shared.TimedPositions({}, {}, [])
 
 NONE = shared.CRUSH_ITEM_NONE
@@ -67,6 +68,7 @@ __all__ = [
     "check_pairs_apply",
     "check_reservation_cap",
     "flat",
+    "mapped_share_pct",
     "messages",
     "osd_df_of",
     "parse_args",
@@ -283,8 +285,9 @@ class SyntheticCluster:
     Six hosts h0..h5 with two hdd OSDs each, numbered host*10 + j (0, 1, 10,
     11, ... 51), every OSD of KB KiB so that utilizations and shard sizes are
     exact percentages. Pool 1 is EC k=2 m=1 (size 3), pool 2 replicated size
-    3, both with a host failure domain. backfillfull_ratio is 90%, so
-    --max-target-util defaults to 89%.
+    3, both with a host failure domain and pg_num 16. backfillfull_ratio is
+    90%, so --max-target-util defaults to 89%. positions are the backfill
+    positions a live 'pg query' returns (see store).
     """
 
     def __init__(self, default_util: float = 50.0):
@@ -293,6 +296,7 @@ class SyntheticCluster:
         self.upmaps: list[dict] = []
         self.classes: dict[int, str] = {}  # device class, if not hdd
         self.rule = HOST_RULE
+        self.positions: dict[str, dict[str, str]] = {}  # {pgid: {peer: position}}
 
     @staticmethod
     def host(osd: int) -> int:
@@ -357,8 +361,15 @@ class SyntheticCluster:
                     "type": 3,
                     "crush_rule": 0,
                     "erasure_code_profile": "p",
+                    "pg_num": 16,
                 },
-                {"pool_id": REP_POOL, "pool_name": "rep", "type": 1, "crush_rule": 0},
+                {
+                    "pool_id": REP_POOL,
+                    "pool_name": "rep",
+                    "type": 1,
+                    "crush_rule": 0,
+                    "pg_num": 16,
+                },
             ],
             "crush_rule_dump": [self.rule],
             "pg_dump_pgs": self.pgs,
@@ -372,16 +383,28 @@ class SyntheticCluster:
             argv.insert(0, "--osds")
         return argv
 
+    @contextlib.contextmanager
+    def store(self):
+        """Yield a live FakeStore of this cluster whose 'pg query's return positions."""
+
+        def query(pgids, *effect):
+            return {p: self.positions[p] for p in pgids if p in self.positions}
+
+        with mock.patch.object(shared, "query_backfill_positions", query):
+            yield FakeStore(self.snapshots(), load_dir=None)
+
     def plan_with(self, module, *argv):
         """Run module.plan() on this cluster (see argv)."""
         args = parse_args(module, self.argv(argv))
-        return module.plan(args, FakeStore(self.snapshots()))
+        with self.store() as store:
+            return module.plan(args, store)
 
     def rendered_with(self, module, *argv) -> tuple[str, str]:
         """Return (stdout, stderr with whitespace collapsed) of module.render()
         for plan_with(module, *argv)."""
         args = parse_args(module, self.argv(argv))
-        result = module.plan(args, FakeStore(self.snapshots()))
+        with self.store() as store:
+            result = module.plan(args, store)
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             module.render(result, args)
@@ -404,6 +427,25 @@ def replayed_cluster(fixture_dir: str | Path) -> "shed.Cluster":
     """A fresh shed.Cluster of a capture, as a run starts from."""
     store = shared.SnapshotStore(shed.SNAPSHOT_COMMANDS, load_dir=Path(fixture_dir))
     return shed.Cluster(store, None)
+
+
+def mapped_share_pct(fixture_dir: str | Path, osds: Iterable[int]) -> dict[int, float]:
+    """Return {osd: % of its capacity} held by the shards CRUSH maps to it ('up').
+
+    Where an OSD that holds no other data (e.g. one newly added) ends up once
+    every backfill completes, derived from the PG dump alone: no projection,
+    no backfill positions. Shard sizes are shared.shard_size_bytes's.
+    """
+    cluster = replayed_cluster(fixture_dir)
+    held = dict.fromkeys(osds, 0)
+    for pg in cluster.pgs:
+        pool = cluster.pools[shared.pgid_pool_id(pg["pgid"])]
+        size = shared.shard_size_bytes(pg, pool, cluster.ec_profiles)
+        for osd in set(pg["up"]) & held.keys():
+            held[osd] += size
+    return {
+        o: b / (cluster.osd_df[o]["kb"] * shared.KIB) * 100 for o, b in held.items()
+    }
 
 
 def check_one_shard_per_host(

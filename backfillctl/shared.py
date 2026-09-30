@@ -33,11 +33,13 @@ from pathlib import Path
 from typing import NamedTuple
 
 from messages import (
+    PROGRESS_QUERY_EFFECT,
     blocking_reason,
     companion_note,
     format_bytes,
     osd_list,
     print_query_failed,
+    stderr_para,
 )
 
 # Sentinel used by CRUSH/Ceph for "no OSD in this slot" (crush/crush.h).
@@ -608,18 +610,17 @@ def _query_positions(pgids: Iterable[str]) -> TimedPositions:
     )
 
 
-def query_backfill_positions(pgids: Iterable[str]) -> dict[str, dict[str, str]]:
+def query_backfill_positions(
+    pgids: Iterable[str], effect: str = PROGRESS_QUERY_EFFECT
+) -> dict[str, dict[str, str]]:
     """Return {pgid: {peer: position}} for pgids, queried from the live cluster.
 
-    PGs whose query fails are left out (and counted on stderr).
+    PGs whose query fails are left out, and counted on stderr with effect
+    (see print_query_failed).
     """
     pgids = set(pgids)
     result = _query_positions(pgids)
-    print_query_failed(
-        result.failed,
-        len(pgids),
-        "their PROGRESS comes from Ceph's counters (marked '~')",
-    )
+    print_query_failed(result.failed, len(pgids), effect)
     return result.positions
 
 
@@ -629,17 +630,28 @@ def query_backfill_positions_timed(pgids: Iterable[str]) -> TimedPositions:
 
 
 def fetch_backfill_positions(
-    store: "SnapshotStore", pgids: Iterable[str]
+    store: "SnapshotStore", pgids: Iterable[str], effect: str | None = None
 ) -> dict[str, dict[str, str]]:
     """Return {pgid: {peer: position}} for pgids, live or from a snapshot.
 
-    A capture without BACKFILL_POSITIONS_FILE yields {}.
+    effect says on stderr what missing positions cost (print_query_failed):
+    for the PGs whose live query fails, and, if given, for all of them when a
+    capture has no BACKFILL_POSITIONS_FILE (which yields {}). By default the
+    cost is PROGRESS_QUERY_EFFECT, which the '~' footnote also covers, so a
+    missing file goes unmentioned.
     """
+    pgids = list(pgids)
     if store.load_dir is None:
-        return query_backfill_positions(pgids)
+        return query_backfill_positions(pgids, effect or PROGRESS_QUERY_EFFECT)
     try:
         saved = json.loads((Path(store.load_dir) / BACKFILL_POSITIONS_FILE).read_text())
     except FileNotFoundError:
+        if effect is not None and pgids:
+            stderr_para(
+                f"NOTE: {store.load_dir} has no {BACKFILL_POSITIONS_FILE} (an older "
+                "capture?), which holds the PGs' backfill positions; without them, "
+                f"{effect}."
+            )
         return {}
     return {pgid: saved[pgid] for pgid in pgids if pgid in saved}
 
@@ -1217,14 +1229,17 @@ def with_exact_progress(
     cancellations: list[Cancellation],
     pg_stats: list[dict],
     pools: dict[int, dict],
+    positions: dict[str, dict[str, str]] | None = None,
 ) -> list[Cancellation]:
     """Replace counter-based progress with each shard's own (copy_progress).
 
-    Queries backfill positions only for the proposed PGs.
+    positions: those of the proposed PGs, if already fetched; else only they
+    are queried.
     """
     pgids = {c.pgid for c in cancellations}
     pgs = {pg["pgid"]: pg for pg in pg_stats if pg["pgid"] in pgids}
-    positions = fetch_backfill_positions(store, pgs)
+    if positions is None:
+        positions = fetch_backfill_positions(store, pgs)
     result = []
     for c in cancellations:
         progress = copy_progress(

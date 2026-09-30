@@ -21,10 +21,14 @@ from _support import (
     TEST_DATA,
     FakeStore,
     flat,
+    mapped_share_pct,
+    messages,
     parse_args,
     plan_from_state,
+    real_query_backfill_positions,
     run_command,
     shared,
+    stderr_of,
 )
 
 from backfillctl import show_backfill as pm
@@ -255,6 +259,39 @@ class MainTest(unittest.TestCase):
         (row,) = self.plan("--pgs", "5.3").rows
         self.assertEqual(proj["5.3"], row.up_projected)
 
+    def test_proj_counts_the_part_already_copied_once(self):
+        # 27.10's shard 1 is all on osd.2 already (MAX): 70 + 0.98 (5.1f's
+        # replica) - 0.98 (5.3's leaving), not 70.49.
+        positions = {"27.10": {"2(1)": "MAX"}}
+        query = mock.Mock(
+            side_effect=lambda pgids, *effect: {
+                p: positions[p] for p in pgids if p in positions
+            }
+        )
+        store = FakeStore(SNAPSHOTS, commands=pm.SNAPSHOT_COMMANDS, load_dir=None)
+        with mock.patch.object(shared, "query_backfill_positions", query):
+            (row,) = pm.plan(parse_args(pm, ["--pgs", "27.10"]), store).rows
+            self.assertAlmostEqual(70.0, row.up_projected, places=2)
+            # 5.1f's replica also goes to osd.2: shown alone, it still needs
+            # 27.10's position, but not that of 27.9, arriving elsewhere.
+            (row,) = pm.plan(parse_args(pm, ["--pgs", "5.1f"]), store).rows
+        self.assertAlmostEqual(70.0, row.up_projected, places=2)
+        self.assertEqual({"5.1f", "27.10"}, set(query.call_args.args[0]))
+
+    def test_a_failed_query_says_what_it_costs_rows_and_proj(self):
+        failed = shared.TimedPositions({}, {}, ["5.3"])
+        store = FakeStore(SNAPSHOTS, commands=pm.SNAPSHOT_COMMANDS, load_dir=None)
+        with (
+            mock.patch.object(
+                shared, "query_backfill_positions", real_query_backfill_positions
+            ),
+            mock.patch.object(shared, "_query_positions", return_value=failed),
+        ):
+            err = stderr_of(pm.plan, parse_args(pm, []), store)
+        self.assertIn("'ceph pg query' failed for 1 of", err)
+        self.assertIn(flat(messages.PROGRESS_QUERY_EFFECT), err)
+        self.assertIn(flat(messages.PROJECTION_QUERY_EFFECT), err)
+
     def test_proj_is_none_without_an_up_osd_or_a_capacity(self):
         snaps = {**SNAPSHOTS, "pg_dump_pgs": [pg("5.2", [0, 3], [0, 1, 2], "active")]}
         with_target, dropped = self.plan(snapshots=snaps).rows
@@ -334,7 +371,7 @@ class MainTest(unittest.TestCase):
         query = mock.Mock(return_value=positions)
         with mock.patch.object(shared, "query_backfill_positions", query):
             out = self.run_main("--pgs", "5.3", "5.1f", "27.10")
-        # Only the PGs shown are queried.
+        # The PGs shown, and none arriving elsewhere (27.9, onto osd.1).
         self.assertEqual({"5.3", "5.1f", "27.10"}, set(query.call_args.args[0]))
         rows = [ln for ln in out.splitlines() if re.match(r"\d+\.[0-9a-f]+ ", ln)]
         self.assertEqual(3, len(rows))
@@ -496,6 +533,7 @@ class FilterTest(unittest.TestCase):
 
 FIXTURE_STUCK_AT_100 = TEST_DATA / "ceph1-backfills-stuck-at-100-pct"
 FIXTURE_RESUMED = TEST_DATA / "ceph1-resumed-backfills-exact-progress"
+FIXTURE_PARTLY_COPIED = TEST_DATA / "ceph2-37-filling-with-partial-backfills"
 
 
 class FixtureReplayTest(unittest.TestCase):
@@ -520,6 +558,10 @@ class FixtureReplayTest(unittest.TestCase):
             "~ marks PROGRESS from Ceph's misplaced/degraded", flat(result.stderr)
         )
 
+    def test_capture_without_positions_is_noted_once(self):
+        err = flat(run_command(pm, load_state=FIXTURE_STUCK_AT_100, check=True).stderr)
+        self.assertEqual(1, err.count(f"has no {shared.BACKFILL_POSITIONS_FILE}"))
+
     def test_resumed_backfills_show_their_real_progress(self):
         # 27.500's counters read 100%, its backfill position 6.6% (see the
         # fixture's README.txt); every PG of the capture has a position.
@@ -541,6 +583,15 @@ class FixtureReplayTest(unittest.TestCase):
         result = run_command(pm, load_state=FIXTURE_RESUMED, check=True)
         self.assertIn("copy movement(s)", result.stderr)  # the notes were captured
         self.assertNotIn("~ marks PROGRESS", flat(result.stderr))
+
+    def test_proj_of_a_new_host_counts_copies_under_way_once(self):
+        # host37 was added empty, so it ends up holding just what CRUSH maps to
+        # it. Counting the part copied twice read 99.2% for osd.924.
+        rows = plan_from_state(pm, FIXTURE_PARTLY_COPIED, "--osds", "924").rows
+        (expected,) = mapped_share_pct(FIXTURE_PARTLY_COPIED, [924]).values()
+        projected = {r.up_projected for r in rows if r.up_osd == 924}
+        self.assertEqual(1, len(projected))
+        self.assertAlmostEqual(expected, projected.pop(), delta=1.0)
 
 
 if __name__ == "__main__":

@@ -96,9 +96,9 @@ def osd_list(osds: Iterable[int]) -> str:
 def blocking_reason(osd_id: int, projected: float) -> str:
     """Say why a shard headed for osd_id is a blocker, in the words every command uses.
 
-    A blocker's target is projected, counting every shard arriving on it,
-    at or over backfillfull_ratio: Ceph refuses that backfill, and
-    backfill_toofull then holds back the whole PG.
+    A blocker's target is projected, counting what every shard arriving on
+    it has yet to copy, at or over backfillfull_ratio: Ceph refuses that
+    backfill, and backfill_toofull then holds back the whole PG.
     """
     return f"osd.{osd_id} projected at {projected:.1f}%, at or over backfillfull_ratio"
 
@@ -125,6 +125,19 @@ def print_progress_note(progress: Iterable[tuple[float | None, bool]]) -> None:
     """Print the '~' footnote if any (pct, exact) is an estimate from counters."""
     if any(pct is not None and not exact for pct, exact in progress):
         stderr_para(f"NOTE: {PROGRESS_APPROX_NOTE}")
+
+
+# What a failed 'pg query' costs (print_query_failed's effect): PROGRESS
+# falls back on the counters, and projections count the PG's arriving shards
+# in full, as not started. One query may serve both.
+PROGRESS_QUERY_EFFECT = "their PROGRESS comes from Ceph's counters (marked '~')"
+PROJECTION_QUERY_EFFECT = (
+    "the projections count their backfills as not started, which may overstate "
+    "their targets"
+)
+PROGRESS_AND_PROJECTION_QUERY_EFFECT = (
+    f"{PROGRESS_QUERY_EFFECT} where shown, and {PROJECTION_QUERY_EFFECT}"
+)
 
 
 def print_query_failed(failed: Iterable[str], total: int, effect: str) -> None:

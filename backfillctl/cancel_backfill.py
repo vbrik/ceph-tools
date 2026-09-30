@@ -5,10 +5,10 @@ the given OSDs.
 
 Each moving shard is pinned to the OSD that holds it now, so nothing moves.
 Ceph refuses a backfill whose target would be projected at or over
-backfillfull_ratio, counting every backfill queued for that OSD, so
-cancelling backfills into a full OSD makes room for the ones you want.
-Without --osds, this stops every backfill it can pin, so you can let them
-through selectively.
+backfillfull_ratio, counting what every backfill queued for that OSD has yet
+to copy, so cancelling backfills into a full OSD makes room for the ones you
+want. Without --osds, this stops every backfill it can pin, so you can let
+them through selectively.
 
 Remove the entries of backfills you want to keep, or pass their PGs to
 --exclude-pgs. Cancelling a running backfill discards its progress.
@@ -26,10 +26,11 @@ the JSON, each entry has its NOTE as 'note', plus 'shard' and 'role'
   shard. Ceph drops an upmap that would put two shards of a PG on one host,
   so the two can only be cancelled together. Keep or remove them together.
 - blocker (--pin-blockers): another shard of the PG whose target is projected
-  at or over backfillfull_ratio, counting every shard arriving there, and the
-  blocker's own companions. backfill_toofull holds back the whole PG,
-  including a backfill you keep. Keep a PG's blocker entries when you keep
-  its backfills into the --osds OSDs.
+  at or over backfillfull_ratio, counting what every shard arriving there has
+  yet to copy (by its position in 'ceph pg query'), and the blocker's own
+  companions. backfill_toofull holds back the whole PG, including a backfill
+  you keep. Keep a PG's blocker entries when you keep its backfills into the
+  --osds OSDs.
 
 A PG with shards arriving on several of the given OSDs is pinned as a
 whole, or not at all.
@@ -52,6 +53,7 @@ import sys
 from typing import NamedTuple
 
 from messages import (
+    PROGRESS_AND_PROJECTION_QUERY_EFFECT,
     osd_list,
     print_pgid_filter,
     print_pin_footer,
@@ -59,7 +61,13 @@ from messages import (
     print_progress_note,
     stderr_para,
 )
-from placement import ProjectedUsage, blocker_projection, find_arriving_shards
+from placement import (
+    ProjectedUsage,
+    arriving_pgids,
+    blocker_projection,
+    find_arriving_shards,
+    with_copied,
+)
 from shared import (
     COLUMNS,
     KIB,
@@ -80,6 +88,7 @@ from shared import (
     check_osds_exist,
     close_pins,
     copies_moving,
+    fetch_backfill_positions,
     fetch_crush_rules,
     fetch_ec_profiles,
     fetch_osd_df,
@@ -236,16 +245,36 @@ def find_blockers(
     ]
 
 
+def blocker_heading(
+    pg_stats: list[dict], pools: dict[int, dict], osds: set[int]
+) -> set[int]:
+    """Return the OSDs a blocker of a PG with one of osds in 'up' may be heading for.
+
+    Those the PG's arriving shards head for (find_blockers). PGs of unknown
+    pools are left out: plan_cancellations rejects them.
+    """
+    return {
+        shard.up_osd
+        for pg in pg_stats
+        if osds & set(pg["up"])
+        and (pool := pools.get(pgid_pool_id(pg["pgid"]))) is not None
+        for shard in find_arriving_shards(pg, is_erasure(pool))
+    }
+
+
 def arrival_projection(
     pg_stats: list[dict],
     pools: dict[int, dict],
     ec_profiles: dict[str, dict],
     osd_df: dict[int, dict],
+    positions: dict[str, dict[str, str]],
 ) -> ProjectedUsage:
-    """Project every OSD with all shards arriving on it, as Ceph does for backfillfull.
+    """Project each OSD as Ceph does for backfillfull: kb_used plus what is arriving.
 
     pg_stats: every remapped PG, not only those being pinned. PGs of
-    unknown pools, or of unknown shard size, add nothing.
+    unknown pools, or of unknown shard size, add nothing. positions is
+    {pgid: {peer: position}}: the part of a shard already copied is in
+    kb_used, so only the rest is added (placement.with_copied).
     """
     arriving = []
     for pg in pg_stats:
@@ -253,7 +282,8 @@ def arrival_projection(
         if pool is None:
             continue
         size = shard_size_bytes(pg, pool, ec_profiles) or 0
-        arriving.extend(find_arriving_shards(pg, is_erasure(pool), size))
+        shards = find_arriving_shards(pg, is_erasure(pool), size)
+        arriving.extend(with_copied(shards, pool, positions.get(pg["pgid"], {})))
     return ProjectedUsage(osd_df, arriving)
 
 
@@ -316,6 +346,7 @@ def plan_cancellations(
     backfillfull_pct: float | None = None,
     pin_blockers: bool = False,
     exclude_pgs: frozenset[str] | set[str] = frozenset(),
+    positions: dict[str, dict[str, str]] | None = None,
 ) -> tuple[list[Cancellation], list[Skipped]]:
     """Return (cancellations, skipped) for the backfills into osds, in PG order.
 
@@ -323,7 +354,8 @@ def plan_cancellations(
     PG's shards arriving on osds are pinned together with their companions
     (close_pins), all or none, and, with pin_blockers, its blockers
     (find_blockers). A blocker that cannot be pinned is skipped; the
-    requested pins stay. PGs in exclude_pgs are ignored.
+    requested pins stay. PGs in exclude_pgs are ignored. positions: the
+    backfill positions of pg_stats, for the blockers' projection.
 
     Exits with an error if a pool is unknown or its failure domain is not
     host.
@@ -333,7 +365,7 @@ def plan_cancellations(
     )
     # From all remapped PGs, before filtering: Ceph counts every queued backfill.
     projection = (
-        arrival_projection(pg_stats, pools, ec_profiles, osd_df)
+        arrival_projection(pg_stats, pools, ec_profiles, osd_df, positions or {})
         if blockers_enabled
         else None
     )
@@ -530,6 +562,17 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
             f"matched a remapped PG{involving} and were left alone",
             "not remapped" + (f", not involving {osd_list(osds)}" if osds else ""),
         )
+    # --pin-blockers projects the OSDs a blocker may be heading for; the same
+    # positions give PROGRESS.
+    positions = (
+        fetch_backfill_positions(
+            store,
+            arriving_pgids(pg_stats, pools, blocker_heading(pg_stats, pools, osds)),
+            PROGRESS_AND_PROJECTION_QUERY_EFFECT,
+        )
+        if args.pin_blockers and backfillfull_pct is not None
+        else None
+    )
     cancellations, skipped = plan_cancellations(
         pg_stats,
         pools,
@@ -541,6 +584,7 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
         backfillfull_pct,
         args.pin_blockers,
         exclude_pgs,
+        positions,
     )
     # Without --osds every pin is wanted for itself, so a chain's last pin
     # stays even when the one before it cannot.
@@ -550,7 +594,9 @@ def plan(args: argparse.Namespace, store: SnapshotStore) -> StopResult:
     cancellations = resolved.cancellations
     skipped = sorted(skipped + resolved.skipped, key=skipped_sort_key)
     if not args.pgremapper_mappings:  # JSON has no PROGRESS: skip the queries
-        cancellations = with_exact_progress(store, cancellations, pg_stats, pools)
+        cancellations = with_exact_progress(
+            store, cancellations, pg_stats, pools, positions
+        )
     return StopResult(
         osds=sorted(osds),
         cancellations=cancellations,

@@ -21,10 +21,11 @@ target is the OSD that ends up least utilized among those that:
 
 Utilization here is projected (PROJ in the table): what an OSD will hold
 once every backfill in motion and every proposal completes, crediting data
-leaving it. Shards whose data sits on the fullest OSD are placed first. If
-room runs out, apply the proposals, let them finish and run again. PGs
-whose existing upmap pairs chain are left alone, and no proposal makes a
-PG's pairs chain: pgremapper would break them.
+leaving it. A backfill under way adds only what it has yet to copy, by its
+position in 'ceph pg query'. Shards whose data sits on the fullest OSD are
+placed first. If room runs out, apply the proposals, let them finish and run
+again. PGs whose existing upmap pairs chain are left alone, and no proposal
+makes a PG's pairs chain: pgremapper would break them.
 
 Table groups: ACTING is where the data is ('none' if unknown, e.g. its OSD
 is out), UP where the stalled backfill is headed, TARGET the proposed OSD.

@@ -181,6 +181,29 @@ class RunTest(unittest.TestCase):
         self.assertEqual(["19.2"], queried)
         self.assertEqual(positions, saved["backfill_positions"])
 
+    def test_positions_are_read_before_osd_df(self):
+        # Then kb_used holds all a position counts as copied: replays may
+        # overstate a target, never understate it.
+        canned, order = self.canned(), []
+
+        def ceph_json(cmd):
+            order.append(" ".join(cmd[1:3]))
+            return canned[tuple(cmd)]
+
+        def query(pgids, *effect):
+            order.append("pg query")
+            return {}
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(shared, "ceph_json", ceph_json),
+            mock.patch.object(ss, "query_backfill_positions", query),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            ss.run(parse_args(ss, [tmp + "/snap"]))
+        self.assertLess(order.index("pg dump"), order.index("pg query"))
+        self.assertLess(order.index("pg query"), order.index("osd df"))
+
     def test_refuses_a_non_empty_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             (pathlib.Path(tmp) / "old.json").write_text("{}")

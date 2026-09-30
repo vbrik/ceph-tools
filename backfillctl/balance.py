@@ -11,8 +11,9 @@ is done once it is below the level, or when none of its shards can move.
 
 Utilization here is projected (PROJ in the table): what an OSD will hold once
 every backfill in motion and every proposal completes, crediting data leaving
-it. The mean is capacity-weighted: where every OSD would be if the class's
-data were spread evenly.
+it. A backfill under way adds only what it has yet to copy, by its position
+in 'ceph pg query'. The mean is capacity-weighted: where every OSD would be
+if the class's data were spread evenly.
 
 The target is the OSD that ends up least utilized among those that:
 

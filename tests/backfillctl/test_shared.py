@@ -544,10 +544,25 @@ class FetchBackfillPositionsTest(unittest.TestCase):
                 shared.fetch_backfill_positions(store, ["1.1", "1.3"]),
             )
 
-    def test_older_capture_without_the_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
+    def fetch_from_empty_capture(self, pgids, *effect):
+        """Return (positions, stderr) of fetching pgids from a capture without the file."""
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             store = FakeStore({}, load_dir=pathlib.Path(tmp))
-            self.assertEqual({}, shared.fetch_backfill_positions(store, ["1.1"]))
+            positions = shared.fetch_backfill_positions(store, pgids, *effect)
+        return positions, " ".join(err.getvalue().split())
+
+    def test_older_capture_without_the_file(self):
+        # PROGRESS's '~' footnote says positions were unavailable: no more to say.
+        self.assertEqual(({}, ""), self.fetch_from_empty_capture(["1.1"]))
+
+    def test_older_capture_is_noted_with_the_effect_given(self):
+        positions, err = self.fetch_from_empty_capture(["1.1"], "the effect")
+        self.assertEqual({}, positions)
+        self.assertIn(f"has no {shared.BACKFILL_POSITIONS_FILE}", err)
+        self.assertIn("the effect", err)
+        # Nothing asked for, nothing missed.
+        self.assertEqual(({}, ""), self.fetch_from_empty_capture([], "the effect"))
 
 
 class EcShardMovesTest(unittest.TestCase):

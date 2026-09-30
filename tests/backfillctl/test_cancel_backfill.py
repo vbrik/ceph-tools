@@ -245,9 +245,9 @@ class ArrivalProjectionTest(unittest.TestCase):
     def setUp(self):
         self.df = {77: osd_df_node(77, 89.0, kb=1000), 5: osd_df_node(5, 50.0, kb=1000)}
 
-    def projection(self, pgs, pools=None):
+    def projection(self, pgs, pools=None, positions=None):
         return cb.arrival_projection(
-            pgs, pools or {19: EC_POOL_DETAIL}, EC_PROFILES, self.df
+            pgs, pools or {19: EC_POOL_DETAIL}, EC_PROFILES, self.df, positions or {}
         )
 
     def test_every_shard_arriving_counts(self):
@@ -257,6 +257,16 @@ class ArrivalProjectionTest(unittest.TestCase):
             pg_stat("19.2", [3, 77], [3, 9], num_bytes=40 * 1024),
         ]
         self.assertAlmostEqual(self.projection(pgs).utilization_after(77, 0), 91.0)
+
+    def test_the_part_already_copied_counts_once(self):
+        # osd.77's 89% holds all of 19.1's shard (MAX) and half of 19.2's.
+        pgs = [
+            pg_stat("19.1", [77, 2], [8, 2], num_bytes=40 * 1024),
+            pg_stat("19.2", [3, 77], [3, 9], num_bytes=40 * 1024),
+        ]
+        positions = {"19.1": {"77(0)": "MAX"}, "19.2": {"77(1)": "48000000"}}
+        projection = self.projection(pgs, positions=positions)
+        self.assertAlmostEqual(projection.utilization_after(77, 0), 89.5)
 
     def test_pgs_of_unknown_pools_add_nothing(self):
         pgs = [pg_stat("42.1", [77, 2], [8, 2], num_bytes=40 * 1024)]
@@ -1242,6 +1252,51 @@ class MainTest(unittest.TestCase):
         self.assertIn(" 0% ", out)
         self.assertNotIn("~", out.split("\n\n")[0])
         self.assertNotIn("~ marks PROGRESS", err)
+
+    def test_pin_blockers_counts_the_part_already_copied_once(self):
+        # 19.5's shard 3 heads for osd.77 at 90.5%: 1% more would be over the
+        # 91% backfillfull_ratio, but that 1% is all there already (MAX).
+        pgs = [pg_stat("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66], num_bytes=40 * 1024)]
+        extra = [{"id": 77, "utilization": 90.5, "kb": 1000, "kb_used": 905}]
+        argv = ("--osds", "682", "--pin-blockers")
+        for positions, shards in (({"19.5": {"77(3)": "MAX"}}, [0]), ({}, [0, 3])):
+            with self.subTest(positions=positions):
+                query = mock.Mock(
+                    side_effect=lambda pgids, *effect, positions=positions: {
+                        p: positions[p] for p in pgids if p in positions
+                    }
+                )
+                with mock.patch.object(shared, "query_backfill_positions", query):
+                    result = self.plan(*argv, pgs=pgs, extra_osds=extra)
+                self.assertEqual([c.shard for c in result.cancellations], shards)
+
+    def test_pin_blockers_queries_each_pg_once(self):
+        # One query serves the blockers' projection and PROGRESS.
+        pgs = [pg_stat("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66])]
+        positions = {"19.5": {f"{OSD}(0)": "MIN"}}
+        query = mock.Mock(
+            side_effect=lambda pgids, *effect: {
+                p: positions[p] for p in pgids if p in positions
+            }
+        )
+        with mock.patch.object(shared, "query_backfill_positions", query):
+            result = self.plan("--osds", "682", "--pin-blockers", pgs=pgs)
+        query.assert_called_once()
+        c = result.cancellations[0]
+        self.assertEqual((0.0, True), (c.progress_pct, c.progress_exact))
+
+    def test_pin_blockers_queries_the_pgs_arriving_where_a_blocker_may_head(self):
+        # 19.5's shards head for osd.682 and osd.77. 19.6 arrives on osd.77
+        # too, so it counts there; 19.7 arrives on osd.44, where none does.
+        pgs = [
+            pg_stat("19.5", [OSD, 2, 3, 77], [8, 2, 3, 66]),
+            pg_stat("19.6", [5, 77], [5, 9]),
+            pg_stat("19.7", [5, 44], [5, 9]),
+        ]
+        query = mock.Mock(return_value={})
+        with mock.patch.object(shared, "query_backfill_positions", query):
+            self.plan("--osds", "682", "--pin-blockers", pgs=pgs)
+        self.assertEqual({"19.5", "19.6"}, set(query.call_args.args[0]))
 
     def test_pgremapper_mappings_is_json_with_every_pair_and_no_warning(self):
         out, err = self.run_main("--pgremapper-mappings", "--osds", "682")

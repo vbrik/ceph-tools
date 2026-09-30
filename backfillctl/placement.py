@@ -19,9 +19,13 @@ from shared import (
     KIB,
     POOL_TYPE_ERASURE,
     SnapshotStore,
+    is_erasure,
     is_real_osd,
+    pgid_pool_id,
     real_osd_set,
     slot,
+    target_peer,
+    target_progress_pct,
 )
 
 # Ceph's defaults (OSDMap::build_simple), for an 'osd dump' without them.
@@ -151,6 +155,7 @@ class ArrivingShard(NamedTuple):
     acting_osd: int | None  # where its data is; None if unknown (out OSD)
     up_set: list  # the PG's up set
     size_bytes: int = 0  # see shard_size_bytes; 0 if unknown
+    copied_bytes: int = 0  # already on up_osd, so in its kb_used (with_copied)
 
 
 def find_arriving_shards(
@@ -185,6 +190,45 @@ def find_arriving_shards(
             found.append(ArrivingShard(pgid, "-", up_osd, acting_osd, up, size_bytes))
 
     return found
+
+
+def with_copied(
+    shards: Iterable[ArrivingShard], pool: dict, positions: dict[str, str]
+) -> list[ArrivingShard]:
+    """Return shards with copied_bytes set from their targets' backfill positions.
+
+    shards are of one PG of pool; positions is that PG's {peer: position}
+    (shared.fetch_backfill_positions). A shard whose position is unknown
+    counts as not started, which may overstate its target. Ceph's counters
+    are no fallback: they can read 100% for a backfill barely started.
+
+    A position read after kb_used (live, the positions come last) also counts
+    what arrived in between, understating its target by those seconds of
+    backfill: a thousandth of a point or so. save-state reads the positions
+    first.
+    """
+    result = []
+    for shard in shards:
+        position = positions.get(target_peer(shard.up_osd, shard.shard))
+        pct = target_progress_pct(shard.pgid, pool, position) or 0.0
+        result.append(shard._replace(copied_bytes=int(shard.size_bytes * pct / 100)))
+    return result
+
+
+def arriving_pgids(
+    pgs: Iterable[dict], pools: dict[int, dict], osds: set[int]
+) -> set[str]:
+    """Return the PGs of pgs with a shard arriving on one of osds.
+
+    These are the PGs whose backfill positions osds' projections need.
+    PGs of pools not in pools are left out.
+    """
+    return {
+        pg["pgid"]
+        for pg in pgs
+        if (pool := pools.get(pgid_pool_id(pg["pgid"]))) is not None
+        and any(s.up_osd in osds for s in find_arriving_shards(pg, is_erasure(pool)))
+    }
 
 
 class MappedShard(NamedTuple):
@@ -281,7 +325,10 @@ def usage_and_capacity(
 
 
 class Retargetable(Protocol):
-    """A shard headed for up_osd, of size_bytes: what ProjectedUsage tracks."""
+    """What ProjectedUsage tracks: a shard of pgid headed for up_osd, of size_bytes."""
+
+    @property
+    def pgid(self) -> str: ...
 
     @property
     def up_osd(self) -> int: ...
@@ -293,19 +340,23 @@ class Retargetable(Protocol):
 class ProjectedUsage:
     """What each OSD will hold once the backfills in motion complete.
 
-    'ceph osd df' usage plus every shard arriving on the OSD (not yet in
-    kb_used). A re-targeted shard counts where it was headed until
-    redirect() or cancel() moves it.
+    'ceph osd df' usage plus the rest of every shard arriving on the OSD:
+    kb_used already holds its copied_bytes. A re-targeted shard counts where
+    it was headed until redirect() or cancel() moves it.
 
-    Data leaving an OSD is never credited, and backfills not passed in are
-    not counted.
+    Data leaving an OSD is never credited, a shard's copied part included,
+    and backfills not passed in are not counted.
     """
 
-    def __init__(self, osd_df: dict[int, dict], arriving: Iterable[Retargetable]):
+    def __init__(self, osd_df: dict[int, dict], arriving: Iterable[ArrivingShard]):
         self._used, self._capacity = usage_and_capacity(osd_df)
+        # copied_bytes by (pgid, up OSD), for cancel(): the shards callers
+        # pass it are built afresh, without them.
+        self._copied: dict[tuple[str, int], int] = {}
         for shard in arriving:
             if shard.up_osd in self._used:
-                self._used[shard.up_osd] += shard.size_bytes
+                self._used[shard.up_osd] += shard.size_bytes - shard.copied_bytes
+                self._copied[shard.pgid, shard.up_osd] = shard.copied_bytes
 
     def knows(self, osd_id: int) -> bool:
         """True if the OSD has a capacity figure, so it can be projected."""
@@ -325,9 +376,21 @@ class ProjectedUsage:
         self._used[osd_id] += size_bytes
 
     def cancel(self, shard: Retargetable) -> None:
-        """Record that shard no longer goes to its up OSD (e.g. pinned back)."""
+        """Record that shard no longer goes to its up OSD (e.g. pinned back).
+
+        Takes off only the part not yet copied: the rest is data leaving.
+        """
         if shard.up_osd in self._used:
-            self._used[shard.up_osd] -= shard.size_bytes
+            self._used[shard.up_osd] -= self._still_to_come(shard)
+
+    def uncancel(self, shard: Retargetable) -> None:
+        """Undo cancel(shard)."""
+        if shard.up_osd in self._used:
+            self._used[shard.up_osd] += self._still_to_come(shard)
+
+    def _still_to_come(self, shard: Retargetable) -> int:
+        """Return the bytes of shard not yet on its up OSD."""
+        return shard.size_bytes - self._copied.get((shard.pgid, shard.up_osd), 0)
 
 
 def departing_osds(pg: dict, is_ec: bool) -> list[int]:
@@ -352,7 +415,8 @@ class FinalUsage:
     Unlike ProjectedUsage, data leaving an OSD is credited: this is where an
     OSD ends up (shed's ranking and levels). Target caps still
     use ProjectedUsage, since Ceph checks a target when reserving the
-    backfill, before the source frees any space.
+    backfill, before the source frees any space. move() counts whole
+    shards, so moving one still arriving also frees its copied part.
     """
 
     def __init__(
@@ -361,7 +425,10 @@ class FinalUsage:
         arriving: Iterable[tuple[int, int]],
         departing: Iterable[tuple[int, int]],
     ):
-        """arriving and departing: (OSD, bytes) of each shard in motion."""
+        """arriving and departing: (OSD, bytes) of each shard in motion.
+
+        An arriving shard's bytes leave out what kb_used already holds.
+        """
         self._used, self._capacity = usage_and_capacity(osd_df)
         for osd_id, size in arriving:
             if osd_id in self._used:
@@ -402,20 +469,30 @@ class FinalUsage:
 
 
 def project_usage(
-    osd_df: dict[int, dict], pgs: Iterable[tuple[dict, bool, int]]
+    osd_df: dict[int, dict],
+    pgs: Iterable[dict],
+    pools: dict[int, dict],
+    ec_profiles: dict[str, dict],
+    positions: dict[str, dict[str, str]],
 ) -> tuple[ProjectedUsage, FinalUsage]:
     """Return (reservation, final) projections of the backfills in motion in pgs.
 
-    pgs: (pg, is_ec, shard size in bytes). reservation counts each arriving
-    shard (target caps, blockers); final also credits the OSD it leaves.
+    Each PG's pool must be in pools (shared.check_known_pools); exits on an
+    unknown shard size. positions is {pgid: {peer: position}}, for the part
+    of each arriving shard already copied (with_copied). reservation counts
+    the rest of each arriving shard (target caps, blockers); final also
+    credits the OSD it leaves.
     """
     arriving: list[ArrivingShard] = []
     departing: list[tuple[int, int]] = []
-    for pg, is_ec, size in pgs:
-        arriving.extend(find_arriving_shards(pg, is_ec, size))
+    for pg in pgs:
+        pool = pools[pgid_pool_id(pg["pgid"])]
+        is_ec, size = is_erasure(pool), shard_size_bytes(pg, pool, ec_profiles)
+        shards = find_arriving_shards(pg, is_ec, size)
+        arriving.extend(with_copied(shards, pool, positions.get(pg["pgid"], {})))
         departing.extend((o, size) for o in departing_osds(pg, is_ec))
     return ProjectedUsage(osd_df, arriving), FinalUsage(
-        osd_df, ((s.up_osd, s.size_bytes) for s in arriving), departing
+        osd_df, ((s.up_osd, s.size_bytes - s.copied_bytes) for s in arriving), departing
     )
 
 
