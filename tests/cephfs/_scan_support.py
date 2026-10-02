@@ -1,6 +1,8 @@
 """Test support for scan-growing-dirs.py: the module itself, a fake CephFS
 with a fake clock, and helpers that build sampled trees directly."""
 
+from __future__ import annotations
+
 import errno
 import importlib.util
 import itertools
@@ -48,10 +50,18 @@ class FakeDir:
 
 class FakeFs:
     """An in-memory CephFS. Each getxattr and listing takes `latency` seconds
-    of fake clock time; sleep() advances the clock without waiting."""
+    of fake clock time; sleep() advances the clock without waiting, then
+    calls after_sleep(self), if given, to change the tree mid-run."""
 
-    def __init__(self, dirs: dict[str, FakeDir], files=(), latency=0.001):
+    def __init__(
+        self,
+        dirs: dict[str, FakeDir],
+        files=(),
+        latency=0.001,
+        after_sleep: Callable[[FakeFs], object] | None = None,
+    ):
         self.dirs = dirs
+        self.after_sleep = after_sleep
         self.files = set(files)
         self.links: dict[str, str] = {}  # path -> realpath
         self.latency = latency
@@ -118,6 +128,8 @@ class FakeFs:
         with self.lock:
             self.calls.append(("sleep", seconds))
             self.t += seconds
+        if self.after_sleep is not None:
+            self.after_sleep(self)
 
     def listed(self) -> list[str]:
         """Paths listed so far, in call order."""
@@ -156,18 +168,17 @@ def bfs(*roots):
     return nodes
 
 
-def mkrun(nodes, probed=0, not_cephfs=()):
-    """A Run of nodes (BFS order) with default limits."""
+def mkrun(nodes, probed=0, not_cephfs=(), **limits):
+    """A Run of nodes (BFS order), with the default sampling limits except
+    those given."""
+    defaults = {k: v for k, v in sg.SAMPLING_DEFAULTS.items() if k != "threads"}
     return sg.Run(
         roots=[node.path for node in nodes if node.parent is None],
         nodes=nodes,
-        delay=60.0,
-        depth=5,
-        max_dirs=1000,
-        max_entries=10_000,
         created="2033-05-18T03:33:20+00:00",
         probed=probed,
         not_cephfs=list(not_cephfs),
+        **(defaults | limits),
     )
 
 

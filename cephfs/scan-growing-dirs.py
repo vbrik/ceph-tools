@@ -21,6 +21,7 @@ import contextlib
 import datetime
 import enum
 import errno
+import itertools
 import json
 import math
 import os
@@ -28,11 +29,18 @@ import re
 import sys
 import textwrap
 import time
-from collections.abc import Collection, Sequence
-from concurrent.futures import Executor, ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Executor,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import NoReturn, TextIO
+from types import NoneType
+from typing import Any, NoReturn, TextIO
 
 RBYTES = "ceph.dir.rbytes"
 RCTIME = "ceph.dir.rctime"
@@ -42,9 +50,13 @@ ENTRIES = "ceph.dir.entries"
 # clock skew and late size and rstat updates.
 IDLE_GRACE = 30.0
 
-# Subdirs per rctime probe task: enough tasks to keep the threads busy on one
-# wide dir, few enough futures for millions of probes.
+# Subdirs per rctime probe task, so that one wide dir still spreads over the
+# threads.
 PROBE_BATCH = 16
+
+# Probe tasks in flight at once: enough to keep any sensible --threads busy,
+# few enough that millions of probes don't hold millions of futures.
+IN_FLIGHT_BATCHES = 1024
 
 # Warnings and notes name at most this many paths; --json lists them all.
 MAX_LISTED_PATHS = 10
@@ -156,6 +168,8 @@ class Reason(enum.StrEnum):
 
 
 class Kind(enum.StrEnum):
+    """A row's kind. Members are in sort and legend order."""
+
     FILES = "files"
     SPREAD = "spread"
     TREE = "tree"
@@ -168,6 +182,14 @@ KIND_TEXT = {
     Kind.TREE: "growth of a subtree that wasn't explored (NOTE says why)",
 }
 APPROX_TEXT = "may include growth in subdirs that couldn't be measured"
+
+# For each leaf reason: the NOTE of its tree row, and what to do (--help).
+REASON_TEXT = {
+    Reason.DEPTH: ("depth limit", "rerun with the dir as ROOT or a larger --depth"),
+    Reason.WIDE: ("{entries} entries", "raise --max-entries"),
+    Reason.UNLISTABLE: ("unlistable", "the dir needs read permission"),
+    Reason.IDLE: ("idle at start", "rerun"),
+}
 
 
 @dataclass(slots=True)
@@ -321,7 +343,7 @@ def analyze(nodes: list[Node], threshold: float) -> list[Row]:
         own = own_rate(node)
         unreadable = [
             *node.unreadable,
-            *(c.path for c in node.children if c.rate is None and not c.vanished),
+            *(c.path for c in node.children if c.sample_error is not None),
         ]
         if own >= threshold:
             add_row(node, Kind.FILES, own, unreadable, node.woke_up)
@@ -337,16 +359,9 @@ def analyze(nodes: list[Node], threshold: float) -> list[Row]:
 
 def reason_note(node: Node) -> str:
     """NOTE for a tree row: why its subtree wasn't explored."""
-    match node.reason:
-        case Reason.DEPTH:
-            return "depth limit"
-        case Reason.WIDE:
-            return f"{node.entries} entries"
-        case Reason.UNLISTABLE:
-            return "unlistable"
-        case Reason.IDLE:
-            return "idle at start"
-    raise ValueError(f"{node.path} has no leaf reason")
+    if node.reason is None:
+        raise ValueError(f"{node.path} has no leaf reason")
+    return REASON_TEXT[node.reason][0].format(entries=node.entries)
 
 
 def unmeasured_note(unreadable: Sequence[str], woke_up: Sequence[str]) -> str:
@@ -359,7 +374,7 @@ def unmeasured_note(unreadable: Sequence[str], woke_up: Sequence[str]) -> str:
     return "; ".join(parts)
 
 
-_KIND_ORDER = {Kind.FILES: 0, Kind.SPREAD: 1, Kind.TREE: 2}
+_KIND_ORDER = {kind: i for i, kind in enumerate(Kind)}
 
 
 def _depth_key(row: Row) -> tuple:
@@ -595,9 +610,28 @@ def _xattr_problem(exc: OSError) -> str:
     return f"can't read ceph.dir.* attributes: {_strerror(exc)}"
 
 
-def preflight(paths: list[str], fs: Fs) -> list[Node]:
+def _within(path: str, top: str) -> bool:
+    """Whether path is top or inside it. Both are absolute and normalized."""
+    return os.path.commonpath([path, top]) == top
+
+
+def _check_root(fs: Fs, given: str) -> tuple[str, str | None]:
+    """(given resolved, why it can't be a root or None)."""
+    path = fs.realpath(os.path.abspath(given))
+    if not fs.isdir(path):
+        return path, "not a directory" if fs.exists(path) else "no such directory"
+    try:
+        for name in (RBYTES, RCTIME, ENTRIES):
+            fs.getxattr(path, name)
+    except OSError as exc:
+        return path, _xattr_problem(exc)
+    return path, None
+
+
+def preflight(paths: list[str], fs: Fs, pool: Executor) -> list[Node]:
     """Return a depth-0 Node for each root, its path resolved: made absolute,
-    with symlinks followed.
+    with symlinks followed. Roots are checked in parallel, since a glob such
+    as /home/* can give hundreds.
 
     Raises FatalError, with one argument per problem, if any root is
     missing, isn't a directory, has unreadable or no ceph.dir.* attributes,
@@ -605,27 +639,19 @@ def preflight(paths: list[str], fs: Fs) -> list[Node]:
     """
     problems = []
     found: list[tuple[str, str]] = []  # (resolved path, as given)
-    for given in paths:
-        path = fs.realpath(os.path.abspath(given))
-        if not fs.isdir(path):
-            what = "not a directory" if fs.exists(path) else "no such directory"
-            problems.append(f"{given}: {what}")
-            continue
-        try:
-            for name in (RBYTES, RCTIME, ENTRIES):
-                fs.getxattr(path, name)
-        except OSError as exc:
-            problems.append(f"{given}: {_xattr_problem(exc)}")
-            continue
-        found.append((path, given))
+    checked = pool.map(partial(_check_root, fs), paths)
+    for given, (path, problem) in zip(paths, checked, strict=True):
+        if problem is None:
+            found.append((path, given))
+        else:
+            problems.append(f"{given}: {problem}")
     for i, (a, given_a) in enumerate(found):
         for b, given_b in found[:i]:
-            common = os.path.commonpath([a, b])
             if a == b:
                 problems.append(f"{given_a} is the same directory as {given_b}")
-            elif common == b:
+            elif _within(a, b):
                 problems.append(f"{given_a} is inside {given_b}")
-            elif common == a:
+            elif _within(b, a):
                 problems.append(f"{given_b} is inside {given_a}")
     if problems:
         raise FatalError(*problems)
@@ -684,6 +710,53 @@ def _probe(fs: Fs, paths: list[str]) -> list[float | OSError]:
     return results
 
 
+def _probe_batches(
+    batches: list[tuple[Node, list[str]]],
+    fs: Fs,
+    pool: Executor,
+    on_done: Callable[[list[float | OSError]], None] | None = None,
+) -> list[list[float | OSError]]:
+    """Probe the paths of each batch, IN_FLIGHT_BATCHES at a time, and return
+    the results in batch order.
+
+    on_done(results) runs in this thread as each batch finishes. If it
+    raises, the batches not yet done are cancelled.
+    """
+    results: list[list[float | OSError]] = [[] for _ in batches]
+    todo = iter(enumerate(batches))
+    pending: dict[Future, int] = {}
+
+    def submit(count: int) -> None:
+        for i, (_, paths) in itertools.islice(todo, count):
+            pending[pool.submit(_probe, fs, paths)] = i
+
+    try:
+        submit(IN_FLIGHT_BATCHES)
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                i = pending.pop(future)
+                results[i] = future.result()
+                if on_done is not None:
+                    on_done(results[i])
+            submit(len(done))
+    except BaseException:
+        for future in pending:
+            future.cancel()
+        raise
+    return results
+
+
+def _each_probe(
+    batches: Iterable[tuple[Node, list[str]]],
+    results: Iterable[list[float | OSError]],
+) -> Iterator[tuple[Node, str, float | OSError]]:
+    """(node, path, result) for each path probed in batches."""
+    for (node, paths), probed in zip(batches, results, strict=True):
+        for path, result in zip(paths, probed, strict=True):
+            yield node, path, result
+
+
 def _list_subdirs(
     node: Node, fs: Fs, cutoff: float, max_entries: int
 ) -> dict[str, int]:
@@ -708,11 +781,6 @@ def _list_subdirs(
 
 def _too_many(run: Run, depth: int) -> FatalError:
     """The error for tracking more than --max-dirs dirs, found at depth."""
-    if depth == 0:
-        return FatalError(
-            f"{plural(len(run.nodes), 'root')} given, but --max-dirs is "
-            f"{run.max_dirs}; give fewer roots or raise --max-dirs"
-        )
     return FatalError(
         f"more than {run.max_dirs} dirs changed in the last "
         f"{run.delay + IDLE_GRACE:g} s (stopped at depth {depth}); lower "
@@ -732,51 +800,40 @@ def _expand(
     tracked ones: the next level, in BFS order."""
     depth = level[0].depth + 1
     list_one = partial(_list_subdirs, fs=fs, cutoff=cutoff, max_entries=run.max_entries)
-    listings = list(pool.map(list_one, level))
-    inodes = {path: ino for listing in listings for path, ino in listing.items()}
+    listings = dict(zip(level, pool.map(list_one, level), strict=True))
     batches = [
         batch
-        for node, listing in zip(level, listings, strict=True)
+        for node, listing in listings.items()
         for batch in _batched(node, list(listing))
     ]
-    futures = {
-        pool.submit(_probe, fs, paths): i for i, (_, paths) in enumerate(batches)
-    }
-    results: list[list[float | OSError]] = [[] for _ in batches]
     active = 0
-    try:
-        for future in as_completed(futures):
-            probed = results[futures[future]] = future.result()
-            run.probed += len(probed)
-            active += sum(
-                not isinstance(result, OSError) and result >= cutoff
-                for result in probed
-            )
-            if len(run.nodes) + active > run.max_dirs:
-                raise _too_many(run, depth)
-            progress.update(
-                f"Depth {depth}: probed {plural(run.probed, 'subdir')}, "
-                f"tracking {plural(len(run.nodes) + active, 'dir')}"
-            )
-    except BaseException:
-        for future in futures:
-            future.cancel()
-        raise
+
+    def count(probed: list[float | OSError]) -> None:
+        """Stop once too many dirs are active; show progress."""
+        nonlocal active
+        run.probed += len(probed)
+        active += sum(not isinstance(r, OSError) and r >= cutoff for r in probed)
+        if len(run.nodes) + active > run.max_dirs:
+            raise _too_many(run, depth)
+        progress.update(
+            f"Depth {depth}: probed {plural(run.probed, 'subdir')}, "
+            f"tracking {plural(len(run.nodes) + active, 'dir')}"
+        )
 
     next_level = []
-    for (node, paths), probed in zip(batches, results, strict=True):
-        for path, result in zip(paths, probed, strict=True):
-            if isinstance(result, OSError):
-                if result.errno in NOT_CEPHFS:
-                    run.not_cephfs.append(path)
-                elif result.errno not in VANISHED:
-                    node.unreadable[path] = _strerror(result)
-            elif result >= cutoff:
-                child = Node(path, node.root, depth, parent=node, ino=inodes[path])
-                node.children.append(child)
-                next_level.append(child)
-            else:
-                node.idle[path] = result
+    probed = _probe_batches(batches, fs, pool, count)
+    for node, path, result in _each_probe(batches, probed):
+        if isinstance(result, OSError):
+            if result.errno in NOT_CEPHFS:
+                run.not_cephfs.append(path)
+            elif result.errno not in VANISHED:
+                node.unreadable[path] = _strerror(result)
+        elif result >= cutoff:
+            child = Node(path, node.root, depth, parent=node, ino=listings[node][path])
+            node.children.append(child)
+            next_level.append(child)
+        else:
+            node.idle[path] = result
     run.nodes += next_level
     return next_level
 
@@ -790,7 +847,10 @@ def build(run: Run, fs: Fs, pool: Executor, progress: Progress) -> None:
     """
     cutoff = fs.now() - run.delay - IDLE_GRACE
     if len(run.nodes) > run.max_dirs:
-        raise _too_many(run, 0)
+        raise FatalError(
+            f"{plural(len(run.nodes), 'root')} given, but --max-dirs is "
+            f"{run.max_dirs}; give fewer roots or raise --max-dirs"
+        )
     level = list(run.nodes)
     for depth in range(run.depth):
         progress.phase(f"Depth {depth + 1}: exploring {plural(len(level), 'dir')}")
@@ -820,19 +880,16 @@ def sample_all(nodes: list[Node], fs: Fs, pool: Executor, *, second: bool) -> No
     """
     todo = [node for node in nodes if node.sample_error is None and not node.vanished]
     read = pool.map(partial(_read_rbytes, fs), [node.path for node in todo])
+    slot = "s2" if second else "s1"
     for node, (result, t) in zip(todo, read, strict=True):
-        if isinstance(result, OSError):
-            if result.errno not in VANISHED:
-                node.sample_error = _strerror(result)
-                continue
-            node.vanished = True
-            if not second:
-                continue
-            result = 0
-        if second:
-            node.s2 = Sample(result, t)
+        if not isinstance(result, OSError):
+            setattr(node, slot, Sample(result, t))
+        elif result.errno not in VANISHED:
+            node.sample_error = _strerror(result)
         else:
-            node.s1 = Sample(result, t)
+            node.vanished = True
+            if second:
+                node.s2 = Sample(0, t)
 
 
 def _relist(fs: Fs, node: Node) -> dict[str, int]:
@@ -857,8 +914,7 @@ def _move(node: Node, new: str, run: Run) -> None:
     old = node.path
 
     def moved(path: str) -> str:
-        inside = path == old or path.startswith(old + "/")
-        return new + path[len(old) :] if inside else path
+        return new + path[len(old) :] if _within(path, old) else path
 
     node.renamed_from = old
     for n in _subtree(node):
@@ -869,72 +925,62 @@ def _move(node: Node, new: str, run: Run) -> None:
     run.not_cephfs = [moved(p) for p in run.not_cephfs]
 
 
-def _follow_renames(
-    listings: dict[Node, dict[str, int]], run: Run, fs: Fs, pool: Executor
-) -> list[Node]:
-    """Find tracked subdirs that vanished but reappear in their parent's new
-    listing under another name, with the same inode. Move each one, and
-    re-read the second sample of its tracked subtree at the new paths, so
-    the rename isn't counted as the dir shrinking to 0 and a new dir
-    appearing. Return the renamed nodes."""
+def follow_renames(run: Run, fs: Fs, pool: Executor) -> None:
+    """Follow tracked dirs renamed within their parent during the sleep.
+
+    A tracked dir that vanished in sample 2, while its parent now lists a
+    subdir with its inode, was renamed. Its subtree moves to the new path
+    and is sampled a second time there, so the rename isn't counted as the
+    dir shrinking to 0 plus a new dir appearing.
+    """
+    gone = {
+        node
+        for node in run.nodes
+        if node.vanished and node.s1 is not None and node.parent is not None
+    }
+    parents = list(dict.fromkeys(node.parent for node in gone))
     renamed = []
-    for node, listing in listings.items():
-        gone = {
-            child.ino: child
-            for child in node.children
-            if child.vanished and child.s1 is not None and child.ino is not None
-        }
+    relist = partial(_relist, fs)
+    for parent, listing in zip(parents, pool.map(relist, parents), strict=True):
+        by_ino = {child.ino: child for child in parent.children if child in gone}
         for path, ino in listing.items():
-            if (child := gone.pop(ino, None)) is not None:
+            if (child := by_ino.pop(ino, None)) is not None:
                 _move(child, path, run)
                 renamed.append(child)
-    resample = [n for child in renamed for n in _subtree(child) if n.vanished]
-    read = pool.map(partial(_read_rbytes, fs), [n.path for n in resample])
-    for node, (result, t) in zip(resample, read, strict=True):
-        if not isinstance(result, OSError) and node.s1 is not None:
-            node.vanished, node.s2 = False, Sample(result, t)
-    return renamed
+    again = [n for c in renamed for n in _subtree(c) if n.vanished and n.s1 is not None]
+    for node in again:
+        node.vanished, node.s2 = False, None
+    sample_all(again, fs, pool, second=True)
 
 
 def recheck_subdirs(run: Run, fs: Fs, pool: Executor) -> None:
     """After sampling, look again at the subdirs of each listed dir whose own
-    rate isn't 0, since that own rate absorbs every subdir not measured on
-    its own:
-    - a tracked subdir renamed within its parent is followed by its inode
-      (see _follow_renames);
-    - a subdir created since the build, or an idle one whose rctime moved,
-      became active during sampling: it goes in woke_up.
+    rate isn't 0, since that rate absorbs every subdir not measured on its
+    own. A subdir created since the build, or an idle one whose rctime moved,
+    became active during sampling: it goes in woke_up.
     """
     suspects = [
         node for node in run.nodes if (own := own_rate(node)) is not None and own != 0
     ]
-    relist = partial(_relist, fs)
-    listings = dict(zip(suspects, pool.map(relist, suspects), strict=True))
-    for node in _follow_renames(listings, run, fs, pool):
-        if node in listings:  # listed again at its new path
-            listings[node] = _relist(fs, node)
     skipped = set(run.not_cephfs)
-    for node, listing in listings.items():
-        known = skipped | node.idle.keys() | node.unreadable.keys()
-        known |= {child.path for child in node.children}
-        node.woke_up += [path for path in listing if path not in known]
-
-    batches = [
-        batch
-        for node in suspects
-        if node.idle
-        for batch in _batched(node, list(node.idle))
-    ]
-    probe = partial(_probe, fs)
-    for (node, paths), results in zip(
-        batches, pool.map(probe, [paths for _, paths in batches]), strict=True
-    ):
-        for path, result in zip(paths, results, strict=True):
-            if not isinstance(result, OSError):
-                if result != node.idle[path]:
-                    node.woke_up.append(path)
-            elif result.errno not in VANISHED | NOT_CEPHFS:
-                node.unreadable[path] = _strerror(result)
+    relist = partial(_relist, fs)
+    for node, listing in zip(suspects, pool.map(relist, suspects), strict=True):
+        tracked = {child.path for child in node.children}
+        node.woke_up += [
+            path
+            for path in listing
+            if path not in tracked
+            and path not in node.idle
+            and path not in node.unreadable
+            and path not in skipped
+        ]
+    batches = [batch for node in suspects for batch in _batched(node, list(node.idle))]
+    for node, path, result in _each_probe(batches, _probe_batches(batches, fs, pool)):
+        if not isinstance(result, OSError):
+            if result != node.idle[path]:
+                node.woke_up.append(path)
+        elif result.errno not in VANISHED | NOT_CEPHFS:
+            node.unreadable[path] = _strerror(result)
 
 
 # --- State -------------------------------------------------------------------
@@ -973,6 +1019,64 @@ def _str_dict(value: object) -> dict[str, str]:
     return value
 
 
+def _same(value: Any) -> Any:
+    return value
+
+
+def _checked(*types: type) -> Callable[[object], Any]:
+    """A loader that returns its value if it has one of types (a bool isn't
+    an int), and raises TypeError otherwise."""
+
+    def load(value: object) -> Any:
+        if not isinstance(value, types) or (
+            isinstance(value, bool) and bool not in types
+        ):
+            raise TypeError(
+                f"expected {'/'.join(t.__name__ for t in types)}: {value!r}"
+            )
+        return value
+
+    return load
+
+
+def _reason(value: object) -> Reason | None:
+    return None if value is None else Reason(value)
+
+
+def _number(value: object) -> float:
+    return float(_checked(int, float)(value))
+
+
+# How each saved field is written to JSON and checked and read back from it.
+# Node's parent is saved separately, as an index into the nodes.
+NODE_FIELDS: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any]]] = {
+    "path": (_same, _checked(str)),
+    "root": (_same, _checked(str)),
+    "depth": (_same, _checked(int)),
+    "reason": (_same, _reason),
+    "entries": (_same, _checked(int, NoneType)),
+    "list_error": (_same, _checked(str, NoneType)),
+    "unreadable": (_same, _str_dict),
+    "woke_up": (_same, _strings),
+    "s1": (_sample_state, _sample),
+    "s2": (_sample_state, _sample),
+    "sample_error": (_same, _checked(str, NoneType)),
+    "vanished": (_same, _checked(bool)),
+    "ino": (_same, _checked(int, NoneType)),
+    "renamed_from": (_same, _checked(str, NoneType)),
+}
+RUN_FIELDS: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any]]] = {
+    "created": (_same, _checked(str)),
+    "roots": (_same, _strings),
+    "delay": (_same, _number),
+    "depth": (_same, _checked(int)),
+    "max_dirs": (_same, _checked(int)),
+    "max_entries": (_same, _checked(int)),
+    "probed": (_same, _checked(int)),
+    "not_cephfs": (_same, _strings),
+}
+
+
 def save_state(path: str, run: Run) -> None:
     """Write run to path as JSON, for --load. Raises FatalError on failure.
 
@@ -981,37 +1085,16 @@ def save_state(path: str, run: Run) -> None:
     leaves any earlier file intact.
     """
     index = {node: i for i, node in enumerate(run.nodes)}
+    nodes = [
+        {name: dump(getattr(node, name)) for name, (dump, _) in NODE_FIELDS.items()}
+        | {"parent": None if node.parent is None else index[node.parent]}
+        for node in run.nodes
+    ]
     state = {
         "format": STATE_FORMAT,
         "version": STATE_VERSION,
-        "created": run.created,
-        "roots": run.roots,
-        "delay": run.delay,
-        "depth": run.depth,
-        "max_dirs": run.max_dirs,
-        "max_entries": run.max_entries,
-        "probed": run.probed,
-        "not_cephfs": run.not_cephfs,
-        "nodes": [
-            {
-                "path": node.path,
-                "root": node.root,
-                "depth": node.depth,
-                "parent": None if node.parent is None else index[node.parent],
-                "reason": node.reason,
-                "entries": node.entries,
-                "list_error": node.list_error,
-                "unreadable": node.unreadable,
-                "woke_up": node.woke_up,
-                "s1": _sample_state(node.s1),
-                "s2": _sample_state(node.s2),
-                "sample_error": node.sample_error,
-                "vanished": node.vanished,
-                "ino": node.ino,
-                "renamed_from": node.renamed_from,
-            }
-            for node in run.nodes
-        ],
+        **{name: dump(getattr(run, name)) for name, (dump, _) in RUN_FIELDS.items()},
+        "nodes": nodes,
     }
     target = os.path.realpath(path)
     temp = f"{target}.{os.getpid()}.tmp"
@@ -1044,36 +1127,14 @@ def _node_from_state(item: dict, nodes: list[Node]) -> Node:
     """Rebuild a saved node, linked to its parent among nodes, the ones
     loaded before it. Raises KeyError, TypeError, ValueError or
     OverflowError if item is damaged."""
-    if (parent := item["parent"]) is not None and not 0 <= parent < len(nodes):
+    parent = item["parent"]
+    if parent is not None and not 0 <= _checked(int)(parent) < len(nodes):
         raise ValueError(f"node {len(nodes)} has parent index {parent}")
-    path, root, depth = item["path"], item["root"], item["depth"]
-    if not (isinstance(path, str) and isinstance(root, str) and isinstance(depth, int)):
-        raise TypeError(f"node {len(nodes)} has a bad path, root or depth")
-    s1, s2 = _sample(item["s1"]), _sample(item["s2"])
+    fields = {name: load(item[name]) for name, (_, load) in NODE_FIELDS.items()}
+    s1, s2 = fields["s1"], fields["s2"]
     if s1 is not None and s2 is not None and not s2.t > s1.t:
-        raise ValueError(f"{path} has a sample interval of {s2.t - s1.t} s")
-    reason, ino, renamed_from = item["reason"], item["ino"], item["renamed_from"]
-    if not (ino is None or isinstance(ino, int)):
-        raise TypeError(f"{path} has inode {ino!r}")
-    if not (renamed_from is None or isinstance(renamed_from, str)):
-        raise TypeError(f"{path} was renamed from {renamed_from!r}")
-    node = Node(
-        path,
-        root,
-        depth,
-        parent=None if parent is None else nodes[parent],
-        reason=None if reason is None else Reason(reason),
-        entries=item["entries"],
-        list_error=item["list_error"],
-        unreadable=_str_dict(item["unreadable"]),
-        woke_up=_strings(item["woke_up"]),
-        s1=s1,
-        s2=s2,
-        sample_error=item["sample_error"],
-        vanished=bool(item["vanished"]),
-        ino=ino,
-        renamed_from=renamed_from,
-    )
+        raise ValueError(f"{fields['path']} has a sample interval of {s2.t - s1.t} s")
+    node = Node(**fields, parent=None if parent is None else nodes[parent])
     if node.parent is not None:
         node.parent.children.append(node)
     return node
@@ -1105,17 +1166,8 @@ def load_state(path: str) -> Run:
         nodes: list[Node] = []
         for item in state["nodes"]:
             nodes.append(_node_from_state(item, nodes))
-        return Run(
-            roots=_strings(state["roots"]),
-            nodes=nodes,
-            delay=float(state["delay"]),
-            depth=int(state["depth"]),
-            max_dirs=int(state["max_dirs"]),
-            max_entries=int(state["max_entries"]),
-            created=str(state["created"]),
-            probed=int(state["probed"]),
-            not_cephfs=_strings(state["not_cephfs"]),
-        )
+        fields = {name: load(state[name]) for name, (_, load) in RUN_FIELDS.items()}
+        return Run(nodes=nodes, **fields)
     except (KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
         raise FatalError(f"{path} is a damaged state file ({exc!r})") from None
 
@@ -1131,6 +1183,17 @@ def _epilog() -> str:
     """--help text after the options: the row legend, what to do with each
     row, the limitations, and an example."""
     legend = _legend(set(Kind), approx=True, indent="  ")
+    tree_advice = textwrap.fill(
+        "by NOTE: "
+        + "; ".join(
+            f'"{note.format(entries="N")}": {remedy}'
+            for note, remedy in REASON_TEXT.values()
+        ),
+        width=79,
+        initial_indent=f"  {Kind.TREE:<{_KIND_WIDTH}}  ",
+        subsequent_indent=" " * (_KIND_WIDTH + 4),
+        break_on_hyphens=False,
+    )
     return f"""\
 Rows (only rates at or above --threshold are shown):
 {legend}
@@ -1138,9 +1201,7 @@ Rows (only rates at or above --threshold are shown):
 What to do with a row:
   files   look for the newest or largest files directly in the dir
   spread  lower --threshold to see its parts (with --load, no new sampling)
-  tree    by NOTE: "depth limit": rerun with the dir as ROOT or a larger
-          --depth; "N entries": raise --max-entries; "unlistable": the dir
-          needs read permission; "idle at start": rerun
+{tree_advice}
 
 Limitations:
   - files and spread rates are a dir's rate minus its subdirs' rates. rstats
@@ -1279,28 +1340,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def sample_run(args: argparse.Namespace, fs: Fs) -> Run:
-    """Build the tree under args.roots and sample it twice."""
-    roots = preflight(args.roots, fs)
-    run = Run(
-        roots=[node.path for node in roots],
-        nodes=roots,
-        delay=args.delay,
-        depth=args.depth,
-        max_dirs=args.max_dirs,
-        max_entries=args.max_entries,
-        created=datetime.datetime.fromtimestamp(fs.now(), datetime.UTC).isoformat(
-            timespec="seconds"
-        ),
-    )
+    """Check the roots, build the tree under them, sample it twice, and
+    re-check it."""
     progress = Progress(sys.stderr)
     pool = ThreadPoolExecutor(max_workers=args.threads)
     try:
+        roots = preflight(args.roots, fs, pool)
+        run = Run(
+            roots=[node.path for node in roots],
+            nodes=roots,
+            delay=args.delay,
+            depth=args.depth,
+            max_dirs=args.max_dirs,
+            max_entries=args.max_entries,
+            created=datetime.datetime.fromtimestamp(fs.now(), datetime.UTC).isoformat(
+                timespec="seconds"
+            ),
+        )
         build(run, fs, pool, progress)
         progress.phase(f"Sampling {plural(len(run.nodes), 'dir')}")
         sample_all(run.nodes, fs, pool, second=False)
         progress.phase(f"Sampling again in {run.delay:g} s")
         fs.sleep(run.delay)
         sample_all(run.nodes, fs, pool, second=True)
+        follow_renames(run, fs, pool)
         progress.phase("Re-checking subdirs")
         recheck_subdirs(run, fs, pool)
     finally:
@@ -1309,33 +1372,42 @@ def sample_run(args: argparse.Namespace, fs: Fs) -> Run:
     return run
 
 
-def report(run: Run, threshold: float, sort_key: str, as_json: bool) -> bool:
-    """Print the rows on stdout; footnotes, notes and a summary on stderr.
+def sampled(run: Run) -> bool:
+    """Whether any dir was sampled, i.e. anything was measured."""
+    return any(node.s1 is not None and node.s2 is not None for node in run.nodes)
 
-    Return False if no dir could be sampled, so nothing was measured.
-    """
+
+def nothing_grew(run: Run, threshold: float) -> str | None:
+    """The line for a table without rows, or None if nothing was sampled
+    (main() reports that as an error)."""
+    if not sampled(run):
+        return None
+    scope = "that could be read " if read_problems(run.nodes) else ""
+    return (
+        f"Nothing {scope}grew at {format_rate(threshold)} or more; a lower "
+        "--threshold shows slower growth."
+    )
+
+
+def report(run: Run, threshold: float, sort_key: str, as_json: bool) -> None:
+    """Print the rows on stdout; footnotes, notes and a summary on stderr."""
     rows = sort_rows(analyze(run.nodes, threshold), sort_key)
-    sampled = bool(intervals(run.nodes))
     if as_json:
-        print(render_json(run, rows, threshold))
+        out, lead = render_json(run, rows, threshold), None
     elif rows:
-        print(render_table(rows))
-    # A closed pipe surfaces here, where main() handles it, not at exit.
+        out, lead = render_table(rows), footnotes(rows)
+    else:
+        out, lead = None, nothing_grew(run, threshold)
+    if out is not None:
+        print(out)
+    # Flush before stderr: a closed pipe then surfaces here, where main()
+    # handles it, and in a 2>&1 log the table stays ahead of its footnotes.
     sys.stdout.flush()
-    if not as_json:
-        if rows:
-            print(footnotes(rows), file=sys.stderr)
-        elif sampled:
-            scope = "that could be read " if read_problems(run.nodes) else ""
-            print(
-                f"Nothing {scope}grew at {format_rate(threshold)} or more; a "
-                "lower --threshold shows slower growth.",
-                file=sys.stderr,
-            )
+    if lead is not None:
+        print(lead, file=sys.stderr)
     for note in notes(run):
         print(paragraph(note), file=sys.stderr)
     print(summary(run), file=sys.stderr)
-    return sampled
 
 
 def main(argv: list[str] | None = None, fs: Fs | None = None) -> int:
@@ -1344,22 +1416,20 @@ def main(argv: list[str] | None = None, fs: Fs | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="surrogateescape")
     args = parse_args(argv)
+    status = 0
     try:
         if args.load is not None:
             run = load_state(args.load)
         else:
             run = sample_run(args, fs or Fs())
-        pipe_closed = False
         try:
-            sampled = report(run, args.threshold, args.sort, args.json)
+            report(run, args.threshold, args.sort, args.json)
         except BrokenPipeError:  # e.g. | head: still save, then exit quietly
             _discard_stdout()
-            sampled, pipe_closed = True, True
+            status = EXIT_PIPE_CLOSED
         if args.save is not None:
             save_state(args.save, run)
-        if pipe_closed:
-            return EXIT_PIPE_CLOSED
-        if not sampled:
+        if status == 0 and not sampled(run):
             raise FatalError("no dir could be sampled, so nothing was measured")
     except FatalError as exc:
         for message in exc.args:
@@ -1367,7 +1437,7 @@ def main(argv: list[str] | None = None, fs: Fs | None = None) -> int:
         return 1
     except KeyboardInterrupt:
         return EXIT_INTERRUPTED
-    return 0
+    return status
 
 
 def _discard_stdout() -> None:

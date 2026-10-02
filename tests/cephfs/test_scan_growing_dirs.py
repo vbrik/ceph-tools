@@ -1,5 +1,6 @@
 """Unit tests for cephfs/scan-growing-dirs.py."""
 
+import argparse
 import contextlib
 import errno
 import io
@@ -436,6 +437,11 @@ class RealFsTest(unittest.TestCase):
             sg.Fs().subdirs("/nonexistent/scan-growing-dirs-test")
 
 
+def preflight(paths, fs):
+    with ThreadPoolExecutor(4) as pool:
+        return sg.preflight(paths, fs, pool)
+
+
 class PreflightTest(unittest.TestCase):
     def fs(self, **dirs):
         return FakeFs(
@@ -444,11 +450,11 @@ class PreflightTest(unittest.TestCase):
 
     def problems(self, paths, fs=None):
         with self.assertRaises(sg.FatalError) as cm:
-            sg.preflight(paths, fs or self.fs())
+            preflight(paths, fs or self.fs())
         return list(cm.exception.args)
 
     def test_roots_become_depth_zero_nodes(self):
-        roots = sg.preflight(["/r", "/s/"], self.fs())
+        roots = preflight(["/r", "/s/"], self.fs())
         self.assertEqual(
             [(n.path, n.root, n.depth) for n in roots],
             [("/r", "/r", 0), ("/s", "/s", 0)],
@@ -457,7 +463,7 @@ class PreflightTest(unittest.TestCase):
     def test_symlinked_root_is_resolved(self):
         fs = self.fs()
         fs.links["/link"] = "/r"
-        (root,) = sg.preflight(["/link"], fs)
+        (root,) = preflight(["/link"], fs)
         self.assertEqual((root.path, root.root), ("/r", "/r"))
 
     def test_missing_and_not_a_directory(self):
@@ -486,22 +492,15 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(self.problems(["/r/a", "/r"]), ["/r/a is inside /r"])
 
     def test_sibling_with_common_prefix_is_not_nested(self):
-        roots = sg.preflight(["/r", "/r2"], self.fs(**{"/r2": FakeDir()}))
+        roots = preflight(["/r", "/r2"], self.fs(**{"/r2": FakeDir()}))
         self.assertEqual(len(roots), 2)
 
     def test_all_problems_reported_together(self):
         self.assertEqual(len(self.problems(["/nope", "/f", "/r", "/r/a"])), 3)
 
 
-def make_run(fs, roots=("/r",), **limits):
-    """A Run of the preflighted roots, with default limits overridden."""
-    nodes = sg.preflight(list(roots), fs)
-    kw = {"delay": 60.0, "depth": 5, "max_dirs": 1000, "max_entries": 10_000} | limits
-    return sg.Run(roots=[n.path for n in nodes], nodes=nodes, created="", **kw)
-
-
 def build(fs, roots=("/r",), threads=4, **limits):
-    run = make_run(fs, roots, **limits)
+    run = mkrun(preflight(list(roots), fs), **limits)
     with ThreadPoolExecutor(threads) as pool:
         sg.build(run, fs, pool, sg.Progress(io.StringIO()))
     return run
@@ -589,6 +588,14 @@ class BuildTest(unittest.TestCase):
         message = flat(cm.exception.args[0])
         self.assertIn("more than 3 dirs changed in the last 90 s", message)
         self.assertIn("stopped at depth 1", message)
+
+    def test_probes_stream_through_a_bounded_window(self):
+        n = sg.PROBE_BATCH * 5 + 3
+        with mock.patch.object(sg, "IN_FLIGHT_BATCHES", 2):
+            r = build(self.tree(n), threads=2).nodes[0]
+        self.assertEqual(
+            [c.path for c in r.children], sorted(f"/r/{i}" for i in range(n))
+        )
 
     def test_max_dirs_exceeded_cancels_pending_probes(self):
         class SlowFs(FakeFs):  # takes real time, as CephFS does, so cancelling can win
@@ -681,16 +688,16 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(out.getvalue(), "Sampling 3 dirs\n")
 
 
-def sampled(fs, roots=("/r",), threads=4, delay=60.0, **limits):
-    """Build, sample twice and re-check, like sample_run()."""
-    run = make_run(fs, roots, delay=delay, **limits)
-    with ThreadPoolExecutor(threads) as pool:
-        sg.build(run, fs, pool, sg.Progress(io.StringIO()))
-        sg.sample_all(run.nodes, fs, pool, second=False)
-        fs.sleep(delay)
-        sg.sample_all(run.nodes, fs, pool, second=True)
-        sg.recheck_subdirs(run, fs, pool)
-    return run
+def sampled(fs, roots=("/r",), **options):
+    """The Run that sample_run() makes of fs, with SAMPLING_DEFAULTS except
+    the options given."""
+    args = argparse.Namespace(roots=list(roots), **(sg.SAMPLING_DEFAULTS | options))
+    with contextlib.redirect_stderr(io.StringIO()):
+        return sg.sample_run(args, fs)
+
+
+def add_new_subdir(fs):
+    fs.dirs["/r/new"] = FakeDir()
 
 
 class SampleTest(unittest.TestCase):
@@ -716,14 +723,11 @@ class SampleTest(unittest.TestCase):
         self.assertEqual(after, ["/r", "/r/a", "/r/b"])
 
     def test_dir_gone_in_second_pass_counts_as_zero(self):
-        fs = FakeFs({"/r": FakeDir(rbytes=100), "/r/a": FakeDir(rbytes=6000)})
-        run = make_run(fs)
-        with ThreadPoolExecutor(2) as pool:
-            sg.build(run, fs, pool, sg.Progress(io.StringIO()))
-            sg.sample_all(run.nodes, fs, pool, second=False)
-            del fs.dirs["/r/a"]
-            sg.sample_all(run.nodes, fs, pool, second=True)
-        a = run.nodes[1]
+        fs = FakeFs(
+            {"/r": FakeDir(rbytes=100), "/r/a": FakeDir(rbytes=6000)},
+            after_sleep=lambda fs: fs.dirs.pop("/r/a"),
+        )
+        a = sampled(fs).nodes[1]
         self.assertTrue(a.vanished)
         self.assertEqual((a.s1.rbytes, a.s2.rbytes), (6000, 0))
         self.assertIsNone(a.sample_error)
@@ -739,14 +743,11 @@ class SampleTest(unittest.TestCase):
         self.assertEqual(fs.reads(sg.RBYTES).count("/r/a"), 1)  # not retried
 
     def test_error_in_second_pass_keeps_first_sample(self):
-        fs = FakeFs({"/r": FakeDir(), "/r/a": FakeDir()})
-        run = make_run(fs)
-        with ThreadPoolExecutor(2) as pool:
-            sg.build(run, fs, pool, sg.Progress(io.StringIO()))
-            sg.sample_all(run.nodes, fs, pool, second=False)
+        def deny(fs):
             fs.dirs["/r/a"].errors[sg.RBYTES] = errno.EACCES
-            sg.sample_all(run.nodes, fs, pool, second=True)
-        a = run.nodes[1]
+
+        fs = FakeFs({"/r": FakeDir(), "/r/a": FakeDir()}, after_sleep=deny)
+        a = sampled(fs).nodes[1]
         self.assertIsNotNone(a.s1)
         self.assertIsNone(a.s2)
         self.assertIsNone(a.rate)
@@ -764,18 +765,16 @@ class RecheckSubdirsTest(unittest.TestCase):
         )
 
     def run_with(self, fs, change):
-        """Build and sample, calling change(fs) between the passes, then
-        re-check. Return the root, the number of rctime probes the re-check
-        made, and the dirs it listed."""
-        run = make_run(fs)
-        with ThreadPoolExecutor(2) as pool:
-            sg.build(run, fs, pool, sg.Progress(io.StringIO()))
-            sg.sample_all(run.nodes, fs, pool, second=False)
-            change(fs)
-            sg.sample_all(run.nodes, fs, pool, second=True)
-            probes, listings = len(fs.reads(sg.RCTIME)), len(fs.listed())
-            sg.recheck_subdirs(run, fs, pool)
-        return run.nodes[0], len(fs.reads(sg.RCTIME)) - probes, fs.listed()[listings:]
+        """Sample fs with change(fs) during the sleep. Return the root, and
+        the rctime probes and listings made after the sleep: only following
+        renames and the re-check make those."""
+        fs.after_sleep = change
+        run = sampled(fs)
+        after = fs.calls[fs.calls.index(("sleep", 60.0)) + 1 :]
+        probes = sum(
+            1 for call in after if call[0] == "getxattr" and call[2] == sg.RCTIME
+        )
+        return run.nodes[0], probes, [call[1] for call in after if call[0] == "list"]
 
     def test_records_idle_subdirs_whose_rctime_moved(self):
         def change(fs):
@@ -841,6 +840,34 @@ class RecheckSubdirsTest(unittest.TestCase):
         # call's latency: allow 0.1%.
         self.assertAlmostEqual(job.rate, MiB, delta=MiB / 1000)
         self.assertEqual(r.woke_up, [])
+
+    def renamed_job(self):
+        return FakeFs(
+            {
+                "/r": FakeDir(rbytes=10**9),
+                "/r/job.tmp": FakeDir(rbytes=growing(MiB)),
+                "/r/job.tmp/sub": FakeDir(rbytes=growing(MiB)),
+            }
+        )
+
+    def test_new_subdir_inside_renamed_subtree_is_found(self):
+        def change(fs):
+            fs.rename("/r/job.tmp", "/r/job")
+            fs.dirs["/r/job/sub/new"] = FakeDir()
+
+        r, _, _ = self.run_with(self.renamed_job(), change)
+        (sub,) = r.children[0].children
+        self.assertEqual(sub.woke_up, ["/r/job/sub/new"])
+
+    def test_failed_reread_after_rename_is_unsampled(self):
+        def change(fs):
+            fs.rename("/r/job.tmp", "/r/job")
+            fs.dirs["/r/job"].errors[sg.RBYTES] = errno.EACCES
+
+        r, _, _ = self.run_with(self.renamed_job(), change)
+        (job,) = r.children
+        self.assertEqual((job.path, job.vanished), ("/r/job", False))
+        self.assertEqual(job.sample_error, os.strerror(errno.EACCES))
 
     def test_new_dir_with_another_inode_is_not_a_rename(self):
         def change(fs):
@@ -945,6 +972,12 @@ class StateTest(unittest.TestCase):
             "string roots": ('"/r"', ("roots",)),
             "non-string woke_up": ("[1]", ("nodes", 1, "woke_up")),
             "non-string unreadable": ('{"/r/u": 1}', ("nodes", 1, "unreadable")),
+            "bool depth": ("true", ("nodes", 1, "depth")),
+            "string vanished": ('"no"', ("nodes", 1, "vanished")),
+            "string entries": ('"many"', ("nodes", 1, "entries")),
+            "int list_error": ("7", ("nodes", 1, "list_error")),
+            "string run delay": ('"nan"', ("delay",)),
+            "float run probed": ("5.9", ("probed",)),
         }
         for name, (literal, keys) in cases.items():
             with self.subTest(name):
@@ -1101,37 +1134,29 @@ class MainTest(unittest.TestCase):
         self.assertGreaterEqual(min(sg.intervals(run.nodes)), 10.0)
 
     def test_subdir_created_during_sleep_marks_parent(self):
-        class NewSubdir(FakeFs):
-            def sleep(self, seconds):
-                super().sleep(seconds)
-                self.dirs["/r/new"] = FakeDir()
-
-        fs = NewSubdir({"/r": FakeDir(rbytes=growing(5 * MiB))})
+        fs = FakeFs(
+            {"/r": FakeDir(rbytes=growing(5 * MiB))}, after_sleep=add_new_subdir
+        )
         code, out, _ = self.main("/r", fs=fs)
         self.assertEqual(code, 0)
         self.assertIn("5.0 MiB/s~ files   /r    1 subdir became active", out)
 
     def test_rename_during_sleep_is_not_growth(self):
-        class RenameInSleep(FakeFs):
-            def sleep(self, seconds):
-                super().sleep(seconds)
-                self.rename("/r/job.tmp", "/r/job")
-
-        fs = RenameInSleep({"/r": FakeDir(rbytes=6 * 10**9),
-                            "/r/job.tmp": FakeDir(rbytes=6 * 10**9)})  # fmt: skip
+        fs = FakeFs(
+            {"/r": FakeDir(rbytes=6 * 10**9), "/r/job.tmp": FakeDir(rbytes=6 * 10**9)},
+            after_sleep=lambda fs: fs.rename("/r/job.tmp", "/r/job"),
+        )
         code, out, err = self.main("/r", fs=fs)
         self.assertEqual((code, out), (0, ""))
         self.assertIn("Nothing grew", err)
         self.assertIn("renamed during sampling", err)
 
     def test_new_subdir_behind_shrinking_files_marks_spread(self):
-        class NewSubdir(FakeFs):
-            def sleep(self, seconds):
-                super().sleep(seconds)
-                self.dirs["/r/new"] = FakeDir()
-
         kids = {f"/r/k{i}": FakeDir(rbytes=growing(0.5 * MiB)) for i in range(4)}
-        fs = NewSubdir({"/r": FakeDir(rbytes=growing(1.5 * MiB)), **kids})
+        fs = FakeFs(
+            {"/r": FakeDir(rbytes=growing(1.5 * MiB)), **kids},
+            after_sleep=add_new_subdir,
+        )
         code, out, _ = self.main("/r", fs=fs)
         self.assertEqual(code, 0)
         self.assertIn("1.5 MiB/s~ spread  /r", out)
@@ -1265,11 +1290,10 @@ class MainTest(unittest.TestCase):
         self.assertIn("ERROR: more than 2 dirs", err)
 
     def test_ctrl_c(self):
-        class Interrupted(FakeFs):
-            def sleep(self, seconds):
-                raise KeyboardInterrupt
+        def interrupt(fs):
+            raise KeyboardInterrupt
 
-        fs = Interrupted(self.fs().dirs)
+        fs = FakeFs(self.fs().dirs, after_sleep=interrupt)
         self.assertEqual(self.main("/r", fs=fs)[0], 130)
 
     def test_non_utf8_names_printed_as_bytes(self):
