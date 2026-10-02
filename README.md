@@ -111,8 +111,15 @@ so they are fast on huge trees and need only read access, not cluster
 credentials.
 
 - **`cephfs/du`**: Size of files and directories, without walking the tree.
-- **`cephfs/find-growing-dirs.py`**: Find the fastest-growing subtree without
-  walking the tree.
+- **`cephfs/scan-growing-dirs.py`**: Find fast-growing directories on
+  CephFS across every branch under one or more roots at once, in one
+  sampling interval, from `rbytes` and `rctime` alone. It reports dirs
+  whose own files grow faster than a threshold, subtrees it didn't explore
+  (past `--depth`, or wider than `--max-entries`), and growth spread over
+  many subdirs, each with a rate; `--json`, and `--save`/`--load` to
+  re-report without re-sampling. Needs Python 3.11 or later.
+- **`cephfs/find-growing-dirs.py`**: Follow the fastest-growing subtree down,
+  one level per sampling interval.
 - **`cephfs/find-recent-rctime.py`**: Find files and directories changed
   since a date; much faster than `find -newer`.
 - **`cephfs/cephfs-find-wide-dirs`**: Find directories holding many files.
