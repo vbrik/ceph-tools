@@ -32,7 +32,7 @@ from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
 
-from messages import (
+from backfillctl.messages import (
     PROGRESS_QUERY_EFFECT,
     blocking_reason,
     companion_note,

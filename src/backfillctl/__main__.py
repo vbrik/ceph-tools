@@ -7,16 +7,18 @@ build_parser() has no side effects, so tests and shtab can import it:
 
 import argparse
 
-import balance
-import cancel_backfill
-import cancel_uphill
-import divert_toofull
-import drain
-import measure_rate
-import save_state
-import show_backfill
-import show_pg_osds
-from shared import HelpFormatter, add_load_state_arg, resolve_load_state
+from backfillctl import (
+    balance,
+    cancel_backfill,
+    cancel_uphill,
+    divert_toofull,
+    drain,
+    measure_rate,
+    save_state,
+    show_backfill,
+    show_pg_osds,
+)
+from backfillctl.shared import HelpFormatter, add_load_state_arg, resolve_load_state
 
 _COMMAND_MODULES = (
     show_pg_osds,

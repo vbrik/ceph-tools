@@ -50,7 +50,7 @@ or it may undo them. Assumes the CRUSH failure domain is host.
 
 import argparse
 
-from messages import (
+from backfillctl.messages import (
     RELIEVE_CLAUSE,
     blockers_clause,
     left_alone_clause,
@@ -59,8 +59,8 @@ from messages import (
     stderr_para,
     targets_clause,
 )
-from placement import add_max_target_util_arg
-from shared import (
+from backfillctl.placement import add_max_target_util_arg
+from backfillctl.shared import (
     HelpFormatter,
     SnapshotStore,
     add_load_state_arg,
@@ -70,7 +70,7 @@ from shared import (
     parse_osd,
     short_hosts,
 )
-from shed import (
+from backfillctl.shed import (
     SNAPSHOT_COMMANDS,
     Cluster,
     ShedResult,

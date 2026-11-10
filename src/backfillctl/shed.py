@@ -62,7 +62,7 @@ from collections import Counter, defaultdict
 from functools import cached_property
 from typing import NamedTuple
 
-from messages import (
+from backfillctl.messages import (
     PROJECTION_QUERY_EFFECT,
     blocking_reason,
     companion_note,
@@ -75,7 +75,7 @@ from messages import (
     print_still_above,
     print_unplaceable,
 )
-from placement import (
+from backfillctl.placement import (
     ArrivingShard,
     FinalUsage,
     FullRatios,
@@ -95,7 +95,7 @@ from placement import (
     shard_size_bytes,
     target_projection,
 )
-from shared import (
+from backfillctl.shared import (
     KIB,
     ROLE_BLOCKER,
     ROLE_REQUESTED,

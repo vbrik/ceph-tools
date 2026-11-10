@@ -28,7 +28,7 @@ import argparse
 from itertools import zip_longest
 from typing import NamedTuple
 
-from messages import (
+from backfillctl.messages import (
     PROGRESS_AND_PROJECTION_QUERY_EFFECT,
     print_movement_summary,
     print_no_movements,
@@ -36,8 +36,8 @@ from messages import (
     print_progress_note,
     stderr_para,
 )
-from placement import arriving_pgids, project_usage
-from shared import (
+from backfillctl.placement import arriving_pgids, project_usage
+from backfillctl.shared import (
     NOT_APPLICABLE,
     HelpFormatter,
     PgidFilter,

@@ -9,20 +9,34 @@ directories on CephFS. Most tools turn `ceph` and `rados` JSON
 output into something more useful; the CephFS tree tools read recursive
 statistics (`ceph.dir.*` xattrs) off a mount.
 
-Every script is standalone; there is no install step. The exception is
-`backfillctl`, a package: copy the whole `backfillctl/` directory, plus
-`backfillctl.py` if you want to run it as `./backfillctl.py`.
+The scripts in the repo root and `cephfs/` are standalone; run them in
+place. `backfillctl` is a Python package in `src/`, installed as a command
+(see [Install](#install)).
 
 ## Requirements
 
 - A `ceph` CLI configured for the cluster.
-- Python 3; `pip install -r requirements.txt` for the few extras some
+- Python 3.12+; `pip install -r requirements.txt` for the few extras some
   scripts use. The `rados` Python bindings (from your distro's Ceph
   packages) make `backfillctl` faster.
 - `jq` for the shell scripts.
 - A mounted CephFS for the CephFS tree tools.
 
 Some scripts default to site-specific pool names; check `--help`.
+
+## Install
+
+Install the packages in `src/` (for now, `backfillctl`) into a venv:
+
+```
+python3 -m venv --system-site-packages .venv && . .venv/bin/activate
+pip install -e '.[dev]'    # or `pip install -e .` without the test tools
+```
+
+`--system-site-packages` lets the venv see the distro's `rados` bindings,
+which are not on PyPI; without them `backfillctl` falls back to the slower
+`ceph` CLI. The install is editable: code changes take effect immediately,
+but re-run `pip install -e .` after adding a command to `pyproject.toml`.
 
 ## Tools
 
@@ -31,8 +45,8 @@ Some scripts default to site-specific pool names; check `--help`.
 #### backfillctl
 
 Commands for inspecting and steering PG backfills. Run it as
-`./backfillctl.py <command>`, `python3 backfillctl <command>` or
-`python3 -m backfillctl <command>`, and see `<command> --help` for details.
+`backfillctl <command>` (or `python3 -m backfillctl <command>`), and see
+`<command> --help` for details.
 
 **Inspect**
 
@@ -66,13 +80,12 @@ and keep drained OSDs up and in: marking them out voids the upmaps. The
 remapping commands assume the CRUSH failure domain is `host`. `balance`
 works in rounds: apply, let the backfills finish, and re-run.
 
-Shell completion via [shtab](https://docs.iterative.ai/shtab/), from the repo
-root:
+Shell completion via [shtab](https://docs.iterative.ai/shtab/) (installed
+by the `dev` extra):
 
 ```
 shtab --shell=bash backfillctl.__main__.build_parser > completions.bash
 source completions.bash
-complete -F _shtab_backfillctl backfillctl backfillctl.py  # also for backfillctl.py
 ```
 
 #### Other
@@ -124,8 +137,9 @@ credentials.
 ## Tests
 
 No test needs a cluster; many replay anonymized cluster captures from
-`tests/backfillctl/test-data/`. Run each group separately (`pytest tests`
-also works):
+`tests/backfillctl/test-data/`. The tests import `backfillctl` from `src/`,
+so they need no install; one test of the installed `backfillctl` command
+is skipped without one. Run each group separately (`pytest` also works):
 
 ```
 python3 -m unittest discover -s tests/backfillctl

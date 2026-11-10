@@ -48,8 +48,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
-import show_backfill as sb
-from messages import (
+from backfillctl import show_backfill as sb
+from backfillctl.messages import (
     format_bytes,
     print_movement_summary,
     print_no_movements,
@@ -58,8 +58,8 @@ from messages import (
     print_query_failed,
     stderr_para,
 )
-from save_state import trim_osd_dump, trim_pg_dump
-from shared import (
+from backfillctl.save_state import trim_osd_dump, trim_pg_dump
+from backfillctl.shared import (
     BACKFILL_POSITIONS_FILE,
     NOT_APPLICABLE,
     UNKNOWN_HOST,

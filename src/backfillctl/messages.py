@@ -16,7 +16,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from shared import PgidFilter, PinTotals, Skipped
+    from backfillctl.shared import PgidFilter, PinTotals, Skipped
 
 # ---------------------------------------------------------------------------
 # stderr

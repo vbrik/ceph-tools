@@ -1,3 +1,8 @@
 # coverage.py data (`coverage html` writes its own ignore into htmlcov/)
 .coverage
 .coverage.*
+# Packaging (`pip install -e .` writes src/*.egg-info) and the venv the README creates
+*.egg-info/
+/build/
+/dist/
+/.venv/

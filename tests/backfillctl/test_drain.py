@@ -9,11 +9,10 @@ import contextlib
 import io
 import json
 import subprocess
-import sys
 import unittest
 
 from _support import (
-    REPO_ROOT,
+    BACKFILLCTL,
     TEST_DATA,
     FakeStore,
     SyntheticCluster,
@@ -21,6 +20,7 @@ from _support import (
     check_own_moves_in_or_out,
     check_pairs_apply,
     check_reservation_cap,
+    child_env,
     flat,
     messages,
     parse_args,
@@ -429,8 +429,7 @@ class CliTest(unittest.TestCase):
     def test_runs_end_to_end_and_prints_json(self):
         proc = subprocess.run(
             [
-                sys.executable,
-                str(REPO_ROOT / "backfillctl"),
+                *BACKFILLCTL,
                 "--load-state",
                 str(FIXTURE),
                 "drain",
@@ -440,6 +439,7 @@ class CliTest(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            env=child_env(),
             check=False,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)

@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+# One distribution for every tool in src/: each is its own top-level package
+# with its own [project.scripts] entry, so they share this version.
+[project]
+name = "ceph-tools"
+version = "0.1.0"
+description = "Ceph and CephFS admin tools: PG backfill control, upmaps, OSD draining and balancing"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+# The optional `rados` bindings come from the distro's Ceph packages, not PyPI.
+dependencies = []
+keywords = [
+    "ceph",
+    "cephfs",
+    "backfill",
+    "upmap",
+    "pg-upmap-items",
+    "placement group",
+    "osd",
+    "drain osd",
+    "rebalancing",
+    "storage administration",
+]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Clustering",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Filesystems",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "coverage>=7.10", "shtab"]
+
+[project.scripts]
+backfillctl = "backfillctl.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/vbrik/ceph-tools"
+
+[tool.ruff]
+target-version = "py312"
+extend-exclude = ["*.md"]  # ruff would otherwise reformat code blocks in docs
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

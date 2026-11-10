@@ -14,8 +14,8 @@ import sys
 from collections.abc import Iterable
 from typing import NamedTuple, Protocol
 
-import shared
-from shared import (
+from backfillctl import shared
+from backfillctl.shared import (
     KIB,
     POOL_TYPE_ERASURE,
     SnapshotStore,

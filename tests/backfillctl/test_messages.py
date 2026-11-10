@@ -9,22 +9,41 @@ import ast
 import contextlib
 import io
 import unittest
+from pathlib import Path
 
-from _support import REPO_ROOT, flat, messages, shared, stderr_of
+from _support import flat, messages, shared, stderr_of
+
+
+def runtime_imports(source: str) -> set[str]:
+    """Top-level modules that source imports when run, '.' for a relative
+    import. Top level only: imports under 'if TYPE_CHECKING:' never run."""
+    imported = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Import):
+            imported |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            imported.add("." if node.level else node.module.split(".")[0])
+    return imported
 
 
 class LeafModuleTest(unittest.TestCase):
     def test_imports_nothing_from_backfillctl_at_runtime(self):
-        tree = ast.parse((REPO_ROOT / "backfillctl" / "messages.py").read_text())
-        own = {p.stem for p in (REPO_ROOT / "backfillctl").glob("*.py")}
-        # Top level only: imports under 'if TYPE_CHECKING:' never run.
-        imported = set()
-        for node in tree.body:
-            if isinstance(node, ast.Import):
-                imported |= {a.name.split(".")[0] for a in node.names}
-            elif isinstance(node, ast.ImportFrom):
-                imported.add(node.module.split(".")[0])
-        self.assertEqual(imported & own, set())
+        imported = runtime_imports(Path(messages.__file__).read_text())
+        self.assertTrue(imported)  # the parse found messages.py's imports
+        self.assertEqual(imported & {"backfillctl", "."}, set())
+
+    def test_runtime_imports_sees_each_form_of_package_import(self):
+        for line in (
+            "import backfillctl.shared",
+            "from backfillctl import shared",
+            "from backfillctl.shared import x",
+            "from . import shared",
+            "from .shared import x",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(runtime_imports(line) & {"backfillctl", "."})
+        guarded = "if TYPE_CHECKING:\n    from backfillctl.shared import x\n"
+        self.assertEqual(runtime_imports(guarded), set())
 
 
 class FormatTest(unittest.TestCase):

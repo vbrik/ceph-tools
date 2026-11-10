@@ -50,7 +50,7 @@ import argparse
 import sys
 from typing import NamedTuple
 
-from messages import (
+from backfillctl.messages import (
     blockers_clause,
     left_alone_clause,
     level_text,
@@ -58,8 +58,8 @@ from messages import (
     stderr_para,
     targets_clause,
 )
-from placement import add_max_target_util_arg
-from shared import (
+from backfillctl.placement import add_max_target_util_arg
+from backfillctl.shared import (
     HelpFormatter,
     SnapshotStore,
     add_load_state_arg,
@@ -68,7 +68,7 @@ from shared import (
     parse_osd,
     percentage_points,
 )
-from shed import (
+from backfillctl.shed import (
     SNAPSHOT_COMMANDS,
     Cluster,
     ShedResult,

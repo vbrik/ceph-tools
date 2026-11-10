@@ -47,7 +47,7 @@ import math
 from collections import deque
 from typing import NamedTuple
 
-from messages import (
+from backfillctl.messages import (
     RELIEVE_CLAUSE,
     chained_text,
     named_list,
@@ -57,7 +57,7 @@ from messages import (
     stderr_para,
     targets_clause,
 )
-from placement import (
+from backfillctl.placement import (
     ArrivingShard,
     FullRatios,
     add_max_target_util_arg,
@@ -67,7 +67,7 @@ from placement import (
     resolve_toofull_util,
     usage_and_capacity,
 )
-from shared import (
+from backfillctl.shared import (
     HelpFormatter,
     PgidFilter,
     SnapshotStore,
@@ -77,7 +77,7 @@ from shared import (
     check_known_pools,
     pgid_sort_key,
 )
-from shed import (
+from backfillctl.shed import (
     SNAPSHOT_COMMANDS,
     Cluster,
     Move,

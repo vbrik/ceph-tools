@@ -22,14 +22,14 @@ Assumes the CRUSH failure domain is host.
 import argparse
 from typing import NamedTuple
 
-from messages import (
+from backfillctl.messages import (
     print_pgid_filter,
     print_pin_footer,
     print_pin_summary,
     print_progress_note,
     stderr_para,
 )
-from shared import (
+from backfillctl.shared import (
     COLUMNS,
     POOL_TYPE_ERASURE,
     Cancellation,

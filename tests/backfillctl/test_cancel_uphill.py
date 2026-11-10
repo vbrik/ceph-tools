@@ -13,17 +13,17 @@ import contextlib
 import io
 import json
 import subprocess
-import sys
 import unittest
 
 from _support import (
+    BACKFILLCTL,
     EC_POOL_DETAIL,
     EC_PROFILES,
     NONE,
     REP_POOL_DETAIL,
-    REPO_ROOT,
     RULES,
     TEST_DATA,
+    child_env,
     parse_args,
     pg_stat,
     plan_from_state,
@@ -507,14 +507,14 @@ class MainRegistrationTest(unittest.TestCase):
     def test_runs_end_to_end_through_the_dispatcher(self):
         result = subprocess.run(
             [
-                sys.executable,
-                str(REPO_ROOT / "backfillctl"),
+                *BACKFILLCTL,
                 "--load-state",
                 str(FIXTURE),
                 "cancel-uphill",
             ],
             capture_output=True,
             text=True,
+            env=child_env(),
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -21,15 +21,16 @@ from typing import ClassVar
 from unittest import mock
 
 from _support import (
+    BACKFILLCTL,
     EC_POOL_DETAIL,
     EC_PROFILES,
     HOST_RULE,
     NONE,
     REP_POOL_DETAIL,
-    REPO_ROOT,
     RULES,
     TEST_DATA,
     FakeStore,
+    child_env,
     flat,
     parse_args,
     pg_stat,
@@ -1585,26 +1586,25 @@ def run_cli(*argv, load_state=None, path=None, no_rados=None):
     """Run the subcommand as a subprocess.
 
     load_state, when given, is passed as the global --load-state; path
-    replaces PATH when given; no_rados, a directory, becomes PYTHONPATH (see
-    LoadStateCliTest.setUp).
+    replaces PATH when given; no_rados, a directory, goes on PYTHONPATH after
+    src/ (see LoadStateCliTest.setUp).
     """
-    env = None
+    env = dict(os.environ)
     if path is not None:
-        env = {**os.environ, "PATH": path}
+        env["PATH"] = path
     if no_rados is not None:
-        env = {**(env or os.environ), "PYTHONPATH": str(no_rados)}
+        env["PYTHONPATH"] = str(no_rados)
     global_argv = ["--load-state", load_state] if load_state is not None else []
     return subprocess.run(
         [
-            sys.executable,
-            str(REPO_ROOT / "backfillctl"),
+            *BACKFILLCTL,
             *global_argv,
             "cancel-backfill",
             *argv,
         ],
         capture_output=True,
         text=True,
-        env=env,
+        env=child_env(env),
         check=False,
     )
 

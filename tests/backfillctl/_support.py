@@ -1,17 +1,9 @@
 """Test support: import backfillctl's modules, fake cluster state, and the
 helpers more than one test file uses.
 
-REPO_ROOT is put on sys.path so `from backfillctl import ...` resolves.
-backfillctl/'s own directory is put on sys.path here too (the same thing
-backfillctl/__init__.py does when the package is imported, and what running
-it directly relies on), so a bare `import shared` below -- and the command
-modules' own `import shared` / `from shared import ...` -- resolve to the
-exact same module object (and likewise `placement` and `shed`). That identity matters: tests that
-mock.patch.object(shared, ...) need to be patching the module the code under
-test actually calls, not a separate `backfillctl.shared` copy. This is set up
-with an explicit sys.path.insert rather than an `import backfillctl` side
-effect, since an isort/ruff cleanup could otherwise reorder that import after
-`import shared` and silently break it.
+src/ is put on sys.path, and src/ is put on PYTHONPATH for any subprocess
+started through child_env(), so the tests always exercise the working tree,
+whether or not the package is installed (and never a stale install).
 """
 
 import argparse
@@ -21,22 +13,30 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BACKFILLCTL_DIR = REPO_ROOT / "backfillctl"
+SRC = REPO_ROOT / "src"
 TEST_DATA = REPO_ROOT / "tests" / "backfillctl" / "test-data"  # captures
 
-for path in (REPO_ROOT, BACKFILLCTL_DIR):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
-import messages
-import placement
-import shared
-import shed
+from backfillctl import messages, placement, shared, shed
+
+# The command line that starts backfillctl in a subprocess; pair with child_env().
+BACKFILLCTL = (sys.executable, "-m", "backfillctl")
+
+
+def child_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """env (default: os.environ) with src/ first on PYTHONPATH, so that
+    BACKFILLCTL runs this working tree's package."""
+    env = dict(os.environ if env is None else env)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SRC), env.get("PYTHONPATH")]))
+    return env
+
 
 # A live (non --load-state) run queries each shown PG's backfill position
 # with 'ceph pg query', over librados or the ceph CLI. No test may reach a real
@@ -49,6 +49,7 @@ shared.query_backfill_positions_timed = lambda pgids: shared.TimedPositions({}, 
 NONE = shared.CRUSH_ITEM_NONE
 
 __all__ = [
+    "BACKFILLCTL",
     "EC_POOL",
     "EC_POOL_DETAIL",
     "EC_PROFILES",
@@ -67,6 +68,7 @@ __all__ = [
     "check_own_moves_in_or_out",
     "check_pairs_apply",
     "check_reservation_cap",
+    "child_env",
     "flat",
     "mapped_share_pct",
     "messages",

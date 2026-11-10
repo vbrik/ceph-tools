@@ -15,11 +15,11 @@ import argparse
 import json
 import sys
 
-from messages import (
+from backfillctl.messages import (
     PROGRESS_AND_PROJECTION_QUERY_EFFECT,
     stderr_para,
 )
-from shared import (
+from backfillctl.shared import (
     BACKFILL_POSITIONS_FILE,
     PROGRESS_COUNTERS,
     HelpFormatter,
@@ -28,7 +28,7 @@ from shared import (
     query_backfill_positions,
     resolve_save_dir,
 )
-from shared import anonymize_snapshots as anonymize_common
+from backfillctl.shared import anonymize_snapshots as anonymize_common
 
 # One file per command. Subcommands filter pg_dump_pgs in place of their
 # narrower live listings.

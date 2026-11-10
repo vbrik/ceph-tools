@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from unittest import mock
 
-from _support import REPO_ROOT, TEST_DATA, run_command
+from _support import BACKFILLCTL, TEST_DATA, child_env, run_command
 
 from backfillctl import divert_toofull as dt
 from backfillctl.__main__ import _COMMAND_MODULES, build_parser
@@ -57,11 +57,18 @@ def help_text(*argv: str) -> str:
 
 def run_backfillctl(
     *argv: str,
-    launch: Sequence[str] = (sys.executable, str(REPO_ROOT / "backfillctl")),
+    launch: Sequence[str] = BACKFILLCTL,
     cwd: Path | None = None,
+    working_tree: bool = True,
 ) -> subprocess.CompletedProcess:
-    """Run 'backfillctl *argv', started by the command line launch, in cwd."""
+    """Run 'backfillctl *argv', started by the command line launch, in cwd.
+
+    working_tree=False leaves PYTHONPATH alone, so the package is imported
+    from wherever it is installed rather than from this repo's src/.
+    """
     env = {k: v for k, v in os.environ.items() if k != "FORCE_COLOR"}
+    if working_tree:
+        env = child_env(env)
     return subprocess.run(
         [*launch, *argv],
         capture_output=True,
@@ -69,14 +76,7 @@ def run_backfillctl(
         check=False,
         cwd=cwd,
         # Plain text, wrapped at 80 columns, whatever the caller's shell sets.
-        # A '#!/usr/bin/env python3' script gets this interpreter, if its
-        # directory has a python3.
-        env=env
-        | {
-            "PYTHON_COLORS": "0",
-            "COLUMNS": "80",
-            "PATH": os.pathsep.join([str(Path(sys.executable).parent), env["PATH"]]),
-        },
+        env=env | {"PYTHON_COLORS": "0", "COLUMNS": "80"},
     )
 
 
@@ -151,16 +151,11 @@ class LoadStateTest(unittest.TestCase):
         self.assertIn("movement(s)", alone.stderr)
         # 2>&1: stdout is flushed before each note, so the order holds.
         both = subprocess.run(
-            [
-                sys.executable,
-                str(REPO_ROOT / "backfillctl"),
-                "--load-state",
-                str(FIXTURE),
-                "show-backfill",
-            ],
+            [*BACKFILLCTL, "--load-state", str(FIXTURE), "show-backfill"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            env=child_env(),
             check=False,
         ).stdout
         # A note on the input first: this capture has no backfill positions.
@@ -173,9 +168,12 @@ class LoadStateTest(unittest.TestCase):
         self.assertIn("--load-state directory not found", result.stderr)
 
 
+# Where 'pip install' puts the console script: next to this interpreter.
+CONSOLE_SCRIPT = Path(sys.executable).parent / "backfillctl"
+
+
 class EntryPointTest(unittest.TestCase):
-    """Each way the README starts backfillctl finds the package's modules
-    (they import each other unqualified) and prints the same."""
+    """Each way the README starts backfillctl prints the same."""
 
     ARGV = ("--load-state", str(FIXTURE), "show-backfill")
 
@@ -187,26 +185,25 @@ class EntryPointTest(unittest.TestCase):
             (0, reference.stdout, reference.stderr),
         )
 
-    def test_python_m_backfillctl(self):
-        self.assert_like_reference(
-            run_backfillctl(
-                *self.ARGV, launch=[sys.executable, "-m", "backfillctl"], cwd=REPO_ROOT
-            )
-        )
-
-    def test_launcher_script(self):
-        # Executed itself, as './backfillctl.py': needs its shebang and exec bit.
-        self.assert_like_reference(
-            run_backfillctl(*self.ARGV, launch=["./backfillctl.py"], cwd=REPO_ROOT)
-        )
-
-    def test_launcher_through_a_symlink_elsewhere(self):
-        # E.g. ~/bin/backfillctl.py: the package is next to the link's target.
+    def test_python_m_backfillctl_outside_the_repo(self):
+        # The package is found on the path, not relative to the current dir.
         with tempfile.TemporaryDirectory() as tmp:
-            link = Path(tmp) / "backfillctl.py"
-            link.symlink_to(REPO_ROOT / "backfillctl.py")
+            self.assert_like_reference(run_backfillctl(*self.ARGV, cwd=Path(tmp)))
+
+    @unittest.skipUnless(
+        CONSOLE_SCRIPT.exists(), "not installed: pip install -e . to test this"
+    )
+    def test_installed_console_script(self):
+        # The package as installed, not src/: checks the [project.scripts]
+        # entry, and flags a stale non-editable install of an older tree.
+        with tempfile.TemporaryDirectory() as tmp:
             self.assert_like_reference(
-                run_backfillctl(*self.ARGV, launch=[str(link)], cwd=Path(tmp))
+                run_backfillctl(
+                    *self.ARGV,
+                    launch=[str(CONSOLE_SCRIPT)],
+                    cwd=Path(tmp),
+                    working_tree=False,
+                )
             )
 
 

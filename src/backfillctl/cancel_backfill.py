@@ -52,7 +52,7 @@ import argparse
 import sys
 from typing import NamedTuple
 
-from messages import (
+from backfillctl.messages import (
     PROGRESS_AND_PROJECTION_QUERY_EFFECT,
     osd_list,
     print_pgid_filter,
@@ -61,14 +61,14 @@ from messages import (
     print_progress_note,
     stderr_para,
 )
-from placement import (
+from backfillctl.placement import (
     ProjectedUsage,
     arriving_pgids,
     blocker_projection,
     find_arriving_shards,
     with_copied,
 )
-from shared import (
+from backfillctl.shared import (
     COLUMNS,
     KIB,
     POOL_TYPE_ERASURE,
