@@ -32,6 +32,8 @@ from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
 
+import shtab
+
 from backfillctl.messages import (
     PROGRESS_QUERY_EFFECT,
     blocking_reason,
@@ -792,12 +794,20 @@ def add_load_state_arg(
     Both exist so the option works before or after the subcommand name.
     parser may be an argument group, e.g. to make it exclusive with another.
     """
-    parser.add_argument(
+    add_dir_arg(
+        parser,
         "--load-state",
-        metavar="DIR",
         dest=SUB_LOAD_STATE if after_command else "load_state",
         help=help,
     )
+
+
+def add_dir_arg(parser, *name_or_flags: str, **kwargs) -> argparse.Action:
+    """parser.add_argument() for a directory: shown as DIR, and shell
+    completion (--print-completion) offers only directories for it."""
+    action = parser.add_argument(*name_or_flags, metavar="DIR", **kwargs)
+    action.complete = shtab.DIRECTORY
+    return action
 
 
 def resolve_load_state(

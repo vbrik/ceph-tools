@@ -24,6 +24,7 @@ from backfillctl.shared import (
     PROGRESS_COUNTERS,
     HelpFormatter,
     SnapshotStore,
+    add_dir_arg,
     extract_pg_stats,
     query_backfill_positions,
     resolve_save_dir,
@@ -94,9 +95,9 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         description=__doc__,
         formatter_class=HelpFormatter,
     )
-    parser.add_argument(
+    add_dir_arg(
+        parser,
         "dir",
-        metavar="DIR",
         help="Output directory; created if missing, must be empty.",
     )
     return parser

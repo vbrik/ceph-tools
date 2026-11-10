@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 """Dispatch to backfillctl's subcommands.
 
-build_parser() has no side effects, so tests and shtab can import it:
-'shtab --shell=bash backfillctl.__main__.build_parser'.
+build_parser() has no side effects, so tests can import it. Its
+--print-completion (from shtab) prints a completion script for it.
 """
 
 import argparse
+
+import shtab
 
 from backfillctl import (
     balance,
@@ -42,6 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=HelpFormatter,
     )
     add_load_state_arg(parser)
+    shtab.add_argument_to(
+        parser, help="Print a shell completion script and exit; see the README."
+    )
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,

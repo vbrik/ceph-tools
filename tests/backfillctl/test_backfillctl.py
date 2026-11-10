@@ -12,15 +12,18 @@ import argparse
 import contextlib
 import io
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from unittest import mock
 
-from _support import BACKFILLCTL, TEST_DATA, child_env, run_command
+import shtab
+from _support import BACKFILLCTL, REPO_ROOT, TEST_DATA, child_env, run_command
 
 from backfillctl import divert_toofull as dt
 from backfillctl.__main__ import _COMMAND_MODULES, build_parser
@@ -261,6 +264,115 @@ class TopLevelHelpTest(unittest.TestCase):
     def test_cancel_backfill_usage_shows_pin_blockers_needs_osds(self):
         usage = help_text("cancel-backfill")
         self.assertIn("[--osds OSD [OSD ...] [--pin-blockers]]", usage)
+
+
+# The README's one-time completion setup: bash-completion sources this file the
+# first time <Tab> completes 'backfillctl', in each new shell.
+COMPLETION_STUB = (
+    'command -v backfillctl >/dev/null && eval "$(backfillctl --print-completion bash)"'
+)
+
+
+def all_actions(parser: argparse.ArgumentParser) -> Iterator[argparse.Action]:
+    """Every argument of parser and, recursively, of its subcommands."""
+    for action in parser._actions:
+        yield action
+        if isinstance(action, argparse._SubParsersAction):
+            for subparser in action.choices.values():
+                yield from all_actions(subparser)
+
+
+@unittest.skipUnless(shutil.which("bash"), "needs bash")
+class CompletionTest(unittest.TestCase):
+    """--print-completion, and the README's setup that loads it in bash."""
+
+    def setUp(self):
+        # A 'backfillctl' on PATH that runs this working tree, as installed.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        launcher = self.bin / "backfillctl"
+        launcher.write_text(f'#!/bin/sh\nexec {shlex.join(BACKFILLCTL)} "$@"\n')
+        launcher.chmod(0o755)
+        self.stub = self.tmp / "stub"
+        self.stub.write_text(COMPLETION_STUB + "\n")
+
+    def bash(self, script: str, path: str | None = None) -> subprocess.CompletedProcess:
+        """Run script in a fresh bash, in self.tmp, after sourcing the stub.
+
+        path replaces PATH; by default self.bin goes in front of it.
+        """
+        env = child_env()
+        env["PATH"] = path or os.pathsep.join([str(self.bin), env["PATH"]])
+        return subprocess.run(
+            ["bash", "--norc", "--noprofile", "-c", f"source ./stub\n{script}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=self.tmp,
+            env=env,
+        )
+
+    def complete(self, *words: str) -> list[str]:
+        """What <Tab> offers, sorted, after 'backfillctl *words' (the last
+        word is the one being completed)."""
+        result = self.bash(
+            f"COMP_WORDS=(backfillctl {shlex.join(words)})\n"
+            "COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))\n"
+            'COMP_LINE="${COMP_WORDS[*]}"; COMP_POINT=${#COMP_LINE}\n'
+            '_shtab_backfillctl && printf "%s\\n" "${COMPREPLY[@]}"\n'
+        )
+        self.assertEqual(result.stderr, "")
+        return sorted(result.stdout.split())
+
+    def test_readme_gives_the_setup_this_tests(self):
+        self.assertIn(COMPLETION_STUB, (REPO_ROOT / "README.md").read_text())
+
+    def test_bash_script_is_valid(self):
+        script = run_backfillctl("--print-completion", "bash")
+        self.assertEqual(script.returncode, 0, script.stderr)
+        check = subprocess.run(
+            ["bash", "-n"],
+            input=script.stdout,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(check.returncode, 0, check.stderr)
+
+    def test_completes_subcommands(self):
+        self.assertEqual(self.complete(""), sorted(command_names()))
+        self.assertEqual(self.complete("show-"), ["show-backfill", "show-pg-osds"])
+
+    def test_dir_arguments_offer_only_directories(self):
+        (self.tmp / "capture").mkdir()
+        (self.tmp / "cat.txt").write_text("")
+        for words in (
+            ("--load-state", "ca"),
+            ("measure-rate", "--save-state", "ca"),
+            ("save-state", "ca"),
+        ):
+            with self.subTest(words=words):
+                self.assertEqual(self.complete(*words), ["capture"])
+
+    def test_every_dir_argument_is_marked_for_completion(self):
+        dirs = [a for a in all_actions(build_parser()) if a.metavar == "DIR"]
+        self.assertGreaterEqual(len(dirs), 4)  # --load-state twice, save dirs
+        for action in dirs:
+            with self.subTest(action=action.dest):
+                self.assertEqual(getattr(action, "complete", None), shtab.DIRECTORY)
+
+    def test_setup_is_silent_without_backfillctl_on_path(self):
+        # E.g. <Tab> before the venv is activated: no completion, no error.
+        result = self.bash("complete -p backfillctl 2>/dev/null", path="/usr/bin:/bin")
+        self.assertEqual((result.stdout, result.stderr), ("", ""))
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_setup_registers_the_completion(self):
+        result = self.bash("complete -p backfillctl")
+        self.assertIn("-F _shtab_backfillctl backfillctl", result.stdout)
 
 
 class RunCommandTest(unittest.TestCase):

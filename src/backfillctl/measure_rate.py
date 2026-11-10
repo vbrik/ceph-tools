@@ -68,6 +68,7 @@ from backfillctl.shared import (
     SnapshotStore,
     TimedPositions,
     abbreviate_state,
+    add_dir_arg,
     add_load_state_arg,
     anonymize_snapshots,
     fetch_backfill_positions,
@@ -159,9 +160,9 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
         "(e.g. waiting or too full).",
     )
     state = parser.add_mutually_exclusive_group()
-    state.add_argument(
+    add_dir_arg(
+        state,
         "--save-state",
-        metavar="DIR",
         help="Also save both samples to DIR (created if missing, must be empty), "
         "for --load-state.",
     )

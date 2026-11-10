@@ -36,7 +36,8 @@ pip install -e '.[dev]'    # or `pip install -e .` without the test tools
 `--system-site-packages` lets the venv see the distro's `rados` bindings,
 which are not on PyPI; without them `backfillctl` falls back to the slower
 `ceph` CLI. The install is editable: code changes take effect immediately,
-but re-run `pip install -e .` after adding a command to `pyproject.toml`.
+but re-run `pip install -e .` after changing `pyproject.toml` (e.g. adding a
+command or a dependency).
 
 ## Tools
 
@@ -80,13 +81,20 @@ and keep drained OSDs up and in: marking them out voids the upmaps. The
 remapping commands assume the CRUSH failure domain is `host`. `balance`
 works in rounds: apply, let the backfills finish, and re-run.
 
-Shell completion via [shtab](https://docs.iterative.ai/shtab/) (installed
-by the `dev` extra):
+**Shell completion** (bash, via [shtab](https://docs.iterative.ai/shtab/)):
+`backfillctl --print-completion bash` prints the script. To load it in every
+shell, once:
 
 ```
-shtab --shell=bash backfillctl.__main__.build_parser > completions.bash
-source completions.bash
+mkdir -p ~/.local/share/bash-completion/completions
+echo 'command -v backfillctl >/dev/null && eval "$(backfillctl --print-completion bash)"' \
+    > ~/.local/share/bash-completion/completions/backfillctl
 ```
+
+[bash-completion](https://github.com/scop/bash-completion) sources that file
+the first time you press Tab on `backfillctl` in a shell, so completion
+always matches the installed version. `--print-completion` also takes `zsh`,
+`tcsh` and others.
 
 #### Other
 
