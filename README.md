@@ -75,7 +75,11 @@ Commands for inspecting and steering PG backfills. Run it as
 The Remap and Cancel commands change nothing; they print upmap proposals.
 Apply them with [pgremapper](https://github.com/digitalocean/pgremapper)'s
 `import-mappings` (see `--pgremapper-mappings`), which, unlike
-`ceph osd pg-upmap-items`, keeps a PG's existing upmap pairs. Turn off the
+`ceph osd pg-upmap-items`, keeps a PG's existing upmap pairs. Besides
+`pgid` and `mapping`, each JSON entry carries the table's `shard`, `role`
+and `note`; pgremapper ignores them, but they let you edit the proposal
+with `jq` first (e.g. keep a PG's `blocker` pins while dropping the rest;
+each command's `--help` explains its roles). Turn off the
 upmap balancer (`ceph balancer off`) for as long as the upmaps should hold,
 and keep drained OSDs up and in: marking them out voids the upmaps. The
 remapping commands assume the CRUSH failure domain is `host`. `balance`
