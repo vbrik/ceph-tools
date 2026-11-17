@@ -578,6 +578,7 @@ class FixtureInvariantTest(unittest.TestCase):
         "ceph1-resumed-backfills-exact-progress",
         "ceph2-37-filling-with-partial-backfills",
         "ceph2-just-added-ceph2-38-all-pgs-pinned-in-place-no-backfills",
+        "ceph2-just-added-ceph2-38-rebalance-only-to-ceph2-38-with-max-target-util-80",
         "divert-toofull-ceph2-util-emergency-2-new-hosts",
         "divert-toofull-osd263-existing-upmap-chain",
     ]
@@ -687,6 +688,14 @@ class FixtureInvariantTest(unittest.TestCase):
         )
         self.assertGreater(r.unpinned_count, len(r.requested) / 2)
 
+    def test_target_hosts_with_their_backfills_in_flight(self):
+        # A round applied: 1976 shards arriving on host38, 593 pins left.
+        r = self.check_target_hosts(
+            "ceph2-just-added-ceph2-38-rebalance-only-to-ceph2-38-with-max-target-util-80",
+            "host38",
+        )
+        self.assertTrue(r.unpinned_count)
+
     def test_a_busy_cluster_gets_relieved(self):
         result, trace = self.traced["ceph1-resumed-backfills-exact-progress"]
         self.assertGreater(len(trace), 10)
@@ -738,6 +747,35 @@ class PartlyCopiedFixtureTest(unittest.TestCase):
         err = flat(run_command(bal, load_state=fixture, check=True).stderr)
         self.assertEqual(1, err.count(f"has no {shared.BACKFILL_POSITIONS_FILE}"))
         self.assertIn(flat(messages.PROJECTION_QUERY_EFFECT), err)
+
+
+class AppliedRoundFixtureTest(unittest.TestCase):
+    """A round of balance --target-hosts, applied, its backfills just started.
+
+    FIXTURE: 'balance --target-hosts host38 --max-target-util 80' applied to
+    ../ceph2-just-added-ceph2-38-all-pgs-pinned-in-place-no-backfills/ (see
+    the fixture's README.txt).
+    """
+
+    FIXTURE = (
+        TEST_DATA
+        / "ceph2-just-added-ceph2-38-rebalance-only-to-ceph2-38-with-max-target-util-80"
+    )
+    NEW_HOST = range(926, 952)
+    ROUND = ("--target-hosts", "host38", "--max-target-util", "80")
+
+    def test_the_round_run_again_proposes_nothing(self):
+        result = plan_from_state(bal, self.FIXTURE, *self.ROUND)
+        self.assertTrue(result.shed.sources)
+        self.assertEqual(result.shed.moves, [])
+
+    def test_new_osds_end_up_where_their_shards_take_them(self):
+        # Under the cap, within the ~0.3% a new OSD holds empty.
+        final = replayed_cluster(self.FIXTURE).final
+        for osd, pct in mapped_share_pct(self.FIXTURE, self.NEW_HOST).items():
+            with self.subTest(osd=osd):
+                self.assertLess(final.utilization(osd), 80.0)
+                self.assertAlmostEqual(final.utilization(osd), pct, delta=0.5)
 
 
 if __name__ == "__main__":

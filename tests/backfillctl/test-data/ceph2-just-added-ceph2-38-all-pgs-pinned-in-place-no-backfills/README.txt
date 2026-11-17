@@ -38,4 +38,7 @@ move a shard that is not pinned. Where an unpin is refused, it is mostly
 because the host38 OSD would end up above the source it relieves; the
 pinned shard then usually stays, and its source sheds another.
 
+../ceph2-just-added-ceph2-38-rebalance-only-to-ceph2-38-with-max-target-util-80/
+is this state with one round of 'balance --target-hosts' applied.
+
 tests/backfillctl/test_balance.py replays it (FixtureInvariantTest).
