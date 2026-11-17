@@ -12,9 +12,11 @@ backfill in motion and every proposal completes, crediting data leaving it.
 A backfill under way adds only what it has yet to copy (placement.with_copied),
 so every PG in motion is queried for its backfill position. Each turn takes
 the source projected fullest and moves its largest shard that has a legal
-target (one still arriving on it is redirected). A source is done once it is
-below the level, or when none of its shards can go anywhere; the others carry
-on. Without a level, a source is done when it has no shards left.
+target (one still arriving on it is redirected); given target hosts, shards
+pinned away from their OSDs go first (shed_sources). A source is done once
+it is below the level, or when none of its shards can go anywhere; the
+others carry on. Without a level, a source is done when it has no shards
+left.
 
 The run's own moves take data off the sources and put it on other OSDs, never
 the reverse, so none of them makes an OSD read and write backfill data at
@@ -820,6 +822,11 @@ def shed_sources(
     (targets only fill up, so it would not get one later). So is every
     shard of a source once it is below the level. A source without a
     capacity figure goes first, and is drained in full.
+
+    Given target hosts, shards pinned away from one of their OSDs
+    (unpin_target) go first: a source sheds only a few shards, and the
+    largest is rarely the pinned one, so most pins would stay and their
+    data would move twice (here, then where CRUSH maps it).
     """
     final = planner.cluster.final
 
@@ -827,12 +834,15 @@ def shed_sources(
         util = final.utilization(source) if final.knows(source) else math.inf
         return -util, source
 
+    def order(shard: MappedShard) -> tuple:
+        pinned = planner.unpin_target(states[shard.pgid], shard) is not None
+        return not pinned, *shard_order(shard)
+
     heap = [priority(s) for s in by_source]
     heapq.heapify(heap)
-    # Reversed, so pop() takes the largest.
+    # Reversed, so pop() takes the first in order.
     todo = {
-        s: sorted(shards, key=shard_order, reverse=True)
-        for s, shards in by_source.items()
+        s: sorted(shards, key=order, reverse=True) for s, shards in by_source.items()
     }
     left: list[tuple[int, MappedShard]] = []
 

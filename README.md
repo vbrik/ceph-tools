@@ -91,9 +91,9 @@ terminal, stderr shows the balancer reminder in bold yellow (set
 **After adding hosts** to a full cluster, relieve the fullest OSDs first
 without CRUSH's cluster-wide reshuffle: turn the balancer off, add the hosts,
 pin every backfill with `cancel-backfill`, then run `balance --target-hosts`
-with the new hosts in rounds. Where it costs no relief, a shard pinned away
-from a new host goes back to the OSD CRUSH chose for it, so that data moves
-once. Turn the balancer back on to finish gradually.
+with the new hosts in rounds. Each source sheds its shards pinned away from
+a new host first, and where it costs no relief, such a shard goes back to the
+OSD CRUSH chose for it, so that data moves once. Turn the balancer back on to finish gradually.
 
 **Shell completion** (bash, via [shtab](https://docs.iterative.ai/shtab/)):
 `backfillctl --print-completion bash` prints the script. To load it in every

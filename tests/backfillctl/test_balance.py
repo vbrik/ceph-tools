@@ -260,6 +260,23 @@ class TargetHostsTest(unittest.TestCase):
         _, err = self.pinned().rendered("--target-hosts", "h5")
         self.assertNotIn("CRUSH maps it to", err)
 
+    def test_a_source_sheds_its_pinned_shard_before_a_larger_one(self):
+        # osd.0 sheds one shard to get below the level. Largest first would
+        # send 1.1's to h4 and leave 1.0 pinned away from osd.40.
+        c = self.pinned()
+        c.util[0] = 55.0
+        c.pg("1.1", [0, 11, 21], shard_pct=2)
+        result = c.plan("--until-util", "54.5", "--target-hosts", "h4")
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 40)])
+        self.assertEqual(result.shed.unpinned_count, 1)
+
+    def test_without_target_hosts_the_largest_shard_goes_first(self):
+        c = self.pinned()
+        c.util[0] = 55.0
+        c.pg("1.1", [0, 11, 21], shard_pct=2)
+        result = c.plan("--until-util", "54.5")
+        self.assertEqual([m.pgid for m in result.shed.moves], ["1.1"])
+
     def test_unpin_json_entry_is_up_to_crush_osd(self):
         out, _ = self.pinned().rendered("--target-hosts", "h4", "--pgremapper-mappings")
         self.assertEqual(
@@ -560,6 +577,7 @@ class FixtureInvariantTest(unittest.TestCase):
     FIXTURES: ClassVar = [
         "ceph1-resumed-backfills-exact-progress",
         "ceph2-37-filling-with-partial-backfills",
+        "ceph2-just-added-ceph2-38-all-pgs-pinned-in-place-no-backfills",
         "divert-toofull-ceph2-util-emergency-2-new-hosts",
         "divert-toofull-osd263-existing-upmap-chain",
     ]
@@ -645,16 +663,29 @@ class FixtureInvariantTest(unittest.TestCase):
                     self.assertNotIn(m.target_osd, {f for f, _ in existing})
                 self.assertLess(m.target_projected, r.level)
 
-    def test_target_hosts_on_new_hosts(self):
-        fixture = "divert-toofull-ceph2-util-emergency-2-new-hosts"
-        hosts = {"host50", "host51"}
-        result, trace = self.run_traced(fixture, "--target-hosts", *sorted(hosts))
+    def check_target_hosts(self, fixture: str, *hosts: str) -> sh.ShedResult:
+        """Check balance --target-hosts hosts on fixture; return its ShedResult."""
+        result, trace = self.run_traced(fixture, "--target-hosts", *hosts)
         self.check(fixture, result, trace)
         r = result.shed
         self.assertTrue(r.requested)
         for m in r.moves:
             if not sh.is_pin(m):
                 self.assertIn(r.osd_host[m.target_osd], hosts, m)
+        return r
+
+    def test_target_hosts_on_new_hosts(self):
+        self.check_target_hosts(
+            "divert-toofull-ceph2-util-emergency-2-new-hosts", "host50", "host51"
+        )
+
+    def test_target_hosts_send_most_pinned_shards_home(self):
+        # 2092 pairs pin shards CRUSH maps to host38 on old OSDs. Shed largest
+        # first, only 59 of 2140 moves were unpins (see its README.txt).
+        r = self.check_target_hosts(
+            "ceph2-just-added-ceph2-38-all-pgs-pinned-in-place-no-backfills", "host38"
+        )
+        self.assertGreater(r.unpinned_count, len(r.requested) / 2)
 
     def test_a_busy_cluster_gets_relieved(self):
         result, trace = self.traced["ceph1-resumed-backfills-exact-progress"]

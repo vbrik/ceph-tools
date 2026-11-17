@@ -53,7 +53,8 @@ CRUSH's own moves would leave little for balance to do. A shard pinned away
 from a target host's OSD by an upmap pair goes back to that OSD rather than
 to the emptiest, if it is a legal target and ends more than the shard's size
 below the level (closer, it could hold back later moves off the source): the
-data then moves only once, and pgremapper drops the pair.
+data then moves only once, and pgremapper drops the pair. So that most pins
+go, each source sheds such shards before its larger ones.
 
 stderr names the sources projected to stay at or above the level. For more,
 apply the output, let the backfills finish and run again:
