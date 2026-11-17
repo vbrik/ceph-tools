@@ -504,7 +504,7 @@ class PgPlacement:
         self.is_ec = is_ec
         self.size_bytes = size_bytes
         self.new_up = list(pg["up"])  # 'up' once the proposals are applied
-        # raw: see raw_crush_osds.
+        self.raw = raw  # see raw_crush_osds
         self.forbidden_osds = raw | real_osd_set(pg["up"])
 
     def forbidden_hosts(self, moving_osd: int, osd_host: dict[int, str]) -> set:

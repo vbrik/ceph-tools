@@ -315,6 +315,11 @@ def unplaceable_note(guards: str | None = None) -> str:
     )
 
 
+# The NOTE of a move that sends a pinned shard back to the OSD CRUSH maps it
+# to: pgremapper drops the existing pair instead of adding one.
+UNPIN_NOTE = "back to its CRUSH OSD, dropping its upmap pair"
+
+
 # Appended to targets_clause when a target must end up below its source.
 RELIEVE_CLAUSE = ", ending up below the OSD they relieve"
 

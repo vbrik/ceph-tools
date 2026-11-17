@@ -38,12 +38,18 @@ from _support import shed as sh
 
 class Cluster(SyntheticCluster):
     def shed(
-        self, *sources, level=None, level_class=None, max_target_util=None
+        self,
+        *sources,
+        level=None,
+        level_class=None,
+        max_target_util=None,
+        target_hosts=None,
     ) -> sh.ShedResult:
         """Run shed() on this cluster, off sources, down to level."""
+        hosts = None if target_hosts is None else frozenset(target_hosts)
         with self.store() as store:
             cluster = sh.Cluster(store, max_target_util)
-            return sh.shed(cluster, set(sources), level, level_class)
+            return sh.shed(cluster, set(sources), level, level_class, hosts)
 
 
 def pairs(result: sh.ShedResult) -> list[tuple[str, object, int, int]]:
@@ -877,6 +883,223 @@ class BlockerTest(unittest.TestCase):
         result = c.pg("1.0", [0, 10, 20], [0, 11, 20]).shed(0)
         self.assertEqual(pairs(result), [("1.0", 0, 0, 1), ("1.0", 1, 10, 11)])
         self.assertEqual(result.stuck_pgs, [])
+
+
+class TargetHostsTest(unittest.TestCase):
+    """Target hosts: only OSDs on these hosts receive data."""
+
+    def test_targets_are_on_the_target_hosts_only(self):
+        c = Cluster()
+        c.util[31] = 5.0  # emptiest, but on h3
+        c.util[41] = 30.0
+        c.pg("1.0", [0, 10, 20])
+        self.assertEqual(pairs(c.shed(0)), [("1.0", 0, 0, 31)])
+        result = c.shed(0, target_hosts={"h4"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 41)])
+        self.assertEqual(result.target_hosts, ["h4"])
+
+    def test_blocker_is_diverted_onto_a_target_host_only(self):
+        # As BlockerTest.test_blocker_is_diverted, restricted to h4 and h5.
+        c = Cluster()
+        c.util[10] = 95.0
+        c.util[31] = 10.0
+        c.util[41] = 20.0
+        c.pg("1.0", [0, 10, 20], [0, 11, 20])
+        result = c.shed(0, target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 41), ("1.0", 1, 10, 50)])
+        self.assertEqual(result.diverted_count, 1)
+
+    def test_no_target_host_with_room_leaves_the_shard(self):
+        c = Cluster()
+        c.util[50] = c.util[51] = 89.5  # over the 89% cap with a 1% shard
+        result = c.pg("1.0", [0, 10, 20]).shed(0, target_hosts={"h5"})
+        self.assertEqual((result.moves, len(result.unplaceable)), ([], 1))
+
+    def test_no_restriction_by_default(self):
+        self.assertIsNone(Cluster().pg("1.0", [0, 10, 20]).shed(0).target_hosts)
+
+
+class UnpinTest(unittest.TestCase):
+    """Given target hosts, a pinned shard goes back to its CRUSH OSD if legal.
+
+    CRUSH chose osd.40 for the shard; an existing pin 40->0 holds it on osd.0.
+    """
+
+    @staticmethod
+    def pinned(pgid="1.0", up=(0, 10, 20)) -> Cluster:
+        c = Cluster()
+        c.util[40] = 30.0  # CRUSH's choice
+        c.util[50] = 10.0  # emptier
+        c.upmaps.append({"pgid": pgid, "mappings": [{"from": 40, "to": up[0]}]})
+        return c.pg(pgid, list(up))
+
+    def test_pinned_shard_goes_back_to_its_crush_osd(self):
+        result = self.pinned().shed(0, target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 40)])
+        self.assertEqual(result.moves[0].note, messages.UNPIN_NOTE)
+        self.assertEqual(result.unpinned_count, 1)
+
+    def test_replicated_pinned_shard_goes_back_too(self):
+        result = self.pinned("2.0").shed(0, target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("2.0", "-", 0, 40)])
+
+    def test_no_unpin_without_target_hosts(self):
+        result = self.pinned().shed(0)
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 50)])  # 40 is raw: banned
+        self.assertEqual(result.unpinned_count, 0)
+
+    def test_crush_osd_not_on_a_target_host_is_not_unpinned_to(self):
+        result = self.pinned().shed(0, target_hosts={"h5"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 50)])
+
+    def test_crush_osd_over_the_cap_falls_back(self):
+        c = self.pinned()
+        c.util[40] = 89.5  # + 1% shard: over the 89% cap
+        result = c.shed(0, target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 50)])
+
+    def test_crush_osd_at_the_level_falls_back(self):
+        c = self.pinned()
+        c.util[0] = 80.0
+        c.util[40] = 39.5  # + 1% shard: 40.5%, at or above the level
+        result = c.shed(0, level=40.0, level_class="hdd", target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 50)])
+
+    def test_crush_osd_on_a_host_the_pg_uses_falls_back(self):
+        # osd.41, on osd.40's host, holds another shard of the PG.
+        result = self.pinned(up=(0, 41, 20)).shed(0, target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 50)])
+
+    def test_crush_osd_whose_host_another_shard_took_falls_back(self):
+        # The fuller source osd.10 goes first; its shard 1 takes osd.41 (40,
+        # raw, is banned for it), so osd.40's host is used when shard 0 moves.
+        c = self.pinned()
+        c.util[10] = 90.0
+        c.util[41] = 5.0
+        c.util[50] = 60.0
+        c.util[51] = 70.0
+        result = c.shed(0, 10, target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("1.0", 1, 10, 41), ("1.0", 0, 0, 50)])
+        self.assertEqual(result.unpinned_count, 0)
+
+    def test_crush_osd_that_is_a_source_is_not_unpinned_to(self):
+        result = self.pinned().shed(0, 40, target_hosts={"h4", "h5"})
+        self.assertNotIn(("1.0", 0, 0, 40), pairs(result))
+        self.assertEqual(result.unpinned_count, 0)
+
+    def test_unpin_re_placed_for_a_blockers_pin_loses_its_note(self):
+        # As BlockerTest.test_move_clashing_with_a_blockers_pin_is_placed_elsewhere,
+        # but shard 0 is pinned away from osd.10 (h1), so it first unpins there.
+        # Pinning blocker shard 1 back to osd.11 (h1) clashes: shard 0 goes
+        # to osd.40 instead, an ordinary move.
+        c = Cluster()
+        for osd in (11, 30, 31, 41):
+            c.classes[osd] = "ssd"
+            c.util[osd] = 95.0
+        c.util[10], c.util[40] = 10.0, 20.0
+        c.upmaps.append({"pgid": "1.0", "mappings": [{"from": 10, "to": 0}]})
+        c.pg("1.0", [0, 30, 20], [0, 11, 20])
+        result = c.shed(0, target_hosts={"h1", "h4"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 40), ("1.0", 1, 30, 11)])
+        self.assertEqual(result.moves[0].note, "")
+        self.assertEqual(result.unpinned_count, 0)
+
+    def test_crush_osd_stays_banned_once_an_unpin_is_undone(self):
+        # uncommit frees a target for the PG's other shards, but not one in
+        # the raw CRUSH mapping.
+        c = self.pinned()
+        with c.store() as store:
+            cluster = sh.Cluster(store, None)
+            planner = sh.Planner(
+                cluster,
+                {0},
+                None,
+                None,
+                relieve=False,
+                target_hosts=frozenset({"h4", "h5"}),
+            )
+            state = cluster.pg_state(cluster.pgs[0])
+            [shard], _ = placement.find_mapped_shards(
+                state.pg, True, {0}, state.size_bytes
+            )
+            self.assertEqual(planner.place(state, shard)[1], 40)
+            planner.commit(state, shard, 40)
+            planner.uncommit(state, shard, 40)
+        self.assertIn(40, state.forbidden_osds)
+
+    def test_crush_osd_of_another_class_is_not_unpinned_to(self):
+        c = self.pinned()
+        c.classes[40] = "ssd"
+        result = c.shed(0, target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 50)])
+
+    def test_crush_osd_holding_the_shards_data_is_not_unpinned_to(self):
+        # Shard 0 is still arriving on osd.0 from osd.40: 0->40 would be a pin.
+        c = self.pinned()
+        c.pgs[0]["acting"] = [40, 10, 20]
+        c.pgs[0]["state"] += "+remapped"
+        result = c.shed(0, target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 50)])
+        self.assertEqual(result.unpinned_count, 0)
+
+    def test_crush_osd_in_acting_at_another_slot_is_not_unpinned_to(self):
+        # osd.40 still holds slot 2's data: it would hold two shards of the PG.
+        c = self.pinned()
+        c.pgs[0]["acting"] = [0, 10, 40]
+        c.pgs[0]["state"] += "+remapped"
+        result = c.shed(0, target_hosts={"h4", "h5"})
+        self.assertNotIn(("1.0", 0, 0, 40), pairs(result))
+
+    def test_unpin_that_would_hold_back_relief_is_not_preferred(self):
+        # osd.40, CRUSH's choice for 1.0's shard 0, would end at 59.5%: every
+        # later shard off osd.0 must then leave it above 59.5%, and the third
+        # could not. The emptiest targets get osd.0 below the 60% level.
+        c = Cluster(default_util=30.0)
+        c.util[0] = 62.0
+        c.util[40] = 58.5
+        c.util[50] = c.util[51] = 10.0
+        c.upmaps.append({"pgid": "1.0", "mappings": [{"from": 40, "to": 0}]})
+        c.pg("1.0", [0, 10, 20]).pg("1.1", [0, 11, 21]).pg("1.2", [0, 10, 31])
+        result = c.shed(0, level=60.0, level_class="hdd", target_hosts={"h4", "h5"})
+        self.assertEqual(result.unplaceable, [])
+        self.assertLess(result.final_util[0], 60.0)
+        self.assertEqual(result.unpinned_count, 0)
+
+    def test_unpin_well_below_the_level_is_preferred(self):
+        # osd.40 ends at 31%, fuller than osd.50 would (11%), but more than a
+        # shard below the 60% level: osd.0's later moves, made while it is at
+        # or above the level, and of shards no larger, still leave it above.
+        c = self.pinned()
+        c.util[0] = 80.0
+        result = c.shed(0, level=60.0, level_class="hdd", target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 40)])
+
+    def test_unpin_within_a_shard_of_the_level_is_not_preferred(self):
+        # osd.0's largest shard (1.1's, 3%) can go to h3 only: osd.30, ending
+        # at 59.6%. osd.40, CRUSH's choice for 1.0's shard 0, would end at
+        # 59.3%: no fuller, but within a shard (1%) of the 60% level, so the
+        # emptiest wins. The rule stays one clause, at the cost of an unpin.
+        c = Cluster(default_util=30.0)
+        c.util[0] = 80.0
+        c.util[30] = 56.6
+        c.util[31] = 70.0  # above the level: no target
+        c.util[40] = 58.3
+        c.util[50] = 10.0
+        c.upmaps.append({"pgid": "1.0", "mappings": [{"from": 40, "to": 0}]})
+        c.pg("1.0", [0, 10, 20]).pg("1.1", [0, 41, 51], shard_pct=3.0)
+        hosts = {"h3", "h4", "h5"}
+        result = c.shed(0, level=60.0, level_class="hdd", target_hosts=hosts)
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 50), ("1.1", 0, 0, 30)])
+        self.assertEqual(result.unpinned_count, 0)
+
+    def test_stale_pair_is_ignored(self):
+        # osd.40 is still in 'up': the pair 40->0 is stale, no unpin target.
+        c = Cluster()
+        c.util[51] = 10.0
+        c.upmaps.append({"pgid": "1.0", "mappings": [{"from": 40, "to": 0}]})
+        result = c.pg("1.0", [0, 40, 20]).shed(0, target_hosts={"h4", "h5"})
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 51)])
+        self.assertEqual(result.unpinned_count, 0)
 
 
 class OutputTest(unittest.TestCase):

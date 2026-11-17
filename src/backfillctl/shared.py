@@ -689,8 +689,10 @@ def short_hosts(hosts: Iterable[str]) -> list[str]:
     return sorted({h.split(".")[0] for h in hosts})
 
 
-def host_osds(hosts: Iterable[str], osd_host: dict[int, str]) -> set[int]:
-    """Return every OSD of the given --hosts, exiting if a host has none.
+def host_osds(
+    hosts: Iterable[str], osd_host: dict[int, str], option: str = "--hosts"
+) -> set[int]:
+    """Return every OSD of the hosts given with option, exiting if a host has none.
 
     Hosts match by short name (short_hosts), so 'ceph1.example.org' matches
     'ceph1'.
@@ -700,7 +702,7 @@ def host_osds(hosts: Iterable[str], osd_host: dict[int, str]) -> set[int]:
     missing = sorted(wanted - {osd_host[o] for o in osds})
     if missing:
         sys.exit(
-            f"ERROR: --hosts: no OSDs under these in 'ceph osd tree': "
+            f"ERROR: {option}: no OSDs under these in 'ceph osd tree': "
             f"{', '.join(missing)}"
         )
     return osds

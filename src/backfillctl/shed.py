@@ -26,11 +26,16 @@ in the PG's up or acting set or raw CRUSH mapping, not on a host the PG's
 other shards use (the shard's own host is fine), and at or below
 --max-target-util counting arrivals only (ProjectedUsage: Ceph checks when it
 reserves the backfill, before the source frees anything), and its pairs must
-not chain with the PG's others. With a level, it must also end up below the
-OSD it relieves, so that no move raises the maximum or ping-pongs, and, in the
-level's device class if it has one (balance), below the level, so that no move
-pushes another OSD to it. Emptying an OSD may need fuller targets, so without a
-level neither applies. The target that ends up least utilized wins.
+not chain with the PG's others. Given target hosts (balance --target-hosts),
+it must be on one of them. With a level, it must also end up below the OSD it
+relieves, so that no move raises the maximum or ping-pongs, and, in the
+level's device class if it has one (balance), below the level, so that no
+move pushes another OSD to it. Emptying an OSD may need fuller targets, so
+without a level neither applies. The target that ends up least utilized
+wins, except that, given target hosts, a shard pinned away from one of their
+OSDs by an upmap pair goes back to it if it is legal (exempt from the
+raw-mapping ban, which only holds it for this shard), unless that could stop
+later moves off the source (costs_relief): pgremapper then drops the pair.
 
 Ending up below the OSD it relieves holds for the whole run (and in
 divert-toofull, which always applies it), not just when a move is chosen: no
@@ -64,6 +69,7 @@ from typing import NamedTuple
 
 from backfillctl.messages import (
     PROJECTION_QUERY_EFFECT,
+    UNPIN_NOTE,
     blocking_reason,
     companion_note,
     format_bytes,
@@ -292,6 +298,7 @@ class Move(NamedTuple):
     target_projected: float | None = None  # likewise; None for pins
     note: str = ""
     role: str = ROLE_REQUESTED  # blockers and their companions: ROLE_BLOCKER
+    unpin: bool = False  # back to the OSD CRUSH maps it to (Planner.unpin_target)
 
 
 def is_pin(move: Move) -> bool:
@@ -319,6 +326,8 @@ class PgState(PgPlacement):
         target: int,
         note: str = "",
         role: str = ROLE_REQUESTED,
+        *,
+        unpin: bool = False,
     ) -> None:
         """Record a move of shard to target; projections are filled in later."""
         self.moves.append(
@@ -331,6 +340,7 @@ class PgState(PgPlacement):
                 size_bytes=self.size_bytes,
                 note=note,
                 role=role,
+                unpin=unpin,
             )
         )
 
@@ -346,17 +356,21 @@ class Planner:
         level_class: str | None,
         *,
         relieve: bool,
+        target_hosts: frozenset[str] | None = None,
     ):
         """level_class: the device class whose targets must stay below level.
 
         relieve: a target must end up below the OSD it relieves, once every
         move is done (highest_target, lowest_relieved).
+
+        target_hosts: if given, only OSDs on these hosts are targets.
         """
         self.cluster = cluster
         self.sources = sources
         self.level = level
         self.level_class = level_class
         self.relieve = relieve
+        self.target_hosts = target_hosts
         # The committed moves, both ways: the OSDs each target relieved, and
         # the targets each relieved OSD sent data to (counted, as a pair may
         # repeat).
@@ -369,7 +383,12 @@ class Planner:
         self.max_capacity: dict[str, int] = {}
         self.order_key: dict[int, tuple[str, tuple[float, int]]] = {}
         for cls, all_osds in cluster.candidates.items():
-            osds = [o for o in all_osds if o not in sources]
+            osds = [
+                o
+                for o in all_osds
+                if o not in sources
+                and (target_hosts is None or cluster.osd_host.get(o) in target_hosts)
+            ]
             if not osds:
                 continue
             self.order[cls] = sorted((final.utilization(o), o) for o in osds)
@@ -415,7 +434,9 @@ class Planner:
 
         avoid_host is forbidden too. Candidates are tried in final
         projection order, so the search stops at the first that could not
-        beat the best found, or reach below the guards.
+        beat the best found, or reach below the guards. Given target hosts,
+        the OSD CRUSH maps the shard to (unpin_target) wins over the best if
+        legal and relief does not pay for it (see below).
         """
         c = self.cluster
         cls = osd_class(c.osd_df, shard.up_osd)
@@ -430,6 +451,31 @@ class Planner:
         forbidden_hosts = state.forbidden_hosts(shard.up_osd, c.osd_host)
         if avoid_host is not None:
             forbidden_hosts.add(avoid_host)
+
+        def legal(osd: int, forbidden_osds: set[int]) -> float | None:
+            """Return osd's final projection with the shard, if it is a legal target."""
+            if (
+                target_projection(
+                    osd,
+                    shard.size_bytes,
+                    forbidden_hosts=forbidden_hosts,
+                    forbidden_osds=forbidden_osds,
+                    osd_host=c.osd_host,
+                    projection=c.reservation,
+                    max_target_util=c.max_target_util,
+                )
+                is None
+            ):
+                return None
+            projected = c.final.utilization(osd, shard.size_bytes)
+            if below is not None and projected >= below:
+                return None
+            if self.relieve and projected >= self.lowest_relieved(osd):
+                return None
+            if self.chains(state, [(shard.up_osd, osd)]):
+                return None
+            return projected
+
         # A candidate's projection with the shard is at least bound: its own
         # plus what the shard adds to the largest OSD (less rounding).
         bump = shard.size_bytes / self.max_capacity.get(cls, 1) * 100 - 1e-9
@@ -443,30 +489,71 @@ class Planner:
                 or (best is not None and bound > best[0])
             ):
                 break
-            if (
-                target_projection(
-                    osd,
-                    shard.size_bytes,
-                    forbidden_hosts=forbidden_hosts,
-                    forbidden_osds=state.forbidden_osds,
-                    osd_host=c.osd_host,
-                    projection=c.reservation,
-                    max_target_util=c.max_target_util,
-                )
-                is None
+            projected = legal(osd, state.forbidden_osds)
+            if projected is not None and (best is None or (projected, osd) < best):
+                best = projected, osd
+
+        # Back where CRUSH maps it instead, if legal (the raw mapping bans it
+        # only because CRUSH holds it for this very shard; an acting OSD's
+        # ban stands), and unless that could stop later moves off the source.
+        unpin = self.unpin_target(state, shard)
+        if (
+            unpin is not None
+            and unpin not in state.new_up
+            and unpin not in real_osd_set(state.pg["acting"])
+        ):
+            projected = legal(unpin, state.forbidden_osds - {unpin})
+            if projected is not None and (
+                best is None or not self.costs_relief(shard, projected)
             ):
-                continue
-            projected = c.final.utilization(osd, shard.size_bytes)
-            if below is not None and projected >= below:
-                continue
-            if best is not None and (projected, osd) >= best:
-                continue
-            if self.relieve and projected >= self.lowest_relieved(osd):
-                continue
-            if self.chains(state, [(shard.up_osd, osd)]):
-                continue
-            best = projected, osd
+                return projected, unpin
         return best
+
+    def costs_relief(
+        self, shard: MappedShard | ArrivingShard, projected: float
+    ) -> bool:
+        """True if a target of shard ending at projected could stop later moves.
+
+        With relieve, a later move off the source must leave it above every
+        target it sent data to (highest_target). Such a move comes while the
+        source is at or above the level, with a shard no larger than this
+        one, so a target ending more than this shard below the level cannot
+        stop it. Without a level, any target could.
+        """
+        source, final = shard.up_osd, self.cluster.final
+        if not self.relieve or not final.knows(source):
+            return False
+        if self.level is None:  # divert-toofull: no bound on later moves
+            return True
+        shard_pct = final.utilization(source) - final.utilization(
+            source, -shard.size_bytes
+        )
+        return projected >= self.level - shard_pct
+
+    def unpin_target(
+        self, state: PgState, shard: MappedShard | ArrivingShard
+    ) -> int | None:
+        """Return the OSD CRUSH maps shard to, if a target host's candidate, else None.
+
+        That is N' of the PG's live existing pair N'->(shard's up OSD): N' is
+        not in 'up' (else the pair is stale), and a candidate of the shard's
+        device class. Only given target hosts.
+        """
+        if self.target_hosts is None:
+            return None
+        up = state.pg["up"]
+        cls = osd_class(self.cluster.osd_df, shard.up_osd)
+        for from_osd, to_osd in self.cluster.existing_pairs(state.pg):
+            if to_osd == shard.up_osd and from_osd not in up:
+                key = self.order_key.get(from_osd)
+                return from_osd if key is not None and key[0] == cls else None
+        return None
+
+    def is_unpin(
+        self, state: PgState, shard: MappedShard | ArrivingShard, target: int
+    ) -> bool:
+        """True if moving shard to target sends it back to the OSD CRUSH maps it to."""
+        return target == self.unpin_target(state, shard)
 
     def highest_target(self, osd_id: int) -> float:
         """Return the highest final projection of the targets osd_id sent data to.
@@ -511,7 +598,8 @@ class Planner:
     def uncommit(self, state: PgState, shard: MappedShard, target: int) -> None:
         """Undo commit(state, shard, target), which place() chose.
 
-        So target was not forbidden before: it no longer is.
+        So target was not forbidden before, unless it is in the raw CRUSH
+        mapping (an unpin): it no longer is.
         """
         c = self.cluster
         c.reservation.add(target, -shard.size_bytes)
@@ -526,7 +614,8 @@ class Planner:
             if not counts[key]:
                 del counts[key]
         state.retarget(target, shard.up_osd)
-        state.forbidden_osds.discard(target)
+        if target not in state.raw:
+            state.forbidden_osds.discard(target)
         state.changed.discard(state.key(shard))
 
     def is_blocker(
@@ -678,7 +767,15 @@ class Planner:
         pins, why = [], None
         if picked is not None:
             self.commit(state, shard, picked[1])
-            state.moves.insert(i, move._replace(target_osd=picked[1]))
+            unpin = self.is_unpin(state, shard, picked[1])
+            state.moves.insert(
+                i,
+                move._replace(
+                    target_osd=picked[1],
+                    note=UNPIN_NOTE if unpin else "",
+                    unpin=unpin,
+                ),
+            )
             pins, why = self.try_pin(state, blocker)
             if pins:
                 return pins, None
@@ -754,7 +851,9 @@ def shed_sources(
                 left.append((source, shard))
                 continue
             planner.commit(state, shard, picked[1])
-            state.add_move(shard, picked[1])
+            unpin = planner.is_unpin(state, shard, picked[1])
+            note = UNPIN_NOTE if unpin else ""
+            state.add_move(shard, picked[1], note, unpin=unpin)
             heapq.heappush(heap, priority(source))
             break
     return left
@@ -868,6 +967,7 @@ class ShedResult(NamedTuple):
     sources: list[int]  # in id order
     level: float | None  # None: empty the sources
     level_class: str | None  # the class whose targets must stay below level
+    target_hosts: list[str] | None  # the only hosts receiving data, sorted
     moves: list[Move]  # in PG order; within a PG, in the order proposed
     unplaceable: list[MappedShard]  # in PG, then shard order
     mapped_count: int  # shards mapped to a source, in PGs not left alone
@@ -902,6 +1002,11 @@ class ShedResult(NamedTuple):
         return [m for m in self.moves if m.role == ROLE_REQUESTED]
 
     @property
+    def unpinned_count(self) -> int:
+        """Requested moves that send a shard back to the OSD CRUSH maps it to."""
+        return sum(m.unpin for m in self.requested)
+
+    @property
     def moved_bytes(self) -> int:
         """Data the requested moves take off the sources."""
         return sum(m.size_bytes for m in self.requested)
@@ -912,10 +1017,12 @@ def shed(
     sources: set[int],
     level: float | None,
     level_class: str | None = None,
+    target_hosts: frozenset[str] | None = None,
 ) -> ShedResult:
     """Work out the moves that take each source below level (None: empty them).
 
     level_class: the device class whose targets must end up below level too.
+    target_hosts: if given, only OSDs on these hosts receive data.
     Updates cluster's projections to include the moves. Exits if a PG to
     move is in an unknown pool, or one whose CRUSH failure domain is not host.
     """
@@ -956,7 +1063,14 @@ def shed(
         for shard in found:
             by_source[shard.up_osd].append(shard)
 
-    planner = Planner(cluster, sources, level, level_class, relieve=level is not None)
+    planner = Planner(
+        cluster,
+        sources,
+        level,
+        level_class,
+        relieve=level is not None,
+        target_hosts=target_hosts,
+    )
     left = shed_sources(planner, states, by_source)
 
     diverted = pinned = 0
@@ -999,6 +1113,7 @@ def shed(
         sources=sorted(sources),
         level=level,
         level_class=level_class,
+        target_hosts=None if target_hosts is None else sorted(target_hosts),
         moves=project_moves(cluster, moves),
         unplaceable=unplaceable,
         mapped_count=sum(len(shards) for *_, shards in movable),

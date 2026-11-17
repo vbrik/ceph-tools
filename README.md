@@ -59,7 +59,8 @@ Commands for inspecting and steering PG backfills. Run it as
 **Remap**
 
 - `drain`: empty OSDs or hosts (or only down to a utilization).
-- `balance`: move data off a device class's fullest OSDs onto its emptiest.
+- `balance`: move data off a device class's fullest OSDs onto its emptiest,
+  or with `--target-hosts` onto given hosts only (see below).
 - `divert-toofull`: re-target shards stuck in `backfill_toofull`.
 
 **Cancel**
@@ -86,6 +87,13 @@ remapping commands assume the CRUSH failure domain is `host`. `balance`
 works in rounds: apply, let the backfills finish, and re-run. On a
 terminal, stderr shows the balancer reminder in bold yellow (set
 `NO_COLOR` to turn that off).
+
+**After adding hosts** to a full cluster, relieve the fullest OSDs first
+without CRUSH's cluster-wide reshuffle: turn the balancer off, add the hosts,
+pin every backfill with `cancel-backfill`, then run `balance --target-hosts`
+with the new hosts in rounds. Where it costs no relief, a shard pinned away
+from a new host goes back to the OSD CRUSH chose for it, so that data moves
+once. Turn the balancer back on to finish gradually.
 
 **Shell completion** (bash, via [shtab](https://docs.iterative.ai/shtab/)):
 `backfillctl --print-completion bash` prints the script. To load it in every

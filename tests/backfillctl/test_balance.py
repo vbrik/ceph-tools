@@ -45,6 +45,7 @@ from _support import (
     run_command,
     shared,
     stderr_of,
+    upmap_pairs,
 )
 from _support import shed as sh
 
@@ -159,6 +160,7 @@ class SourcesTest(unittest.TestCase):
         for argv, error in (
             (["--class", "ssd"], "ERROR: --class: "),
             (["--osds", "999"], "ERROR: --osds: "),
+            (["--target-hosts", "nope"], "ERROR: --target-hosts: "),
         ):
             with self.subTest(argv=argv), self.assertRaises(SystemExit) as cm:
                 bal.plan(parse_args(bal, argv), FakeStore(snapshots))
@@ -198,6 +200,72 @@ class SourcesTest(unittest.TestCase):
         result = c.pg("1.0", [40, 10, 20]).plan("--class", "ssd")
         self.assertEqual(result.shed.sources, [40])
         self.assertEqual(pairs(result), [("1.0", 0, 40, 41)])
+
+
+class TargetHostsTest(unittest.TestCase):
+    """--target-hosts: only these hosts receive data; pinned shards go home."""
+
+    @staticmethod
+    def pinned() -> Cluster:
+        """osd.0 over the level; CRUSH chose osd.40 for its shard (pin 40->0)."""
+        c = Cluster()
+        c.util[0] = 80.0
+        c.util[40] = 30.0
+        c.upmaps.append({"pgid": "1.0", "mappings": [{"from": 40, "to": 0}]})
+        return c.pg("1.0", [0, 10, 20])
+
+    def test_moves_go_to_the_target_hosts(self):
+        c = Cluster()
+        c.util[0] = 80.0
+        c.util[31] = 5.0  # emptiest, but not on a target host
+        c.util[50] = 10.0
+        result = c.pg("1.0", [0, 10, 20]).plan("--target-hosts", "h5")
+        self.assertEqual(pairs(result), [("1.0", 0, 0, 50)])
+
+    def test_unknown_host_is_named(self):
+        with self.assertRaises(SystemExit) as cm:
+            Cluster().plan("--target-hosts", "h5", "nope")
+        self.assertEqual(
+            str(cm.exception),
+            "ERROR: --target-hosts: no OSDs under these in 'ceph osd tree': nope",
+        )
+
+    def test_hosts_match_by_short_name(self):
+        c = Cluster()
+        c.util[0] = 80.0
+        result = c.pg("1.0", [0, 10, 20]).plan("--target-hosts", "h5.example.org")
+        self.assertEqual(result.shed.target_hosts, ["h5"])
+
+    def test_host_without_class_osds_is_named(self):
+        c = Cluster()
+        c.classes[50] = c.classes[51] = "ssd"
+        with self.assertRaises(SystemExit) as cm:
+            c.plan("--target-hosts", "h4", "h5")
+        self.assertEqual(
+            str(cm.exception),
+            "ERROR: --target-hosts: no up and in hdd OSDs with a size and "
+            "utilization in 'ceph osd df': h5",
+        )
+
+    def test_stderr_names_the_target_hosts_and_counts_unpins(self):
+        _, err = self.pinned().rendered("--target-hosts", "h5", "h4")
+        self.assertIn("Targets: the hdd OSDs on h4, h5, ", err)
+        self.assertIn(
+            "1 move sends a shard back to the OSD CRUSH maps it to, "
+            "dropping its upmap pair.",
+            err,
+        )
+
+    def test_no_unpin_sentence_without_unpins(self):
+        _, err = self.pinned().rendered("--target-hosts", "h5")
+        self.assertNotIn("CRUSH maps it to", err)
+
+    def test_unpin_json_entry_is_up_to_crush_osd(self):
+        out, _ = self.pinned().rendered("--target-hosts", "h4", "--pgremapper-mappings")
+        self.assertEqual(
+            upmap_pairs(out), [{"pgid": "1.0", "mapping": {"from": 0, "to": 40}}]
+        )
+        self.assertEqual(json.loads(out)[0]["note"], messages.UNPIN_NOTE)
 
 
 # ---------------------------------------------------------------------------
@@ -569,9 +637,24 @@ class FixtureInvariantTest(unittest.TestCase):
                 self.assertNotIn(m.target_osd, pgs[m.pgid]["acting"])
                 self.assertNotIn(m.target_osd, pgs[m.pgid]["up"])
                 # Nor in the raw CRUSH mapping: Ceph drops such an upmap.
+                # An unpin is the exception: it reverses an existing pair.
                 existing = cluster.existing_pairs(pgs[m.pgid])
-                self.assertNotIn(m.target_osd, {f for f, _ in existing})
+                if m.unpin:
+                    self.assertIn((m.target_osd, m.up_osd), existing)
+                else:
+                    self.assertNotIn(m.target_osd, {f for f, _ in existing})
                 self.assertLess(m.target_projected, r.level)
+
+    def test_target_hosts_on_new_hosts(self):
+        fixture = "divert-toofull-ceph2-util-emergency-2-new-hosts"
+        hosts = {"host50", "host51"}
+        result, trace = self.run_traced(fixture, "--target-hosts", *sorted(hosts))
+        self.check(fixture, result, trace)
+        r = result.shed
+        self.assertTrue(r.requested)
+        for m in r.moves:
+            if not sh.is_pin(m):
+                self.assertIn(r.osd_host[m.target_osd], hosts, m)
 
     def test_a_busy_cluster_gets_relieved(self):
         result, trace = self.traced["ceph1-resumed-backfills-exact-progress"]
