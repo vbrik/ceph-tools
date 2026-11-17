@@ -83,7 +83,9 @@ each command's `--help` explains its roles). Turn off the
 upmap balancer (`ceph balancer off`) for as long as the upmaps should hold,
 and keep drained OSDs up and in: marking them out voids the upmaps. The
 remapping commands assume the CRUSH failure domain is `host`. `balance`
-works in rounds: apply, let the backfills finish, and re-run.
+works in rounds: apply, let the backfills finish, and re-run. On a
+terminal, stderr shows the balancer reminder in bold yellow (set
+`NO_COLOR` to turn that off).
 
 **Shell completion** (bash, via [shtab](https://docs.iterative.ai/shtab/)):
 `backfillctl --print-completion bash` prints the script. To load it in every

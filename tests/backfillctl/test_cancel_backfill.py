@@ -925,7 +925,7 @@ class RenderTest(unittest.TestCase):
 
     def test_no_warning_without_chains(self):
         _, err = self.render(chained={}, skipped=[])
-        self.assertNotIn("WARNING", err)
+        self.assertNotIn("WARNING: the pins", err)
 
     def test_planning_notes_are_printed_even_when_planning_then_exits(self):
         # A typo in --exclude-pgs is worth knowing about even when a PG then
@@ -1309,12 +1309,12 @@ class MainTest(unittest.TestCase):
                 {"pgid": "19.d", "mapping": {"from": 9, "to": 4}},
             ],
         )
-        self.assertNotIn("WARNING", err)
+        self.assertNotIn("WARNING: the pins", err)
         self.assertIn("19.a", err)  # unpinnable shards are still reported
 
     def test_table_output_does_not_warn(self):
         _, err = self.run_main("--osds", "682")
-        self.assertNotIn("WARNING", err)
+        self.assertNotIn("WARNING: the pins", err)
 
     def test_blockers_are_not_pinned_by_default(self):
         # osd.77 is at 92%, over the 91% backfillfull_ratio, so shard 3 (66->77)
@@ -1791,7 +1791,7 @@ class FixtureReplayTest(unittest.TestCase):
                     ],
                     expected.splitlines(),
                 )
-                self.assertNotIn("WARNING", result.stderr)
+                self.assertNotIn("WARNING: the pins", result.stderr)
 
     def summary_counts(self, result):
         """(requested pins, other pins, blockers, skipped): what the summary reports."""

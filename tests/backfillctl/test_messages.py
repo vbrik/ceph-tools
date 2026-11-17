@@ -8,7 +8,9 @@ leaf module (shared.py imports it, so importing back would be a cycle).
 import ast
 import contextlib
 import io
+import os
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from _support import flat, messages, shared, stderr_of
@@ -179,20 +181,82 @@ class PinSummaryTest(unittest.TestCase):
         )
 
 
-class BalancerNoteTest(unittest.TestCase):
+class TtyStringIO(io.StringIO):
+    """A StringIO that passes for a terminal."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def styled_stderr_of(fn, env: dict[str, str], *, tty: bool = True) -> str:
+    """Call fn with stderr a terminal (or not) and env as NO_COLOR/TERM, and
+    return what it printed, verbatim.
+    """
+    err = TtyStringIO() if tty else io.StringIO()
+    env = {"NO_COLOR": "", "TERM": "xterm-256color"} | env
+    with (
+        contextlib.redirect_stderr(err),
+        unittest.mock.patch.dict(os.environ, env),
+        # No blank line separating it from an earlier test's paragraph.
+        unittest.mock.patch.object(messages.stderr_para, "printed", False),
+    ):
+        fn()
+    return err.getvalue()
+
+
+class EmphasisTest(unittest.TestCase):
+    def test_emphasized_on_a_terminal(self):
+        text = styled_stderr_of(lambda: messages.stderr_para("x", emphasized=True), {})
+        self.assertEqual(text, f"{messages.EMPHASIS_ON}x{messages.EMPHASIS_OFF}\n")
+
+    def test_plain_when_not_emphasized(self):
+        self.assertEqual(styled_stderr_of(lambda: messages.stderr_para("x"), {}), "x\n")
+
+    def test_plain_off_a_terminal_with_no_color_or_on_a_dumb_terminal(self):
+        def para():
+            messages.stderr_para("x", emphasized=True)
+
+        for env, tty in (
+            ({}, False),
+            ({"NO_COLOR": "1"}, True),
+            ({"TERM": "dumb"}, True),
+        ):
+            with self.subTest(env=env, tty=tty):
+                self.assertEqual(styled_stderr_of(para, env, tty=tty), "x\n")
+
+    def test_wrapped_before_styling(self):
+        # Escape codes counted as width would wrap the line short.
+        words = " ".join(["word"] * 50)
+        plain = styled_stderr_of(lambda: messages.stderr_para(words), {})
+        styled = styled_stderr_of(
+            lambda: messages.stderr_para(words, emphasized=True), {}
+        )
+        self.assertEqual(
+            styled, f"{messages.EMPHASIS_ON}{plain[:-1]}{messages.EMPHASIS_OFF}\n"
+        )
+
+
+class BalancerWarningTest(unittest.TestCase):
     def test_note_is_the_advice(self):
         self.assertEqual(
-            stderr_of(messages.print_balancer_note),
-            "NOTE: turn off the upmap balancer ('ceph balancer off') for as long "
+            stderr_of(messages.print_balancer_warning),
+            "WARNING: turn off the upmap balancer ('ceph balancer off') for as long "
             "as these upmaps should hold, or it may undo them.",
         )
+
+    def test_note_is_emphasized_on_a_terminal(self):
+        text = styled_stderr_of(messages.print_balancer_warning, {})
+        self.assertTrue(text.startswith(messages.EMPHASIS_ON + "WARNING: turn off"))
+        self.assertTrue(text.endswith(messages.EMPHASIS_OFF + "\n"))
 
 
 class PinFooterTest(unittest.TestCase):
     def test_only_the_cost_of_cancelling_and_the_balancer_by_default(self):
         self.assertEqual(
             stderr_of(messages.print_pin_footer, {}),
-            flat(messages.CANCEL_NOTE) + " " + stderr_of(messages.print_balancer_note),
+            flat(messages.CANCEL_NOTE)
+            + " "
+            + stderr_of(messages.print_balancer_warning),
         )
 
     def test_chains_then_extra_notes_then_the_cost(self):
@@ -205,7 +269,7 @@ class PinFooterTest(unittest.TestCase):
                 "NOTE: extra. "
                 + flat(messages.CANCEL_NOTE)
                 + " "
-                + stderr_of(messages.print_balancer_note)
+                + stderr_of(messages.print_balancer_warning)
             )
         )
 

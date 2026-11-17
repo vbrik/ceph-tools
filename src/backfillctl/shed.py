@@ -68,7 +68,7 @@ from backfillctl.messages import (
     companion_note,
     format_bytes,
     level_text,
-    print_balancer_note,
+    print_balancer_warning,
     print_level_unplaceable,
     print_shed_outcome,
     print_stalled,
@@ -1128,7 +1128,7 @@ def print_notes(result: ShedResult, which: str) -> None:
         print_level_unplaceable(len(result.unplaceable), guards)
     print_stalled(result.stalled_pgs)
     if result.moves:
-        print_balancer_note()
+        print_balancer_warning()
 
 
 def unsized_sources(result: ShedResult) -> list[int]:

@@ -457,12 +457,12 @@ class RenderTest(unittest.TestCase):
             ],
         )
 
-    def test_balancer_note_closes_a_run_that_moves_something(self):
-        note = stderr_of(messages.print_balancer_note)
+    def test_balancer_warning_closes_a_run_that_moves_something(self):
+        warning = stderr_of(messages.print_balancer_warning)
         for argv in ([], ["--pgremapper-mappings"]):
             with self.subTest(argv=argv):
                 _, err = self.cluster().rendered(*argv)
-                self.assertTrue(err.endswith(note), err)
+                self.assertTrue(err.endswith(warning), err)
 
     def test_no_sources_says_so(self):
         for argv, out_text in (([], ""), (["--pgremapper-mappings"], "[]\n")):

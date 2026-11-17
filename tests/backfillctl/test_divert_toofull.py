@@ -961,8 +961,10 @@ class FixtureReplayTest(unittest.TestCase):
         entries = upmap_pairs(proc.stdout)
         self.assertEqual(len(entries), 5)
         self.assertIn({"pgid": "19.bd5", "mapping": {"from": 263, "to": 842}}, entries)
-        # The balancer's, and that the capture has no backfill positions; no more.
-        self.assertEqual(proc.stderr.count("NOTE"), 2)
+        # The balancer warning, and a note that the capture has no backfill
+        # positions; no more.
+        self.assertEqual(proc.stderr.count("WARNING"), 1)
+        self.assertEqual(proc.stderr.count("NOTE"), 1)
         self.assertIn("has no backfill_positions.json", proc.stderr)
 
     def test_pgremapper_mappings_emits_up_osd_not_acting_osd(self):
@@ -987,14 +989,14 @@ class FixtureReplayTest(unittest.TestCase):
     def test_no_backfill_toofull_pgs_prints_an_empty_json_array(self):
         self.assertEqual(self.run_script(NOMINAL, "--pgremapper-mappings"), "[]")
 
-    def test_balancer_note_closes_a_run_with_proposals(self):
-        note = stderr_of(messages.print_balancer_note)
+    def test_balancer_warning_closes_a_run_with_proposals(self):
+        warning = stderr_of(messages.print_balancer_warning)
         for extra in ((), ("--pgremapper-mappings",)):
             with self.subTest(extra=extra):
                 err = flat(self.run_proc(OSD457, *extra).stderr)
-                self.assertTrue(err.endswith(note), err)
+                self.assertTrue(err.endswith(warning), err)
 
-    def test_no_balancer_note_without_proposals(self):
+    def test_no_balancer_warning_without_proposals(self):
         for fixture, extra in (
             (NOMINAL, ()),
             # No room anywhere: the one stuck shard is unplaceable.

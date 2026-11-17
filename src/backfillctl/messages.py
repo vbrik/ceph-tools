@@ -9,6 +9,7 @@ Imports nothing from backfillctl (types only, for annotations), so that
 shared.py and placement.py can use it too.
 """
 
+import os
 import shutil
 import sys
 import textwrap
@@ -39,16 +40,37 @@ def wrap_text(text: str, indent: str = "") -> str:
     )
 
 
-def stderr_para(text: str) -> None:
+# SGR codes for a paragraph that must not get lost among the notes: bold yellow.
+EMPHASIS_ON = "\033[1;33m"
+EMPHASIS_OFF = "\033[0m"
+
+
+def stderr_styled() -> bool:
+    """Whether stderr takes escape codes: a terminal other than TERM=dumb, and
+    NO_COLOR (no-color.org) unset or empty.
+    """
+    return (
+        sys.stderr.isatty()
+        and not os.environ.get("NO_COLOR")
+        and os.environ.get("TERM") != "dumb"
+    )
+
+
+def stderr_para(text: str, *, emphasized: bool = False) -> None:
     """Print a wrapped stderr paragraph, separated from the previous by a blank line.
 
     Flushes stdout first, so a table and the notes about it keep their
-    order when both streams go to one pipe (2>&1).
+    order when both streams go to one pipe (2>&1). emphasized prints it in
+    bold yellow if stderr_styled().
     """
     sys.stdout.flush()
     if stderr_para.printed:
         print(file=sys.stderr)
-    print(wrap_text(text), file=sys.stderr)
+    # Styled after wrapping: textwrap would count the escape codes as width.
+    para = wrap_text(text)
+    if emphasized and stderr_styled():
+        para = f"{EMPHASIS_ON}{para}{EMPHASIS_OFF}"
+    print(para, file=sys.stderr)
     stderr_para.printed = True
 
 
@@ -211,9 +233,13 @@ BALANCER_ADVICE = (
 )
 
 
-def print_balancer_note() -> None:
-    """Print BALANCER_ADVICE on stderr, as a NOTE."""
-    stderr_para(f"NOTE: {BALANCER_ADVICE}")
+def print_balancer_warning() -> None:
+    """Print BALANCER_ADVICE on stderr, as an emphasized WARNING.
+
+    Emphasized because it closes a run, after many notes, and missing it
+    lets the balancer quietly undo the upmaps.
+    """
+    stderr_para(f"WARNING: {BALANCER_ADVICE}", emphasized=True)
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +291,7 @@ def print_pin_footer(
     for note in extra_notes:
         stderr_para(note)
     stderr_para(CANCEL_NOTE)
-    print_balancer_note()
+    print_balancer_warning()
 
 
 # ---------------------------------------------------------------------------

@@ -51,7 +51,7 @@ from backfillctl.messages import (
     RELIEVE_CLAUSE,
     chained_text,
     named_list,
-    print_balancer_note,
+    print_balancer_warning,
     print_pgid_filter,
     print_unplaceable,
     stderr_para,
@@ -428,7 +428,7 @@ def render(result: DivertResult, args: argparse.Namespace) -> None:
     print_moves(r.moves, r.osd_host, r.osd_df, args)
     print_outcome(r)
     if r.moves:
-        print_balancer_note()
+        print_balancer_warning()
 
 
 def run(args: argparse.Namespace) -> None:
